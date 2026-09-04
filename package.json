@@ -1,0 +1,41 @@
+{
+  "name": "sonore-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Header-only C++17 audio plugin framework: one source builds CLAP, VST3, AU, LV2 and a standalone app, with a software-rasterised native UI.",
+  "homepage": "https://github.com/SonorieAI/sonore-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SonorieAI/sonore-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SonorieAI/sonore-sdk/issues"
+  },
+  "keywords": [
+    "audio",
+    "dsp",
+    "audio-plugin",
+    "vst3",
+    "clap",
+    "audio-unit",
+    "lv2",
+    "header-only",
+    "cpp17"
+  ],
+  "type": "module",
+  "scripts": {
+    "verify": "node scripts/sdk-verify.mjs",
+    "verify:sdk": "node scripts/sdk-verify.mjs",
+    "verify:sanitize": "node scripts/sdk-sanitize.mjs",
+    "verify:features": "node scripts/feature-map.mjs",
+    "verify:parity": "node scripts/reference-parity.mjs",
+    "verify:unclaimed": "node scripts/unclaimed.mjs",
+    "verify:headers": "node scripts/header-rules.mjs",
+    "verify:namespaces": "node scripts/namespace-rules.mjs",
+    "verify:backends": "node scripts/backend-surface.mjs",
+    "verify:rt": "node scripts/audio-thread-rules.mjs",
+    "verify:daw": "node scripts/daw-probe.mjs",
+    "verify:daw-render": "node scripts/daw-render.mjs"
+  }
+}

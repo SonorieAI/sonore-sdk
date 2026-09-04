@@ -1,0 +1,22 @@
+Sonore SDK
+Copyright 2026 Sonorie
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License in the LICENSE file at the root of this repository, or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The framework's own source — everything under sdk/include/sonore, sdk/examples
+and sdk/tests — is original work. Its DSP is implemented from published
+mathematics (RBJ, Zavalishin, Jot, Dattorro, Yeh, BS.1770 and the papers each
+header cites) rather than adapted from any other framework's source.
+
+This distribution vendors a small amount of third-party code, each under its
+own licence, and links one dependency fetched at build time. Their notices are
+reproduced in THIRD_PARTY_NOTICES.md, which is part of this NOTICE for the
+purposes of section 4(d) of the License.
+
+Some plugin formats this SDK can build carry obligations from their format
+owners that no software licence can grant. Those are listed in
+THIRD_PARTY_NOTICES.md too — read it before shipping a commercial product.

@@ -1,0 +1,145 @@
+# Sonore SDK: build and test on all three desktop platforms.
+#
+# Linux and Windows are also proven locally on the dev box, Windows natively
+# and Linux through WSL. This workflow runs the SAME tests on all three
+# platforms rather than a reduced set on any of them, because a per-platform
+# gap is invisible until the code is compiled for that platform: an early
+# `nativeWindowApi()` returned "win32" on Linux, which would have meant no
+# exported Linux plugin ever showed a UI.
+name: SDK
+
+on:
+  push:
+    paths:
+      - "sdk/**"
+      - "scripts/**"
+      - ".github/workflows/sdk.yml"
+  # The verification instruments live in scripts/, so a pull request that
+  # changes one must run the gate too -- without this a contributor could
+  # weaken a check and CI would say nothing.
+  pull_request:
+    paths:
+      - "sdk/**"
+      - "scripts/**"
+      - ".github/workflows/sdk.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+          - name: Linux
+            os: ubuntu-24.04
+          - name: Windows
+            os: windows-2022
+          # The marketplace's Windows binaries are cross-built with clang-cl
+          # and lld-link, so the SDK is compiled by that compiler here too.
+          # Visual Studio's own LLVM toolset (-T ClangCL) is on the image.
+          - name: Windows-clangcl
+            os: windows-2022
+            configure: -T ClangCL
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebKitGTK is dlopened at runtime, so it is not needed to BUILD, but the
+      # GUI half of the tests can only do something real when it is installed.
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-0 libwebkit2gtk-4.1-0 libx11-dev xvfb
+
+      - name: Configure
+        run: cmake -S sdk -B sdk/build -DCMAKE_BUILD_TYPE=Release ${{ matrix.configure }}
+
+      - name: Build
+        run: cmake --build sdk/build --config Release
+
+      # A desktop session the editor can attach to. Without one the GUI tests
+      # skip, and a green run would mean less than it appears to.
+      - name: Test (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a ctest --test-dir sdk/build -C Release --output-on-failure
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: ctest --test-dir sdk/build -C Release --output-on-failure
+
+      # Apple's own validator - the gate Logic and GarageBand apply before
+      # they will even list a plugin. auval only sees INSTALLED and REGISTERED
+      # components, so the bundles are copied where a user's DAW would find
+      # them and the registrar is then asked whether it agrees they exist.
+      - name: auval (Apple's AU validator)
+        if: runner.os == 'macOS'
+        run: |
+          set -x
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          # No -maxdepth, and the results are PRINTED: the first run of this step
+          # installed nothing, and auval then said "didn't find the component",
+          # which reads like a broken plugin when the real event was a copy that
+          # matched no files. A step that cannot show what it saw cannot be
+          # debugged from a log.
+          find sdk/build -name "*.component" -print
+          find sdk/build -name "*.component" -exec cp -R {} ~/Library/Audio/Plug-Ins/Components/ \;
+          ls -la ~/Library/Audio/Plug-Ins/Components/
+          if [ -z "$(ls -A ~/Library/Audio/Plug-Ins/Components/)" ]; then
+            echo "no .component bundles installed - the auval runs below would be meaningless"
+            ls -la sdk/build | head -40
+            exit 1
+          fi
+          # INSTALLED IS NOT REGISTERED, and the two failures read identically
+          # in an auval log (-50 on the name, then "didn't find the component").
+          # The registrar normally notices a new bundle by itself; restarting it
+          # makes the scan happen NOW rather than whenever the daemon gets to it.
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            auval -a 2>/dev/null | grep -q "Sonr" && break
+            sleep 2
+          done
+          if ! auval -a 2>/dev/null | grep "Sonr"; then
+            echo "macOS registered NONE of the installed components."
+            echo "That is a bundle problem, not a plugin problem - check the"
+            echo "signature and the AudioComponents array before reading further:"
+            codesign -dv --verbose=2 ~/Library/Audio/Plug-Ins/Components/SonoreSaturatorAU.component || true
+            cat ~/Library/Audio/Plug-Ins/Components/SonoreSaturatorAU.component/Contents/Info.plist || true
+            exit 1
+          fi
+          auval -v aufx Sat1 Sonr
+          auval -v aumu Syn1 Sonr
+          auval -v aufx Duk1 Sonr
+          auval -v aufx Trm1 Sonr
+          auval -v aufx Spl1 Sonr
+          auval -v aumu Arp1 Sonr
+
+      # The artifacts a human can actually load into a DAW to check by hand.
+      - name: Collect plugins
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonore-plugins-${{ matrix.name }}
+          path: |
+            sdk/build/**/*.clap
+            sdk/build/**/*.vst3
+            sdk/build/**/*.component
+          if-no-files-found: warn
+
+  # The sanitizers, on the one platform where they cost nothing to set up.
+  # Slow by nature -- the instrumented builds are most of it -- so a job of
+  # its own rather than a step in the matrix, and never a reason to skip the
+  # fast gate above.
+  sanitize:
+    name: Sanitize (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: ASan+UBSan on every wrapper, the suites and the fuzzer; TSan on the handover
+        run: npm run verify:sanitize

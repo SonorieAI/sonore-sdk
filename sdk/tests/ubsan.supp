@@ -1,0 +1,12 @@
+# UndefinedBehaviorSanitizer suppressions for scripts/sdk-sanitize.mjs.
+#
+# Every entry here is a finding somebody LOOKED AT and decided to leave, with
+# the reason beside it. An entry without a reason is a finding being hidden.
+#
+# stb_vorbis (vendored, upstream v1.22): get32_packet assembles a value with
+# `get8_packet(f) << 8`, and at end-of-packet get8_packet returns -1, so the
+# shift is of a negative int -- undefined in C++17, and arithmetic on every
+# compiler this SDK builds with. The value is discarded by the checks that
+# follow. Upstream's code; not memory-unsafe; left alone so the vendored file
+# stays upstream's byte for byte apart from the one fix marked in it.
+shift-base:stb_vorbis.c

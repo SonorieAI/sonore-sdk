@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The AudioComponents array IS the registration. A host reads this to discover
+  the plugin and to find the factory function by name; a bundle without it is
+  simply never seen, however correct the code inside is.
+
+  `type` distinguishes an effect (aufx) from an instrument (aumu), and the host
+  files them in different menus — so it is set from the descriptor at configure
+  time rather than hardcoded.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>English</string>
+  <key>CFBundleExecutable</key>
+  <string>@SONORE_AU_NAME@</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.sonorie.@SONORE_AU_NAME@</string>
+  <key>CFBundleName</key>
+  <string>@SONORE_AU_NAME@</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1.0.0</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>AudioComponents</key>
+  <array>
+    <dict>
+      <key>name</key>
+      <string>Sonorie: @SONORE_AU_NAME@</string>
+      <key>description</key>
+      <string>@SONORE_AU_NAME@</string>
+      <key>factoryFunction</key>
+      <string>SonoreAUFactory</string>
+      <key>type</key>
+      <string>@SONORE_AU_TYPE@</string>
+      <key>subtype</key>
+      <string>@SONORE_AU_SUBTYPE@</string>
+      <key>manufacturer</key>
+      <string>@SONORE_AU_MANUFACTURER@</string>
+      <key>version</key>
+      <integer>65536</integer>
+      <key>sandboxSafe</key>
+      <true/>
+    </dict>
+  </array>
+</dict>
+</plist>

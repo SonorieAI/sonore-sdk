@@ -1,0 +1,25 @@
+# Build output
+sdk/build/
+node_modules/
+
+# Industry validators — fetched binaries, never committed.
+# clap-validator from free-audio/clap-validator releases,
+# pluginval from Tracktion/pluginval releases. verify:sdk skips
+# LOUDLY when they are absent, so a fresh clone still runs green.
+sdk/tools/
+
+# Steinberg's ASIO SDK is NOT redistributable. sonore_enable_asio()
+# skips loudly and names where to get it; the headers must never be
+# committed here.
+sdk/third_party/asio/
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.user
+.DS_Store
+
+# Test vectors the audiofile tests write beside the exe on every run.
+sonore-stream*
+sonore-streamer-test.wav
+sdk/build-clangcl/
