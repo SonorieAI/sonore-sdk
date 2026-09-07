@@ -26,6 +26,9 @@
   "type": "module",
   "scripts": {
     "verify": "node scripts/sdk-verify.mjs",
+    "llms": "node scripts/llms-txt.mjs",
+    "verify:llms": "node scripts/llms-txt.mjs --check",
+    "mcp": "node scripts/mcp-server.mjs",
     "verify:sdk": "node scripts/sdk-verify.mjs",
     "verify:sanitize": "node scripts/sdk-sanitize.mjs",
     "verify:features": "node scripts/feature-map.mjs",

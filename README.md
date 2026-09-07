@@ -42,6 +42,46 @@ The industry validators (`clap-validator`, `pluginval`) are fetched binaries,
 not committed. Drop them into `sdk/tools/` and the gate uses them; when they
 are absent it says so explicitly.
 
+## Writing plugins with a coding agent
+
+Two things in this repository exist for language models rather than for people,
+because the way an unfamiliar C++ library usually fails an agent is not refusal,
+it is invention: a class name that sounds like it should exist, a real class
+given a method from a different library, and code that reads perfectly and does
+not compile.
+
+**[llms.txt](llms.txt)** is the map, in the [llmstxt.org](https://llmstxt.org)
+convention: what this is, the shape of a plugin, the rules that cannot be
+guessed from the API, and one line per header.
+**[llms-full.txt](llms-full.txt)** adds every public type in every header, which
+is the part that settles whether a name exists. Both are generated from the
+headers by `scripts/llms-txt.mjs`, so they cannot describe an API the code does
+not have, and `npm run verify:llms` fails if they have drifted.
+
+**An MCP server** lets an agent ask instead of guess. No dependencies, no
+install: it is plain JSON-RPC over stdio.
+
+```
+claude mcp add sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs
+```
+
+Or, for any other MCP client:
+
+```json
+{ "mcpServers": { "sonore-sdk": {
+    "command": "node",
+    "args": ["/path/to/sonore-sdk/scripts/mcp-server.mjs"] } } }
+```
+
+| Tool | What it answers |
+| --- | --- |
+| `search` | Does this class or concept exist here, and where. An empty result is a real answer. |
+| `type` | The actual declaration of a public type, with the comment explaining why it exists. |
+| `header` | What one header is for, its public types, and the include line. |
+| `headers` | Every header with a one-line purpose. |
+| `example` | A complete working plugin: effect, instrument, sidechain, aux outputs, MIDI output, sampler. |
+| `rules` | The shape of a plugin, which `process` signature makes an instrument, latency reporting, and what is forbidden on the audio thread. |
+
 ## Status
 
 Windows and Linux are built and tested continuously (unit tests, our own host

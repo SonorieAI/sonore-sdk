@@ -143,3 +143,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: ASan+UBSan on every wrapper, the suites and the fuzzer; TSan on the handover
         run: npm run verify:sanitize
+
+  # llms.txt and llms-full.txt are generated FROM the headers, which is the only
+  # reason they can be trusted: a hand-written index of an API drifts from the
+  # API, and an agent that reads a class which no longer exists writes code that
+  # cannot compile and does it confidently. This check costs seconds and is what
+  # makes "generated, so it cannot be wrong" a fact rather than an intention.
+  docs:
+    name: Agent docs are current
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm run verify:llms

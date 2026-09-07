@@ -1,0 +1,281 @@
+# Sonore SDK
+
+> A header-only C++17 audio plugin framework. One source file builds a `.clap`,
+> a `.vst3`, an AUv2 `.component`, an `.lv2` bundle and a standalone
+> application. No framework runtime is linked into the result and there is no
+> separate framework licence to obtain. Apache-2.0.
+
+This file exists for language models and coding agents. It is generated from the
+headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
+not have. 171 headers, 426 public types.
+
+Two things are worth knowing before writing any code against it. Every claim in
+this repository has a measurement behind it in `sdk/tests`, so if you are
+unsure whether something behaves as documented, the test says. And the DSP is
+implemented from published mathematics rather than adapted from another
+framework, so names will not always match what a similar library calls them:
+check the inventory below rather than assuming.
+
+## The shape of a plugin
+
+```cpp
+// One file is a whole plugin. This builds a .clap, and the same source builds
+// every other format by defining SONORE_BUILD_<FORMAT> and including one more
+// header at the bottom.
+
+#define SONORE_NUM_PARAMS 2
+#include <sonore/dsp.h>
+
+struct SonoreDsp {
+  sonore::Smooth gainSm;
+
+  void prepare(const sonore::ProcessSpec& spec) {
+    gainSm.setup((float) spec.sampleRate, 12.0f);
+    gainSm.snap(1.0f);
+  }
+
+  // p[] is the parameter array, in the order of kParamTable below.
+  void process(sonore::AudioBlock<float>& io, const float* p) {
+    for (size_t i = 0; i < io.getNumSamples(); ++i) {
+      const float g = gainSm.next(sonore::dbToGain(p[0]));
+      for (int c = 0; c < io.getNumChannels(); ++c)
+        io.getChannelPointer(c)[i] *= g;
+    }
+  }
+};
+
+// id, label, unit, min, max, default, stepCount
+static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
+    {"gain", "Gain", "dB", -24.0f, 12.0f, 0.0f, 0},
+    {"mix",  "Mix",  "%",    0.0f, 100.0f, 100.0f, 0},
+};
+
+static const sonore::PluginDescriptor kDesc = {
+    "com.example.gain", "Example Gain", "Vendor", "1.0.0",
+    "A gain stage.", "https://example.com",
+    false,                       // true for an instrument
+    kParamTable, SONORE_NUM_PARAMS,
+    nullptr, 0,                  // factory presets, if any
+    "utility",                   // category
+};
+
+#include <sonore/clap_wrapper.h>
+
+#if defined(SONORE_BUILD_VST3)
+#include <sonore/vst3_wrapper.h>
+#endif
+#if defined(SONORE_BUILD_AU)
+#include <sonore/au_wrapper.h>
+#include <sonore/au_view.h>
+#endif
+#if defined(SONORE_BUILD_LV2)
+#include <sonore/lv2_wrapper.h>
+#endif
+#if defined(SONORE_BUILD_STANDALONE)
+#include <sonore/standalone.h>
+#endif
+```
+
+## Rules that are not guessable from the API
+
+- **Pick the process signature you need; the wrapper detects it at compile time.** `process(AudioBlock<float>&, const float* p)` is an effect. Add a third `sonore::MidiBuffer&` and the plugin becomes an INSTRUMENT: note ports, no audio input bus. Add a second `AudioBlock<float>&` before `p` for a sidechain input. Take `sonore::ProcessContext&` instead when you need aux outputs, MIDI output or per-note expression. Writing the signature is how you ask; there is no flag to set.
+- **Declare latency or the host cannot align you.** Anything that delays its signal (look-ahead limiter, convolver, oversampler) must define `int latencySamples() const`. A plugin that delays and reports zero silently smears every parallel path it sits in. It is detected the same way as the process signature.
+- **prepare() is where you learn the sample rate, and the only place to allocate.** `process()` runs on the audio thread: no allocation, no locks, no file or network access, no `new`, no `std::string`. Size every buffer in `prepare()`. The rate is not fixed: a plugin that assumes 44100 or 48000 is a plugin that breaks at 96k.
+- **Rebuild filter coefficients only when a control moved.** Recomputing a biquad or a ladder every block costs more than the filter does. Keep the last value and compare, as the examples do.
+- **Big objects are members, never locals.** `FdnReverb` is around 320 KB, `Convolver<256,32>` around 400 KB, `StereoDelay` about 1.5 MB. The WebAssembly stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
+- **Parameters are plain values, in the order of the table.** `p[0]` is the first row of `kParamTable`. Not normalised: if the row says -24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each format's own convention.
+
+## Building
+
+```cmake
+add_subdirectory(sdk)
+sonore_add_plugin(MyPlugin SOURCES plugin.cpp)   # CLAP, VST3, AU, LV2, standalone
+```
+
+`npm run verify:sdk` builds the examples, runs the DSP measurements, drives the
+built binaries as a host, and compiles the same DSP to WebAssembly.
+
+## Headers
+
+- [asio_format.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/asio_format.h): ASIO sample formats, and the conversion to and from them
+- [au_view.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/au_view.h): the Audio Unit editor
+- [au_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/au_wrapper.h): the Audio Unit (AUv2) format wrapper, for macOS
+- [audio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio.h): core audio types. Our own, dependency-free equivalents of the
+- [audio_alsa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa.h): Linux audio output (ALSA, dlopened)
+- [audio_alsa_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa_input.h): Linux audio capture (ALSA, dlopened)
+- [audio_asio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_asio.h): ASIO output, without Steinberg's SDK
+- [audio_coreaudio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio.h): macOS audio output (the default-output AudioUnit)
+- [audio_coreaudio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio_input.h): macOS audio capture (AUHAL, input scope)
+- [audio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_input.h): live audio input for the standalone build
+- [audio_jack.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_jack.h): Linux audio output through JACK, dlopened
+- [audio_linux.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_linux.h): the Linux output the standalone actually uses
+- [audio_ring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_ring.h): the one lock-free ring both directions of audio use
+- [audio_wasapi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_wasapi.h): Windows audio output (WASAPI, shared mode, event driven)
+- [audio_wasapi_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_wasapi_input.h): Windows audio capture (WASAPI, shared mode, event driven)
+- [audiofile.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile.h): audio files beyond WAV
+- [audiofile_codecs.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile_codecs.h): the lossy decoders, vendored
+- [audiostream.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiostream.h): reading an audio file without holding all of it
+- [broadcaster.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/broadcaster.h): "Something changed": told to whoever asked, without either side knowing the
+- [channel_matrix.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/channel_matrix.h): mixing between channel layouts
+- [circuit.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/circuit.h): a nodal circuit engine (the DK method)
+- [clap_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/clap_wrapper.h): the CLAP format wrapper
+- [clipper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/clipper.h): the diode clipper, solved
+- [commands.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/commands.h): Named actions, and the keys that reach them
+- [compressors.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/compressors.h): the hardware compressors: opto, FET, VCA
+- [crossover.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/crossover.h): a crossover into any number of bands that still sums flat
+- [delay.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/delay.h): the delay as a finished machine
+- [denormals.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/denormals.h): ScopedNoDenormals: turn off denormal arithmetic for the length of a block
+- [distortion.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/distortion.h): distortion as one object
+- [dsp.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dsp.h): the DSP toolkit. Header-only, allocation-free, dependency-free
+- [dynamic_eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dynamic_eq.h): the dynamic equaliser: a band that compresses itself
+- [dynamics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dynamics.h): the rest of the dynamics family
+- [effects.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/effects.h): composite effects
+- [eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/eq.h): the parametric equaliser, as a machine
+- [fast_math.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/fast_math.h): Cheap approximations of the expensive functions
+- [fdn.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/fdn.h): a feedback delay network reverb
+- [fft.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/fft.h): frequency domain
+- [file_dialog.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/file_dialog.h): asking the user for a file
+- [files.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/files.h): Looking at a directory
+- [filter_design.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/filter_design.h): filters steeper than one biquad
+- [fir.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/fir.h): FIR filters, designed and run
+- [flac_encode.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/flac_encode.h): writing FLAC
+- [fuzz.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/fuzz.h): the Fuzz Face, as its circuit
+- [granular.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/granular.h): a granular engine
+- [graph.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/graph.h): a graph of hosted plugins
+- [gui.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gui.h): the plugin's native interface
+- [hash.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/hash.h): SHA-256
+- [hilbert.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/hilbert.h): the analytic signal, and the frequency shifter built on it
+- [host.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/host.h): hosting OTHER people's plugins
+- [impulse.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/impulse.h): impulse responses, prepared for convolution
+- [interpolation.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/interpolation.h): reading a stream at a rate that is not one sample per sample
+- [json.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/json.h): JSON, and Base64, for state a plugin has to write down
+- [license.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/license.h): dependency-free offline licence verification
+- [license_runtime.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/license_runtime.h): Sonorie licensing RUNTIME -- the platform half of license.h
+- [limiting.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/limiting.h): the true-peak limiter
+- [load.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/load.h): LoadMeasurer: how much of the audio deadline a DSP is using
+- [lofi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lofi.h): degradation on purpose: bit depth, sample rate, wavefolding
+- [logger.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/logger.h): A log a user can send you
+- [lv2_ports.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lv2_ports.h): the LV2 port map, in one place
+- [lv2_ui.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lv2_ui.h): the LV2 user interface
+- [lv2_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lv2_wrapper.h): the LV2 format wrapper
+- [metering.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/metering.h): programme loudness and true peak, the way broadcast measures it
+- [midi_ci.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_ci.h): MIDI Capability Inquiry
+- [midi_clock.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_clock.h): MIDI clock: tempo and transport from the wire
+- [midi_file.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_file.h): Standard MIDI Files
+- [midi_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_input.h): live MIDI input for the standalone build
+- [midi_output.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_output.h): where a plugin's own MIDI goes
+- [midi_sequence.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/midi_sequence.h): MIDI as a timeline rather than as one block's worth
+- [modulation.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/modulation.h): the modulation family: an LFO, and the four effects that are
+- [multi_timer.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/multi_timer.h): Several clocks in one object
+- [multiband.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/multiband.h): multiband dynamics, wired once
+- [osc.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/osc.h): Open Sound Control
+- [passive_eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/passive_eq.h): a Pultec-style passive program equaliser
+- [phase_vocoder.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/phase_vocoder.h): the phase vocoder: pitch shifting without the grain
+- [pitch.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/pitch.h): pitch: finding it, and moving it
+- [pitch_correct.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/pitch_correct.h): pitch correction: detect, decide, shift
+- [plate.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/plate.h): the Dattorro plate
+- [plugin.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/plugin.h): what a plugin declares about itself. The generated project fills
+- [plugin_cache.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/plugin_cache.h): remembering what a scan found, and what killed it
+- [preset_file.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/preset_file.h): presets as FILES, in the format the rest of the world uses
+- [presets.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/presets.h): factory presets
+- [random.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/random.h): Randomness, and the noise a DSP makes out of it
+- [record.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/record.h): recording audio to disk from a plugin, without stalling it
+- [reflections.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/reflections.h): early reflections from a room, by the image-source method
+- [resample.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/resample.h): rate conversion
+- [sample_stream.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/sample_stream.h): playing a file from disk instead of from memory
+- [sampler.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/sampler.h): sample playback
+- [scope_buffer.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/scope_buffer.h): The scope's buffer, with no user interface anywhere near it
+- [screamer.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/screamer.h): the Tube Screamer's clipping stage, as its circuit
+- [shaping.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/shaping.h): waveshaping, lookup tables, ballistics and chain composition
+- [simd.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/simd.h): SIMD
+- [special.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/special.h): the handful of functions the standard library does not carry
+- [spring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/spring.h): a spring reverb
+- [standalone.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone.h): the standalone application
+- [state_bag.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/state_bag.h): state a plugin has beyond its parameters
+- [stft.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/stft.h): a short-time Fourier transform you can process in the middle of
+- [synth.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/synth.h): the synthesiser side, past one oscillator and one envelope
+- [sysex.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/sysex.h): SysexAssembler: one complete message out of however many pieces arrive
+- [system_stats.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/system_stats.h): What machine this is
+- [tape.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/tape.h): tape, modelled rather than named
+- [thread_pool.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/thread_pool.h): Work that happens somewhere other than the two threads that matter
+- [thumbnail.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/thumbnail.h): AudioThumbnail: the peak envelope a waveform display is drawn from
+- [time.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/time.h): Dates, and lengths of time, as text
+- [tone.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/tone.h): the two tone controls every second plugin has, done once
+- [transport.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/transport.h): musical time
+- [tube.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/tube.h): a valve gain stage and the tone stack after it
+- [turtle.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/turtle.h): enough Turtle to read an LV2 bundle
+- [ump.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/ump.h): Universal MIDI Packets: the MIDI 2.0 wire format
+- [undo.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/undo.h): UndoHistory: undo and redo for a plugin's own editor
+- [user_settings.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/user_settings.h): settings that belong to the USER, not to the session
+- [uuid.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/uuid.h): A unique identifier
+- [va_filters.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/va_filters.h): the two other synth filters people ask for by name
+- [vocoder.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/vocoder.h): the channel vocoder and the formant filter
+- [vst3_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/vst3_wrapper.h): the VST3 format wrapper
+- [wasm_abi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/wasm_abi.h): the WebAssembly ABI glue (GENERATED, never authored against)
+- [wav.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/wav.h): WAV files
+- [waveform.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/waveform.h): waveform peaks, for drawing
+- [webview_cocoa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/webview_cocoa.h): the macOS webview backend (WKWebView)
+- [webview_gtk.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/webview_gtk.h): the Linux webview backend (GTK3 + WebKitGTK)
+- [webview_win32.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/webview_win32.h): the Windows webview backend (Edge WebView2)
+- [zip.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/zip.h): Reading a .zip
+
+### Native UI toolkit (gfx/)
+
+- [accessibility.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/accessibility.h): Walking the tree a screen reader would want to see
+- [accessible_info.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/accessible_info.h): What a component IS, as opposed to what it looks like
+- [alert.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/alert.h): Telling the user something, and asking them something
+- [animator.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/animator.h): Bounds that move over time rather than jumping
+- [audio_display.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/audio_display.h): Two ways to look at audio: a scope that scrolls, and a waveform that sits
+- [backing.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/backing.h): The backing store a window peer paints into, and the one place scale lives
+- [bitmap.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/bitmap.h): Bitmap: premultiplied RGBA8, and the antialiased rasteriser that fills it
+- [clipboard.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/clipboard.h): The system clipboard
+- [colour.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/colour.h): Colour, and blending
+- [component.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/component.h): Component: the tree, and the mouse
+- [concertina.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/concertina.h): Stacked sections that open and close
+- [containers.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/containers.h): A list, a set of tabs, and a progress bar
+- [displays.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/displays.h): The screens, and which one something is on
+- [effects2d.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/effects2d.h): Blur, drop shadows, rectangle fitting, and the named colours
+- [file_browser.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/file_browser.h): Choosing a file from inside the editor
+- [font.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/font.h): Font: a typeface at a size, and drawing text with it
+- [geometry.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/geometry.h): Points, rectangles, lines and affine transforms
+- [gradient.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/gradient.h): Colour that varies across a shape
+- [graphics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/graphics.h): Graphics: the drawing API a component paints through
+- [group.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/group.h): A titled box around a set of controls
+- [inflate.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/inflate.h): DEFLATE, because PNG is a container around it
+- [layout.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/layout.h): FlexBox and Grid: two ways to place things without arithmetic in resized()
+- [lookandfeel.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/lookandfeel.h): LookAndFeel: where a widget's appearance lives, separately from what it does
+- [midi_keyboard.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/midi_keyboard.h): An on-screen keyboard
+- [native_editor.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/native_editor.h): The native editor as a plugin format sees it: one object with a window in
+- [path.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/path.h): Path: the shape everything is drawn from
+- [plugin_editor.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/plugin_editor.h): Binding the native UI to plugin parameters, and the editor a plugin gets
+- [png.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/png.h): PNG, into the same premultiplied RGBA a Bitmap holds
+- [popup.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/popup.h): PopupMenu: a list that opens over everything, takes the mouse, and closes on
+- [popup_item.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/popup_item.h): One row of a popup menu
+- [region.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/region.h): A set of rectangles, and the reason it exists: partial repaint
+- [resizer.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/resizer.h): Dragging an editor's edges, not just the corner in the bottom right
+- [selection.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/selection.h): Choosing several things, and moving them
+- [splitter.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/splitter.h): Panes the user can resize, and the bar between them
+- [stroke.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/stroke.h): Stroking: turning a path into the outline of a pen drawn along it
+- [svg.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/svg.h): SVG, into Paths this rasteriser already knows how to draw
+- [system_font.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/system_font.h): Finding a typeface on the machine the plugin is running on
+- [table.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/table.h): A list with columns you can sort and resize
+- [text_editor.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/text_editor.h): A single-line text field
+- [tooltip.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/tooltip.h): Tooltips, and the corner you drag to resize an editor
+- [treeview.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/treeview.h): A tree you can open, close and walk
+- [truetype.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/truetype.h): A TrueType parser: glyph outlines out of a .ttf, as ordinary Paths
+- [uia_win32.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/uia_win32.h): The Windows end of accessibility: handing our component tree to UI Automation
+- [value_box.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/value_box.h): A readout you can type into
+- [viewport.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/viewport.h): A window onto something bigger than itself, and the bar that moves it
+- [widgets.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/widgets.h): Slider, Button, Label, ComboBox
+- [widgets2.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/widgets2.h): A range slider, and a button with a picture on it
+- [window_cocoa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_cocoa.h): The Cocoa window, so the native UI runs on the third platform
+- [window_win32.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_win32.h): The Win32 window a native editor lives in: the platform peer for a
+- [window_x11.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_x11.h): The X11 window, so the native UI is not a Windows-only thing
+
+## Optional
+
+- [llms-full.txt](https://github.com/SonorieAI/sonore-sdk/blob/main/llms-full.txt): the same, plus every public type in
+  each header. Read this one before naming a class you have not verified exists.
+- [sdk/README.md](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/README.md): the full prose documentation.
+- [examples](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/examples): nine working plugins, including an
+  instrument, a sidechain effect and one with multiple output buses.
