@@ -267,9 +267,31 @@ inline std::string bridgeScript(const PluginDescriptor& desc) {
   // An explicit id wins over a positional guess: a plugin whose first
   // parameter is called "0" means that one, not index zero.
   js += "function norm(s){return String(s).toLowerCase().replace(/[^a-z0-9]/g,'');}\n";
-  js += "var byKey={};\n";
-  js += "function reindex(){byKey={};for(var i=0;i<params.length;i++){var p=params[i];"
-        "p.__i=i;byKey[p.id]=p;byKey[norm(p.id)]=p;byKey[norm(p.label)]=p;}}\n";
+  // LOOKUP ORDER, and why it is three passes rather than one.
+  //
+  // `norm` strips everything that is not a letter or a digit, the decimal
+  // point included, so two different labels can normalise onto the same key.
+  // Building the table in one pass let the LAST parameter to claim a key win,
+  // so a shared key resolved to whichever one happened to be written last.
+  // Silent, too, because both names still resolved to something.
+  //
+  // So: exact id first, then exact label, then the normalised aliases, and a
+  // later pass never overwrites an earlier one. An exact name is always
+  // reachable, and an ambiguous normalised key resolves to the first
+  // parameter that claimed it, which is at least deterministic.
+  //
+  // Object.create(null) rather than {}: with a plain object a parameter named
+  // "constructor" or "toString" would resolve against Object.prototype and
+  // hand the page a function where it asked for a parameter.
+  js += "var byKey=Object.create(null);\n";
+  js += "function reindex(){byKey=Object.create(null);var i,p,a,b;"
+        "for(i=0;i<params.length;i++)params[i].__i=i;"
+        "for(i=0;i<params.length;i++)byKey[params[i].id]=params[i];"
+        "for(i=0;i<params.length;i++){p=params[i];"
+        "if(byKey[p.label]===undefined)byKey[p.label]=p;}"
+        "for(i=0;i<params.length;i++){p=params[i];a=norm(p.id);b=norm(p.label);"
+        "if(byKey[a]===undefined)byKey[a]=p;"
+        "if(byKey[b]===undefined)byKey[b]=p;}}\n";
   js += "reindex();\n";
   js += "function P(r){if(r&&r.__i!==undefined&&r.id!==undefined)return r;"
         "if(typeof r==='number')return params[r]||null;"
