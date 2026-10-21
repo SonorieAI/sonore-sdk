@@ -43,6 +43,7 @@ namespace gfx {
  * a pointer to a node is only valid while its parent stays open.
  */
 struct TreeNode {
+  /** The row's label. */
   std::string text;
   /** Whatever the owner needs to identify this node -- a path, an id, an index
    *  into their own data. Not interpreted here. */
@@ -52,14 +53,22 @@ struct TreeNode {
    *  openable because it is a folder, not because somebody has already read
    *  it. */
   bool mightHaveChildren = false;
+  /** Whether its children are shown. TreeView::setOpen changes it and builds
+   *  the children; set here, nothing is built and the view needs rebuild(). */
   bool isOpen = false;
   /** Set once the callback has run, so it runs once per node rather than once
    *  per repaint. */
   bool childrenBuilt = false;
 
+  /** Owned, in the order they are drawn. Removing one destroys its subtree;
+   *  call TreeView::rebuild() before the view paints again. */
   std::vector<std::unique_ptr<TreeNode>> children;
+  /** The node this one was added to; null for a root. Not owned. */
   TreeNode* parent = nullptr;
 
+  /** Append a child, owned by this node, and return it. The pointer lives as
+   *  long as the child: until it is removed or this node's children are
+   *  cleared. */
   TreeNode* addChild(std::string childText, std::string childId = {},
                      bool childMightHaveChildren = false) {
     auto node = std::unique_ptr<TreeNode>(new TreeNode());
@@ -71,11 +80,17 @@ struct TreeNode {
     return children.back().get();
   }
 
+  /** Destroy every child, and every pointer below them with it, and mark the
+   *  children unbuilt so onNeedChildren fills them again: the next time the
+   *  node is opened, or for the root at the next rebuild(). Call
+   *  TreeView::rebuild() before the view paints again. */
   void clearChildren() {
     children.clear();
     childrenBuilt = false;
   }
 
+  /** How many ancestors it has: 0 for a root, 1 for a top-level row. A row is
+   *  indented by its depth times the view's indent. */
   int depth() const {
     int d = 0;
     for (const TreeNode* p = parent; p; p = p->parent) ++d;
@@ -83,8 +98,21 @@ struct TreeNode {
   }
 };
 
+/**
+ * A tree of TreeNodes that opens, closes and scrolls, built lazily as the
+ * user opens it -- the reference's TreeView, over plain nodes rather than an
+ * item class to derive. The file comment says why it is lazy and virtual.
+ *
+ * The tree belongs to the caller: setRoot() takes a root that is NOT owned
+ * and must outlive the view (or be replaced first), and each node owns its
+ * children. Set onNeedChildren before setRoot(); it is called once per node,
+ * on first opening, and may read the disk. After changing nodes from outside,
+ * call rebuild(). Message thread only.
+ */
 class TreeView : public Widget {
 public:
+  /** Empty until setRoot(). It takes the keyboard focus: Up, Down, Home, End,
+   *  Page Up, Page Down, Left, Right and Return. */
   TreeView() { setWantsKeyboardFocus(true); }
 
   /**
@@ -94,6 +122,11 @@ public:
    * everything that the user must open before they see anything, and every
    * file browser that shows "/" as a row is a browser somebody has to click
    * twice to start using.
+   *
+   * Never drawn, so never opened by a click either: it counts as open, and a
+   * root that lists its children lazily -- mightHaveChildren, filled by
+   * onNeedChildren, as a folder is -- is listed here. Set onNeedChildren
+   * first.
    */
   void setRoot(TreeNode* root) {
     root_ = root;
@@ -102,6 +135,7 @@ public:
     rebuild();
   }
 
+  /** The root setRoot() gave, or null. Not owned. */
   TreeNode* root() const { return root_; }
 
   /** Fill in a node's children. Called once per node, the first time it opens.
@@ -109,14 +143,19 @@ public:
    *  empty, and its twisty goes away. */
   std::function<void(TreeNode&)> onNeedChildren;
 
+  /** The selection moved, by a click, a key or setSelectedNode: the node, or
+   *  null. It may rebuild or replace the tree, or delete the view; a click
+   *  stops there when it did. Not fired when rebuild() drops a selection. */
   std::function<void(TreeNode*)> onSelectionChange;
   /** A double click, or Return. What a browser uses for "load this one". */
   std::function<void(TreeNode*)> onItemChosen;
 
+  /** Each row's height in logical pixels, at least 4; 20 by default. */
   void setRowHeight(float height) {
     rowHeight_ = height > 4.0f ? height : 4.0f;
     rebuild();
   }
+  /** Each row's height, in logical pixels. */
   float rowHeight() const { return rowHeight_; }
 
   /** How far each level is indented. */
@@ -125,8 +164,13 @@ public:
     repaint();
   }
 
+  /** The selected node, or null. rebuild() clears a selection whose node is
+   *  no longer among the visible rows. */
   TreeNode* selectedNode() const { return selected_; }
 
+  /** Select a node, or null for none, and scroll its row into view. A node
+   *  not among the visible rows is held but not drawn, until rebuild() drops
+   *  it. `notify` fires onSelectionChange if the selection changed. */
   void setSelectedNode(TreeNode* node, bool notify = true) {
     if (node == selected_) return;
     selected_ = node;
@@ -139,6 +183,8 @@ public:
    *  reachable without opening anything further. */
   int numVisibleRows() const { return (int) rows_.size(); }
 
+  /** The node on a visible row, 0-based from the top of the tree (not of the
+   *  screen), or null out of range. */
   TreeNode* nodeAtRow(int row) const {
     if (row < 0 || row >= (int) rows_.size()) return nullptr;
     return rows_[(size_t) row];
@@ -167,6 +213,17 @@ public:
   /** Recompute the flattened row list. Called when the tree changes underneath
    *  us -- a folder rescanned, an item removed. */
   void rebuild() {
+    // The root is always open (see setRoot). Without this a lazily listed
+    // root asked for its children only when OPENED, which an undrawn row
+    // never is, and the tree stayed empty for good. Asked BEFORE the rows
+    // are cleared: a callback that rebuilds -- as one that fills the tree
+    // and then refreshes it does -- re-enters here, and with the clear first
+    // its rows and these were both appended, every top-level row twice.
+    if (root_ && root_->mightHaveChildren && !root_->childrenBuilt && onNeedChildren) {
+      root_->childrenBuilt = true;
+      root_->isOpen = true;
+      onNeedChildren(*root_);
+    }
     rows_.clear();
     if (root_)
       for (const auto& child : root_->children) flatten(child.get());
@@ -178,17 +235,24 @@ public:
     repaint();
   }
 
+  /** Every visible row's height together, in logical pixels. */
   float contentHeight() const { return (float) rows_.size() * rowHeight_; }
 
+  /** Scroll so the rows start `y` logical pixels down, held between 0 and
+   *  the last screenful (a NaN goes to 0). */
   void setScrollPosition(float y) {
     scroll_ = y;
     clampScroll();
     repaint();
   }
+  /** How far the rows are scrolled, in logical pixels. */
   float scrollPosition() const { return scroll_; }
 
+  /** Holds the scroll inside the new height. */
   void resized() override { clampScroll(); }
 
+  /** Only the rows on screen, each indented by its depth, with a twisty on
+   *  every node that might have children. */
   void paint(Graphics& g) override {
     LookAndFeel& lf = lookAndFeel();
     const Rect area = localBounds();
@@ -222,6 +286,8 @@ public:
     paintFocusRing(g);
   }
 
+  /** On a twisty, opens or closes the node. Elsewhere on a row, selects it;
+   *  a double click then opens a folder or fires onItemChosen for a leaf. */
   void mouseDown(const MouseEvent& e) override {
     if (!isEnabled()) return;
     const int row = rowAt(e.position.y);
@@ -237,7 +303,15 @@ public:
       return;
     }
 
+    detail::DeletionWatch alive(this);
     setSelectedNode(node);
+    // onSelectionChange is the caller's, and may have rebuilt the tree: a
+    // browser loading a folder replaces every node. Carried on with, `node`
+    // was read and chosen after it was destroyed. If the selection is no
+    // longer it, the tree changed and the click is spent. It may have
+    // deleted the VIEW as well -- a picker that closes on a choice -- and
+    // then nothing here is left to ask.
+    if (alive.deleted || selected_ != node) return;
     if (e.clickCount >= 2) {
       // A double click on a folder opens it; on a leaf it chooses it. The same
       // gesture meaning "go in" either way.
@@ -330,6 +404,8 @@ public:
     return info;
   }
 
+  /** The twisty's width in logical pixels: the part of a row a click opens
+   *  or closes from. */
   static constexpr float kTwistyWidth = 18.0f;
 
 private:
@@ -378,8 +454,10 @@ private:
 
   void clampScroll() {
     const float most = contentHeight() - localBounds().h;
-    if (scroll_ > most) scroll_ = most;
-    if (scroll_ < 0.0f) scroll_ = 0.0f;
+    // Written to catch a NaN too: one set as a scroll position failed both
+    // tests and reached the row arithmetic, and its conversion to int.
+    if (!(scroll_ <= most)) scroll_ = most;
+    if (!(scroll_ >= 0.0f)) scroll_ = 0.0f;
   }
 
   /** A triangle, pointing right when closed and down when open. Drawn rather

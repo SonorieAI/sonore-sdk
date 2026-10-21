@@ -25,6 +25,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <type_traits>
+#include "simd.h"
 
 namespace sonore {
 
@@ -39,6 +41,7 @@ namespace sonore {
  */
 class AudioScopeBuffer {
 public:
+  /** The most columns setColumns() keeps: the size of the fixed storage. */
   static constexpr int kMaxColumns = 1024;
 
   /** How many columns of history to keep. Clamped, because the storage is fixed:
@@ -50,6 +53,8 @@ public:
     clear();
   }
 
+  /** [any thread] Columns of history in use, 8 .. kMaxColumns; 256 until
+   *  setColumns(). */
   int columns() const { return columns_.load(std::memory_order_relaxed); }
 
   /** How many samples make one column. Larger is a slower sweep. */
@@ -57,17 +62,22 @@ public:
     samplesPerColumn_.store(samples < 1 ? 1 : samples, std::memory_order_relaxed);
   }
 
+  /** [any thread] Samples folded into each column, at least 1; 128 until
+   *  setSamplesPerColumn(). */
   int samplesPerColumn() const { return samplesPerColumn_.load(std::memory_order_relaxed); }
 
+  /** [any thread] Empty the display. The columns are atomics and are zeroed
+   *  here; the audio thread's own half-built column and write position are
+   *  reset BY the audio thread, at the start of its next push. clear() --
+   *  and setColumns(), which calls it from the editor -- wrote those plain
+   *  fields from the main thread while push() was writing them, a data race
+   *  on every resize of a running scope. */
   void clear() {
     for (int i = 0; i < kMaxColumns; ++i) {
       low_[i].store(0.0f, std::memory_order_relaxed);
       high_[i].store(0.0f, std::memory_order_relaxed);
     }
-    writeIndex_.store(0, std::memory_order_relaxed);
-    accLow_ = 0.0f;
-    accHigh_ = 0.0f;
-    accCount_ = 0;
+    resetRequested_.store(true, std::memory_order_release);
   }
 
   /**
@@ -104,31 +114,170 @@ public:
 private:
   template <typename Sample>
   void pushImpl(const Sample* const* channels, uint32_t numChannels, uint32_t numFrames) {
+    // Looked at before it is taken: an exchange is a locked instruction, a
+    // full barrier on x86, paid on every block for a request that comes when
+    // an editor resizes. A request made after the look is taken by the next
+    // push, as one made just after the exchange always was.
+    if (resetRequested_.load(std::memory_order_relaxed) &&
+        resetRequested_.exchange(false, std::memory_order_acq_rel)) {
+      writeIndex_.store(0, std::memory_order_release);
+      accLow_ = 0.0f;
+      accHigh_ = 0.0f;
+      accCount_ = 0;
+    }
     const int perColumn = samplesPerColumn();
     const int n = columns();
-    for (uint32_t f = 0; f < numFrames; ++f) {
-      float value = 0.0f;
-      if (channels && numChannels > 0) {
-        // Summed to mono. A scope showing each channel separately needs as many
-        // rows, and a plugin editor has room for one.
-        Sample sum = (Sample) 0;
-        for (uint32_t c = 0; c < numChannels; ++c)
-          if (channels[c]) sum += channels[c][f];
-        value = (float) (sum / (Sample) numChannels);
-      }
+    // A column at a time rather than a sample at a time: the range of the
+    // frames that finish (or continue) the current column in one pass, then
+    // the store. Every wrapper pushes every block, editor open or not, and the
+    // per-sample loop was 150 to 200 ns of each; the mono float feed they all
+    // give it now goes four samples at a time.
+    uint32_t f = 0;
+    while (f < numFrames) {
+      const int room = perColumn - accCount_;
+      uint32_t take = room > 0 ? (uint32_t) room : 1u;
+      if (take > numFrames - f) take = numFrames - f;
+      float low = 0.0f, high = 0.0f;
+      columnRange(channels, numChannels, f, take, low, high);
       if (accCount_ == 0) {
-        accLow_ = value;
-        accHigh_ = value;
+        accLow_ = low;
+        accHigh_ = high;
       } else {
-        if (value < accLow_) accLow_ = value;
-        if (value > accHigh_) accHigh_ = value;
+        if (low < accLow_) accLow_ = low;
+        if (high > accHigh_) accHigh_ = high;
       }
-      if (++accCount_ >= perColumn) {
-        const int at = writeIndex_.load(std::memory_order_relaxed);
+      accCount_ += (int) take;
+      f += take;
+      if (accCount_ >= perColumn) {
+        // Wrapped to THIS push's column count: the editor may have shrunk it
+        // since the index was written, and the slot must stay inside it.
+        const int at = writeIndex_.load(std::memory_order_relaxed) % n;
         low_[at].store(accLow_, std::memory_order_relaxed);
         high_[at].store(accHigh_, std::memory_order_relaxed);
         writeIndex_.store((at + 1) % n, std::memory_order_release);
         accCount_ = 0;
+      }
+    }
+  }
+
+  /** The lowest and highest of `count` frames from `from`, each frame summed
+   *  to mono -- a scope showing each channel separately needs as many rows,
+   *  and a plugin editor has room for one. */
+  //
+  // Two chains of each, as measureBlock (gui.h) takes them: one running min
+  // and max per four samples waited three cycles on the step before, for
+  // each of the 512 samples of a block. The range is the same either way --
+  // a minimum does not depend on the order it is taken in -- for anything
+  // but a NaN, which the output guard has silenced before the scope sees it.
+  // (A column holding both zeros may keep the other one: -0 and +0 compare
+  // equal, and are the same point on a scope.)
+  template <typename Sample>
+  static void columnRange(const Sample* const* channels, uint32_t numChannels, uint32_t from,
+                          uint32_t count, float& low, float& high) {
+    if constexpr (std::is_same<Sample, float>::value) {
+      if (channels && numChannels == 1 && channels[0] && count >= 4) {
+        const float* x = channels[0] + from;
+        simd::Vec4f lo = simd::Vec4f::load(x), hi = lo;
+        uint32_t k = 4;
+        if (k + 4 <= count) {
+          simd::Vec4f lo1 = simd::Vec4f::load(x + k), hi1 = lo1;
+          for (k += 4; k + 8 <= count; k += 8) {
+            const simd::Vec4f a = simd::Vec4f::load(x + k);
+            const simd::Vec4f b = simd::Vec4f::load(x + k + 4);
+            lo = (lo.min)(a);
+            hi = (hi.max)(a);
+            lo1 = (lo1.min)(b);
+            hi1 = (hi1.max)(b);
+          }
+          lo = (lo.min)(lo1);
+          hi = (hi.max)(hi1);
+        }
+        for (; k + 4 <= count; k += 4) {
+          const simd::Vec4f v = simd::Vec4f::load(x + k);
+          lo = (lo.min)(v);
+          hi = (hi.max)(v);
+        }
+        float los[4], his[4];
+        lo.store(los);
+        hi.store(his);
+        low = los[0];
+        high = his[0];
+        for (int j = 1; j < 4; ++j) {
+          if (los[j] < low) low = los[j];
+          if (his[j] > high) high = his[j];
+        }
+        for (; k < count; ++k) {
+          if (x[k] < low) low = x[k];
+          if (x[k] > high) high = x[k];
+        }
+        return;
+      }
+    } else {
+      // The 64-bit feed, mono as every wrapper gives it: it took the general
+      // loop below, a channel sum and a first-frame test per sample. Each
+      // value is exactly what that loop makes of one channel -- 0 + x, which
+      // turns -0 into +0, over a count of 1 -- in four chains.
+      if (channels && numChannels == 1 && channels[0] && count >= 4) {
+        const Sample* x = channels[0] + from;
+        uint32_t k = 4;
+#if defined(SONORE_SIMD_SSE)
+        // In double, rounded to float at the end: rounding never puts two
+        // values in the other order, so the float of the lowest is the lowest
+        // of the floats.
+        static_assert(std::is_same<Sample, double>::value, "the 64-bit feed is double");
+        const __m128d zero = _mm_setzero_pd();
+        __m128d lo = _mm_add_pd(zero, _mm_loadu_pd(x)), hi = lo;
+        __m128d lo1 = _mm_add_pd(zero, _mm_loadu_pd(x + 2)), hi1 = lo1;
+        for (; k + 4 <= count; k += 4) {
+          const __m128d a = _mm_add_pd(zero, _mm_loadu_pd(x + k));
+          const __m128d b = _mm_add_pd(zero, _mm_loadu_pd(x + k + 2));
+          lo = _mm_min_pd(lo, a);
+          hi = _mm_max_pd(hi, a);
+          lo1 = _mm_min_pd(lo1, b);
+          hi1 = _mm_max_pd(hi1, b);
+        }
+        double los[2], his[2];
+        _mm_storeu_pd(los, _mm_min_pd(lo, lo1));
+        _mm_storeu_pd(his, _mm_max_pd(hi, hi1));
+        low = (float) (los[1] < los[0] ? los[1] : los[0]);
+        high = (float) (his[1] > his[0] ? his[1] : his[0]);
+#else
+        float lo[4], hi[4];
+        for (int j = 0; j < 4; ++j) lo[j] = hi[j] = (float) ((Sample) 0 + x[j]);
+        for (; k + 4 <= count; k += 4)
+          for (uint32_t j = 0; j < 4; ++j) {
+            const float v = (float) ((Sample) 0 + x[k + j]);
+            if (v < lo[j]) lo[j] = v;
+            if (v > hi[j]) hi[j] = v;
+          }
+        low = lo[0];
+        high = hi[0];
+        for (int j = 1; j < 4; ++j) {
+          if (lo[j] < low) low = lo[j];
+          if (hi[j] > high) high = hi[j];
+        }
+#endif
+        for (; k < count; ++k) {
+          const float v = (float) ((Sample) 0 + x[k]);
+          if (v < low) low = v;
+          if (v > high) high = v;
+        }
+        return;
+      }
+    }
+    for (uint32_t k = 0; k < count; ++k) {
+      float value = 0.0f;
+      if (channels && numChannels > 0) {
+        Sample sum = (Sample) 0;
+        for (uint32_t c = 0; c < numChannels; ++c)
+          if (channels[c]) sum += channels[c][from + k];
+        value = (float) (sum / (Sample) numChannels);
+      }
+      if (k == 0) {
+        low = high = value;
+      } else {
+        if (value < low) low = value;
+        if (value > high) high = value;
       }
     }
   }
@@ -150,11 +299,13 @@ private:
   std::atomic<int> columns_{256};
   std::atomic<int> samplesPerColumn_{128};
   std::atomic<int> writeIndex_{0};
+  std::atomic<bool> resetRequested_{false};
   std::atomic<float> low_[kMaxColumns] = {};
   std::atomic<float> high_[kMaxColumns] = {};
 
   // Written only by the audio thread, between completed columns. Not atomic
-  // because nothing else reads them.
+  // because nothing else reads or writes them -- a clear() asks, through
+  // resetRequested_, rather than writing them itself.
   float accLow_ = 0.0f, accHigh_ = 0.0f;
   int accCount_ = 0;
 };

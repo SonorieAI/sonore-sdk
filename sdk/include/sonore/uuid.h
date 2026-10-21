@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <random>
 #include <string>
 
@@ -46,15 +47,20 @@ namespace sonore {
 
 /** 128 bits, as sixteen bytes. */
 struct Uuid {
+  /** In the order the text form writes them: bytes[0] is the first two hex
+   *  digits. A default Uuid is all zero (isNull). */
   uint8_t bytes[16] = {0};
 
+  /** The same sixteen bytes. */
   bool operator==(const Uuid& other) const {
     for (int i = 0; i < 16; ++i)
       if (bytes[i] != other.bytes[i]) return false;
     return true;
   }
+  /** Not operator==. */
   bool operator!=(const Uuid& other) const { return !(*this == other); }
 
+  /** All zero: the default value, never one makeUuid() returns. */
   bool isNull() const {
     for (int i = 0; i < 16; ++i)
       if (bytes[i] != 0) return false;
@@ -82,8 +88,14 @@ inline uint64_t mix(uint64_t x) {
  * validates the variant will reject sixteen raw random bytes.
  */
 inline Uuid makeUuid() {
+  // One device for the module, drawn from under a lock: makeUuid() is called
+  // from any thread (temporary file names, pipe names, an advertiser's id),
+  // and two threads calling one random_device at once is a data race the
+  // standard does not excuse. Not thread_local: a plugin's thread_local with
+  // a destructor runs it at thread exit, which for a host's thread can come
+  // after the plugin's module is gone. Never on an audio thread, so a lock.
   static std::random_device device;
-  std::uniform_int_distribution<uint64_t> spread;
+  static std::mutex deviceLock;
 
   // Three sources, mixed. See the header: random_device is permitted to be
   // deterministic, and a collision here is silent and permanent.
@@ -92,8 +104,13 @@ inline Uuid makeUuid() {
       (uint64_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
   const uint64_t address = (uint64_t) (uintptr_t) &counter;
 
-  uint64_t high = uuiddetail::mix(((uint64_t) device() << 32) ^ device() ^ clock);
-  uint64_t low = uuiddetail::mix(((uint64_t) device() << 32) ^ device() ^ address ^ (clock << 7));
+  uint64_t drawn[4];
+  {
+    const std::lock_guard<std::mutex> hold(deviceLock);
+    for (uint64_t& d : drawn) d = device();
+  }
+  uint64_t high = uuiddetail::mix((drawn[0] << 32) ^ drawn[1] ^ clock);
+  uint64_t low = uuiddetail::mix((drawn[2] << 32) ^ drawn[3] ^ address ^ (clock << 7));
 
   Uuid out;
   for (int i = 0; i < 8; ++i) out.bytes[i] = (uint8_t) (high >> (i * 8));

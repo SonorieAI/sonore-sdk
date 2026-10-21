@@ -42,8 +42,22 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * Titled sections stacked vertically, each opening and closing under its
+ * header -- the reference's ConcertinaPanel. The file comment says why the
+ * heights animate and why several may be open by default.
+ *
+ * Section contents are NOT owned and must outlive the panel. The panel has no
+ * clock: whoever owns it calls setInputClock(now) and tick(now) on every
+ * frame. Without tick an animated section never finishes opening; without
+ * setInputClock a click animates from time zero and jumps. preferredHeight()
+ * changes during a transition, so a panel inside a Viewport wants its size
+ * updated from the same tick. Message thread only.
+ */
 class ConcertinaPanel : public Widget {
 public:
+  /** No sections. Takes keyboard focus, so its headers can be opened from the
+   *  keyboard. */
   ConcertinaPanel() { setWantsKeyboardFocus(true); }
 
   /**
@@ -64,8 +78,10 @@ public:
     return (int) sections_.size() - 1;
   }
 
+  /** How many sections have been added. */
   int numSections() const { return (int) sections_.size(); }
 
+  /** Whether section `index` is open (or opening); false out of range. */
   bool isSectionOpen(int index) const {
     return index >= 0 && index < (int) sections_.size() && sections_[(size_t) index].open;
   }
@@ -90,6 +106,12 @@ public:
     enforceLimit(-1, 0.0);
   }
 
+  /**
+   * Open or close section `index`; ignored out of range or when it is already
+   * so. Animated over kOpenSeconds from `now` -- the clock tick() is given --
+   * unless `animated` is false. Opening past setMaximumOpen closes the least
+   * recently opened. onSectionToggled is called either way.
+   */
   void setSectionOpen(int index, bool open, bool animated = true, double now = 0.0) {
     if (index < 0 || index >= (int) sections_.size()) return;
     Section& section = sections_[(size_t) index];
@@ -104,6 +126,9 @@ public:
     if (onSectionToggled) onSectionToggled(index, open);
   }
 
+  /** A section opened or closed -- by a click, a key, setSectionOpen, or the
+   *  open limit closing the least recently opened -- with its 0-based index and
+   *  its new state. */
   std::function<void(int index, bool open)> onSectionToggled;
 
   /** Drive the transitions. Called from the editor's clock; returns whether
@@ -115,10 +140,12 @@ public:
     return true;
   }
 
+  /** Every header's height, logical pixels; anything under 4 is 4. */
   void setHeaderHeight(float height) {
     headerHeight_ = height > 4.0f ? height : 4.0f;
     resized();
   }
+  /** Every header's height, logical pixels. */
   float headerHeight() const { return headerHeight_; }
 
   /** How tall the whole panel wants to be right now. A Viewport above this asks
@@ -215,13 +242,20 @@ public:
     return info;
   }
 
+  /** The width of a header's open/closed arrow, logical pixels; the title
+   *  starts after it. */
   static constexpr float kTwistyWidth = 18.0f;
+  /** How far the arrow sits in from the header's left edge. */
   static constexpr float kTwistyInset = 6.0f;
   /** How long a section takes to open. Long enough for the eye to follow the
    *  movement, short enough that nobody waits for it. */
   static constexpr double kOpenSeconds = 0.15;
 
 private:
+  /** One section: its header text, its content (not owned), the full height
+   *  the content asked for, and the height it has right now -- between zero
+   *  and the full height while `animation` (a ValueAnimator id, 0 for none)
+   *  is running. */
   struct Section {
     std::string title;
     Component* content = nullptr;

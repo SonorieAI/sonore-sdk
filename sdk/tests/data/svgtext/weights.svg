@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="230" height="120" viewBox="0 0 230 120">
+  <g font-size="18">
+    <text x="4" y="22" font-family="Sonore Text">Regular 400</text>
+    <text x="4" y="44" font-family="Sonore Text" font-weight="bold">Bold face</text>
+    <text x="4" y="66" font-family="Sonore Text" font-style="italic">Italic face</text>
+    <text x="120" y="22" font-family="Sonore Text Var" font-weight="300">Axis 300</text>
+    <text x="120" y="44" font-family="Sonore Text Var">Axis 400</text>
+    <text x="120" y="66" font-family="Sonore Text Var" font-weight="700">Axis 700</text>
+    <text x="4" y="100" font-family="Sonore Text" font-weight="600">Six hundred is bold</text>
+  </g>
+</svg>

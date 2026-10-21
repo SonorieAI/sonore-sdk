@@ -46,15 +46,15 @@ namespace gfx {
 
 /** Which part of the border the pointer is over. */
 enum class ResizeZone {
-  None,
-  Left,
-  Right,
-  Top,
-  Bottom,
-  TopLeft,
-  TopRight,
-  BottomLeft,
-  BottomRight,
+  None,        ///< inside, away from every edge: not a grab
+  Left,        ///< the left edge
+  Right,       ///< the right edge
+  Top,         ///< the top edge
+  Bottom,      ///< the bottom edge
+  TopLeft,     ///< the top-left corner: both edges at once
+  TopRight,    ///< the top-right corner
+  BottomLeft,  ///< the bottom-left corner
+  BottomRight, ///< the bottom-right corner
 };
 
 /**
@@ -65,7 +65,8 @@ enum class ResizeZone {
  * of the same four numbers is how a user ends up dragging to a size the host
  * refuses, and watching the window snap back.
  */
-inline BoundsConstrainer constrainerFor(const EditorConstraints& limits) {
+inline BoundsConstrainer constrainerFor(const EditorConstraints& limits, float naturalWidth = 0.0f,
+                                        float naturalHeight = 0.0f) {
   BoundsConstrainer out;
   out.minWidth = (float) limits.minWidth;
   out.minHeight = (float) limits.minHeight;
@@ -74,8 +75,20 @@ inline BoundsConstrainer constrainerFor(const EditorConstraints& limits) {
   // A fixed axis becomes a minimum equal to its maximum, which is what
   // BoundsConstrainer::isFixedSize already means -- so a fixed editor reports
   // itself fixed to anything that asks, without a second flag to keep in step.
-  if (!limits.resizableHorizontally) out.minWidth = out.maxWidth;
-  if (!limits.resizableVertically) out.minHeight = out.maxHeight;
+  //
+  // Pinned at the editor's NATURAL size, brought inside the declared box, as
+  // applyEditorConstraints pins it. It was pinned at the maximum -- 8192 by
+  // default -- so an editor resizable in one direction asked for an
+  // 8192-pixel window in the other the moment an edge was dragged. A caller
+  // that does not know the natural size gets the minimum.
+  const auto pin = [](float natural, float lo, float hi) {
+    if (natural <= 0.0f) return lo;
+    return natural < lo ? lo : (natural > hi ? hi : natural);
+  };
+  if (!limits.resizableHorizontally)
+    out.minWidth = out.maxWidth = pin(naturalWidth, out.minWidth, out.maxWidth);
+  if (!limits.resizableVertically)
+    out.minHeight = out.maxHeight = pin(naturalHeight, out.minHeight, out.maxHeight);
   return out;
 }
 
@@ -97,6 +110,8 @@ public:
   /** The square at each corner, where two edges are grabbed at once. */
   static constexpr float kCorner = 18.0f;
 
+  /** A border that draws nothing and takes only the presses near its
+   *  draggable edges; its owner sizes it to the whole editor. */
   ResizableBorder() {
     // It draws nothing. Anything painted over the edge of every editor would
     // be a design decision imposed on every plugin built with this.
@@ -106,6 +121,8 @@ public:
     setAccessibilityIgnored(true);
   }
 
+  /** What a drag is held to before onResize; at least 1 by 1 and otherwise
+   *  free by default. */
   BoundsConstrainer constrainer;
 
   /**

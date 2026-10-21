@@ -108,6 +108,10 @@ struct TestAtomSequence {
  *  first version of this test proved nothing. */
 static int g_atomWrites = 0;
 static uint32_t g_atomPort = 0xffffffffu;
+/** The type and size of the last atom the interface wrote. eventTransfer
+ *  carries one bare atom; a Sequence here is the shape no host turns into
+ *  the event the plugin looks for. */
+static uint32_t g_atomType = 0, g_atomSize = 0, g_atomBody = 0;
 
 static void writeFunction(Lv2UiController, uint32_t port, uint32_t size, uint32_t format,
                           const void* buffer) {
@@ -115,6 +119,11 @@ static void writeFunction(Lv2UiController, uint32_t port, uint32_t size, uint32_
   if (format != 0) {
     ++g_atomWrites;
     g_atomPort = port;
+    if (size >= sizeof(TestAtom)) {
+      g_atomType = ((const TestAtom*) buffer)->type;
+      g_atomBody = ((const TestAtom*) buffer)->size;
+      g_atomSize = size;
+    }
     return;
   }
   if (size != sizeof(float)) return;
@@ -273,6 +282,12 @@ int main(int argc, char** argv) {
     g_written.clear();
     ShowWindow(parent, SW_HIDE);
     pump(4000, ui, idle);
+    // Four seconds is what the page takes on a quiet machine, and a fixed
+    // window failed on a busy one: under a parallel ASan run the page had not
+    // loaded yet, and the chain was reported broken when it was only slow.
+    // So the four seconds stay (what is checked below also happens in them)
+    // and a page that has not spoken yet is given until thirty.
+    for (int waited = 4000; g_written.empty() && waited < 30000; waited += 250) pump(250, ui, idle);
 
     check(!g_written.empty(),
           "the page drove a parameter back through the host's write_function");
@@ -297,6 +312,11 @@ int main(int argc, char** argv) {
     std::printf("  ---- atom writes from the interface: %d, on port %u ----\n",
                 g_atomWrites, (unsigned) g_atomPort);
     check(g_atomWrites > 0, "the interface asks the plugin what it has");
+    // One bare atom, the shape eventTransfer carries -- a Sequence was never
+    // read as a request -- and with a body: REAPER drops an empty one.
+    check(g_atomType == mapUri(nullptr, "urn:sonorie:ui:stateRequest") && g_atomBody > 0 &&
+              g_atomSize == sizeof(TestAtom) + g_atomBody,
+          "\u2026with one bare atom that has a body, the shape every host delivers");
 
     // ...and the answer, written the way the plugin writes it.
     {
@@ -322,20 +342,69 @@ int main(int argc, char** argv) {
       seq->atom.size = (uint32_t) (sizeof(TestAtomSequenceBody) + sizeof(TestAtomEvent) +
                                    ((json.size() + 7u) & ~7u));
 
+      // One bare atom -- the state JSON as its own event's body -- which is
+      // how jalv, Carla, Ardour and REAPER deliver eventTransfer. The page
+      // read only whole Sequences and never had the state.
+      alignas(8) uint8_t bare[256] = {};
+      auto* bareAtom = (TestAtom*) bare;
+      bareAtom->size = (uint32_t) json.size();
+      bareAtom->type = uridJson;
+      std::memcpy(bare + sizeof(TestAtom), json.data(), json.size());
       if (notifyPort >= 0)
-        d->port_event(ui, (uint32_t) notifyPort,
-                      (uint32_t) (sizeof(TestAtom) + seq->atom.size), uridTransfer, seq);
+        d->port_event(ui, (uint32_t) notifyPort, (uint32_t) (sizeof(TestAtom) + json.size()),
+                      uridTransfer, bareAtom);
+      (void) seq; // the Sequence form is the second page's, below
 
       // The probe's page moves parameter 0 to 1.25 when a state object
       // arrives with a host name in it -- and only then. Seeing that value
       // come back through write_function is the whole path: plugin ->
       // port_event -> page -> bridge -> queue -> idle -> write_function.
-      pump(3000, ui, idle);
+      // Until the page answers, up to fifteen seconds: three were not enough
+      // for a page on a machine busy compiling.
       bool sawGain = false;
-      for (const Written& w : g_written)
-        if (w.port == 0 && std::fabs(w.value - 1.25f) < 1e-3f) sawGain = true;
+      for (int slice = 0; slice < 150 && !sawGain; ++slice) {
+        pump(100, ui, idle);
+        for (const Written& w : g_written)
+          if (w.port == 0 && std::fabs(w.value - 1.25f) < 1e-3f) sawGain = true;
+      }
       std::printf("  ---- writes after the answer: %zu ----\n", g_written.size());
       check(sawGain, "…and the answer reaches the page, which acts on it");
+
+      // The plugin sends its state again every second of audio, asked or
+      // not (a host may not carry the interface's request). The page acts on
+      // every state it is handed -- the probe's sets Gain each time -- so the
+      // interface hands it a state only when it differs from the last one.
+      auto gainWrites = [] {
+        int n = 0;
+        for (const Written& w : g_written)
+          if (w.port == 0 && std::fabs(w.value - 1.25f) < 1e-3f) ++n;
+        return n;
+      };
+      const int before = gainWrites();
+      if (notifyPort >= 0)
+        d->port_event(ui, (uint32_t) notifyPort, (uint32_t) (sizeof(TestAtom) + json.size()),
+                      uridTransfer, bareAtom);
+      pump(1500, ui, idle);
+      const int afterRepeat = gainWrites();
+      const std::string moved = "{'host':'Sonore LV2 Test Host','preset':'B'}";
+      alignas(8) uint8_t bare2[256] = {};
+      auto* movedAtom = (TestAtom*) bare2;
+      movedAtom->size = (uint32_t) moved.size();
+      movedAtom->type = uridJson;
+      std::memcpy(bare2 + sizeof(TestAtom), moved.data(), moved.size());
+      if (notifyPort >= 0)
+        d->port_event(ui, (uint32_t) notifyPort, (uint32_t) (sizeof(TestAtom) + moved.size()),
+                      uridTransfer, movedAtom);
+      int afterMoved = afterRepeat;
+      for (int slice = 0; slice < 150 && afterMoved == afterRepeat; ++slice) {
+        pump(100, ui, idle);
+        afterMoved = gainWrites();
+      }
+      char repeatLine[200];
+      std::snprintf(repeatLine, sizeof(repeatLine),
+                    "the same state again is not handed to the page, a changed one is (Gain set "
+                    "%d time(s), then %d, then %d)", before, afterRepeat, afterMoved);
+      check(afterRepeat == before && afterMoved == before + 1, repeatLine);
     }
 
     // ── port_event, and the echo it must not fight ──────────────────────────
@@ -369,6 +438,120 @@ int main(int argc, char** argv) {
 
     d->cleanup(ui);
     check(true, "the interface cleans up");
+  }
+
+  // ── A host that answers at once ────────────────────────────────────
+  //
+  // A real host sends every control's value right after instantiate(), and a
+  // plugin answers the first state request within a run() or two -- both long
+  // before WebView2 has started. Both were evaluated into the blank document
+  // the navigation then replaced: the page drew defaults and an empty state
+  // until the user touched something. Here the test host does exactly that,
+  // and the probe page answers each one it receives: Gain 0.4321 moves the
+  // probe parameter to 0.5, and a state object moves Gain to 1.25.
+  if (idle && idle->idle) {
+    g_written.clear();
+    Lv2UiWidget early = nullptr;
+    Lv2UiHandle second = d->instantiate(d, "urn:test", bundle.c_str(), writeFunction, nullptr,
+                                        &early, features);
+    check(second != nullptr, "a second interface instantiates");
+    if (second) {
+      const float gain = 0.4321f;
+      d->port_event(second, 0, sizeof(float), 0, &gain);
+      idle->idle(second); // its first state request...
+      const LV2_URID uridSequence = mapUri(nullptr, "http://lv2plug.in/ns/ext/atom#Sequence");
+      const LV2_URID uridJson = mapUri(nullptr, "urn:sonorie:ui:stateJson");
+      const LV2_URID uridTransfer = mapUri(nullptr, "http://lv2plug.in/ns/ext/atom#eventTransfer");
+      const int notifyPort = portIndexBySymbol(readFile(bundle + "/plugin.ttl"), "uiNotify");
+      const std::string json = "{'host':'Sonore LV2 Test Host'}";
+      alignas(8) uint8_t buffer[256] = {};
+      auto* seq = (TestAtomSequence*) buffer;
+      seq->atom.type = uridSequence;
+      auto* ev = (TestAtomEvent*) ((uint8_t*) &seq->body + sizeof(TestAtomSequenceBody));
+      ev->body.size = (uint32_t) json.size();
+      ev->body.type = uridJson;
+      std::memcpy((uint8_t*) ev + sizeof(TestAtomEvent), json.data(), json.size());
+      seq->atom.size = (uint32_t) (sizeof(TestAtomSequenceBody) + sizeof(TestAtomEvent) +
+                                   ((json.size() + 7u) & ~7u));
+      if (notifyPort >= 0) // ...answered before the page exists
+        d->port_event(second, (uint32_t) notifyPort,
+                      (uint32_t) (sizeof(TestAtom) + seq->atom.size), uridTransfer, seq);
+      // The same allowance as the first page: five seconds, then until
+      // thirty for a page that has not answered yet. A fixed five failed
+      // five runs in a row on a machine just out of a build, and passed in
+      // 250 ms to 3.3 s on the same machine idle -- slow, not broken.
+      bool sawValue = false, sawState = false;
+      auto seen = [&] {
+        for (const Written& w : g_written) {
+          if (w.port == 1 && std::fabs(w.value - 0.5f) < 1e-3f) sawValue = true;
+          if (w.port == 0 && std::fabs(w.value - 1.25f) < 1e-3f) sawState = true;
+        }
+        return sawValue && sawState;
+      };
+      pump(5000, second, idle);
+      for (int waited = 5000; !seen() && waited < 30000; waited += 250) pump(250, second, idle);
+      check(sawValue, "a control value the host sent before the page existed reaches it");
+      check(sawState, "…and so does a state answer that arrived before it");
+      d->cleanup(second);
+    }
+  }
+
+  // ── The size it opens at ───────────────────────────────────────────
+  //
+  // The plugin's own -- the probe declares none, so the SDK's 700x420, inside
+  // its 517x341..1200x800 limits, which is what CLAP and VST3 open it at --
+  // times the host's ui:scaleFactor, because the webview draws each CSS pixel
+  // as that many device pixels. It was a fixed 720x480 device pixels for
+  // every plugin and every display: in REAPER at 125% the showcase opened at
+  // 780x500 as CLAP and VST3, and at 576x384 as LV2.
+  if (idle && idle->idle) {
+    struct Resize {
+      void* handle;
+      int (*ui_resize)(void*, int, int);
+    };
+    static int askedW = 0, askedH = 0;
+    Resize resize{nullptr, [](void*, int w, int h) {
+                    askedW = w;
+                    askedH = h;
+                    return 0;
+                  }};
+    Lv2Feature resizeFeature{"http://lv2plug.in/ns/extensions/ui#resize", &resize};
+    // LV2_Options_Option, spelled out like the rest of the ABI here.
+    struct Option {
+      uint32_t context, subject;
+      LV2_URID key;
+      uint32_t size;
+      LV2_URID type;
+      const void* value;
+    };
+    const float two = 2.0f;
+    const Option options[] = {
+        {0, 0, mapUri(nullptr, "http://lv2plug.in/ns/extensions/ui#scaleFactor"), sizeof(float),
+         mapUri(nullptr, "http://lv2plug.in/ns/ext/atom#Float"), &two},
+        {0, 0, 0, 0, 0, nullptr}};
+    Lv2Feature optionsFeature{"http://lv2plug.in/ns/ext/options#options", (void*) options};
+    for (int scale = 1; scale <= 2; ++scale) {
+      const Lv2Feature* sized[] = {&parentFeature, &idleFeature, &mapFeature, &resizeFeature,
+                                   scale == 2 ? &optionsFeature : nullptr, nullptr};
+      askedW = askedH = 0;
+      Lv2UiWidget w = nullptr;
+      Lv2UiHandle h = d->instantiate(d, "urn:test", bundle.c_str(), writeFunction, nullptr, &w,
+                                     sized);
+      RECT r{};
+      if (w) GetClientRect((HWND) w, &r);
+      char line[200];
+      std::snprintf(line, sizeof(line),
+                    "%s: asks the host for %dx%d and is %ldx%ld (want %dx%d)",
+                    scale == 2 ? "at ui:scaleFactor 2" : "with no scale given", askedW, askedH,
+                    (long) r.right, (long) r.bottom, 700 * scale, 420 * scale);
+      check(h != nullptr && askedW == 700 * scale && askedH == 420 * scale &&
+                r.right == 700 * scale && r.bottom == 420 * scale,
+            line);
+      if (h) {
+        pump(500, h, idle);
+        d->cleanup(h);
+      }
+    }
   }
 
   DestroyWindow(parent);

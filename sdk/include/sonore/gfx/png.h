@@ -48,11 +48,27 @@ namespace gfx {
  * kErrorUnsupported tells them to go and read a header.
  */
 struct PngImage {
+  /** The picture, premultiplied RGBA at 8 bits a channel: 16-bit files
+   *  reduced, grey and palette images expanded, tRNS transparency applied.
+   *  Empty for every failure; see `error`. */
   Bitmap bitmap;
+  /** Why there is no picture, as a sentence in English; empty on success. */
   std::string error;
+  /** True on success: `error` is empty. */
   bool ok() const { return error.empty(); }
 };
 
+/**
+ * Decodes a PNG from bytes in memory into a premultiplied RGBA Bitmap. What it
+ * reads and refuses, and why every length is distrusted, is in the file
+ * comment.
+ *
+ * Stateless: decode() is a static function of its input, safe from any thread
+ * but not the audio thread (it inflates and allocates). Any failure, including
+ * a header that asks for more than kMaxPixels, comes back as an empty bitmap
+ * and a sentence in `error`. ImageFileFormat is the entry point that also
+ * reads JPEG and GIF.
+ */
 class PngDecoder {
 public:
   /** No image a plugin embeds is anywhere near this, and it stops a header
@@ -60,11 +76,15 @@ public:
    *  has looked at whether the file even contains that much. */
   static constexpr uint64_t kMaxPixels = 64ull * 1024ull * 1024ull;
 
+  /** Decodes `size` bytes at `data`, only read during the call. Null data
+   *  is "not a PNG file", whatever the size. */
   static PngImage decode(const uint8_t* data, size_t size) {
     PngImage result;
 
     static const uint8_t kSignature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
-    if (size < 8 || std::memcmp(data, kSignature, 8) != 0) {
+    // Null is checked, not only the size: null with a size of 8 or more was
+    // read through by the memcmp.
+    if (!data || size < 8 || std::memcmp(data, kSignature, 8) != 0) {
       result.error = "not a PNG file";
       return result;
     }
@@ -74,7 +94,9 @@ public:
     bool haveHeader = false;
     std::vector<uint8_t> compressed;
     std::vector<uint8_t> palette;      // RGB triples
-    std::vector<uint8_t> paletteAlpha; // one per entry, if a tRNS chunk arrived
+    // The tRNS chunk: one alpha per palette entry -- or, for a grey or RGB
+    // image, the colour that is transparent (see ColourKey below).
+    std::vector<uint8_t> paletteAlpha;
 
     size_t at = 8;
     while (at + 8 <= size) {
@@ -123,6 +145,17 @@ public:
           result.error = "unsupported PNG colour type";
           return result;
         }
+        // And the PAIR, which the two checks above do not test. The spec
+        // allows grey at every depth, a palette at 1-8 bits, and RGB, grey +
+        // alpha and RGBA at 8 or 16 only. A 16-bit PALETTE image passed both
+        // checks, came out as one channel of two bytes, and the 16-bit
+        // expansion fell through to its RGBA case and read p[6] -- past the
+        // end of the image data, into the heap, and out into the picture.
+        const bool paired = colourType == 0 || (colourType == 3 ? depth <= 8 : depth >= 8);
+        if (!paired) {
+          result.error = "PNG bit depth is not one its colour type allows";
+          return result;
+        }
       } else if (std::memcmp(type, "PLTE", 4) == 0) {
         palette.assign(body, body + length);
       } else if (std::memcmp(type, "tRNS", 4) == 0) {
@@ -169,24 +202,56 @@ public:
       return result;
     }
 
+    // For grey and RGB images tRNS is not a table but ONE colour, the one that
+    // is transparent: two bytes of grey or six of RGB, at the image's own
+    // depth. Optimisers write it -- oxipng and OptiPNG turn an RGBA icon
+    // whose only transparency is a fully clear background into RGB plus this
+    // key, a quarter smaller -- and read as a palette's alphas it was never
+    // looked at, so that background came out opaque, in whatever colour the
+    // encoder chose for it. Compared against the samples at full depth, as
+    // libpng and the browsers compare them: at 16 bits a colour one step off
+    // the key in its low byte is a different colour, not a transparent one.
+    ColourKey key;
+    if (colourType == 0 && paletteAlpha.size() >= 2) {
+      key.present = true;
+      key.r = key.g = key.b = readBE16(paletteAlpha.data());
+    } else if (colourType == 2 && paletteAlpha.size() >= 6) {
+      key.present = true;
+      key.r = readBE16(paletteAlpha.data());
+      key.g = readBE16(paletteAlpha.data() + 2);
+      key.b = readBE16(paletteAlpha.data() + 4);
+    }
+
     result.bitmap.resize((int) width, (int) height);
     if (!expand(raw, width, height, (size_t) bytesPerRow, depth, colourType, palette, paletteAlpha,
-                result.bitmap)) {
+                key, result.bitmap)) {
       result.error = "PNG palette index is out of range";
+      // Sized and part-expanded by now; a failure's bitmap is empty, like
+      // every other.
+      result.bitmap = Bitmap();
       return result;
     }
     return result;
   }
 
+  /** Decodes the whole of `bytes` -- a file read into memory. */
   static PngImage decode(const std::vector<uint8_t>& bytes) {
     return decode(bytes.data(), bytes.size());
   }
 
 private:
+  /** The one transparent colour of a grey or RGB image, as its samples. */
+  struct ColourKey {
+    bool present = false;
+    uint32_t r = 0, g = 0, b = 0;
+  };
+
   static uint32_t readBE32(const uint8_t* p) {
     return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) |
            (uint32_t) p[3];
   }
+
+  static uint32_t readBE16(const uint8_t* p) { return ((uint32_t) p[0] << 8) | (uint32_t) p[1]; }
 
   static int channelsFor(int colourType) {
     switch (colourType) {
@@ -252,7 +317,7 @@ private:
   static bool expand(const std::vector<uint8_t>& raw, uint32_t width, uint32_t height,
                      size_t bytesPerRow, int depth, int colourType,
                      const std::vector<uint8_t>& palette,
-                     const std::vector<uint8_t>& paletteAlpha, Bitmap& out) {
+                     const std::vector<uint8_t>& paletteAlpha, const ColourKey& key, Bitmap& out) {
     const int channels = channelsFor(colourType);
 
     for (uint32_t y = 0; y < height; ++y) {
@@ -267,10 +332,13 @@ private:
           const uint8_t* p = row + ((size_t) x * (size_t) channels) * 2;
           if (colourType == 0) {
             r = g = b = p[0];
+            if (key.present && readBE16(p) == key.r) a = 0;
           } else if (colourType == 2) {
             r = p[0];
             g = p[2];
             b = p[4];
+            if (key.present && readBE16(p) == key.r && readBE16(p + 2) == key.g && readBE16(p + 4) == key.b)
+              a = 0;
           } else if (colourType == 4) {
             r = g = b = p[0];
             a = p[2];
@@ -284,10 +352,12 @@ private:
           const uint8_t* p = row + (size_t) x * (size_t) channels;
           if (colourType == 0) {
             r = g = b = p[0];
+            if (key.present && p[0] == key.r) a = 0;
           } else if (colourType == 2) {
             r = p[0];
             g = p[1];
             b = p[2];
+            if (key.present && p[0] == key.r && p[1] == key.g && p[2] == key.b) a = 0;
           } else if (colourType == 3) {
             const size_t index = (size_t) p[0];
             if (index * 3 + 2 >= palette.size()) return false;
@@ -324,6 +394,7 @@ private:
             // image is black and white rather than black and almost-black.
             const uint32_t maximum = (uint32_t) ((1 << depth) - 1);
             r = g = b = (uint8_t) (value * 255u / maximum);
+            if (key.present && value == key.r) a = 0;
           }
         }
 

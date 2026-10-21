@@ -30,8 +30,19 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A titled outline around a set of controls -- the reference's
+ * GroupComponent. The file comment says why it is a container rather than a
+ * painted rectangle.
+ *
+ * Add the controls as children and lay them out inside contentBounds(),
+ * which already leaves room for the caption. Children are not owned, like
+ * any Component's, and clicks fall through the group to them. Message thread
+ * only.
+ */
 class GroupComponent : public Widget {
 public:
+  /** A frame captioned `title`; with no title the line runs unbroken. */
   explicit GroupComponent(std::string title = {}) : title_(std::move(title)) {
     // A group is a frame, not a control. Clicks belong to whatever is inside
     // it, and a group that swallowed them would make its own children unusable
@@ -39,12 +50,15 @@ public:
     setInterceptsMouse(false);
   }
 
+  /** The caption, also the group's accessible name; repaints only when it
+   *  changes. */
   void setTitle(std::string t) {
     if (t == title_) return;
     title_ = std::move(t);
     repaint();
   }
 
+  /** The caption. */
   const std::string& title() const { return title_; }
 
   /** A Group, named by its caption -- which is the whole point of a caption.
@@ -124,8 +138,8 @@ public:
                  font(), Justify::Left, stateFor(false));
   }
 
-  static constexpr float kInset = 8.0f;
-  static constexpr float kGapPadding = 4.0f;
+  static constexpr float kInset = 8.0f;     ///< the content's inset from the frame, and where the caption's gap starts
+  static constexpr float kGapPadding = 4.0f; ///< the space either side of the caption in the line
 
 private:
   std::string title_;

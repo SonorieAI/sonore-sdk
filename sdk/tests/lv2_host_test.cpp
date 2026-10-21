@@ -8,6 +8,9 @@
 // own generated format) precisely because a TTL that disagrees with
 // connect_port() is a crash in a real host, so the test must read the metadata
 // rather than share the plugin's compile-time constants.
+#include <initializer_list>
+
+#include <sonore/audio.h>
 #include <sonore/midi_ci.h>
 #include <lv2/atom/atom.h>
 #include <lv2/core/lv2.h>
@@ -86,13 +89,15 @@ struct UridMap {
 struct StateStore {
   std::map<uint32_t, std::vector<uint8_t>> values;
   std::map<uint32_t, uint32_t> types;
+  std::map<uint32_t, uint32_t> flags;
 
   static LV2_State_Status storeCb(LV2_State_Handle handle, uint32_t key, const void* value,
-                                  size_t size, uint32_t type, uint32_t) {
+                                  size_t size, uint32_t type, uint32_t storeFlags) {
     auto* self = (StateStore*) handle;
     const auto* bytes = (const uint8_t*) value;
     self->values[key] = std::vector<uint8_t>(bytes, bytes + size);
     self->types[key] = type;
+    self->flags[key] = storeFlags;
     return LV2_STATE_SUCCESS;
   }
   static const void* retrieveCb(LV2_State_Handle handle, uint32_t key, size_t* size,
@@ -135,7 +140,7 @@ static std::vector<PortInfo> parsePorts(const std::string& ttl) {
   size_t pos = 0;
   while ((pos = ttl.find("lv2:index ", pos)) != std::string::npos) {
     // Each port block in our generated TTL runs from its type line (before the
-    // index) to the next "] , [" or "] .": scan a window around the index.
+    // index) to the next "] , [" or "] ."; scan a window around the index.
     const size_t blockStart = ttl.rfind('[', pos);
     size_t blockEnd = ttl.find(']', pos);
     if (blockStart == std::string::npos || blockEnd == std::string::npos) break;
@@ -173,13 +178,23 @@ int main(int argc, char** argv) {
   bool expectSidechain = false;
   int expectAuxOuts = -1;
   bool expectMidiOut = false;
+  /** An EFFECT whose DSP reads MIDI, which earns it a MIDI input. */
+  bool expectMidiIn = false;
   /** Is this the fixture that REPORTS what the host told it? Only the probe
    *  can answer a question about whether a flag arrived, because only the
    *  probe turns what it was told back into audio. */
   bool expectProbe = false;
+  /** A fixture that is ONLY this many channels wide (tests/width_fixture.cpp):
+   *  check its port wiring channel by channel, and nothing else. */
+  int expectWidth = 0;
   for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--expect-width") == 0 && i + 1 < argc) {
+      expectWidth = std::atoi(argv[i + 1]);
+      ++i;
+    }
     if (std::strcmp(argv[i], "--expect-sidechain") == 0) expectSidechain = true;
     if (std::strcmp(argv[i], "--expect-midi-out") == 0) expectMidiOut = true;
+    if (std::strcmp(argv[i], "--expect-midi-in") == 0) expectMidiIn = true;
     if (std::strcmp(argv[i], "--expect-probe") == 0) expectProbe = true;
     if (std::strcmp(argv[i], "--expect-aux-outs") == 0 && i + 1 < argc) {
       expectAuxOuts = std::atoi(argv[i + 1]);
@@ -201,6 +216,20 @@ int main(int argc, char** argv) {
 
   const std::vector<PortInfo> ports = parsePorts(ttl);
   check(!ports.empty(), "the TTL declares ports");
+  // Hosts look ports up by symbol, and LV2 requires them unique: a parameter
+  // id the wrapper uses for a port of its own, or two ids that map onto one
+  // symbol, made two ports answer to the same name.
+  {
+    std::vector<std::string> seenSymbols;
+    std::string duplicate;
+    for (const PortInfo& p : ports) {
+      for (const std::string& s : seenSymbols)
+        if (s == p.symbol) duplicate = p.symbol;
+      seenSymbols.push_back(p.symbol);
+    }
+    check(duplicate.empty(), duplicate.empty() ? "every port symbol is unique"
+                                               : ("a port symbol is used twice: " + duplicate).c_str());
+  }
   int controls = 0, audioIn = 0, audioOut = 0, atomIn = 0;
   int maxIndex = -1;
   bool indicesDense = true;
@@ -210,10 +239,11 @@ int main(int argc, char** argv) {
     if (p.audio && p.input) ++audioIn;
     if (p.audio && p.output) ++audioOut;
     // An atom INPUT no longer means MIDI. Every plugin now has one for its
-    // interface to ask questions over, so the two are told apart by SYMBOL --
+    // interface to ask questions over, and one that takes the transport has
+    // one for the host's time:Position, so they are told apart by SYMBOL --
     // which is what a host looks a port up by, and what this file says
     // everywhere else.
-    if (p.atom && p.input && p.symbol != "uiControl") ++atomIn;
+    if (p.atom && p.input && p.symbol != "uiControl" && p.symbol != "time_in") ++atomIn;
     if (p.index > maxIndex) maxIndex = p.index;
     if (p.index >= 0 && p.index < (int) seen.size() && !seen[p.index]) seen[p.index] = true;
     else indicesDense = false;
@@ -230,28 +260,52 @@ int main(int argc, char** argv) {
     }
     check(haveControl, "there is an atom INPUT for the interface to ask over");
     check(haveNotify, "\u2026and an atom OUTPUT for the plugin to answer on");
+    // The state goes out as one message; a host that picks its own buffer
+    // size (4 KB in jalv) never delivered a big plugin's.
+    check(ttl.find("rsz:minimumSize 65536") != std::string::npos &&
+              ttl.find("@prefix rsz:") != std::string::npos,
+          "\u2026which asks the host for room for the state in one message (rsz:minimumSize)");
+    // The transport port, when the DSP takes the transport, is an atom input
+    // and the LAST port: appended, so no port before it renumbers.
+    for (const PortInfo& p : ports)
+      if (p.symbol == "time_in")
+        check(p.atom && p.input && p.index == (int) ports.size() - 1,
+              "the transport port is an atom input, and the last port");
   }
 
+  std::printf("  ---- %d control, %d audio in, %d audio out, %d atom in ----\n", controls, audioIn,
+              audioOut, atomIn);
   check(indicesDense && maxIndex == (int) ports.size() - 1,
         "port indices are dense and unique: hosts connect by index");
 
   // Note-driven or signal-driven is decided by the PORTS, the way a host
-  // decides it: a MIDI input and no audio input means notes come first. The
-  // taxonomy class cannot answer this -- an arpeggiator is note-driven but
-  // files itself under Utility rather than Instrument.
+  // decides it: a MIDI input and no audio input means notes come first.
   const bool instrument = atomIn == 1 && audioIn == 0;
   std::printf("  ---- graded as %s ----\n",
               instrument ? (expectMidiOut ? "a NOTE EFFECT" : "an INSTRUMENT") : "an EFFECT");
-  // The main stereo bus, plus two ports per aux bus when the plugin has them.
-  check(audioOut == 2 + (expectAuxOuts > 0 ? expectAuxOuts * 2 : 0),
+  // ...and the taxonomy class has to say the same, because that is what a
+  // host FILES a plugin by: REAPER lists an LV2 as an instrument ("LV2i:")
+  // only when it is an lv2:InstrumentPlugin. CLAP's features and VST3's
+  // subcategory mark every isInstrument plugin as one; the TTL let a category
+  // win instead, so the arpeggiator ("utility") was CLAPi and VST3i in REAPER
+  // and, alone among its formats, an effect in LV2.
+  if (instrument)
+    check(ttl.find("a lv2:Plugin , lv2:InstrumentPlugin ,") != std::string::npos,
+          "a note-driven plugin is classed lv2:InstrumentPlugin, as CLAP and VST3 file it");
+  // The main bus -- stereo, unless this is a fixed-width fixture -- plus two
+  // ports per aux bus when the plugin has them.
+  const int mainWidth = expectWidth > 0 ? expectWidth : 2;
+  check(audioOut == mainWidth + (expectAuxOuts > 0 ? expectAuxOuts * 2 : 0),
         expectAuxOuts > 0 ? "the main stereo bus plus every aux channel"
-                          : "two audio outputs");
+                          : "one audio output per channel of the main bus");
   if (instrument) {
     check(atomIn == 1 && audioIn == 0, "an instrument has a MIDI port and no audio input");
   } else {
-    check(audioIn == (expectSidechain ? 4 : 2) && atomIn == 0,
-          expectSidechain ? "a sidechain effect has FOUR audio inputs and no MIDI port"
-                          : "an effect has stereo input and no MIDI port");
+    check(audioIn == (expectSidechain ? mainWidth + 2 : mainWidth) &&
+              atomIn == (expectMidiIn ? 1 : 0),
+          expectSidechain ? "a sidechain effect has its main inputs plus two and no MIDI port"
+          : expectMidiIn  ? "an effect that reads MIDI has one input per channel and a MIDI port"
+                          : "an effect has one input per channel and no MIDI port");
   }
 
   // ── Load the binary the TTL named ─────────────────────────────────────────
@@ -288,11 +342,16 @@ int main(int argc, char** argv) {
     LV2_Handle handle = nullptr;
     int scheduled = 0;
     int responded = 0;
+    // What respond() was handed, delivered to work_response() as it was
+    // given -- the plugin's answer is in it, as a real host's ring keeps it.
+    std::vector<uint8_t> response;
   };
   static Worker g_worker;
   struct WorkerBridge {
-    static Lv2WorkerStatus respondCb(Lv2WorkerRespondHandle, uint32_t, const void*) {
+    static Lv2WorkerStatus respondCb(Lv2WorkerRespondHandle, uint32_t size, const void* data) {
       ++g_worker.responded;
+      const auto* p = (const uint8_t*) data;
+      g_worker.response.assign(p, p + size);
       return kLv2WorkerSuccess;
     }
     static Lv2WorkerStatus scheduleCb(Lv2WorkerScheduleHandle, uint32_t size, const void* data) {
@@ -301,9 +360,12 @@ int main(int argc, char** argv) {
       const auto* iface = (const Lv2WorkerInterface*) g_worker.descriptor->extension_data(
           "http://lv2plug.in/ns/ext/worker#interface");
       if (!iface || !iface->work) return kLv2WorkerErrUnknown;
+      g_worker.response.clear();
       const Lv2WorkerStatus st =
           iface->work(g_worker.handle, WorkerBridge::respondCb, nullptr, size, data);
-      if (iface->work_response) iface->work_response(g_worker.handle, 0, nullptr);
+      if (iface->work_response && !g_worker.response.empty())
+        iface->work_response(g_worker.handle, (uint32_t) g_worker.response.size(),
+                             g_worker.response.data());
       return st;
     }
   };
@@ -322,6 +384,84 @@ int main(int argc, char** argv) {
   LV2_Handle without = descriptor->instantiate(descriptor, 48000.0, bundle.c_str(), bare);
   check(without == nullptr, "…and refuses to instantiate without urid:map, as declared");
   if (without) descriptor->cleanup(without);
+
+  // ── A width other than two, wired channel by channel ──────────────────────
+  //
+  // Every example is stereo-capable, so this wiring had only ever run at two.
+  // connectPort mapped "the input port after the first" to the RIGHT input
+  // whatever the width: at width 1 that port is the OUTPUT, so a mono-only
+  // effect never had its output connected and run() returned on its first
+  // line, leaving the host's buffer untouched; at width 4 the two-wide pointer
+  // arrays were indexed at 2 and 3. The fixture passes every channel through,
+  // so each output must carry its OWN input's level.
+  if (expectWidth > 0) {
+    std::vector<int> ins, outs;
+    std::vector<std::string> symbols;
+    bool uniqueSymbols = true;
+    for (const PortInfo& p : ports) {
+      for (const std::string& seen : symbols)
+        if (seen == p.symbol) uniqueSymbols = false;
+      symbols.push_back(p.symbol);
+      if (p.audio && p.input) ins.push_back(p.index);
+      if (p.audio && p.output) outs.push_back(p.index);
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "the TTL declares %d audio inputs and %d outputs (want %d each)",
+                  (int) ins.size(), (int) outs.size(), expectWidth);
+    check((int) ins.size() == expectWidth && (int) outs.size() == expectWidth, line);
+    check(uniqueSymbols, "…and every port symbol is unique, as LV2 requires");
+
+    constexpr uint32_t kN = 256;
+    std::vector<std::vector<float>> inBufs((size_t) expectWidth), outBufs((size_t) expectWidth);
+    std::vector<float> controlValues(ports.size(), 0.0f);
+    alignas(8) static uint8_t seqBuffer[4096];
+    auto* emptySeq = (LV2_Atom_Sequence*) seqBuffer;
+    emptySeq->atom.type = UridMap::mapCb(&urids, LV2_ATOM__Sequence);
+    emptySeq->atom.size = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
+    emptySeq->body.unit = 0;
+    emptySeq->body.pad = 0;
+    alignas(8) static uint8_t outSeqBuffer[4096];
+    auto* outSeqW = (LV2_Atom_Sequence*) outSeqBuffer;
+    int inSeen = 0, outSeen = 0;
+    for (const PortInfo& p : ports) {
+      if (p.control) {
+        controlValues[(size_t) p.index] = p.def;
+        descriptor->connect_port(handle, (uint32_t) p.index, &controlValues[(size_t) p.index]);
+      } else if (p.audio && p.input && inSeen < expectWidth) {
+        inBufs[(size_t) inSeen].assign(kN, 0.1f * (float) (inSeen + 1));
+        descriptor->connect_port(handle, (uint32_t) p.index, inBufs[(size_t) inSeen].data());
+        ++inSeen;
+      } else if (p.audio && p.output && outSeen < expectWidth) {
+        outBufs[(size_t) outSeen].assign(kN, -1.0f);
+        descriptor->connect_port(handle, (uint32_t) p.index, outBufs[(size_t) outSeen].data());
+        ++outSeen;
+      } else if (p.atom && p.output) {
+        descriptor->connect_port(handle, (uint32_t) p.index, outSeqW);
+      } else if (p.atom) {
+        descriptor->connect_port(handle, (uint32_t) p.index, emptySeq);
+      }
+    }
+    if (descriptor->activate) descriptor->activate(handle);
+    for (int b = 0; b < 4; ++b) {
+      outSeqW->atom.size = (uint32_t) (sizeof(outSeqBuffer) - sizeof(LV2_Atom));
+      descriptor->run(handle, kN);
+    }
+    bool eachOwn = outSeen == expectWidth;
+    for (int c = 0; c < outSeen; ++c) {
+      const float want = 0.1f * (float) (c + 1), got = outBufs[(size_t) c][kN - 1];
+      if (std::fabs(got - want) > 1e-5f) {
+        eachOwn = false;
+        std::printf("  ---- output %d reads %.4f, its input is %.4f ----\n", c, got, want);
+      }
+    }
+    std::snprintf(line, sizeof(line), "at width %d, every output carries its own input's level",
+                  expectWidth);
+    check(eachOwn, line);
+    if (descriptor->deactivate) descriptor->deactivate(handle);
+    descriptor->cleanup(handle);
+    std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
+    return g_failures == 0 ? 0 : 1;
+  }
 
   // ── Connect everything and run ────────────────────────────────────────────
   constexpr uint32_t kFrames = 512;
@@ -546,6 +686,74 @@ int main(int argc, char** argv) {
     check(allSane, "…that never blows past sanity, whatever the rate");
   }
 
+  // ── A run() longer than the DSP's slice ───────────────────────────────────
+  //
+  // The wrapper renders a long run() in slices of 8192, because that is what
+  // it promised the DSP. Its MIDI all went to the FIRST slice, at frame
+  // numbers counted from the start of the run, and was cleared after it -- so
+  // a note at frame 9000 of a 12000-frame run reached a DSP rendering 8192
+  // frames, which never got to sample 9000 and never played it. A note-off
+  // lost that way is a stuck note.
+  if (instrument && !expectMidiOut) { // a note effect has no audio to measure
+    const uint32_t kLong = 12000, kAt = 9000;
+    std::vector<float> lin(kLong, 0.0f), rin(kLong, 0.0f), lout(kLong, 0.0f), rout(kLong, 0.0f);
+    std::vector<float> lsc(kLong, 0.0f), rsc(kLong, 0.0f);
+    std::vector<std::vector<float>> aux(8, std::vector<float>(kLong, 0.0f));
+    alignas(8) uint8_t lateBuffer[sizeof(LV2_Atom_Sequence) + 64];
+    auto* late = (LV2_Atom_Sequence*) lateBuffer;
+    {
+      auto* event = (LV2_Atom_Event*) ((uint8_t*) &late->body + sizeof(LV2_Atom_Sequence_Body));
+      event->time.frames = kAt;
+      event->body.size = 3;
+      event->body.type = UridMap::mapCb(&urids, LV2_MIDI__MidiEvent);
+      auto* bytes = (uint8_t*) event + sizeof(LV2_Atom_Event);
+      bytes[0] = 0x90;
+      bytes[1] = 69;
+      bytes[2] = 100;
+      late->atom.type = UridMap::mapCb(&urids, LV2_ATOM__Sequence);
+      late->atom.size = (uint32_t) (sizeof(LV2_Atom_Sequence_Body) + sizeof(LV2_Atom_Event) + 8);
+      late->body.unit = 0;
+      late->body.pad = 0;
+    }
+    LV2_Handle h = descriptor->instantiate(descriptor, 48000.0, bundle.c_str(), features);
+    check(h != nullptr, "a fresh instance for the long run");
+    if (h) {
+      int inSeen = 0, outSeen = 0;
+      for (const PortInfo& pi : ports) {
+        if (pi.control) {
+          descriptor->connect_port(h, (uint32_t) pi.index, &controlValues[(size_t) pi.index]);
+        } else if (pi.audio && pi.input) {
+          float* bufs[4] = {lin.data(), rin.data(), lsc.data(), rsc.data()};
+          descriptor->connect_port(h, (uint32_t) pi.index, bufs[inSeen < 4 ? inSeen : 3]);
+          ++inSeen;
+        } else if (pi.audio && pi.output) {
+          float* dst = outSeen == 0   ? lout.data()
+                       : outSeen == 1 ? rout.data()
+                                      : aux[(size_t) (outSeen - 2)].data();
+          descriptor->connect_port(h, (uint32_t) pi.index, dst);
+          ++outSeen;
+        } else if (pi.atom && pi.output) {
+          outSeq->atom.size = (uint32_t) (sizeof(midiOutBuffer) - sizeof(LV2_Atom));
+          descriptor->connect_port(h, (uint32_t) pi.index, outSeq);
+        } else if (pi.atom) {
+          descriptor->connect_port(h, (uint32_t) pi.index, late);
+        }
+      }
+      if (descriptor->activate) descriptor->activate(h);
+      descriptor->run(h, kLong);
+      double before = 0.0, after = 0.0;
+      for (uint32_t i = 0; i < kLong; ++i)
+        (i < kAt ? before : after) += (double) lout[i] * lout[i];
+      char longLine[200];
+      std::snprintf(longLine, sizeof(longLine), "a note at frame %u of a %u-frame run is played, "
+                    "after the 8192-frame slice (energy %.3g before it, %.3g after)",
+                    (unsigned) kAt, (unsigned) kLong, before, after);
+      check(before == 0.0 && after > 0.0, longLine);
+      if (descriptor->deactivate) descriptor->deactivate(h);
+      descriptor->cleanup(h);
+    }
+  }
+
   // ── lv2:freeWheeling ──────────────────────────────────────────────────────
   //
   // LV2's way of saying what clap.render and VST3's processMode say: the host
@@ -586,6 +794,69 @@ int main(int argc, char** argv) {
       controlValues[(size_t) freeWheelIdx] = 0.0f;
       telemetry();
       check(std::fabs(telemetry() - live) < 1e-4, "…and dropping it puts the plugin back");
+
+      // AT THE SESSION'S RATE. The re-prepare a freewheel flip causes read a
+      // rate, block size and width the LV2 wrapper never wrote, so it
+      // re-prepared at the Instance defaults -- 48 kHz and 128 frames --
+      // whatever the host had instantiated. Every test above runs at 48 kHz,
+      // which is exactly the rate that hid it. So: 44.1 kHz, a flip, and the
+      // probe's own record of what its last prepare() was told.
+      const auto* stateIface =
+          (const LV2_State_Interface*) descriptor->extension_data(LV2_STATE__interface);
+      LV2_Handle h = descriptor->instantiate(descriptor, 44100.0, bundle.c_str(), features);
+      if (h && stateIface) {
+        int inSeen = 0, outSeen = 0;
+        for (const PortInfo& pi : ports) {
+          if (pi.control) {
+            descriptor->connect_port(h, (uint32_t) pi.index, &controlValues[(size_t) pi.index]);
+          } else if (pi.audio && pi.input) {
+            float* bufs[4] = {inL.data(), inR.data(), scL.data(), scR.data()};
+            descriptor->connect_port(h, (uint32_t) pi.index, bufs[inSeen < 4 ? inSeen : 3]);
+            ++inSeen;
+          } else if (pi.audio && pi.output) {
+            float* dst = outSeen == 0   ? outL.data()
+                         : outSeen == 1 ? outR.data()
+                                        : auxOut[(size_t) (outSeen - 2)].data();
+            descriptor->connect_port(h, (uint32_t) pi.index, dst);
+            ++outSeen;
+          } else if (pi.atom && pi.output) {
+            descriptor->connect_port(h, (uint32_t) pi.index, outSeq);
+          } else if (pi.atom) {
+            descriptor->connect_port(h, (uint32_t) pi.index, seq);
+          }
+        }
+        if (descriptor->activate) descriptor->activate(h);
+        auto preparedAs = [&]() {
+          StateStore store;
+          stateIface->save(h, StateStore::storeCb, &store, 0, features);
+          for (const auto& kv : store.values) {
+            const std::string bytes(kv.second.begin(), kv.second.end());
+            const size_t at = bytes.find("prepared ");
+            if (at != std::string::npos) return bytes.substr(at, bytes.find(" frames", at) + 7 - at);
+          }
+          return std::string("(nothing recorded)");
+        };
+        controlValues[(size_t) freeWheelIdx] = 0.0f;
+        descriptor->run(h, kFrames);
+        const std::string atActivate = preparedAs();
+        controlValues[(size_t) freeWheelIdx] = 1.0f;
+        descriptor->run(h, kFrames);
+        const std::string whileFreewheeling = preparedAs();
+        controlValues[(size_t) freeWheelIdx] = 0.0f;
+        descriptor->run(h, kFrames);
+        const std::string afterwards = preparedAs();
+        std::printf("  ---- instantiated at 44.1 kHz: %s at activate, %s freewheeling, %s after ----\n",
+                    atActivate.c_str(), whileFreewheeling.c_str(), afterwards.c_str());
+        const std::string want = "prepared 44100 Hz, 8192 frames";
+        check(atActivate == want, "activate prepares the DSP at the rate the host instantiated");
+        check(whileFreewheeling == want,
+              "…and the freewheel re-prepare keeps that rate and block, not 48 kHz defaults");
+        check(afterwards == want, "…and so does the re-prepare when freewheeling stops");
+        if (descriptor->deactivate) descriptor->deactivate(h);
+      } else {
+        check(false, "a second instance at 44.1 kHz instantiates, with a state interface");
+      }
+      if (h) descriptor->cleanup(h);
     }
   }
 
@@ -761,6 +1032,15 @@ int main(int argc, char** argv) {
       }
     }
     check(noteOns > 1, "the note effect emits note-ons into the sequence");
+
+    // A run of ZERO frames still claims the output: the host reads atom.size
+    // back as what was written, and the claim lived inside the slice loop a
+    // zero-frame run never enters -- leaving the host's capacity there, which
+    // reads as a buffer full of events.
+    outSeq->atom.size = (uint32_t) (sizeof(midiOutBuffer) - sizeof(LV2_Atom));
+    descriptor->run(handle, 0);
+    check(outSeq->atom.size == (uint32_t) sizeof(LV2_Atom_Sequence_Body),
+          "…and a zero-frame run leaves an empty sequence, not the buffer's capacity");
     check(noteOffs > 0, "…and releases them again");
     check(typedCorrectly, "…every event typed as midi:MidiEvent");
     check(framesInBlock, "…with frame stamps inside the block");
@@ -828,6 +1108,23 @@ int main(int argc, char** argv) {
       // Two SysEx messages, the first of a length that is NOT a multiple of
       // eight, is what actually depends on the pad: it decides where the
       // second one begins.
+      //
+      // And short messages LATER than both, which the arpeggiator passes on
+      // as it found them: a controller at 20 and a program change at 21. The
+      // wrapper wrote every short message first and every SysEx after, so
+      // the controller came out ahead of the SysEx at 0 and 1 -- a sequence
+      // out of time order, which JACK refuses event by event -- and it wrote
+      // every short message as three bytes, a program change included.
+      auto addShort = [&](int64_t frame, std::initializer_list<uint8_t> bytes) {
+        auto* ev = (LV2_Atom_Event*) (base + used);
+        ev->time.frames = frame;
+        ev->body.size = (uint32_t) bytes.size();
+        ev->body.type = midiEvent;
+        std::memcpy((uint8_t*) ev + sizeof(LV2_Atom_Event), bytes.begin(), bytes.size());
+        used += (uint32_t) sizeof(LV2_Atom_Event) + 8u;
+      };
+      addShort(20, {0xB0, 7, 100});
+      addShort(21, {0xC0, 5});
       inSeq->atom.size = used;
 
       // Point the plugin at this sequence for one run.
@@ -837,13 +1134,19 @@ int main(int argc, char** argv) {
       descriptor->run(handle, kFrames);
       descriptor->connect_port(handle, (uint32_t) portMidiIn, seq);
 
-      bool sysexBack = false, secondBack = false, parses = false;
+      bool sysexBack = false, secondBack = false, parses = false, ordered = true;
+      bool shortLengths = true;
+      int64_t lastTime = -1;
       const auto* begin = (const uint8_t*) &outSeq->body + sizeof(LV2_Atom_Sequence_Body);
       const auto* end = (const uint8_t*) &outSeq->body + outSeq->atom.size;
       for (const uint8_t* q = begin; q + sizeof(LV2_Atom_Event) <= end;) {
         const auto* ev = (const LV2_Atom_Event*) q;
         const uint8_t* body = q + sizeof(LV2_Atom_Event);
         if (body + ev->body.size > end) break;
+        if (ev->time.frames < lastTime) ordered = false;
+        lastTime = ev->time.frames;
+        if (body[0] != 0xF0 && (int) ev->body.size != sonore::shortMessageLength(body[0]))
+          shortLengths = false;
         if (ev->body.size == discovery.size() &&
             std::equal(body, body + ev->body.size, discovery.begin())) {
           sysexBack = true;
@@ -861,6 +1164,8 @@ int main(int argc, char** argv) {
             "…and still decodes as MIDI-CI -- it sits AFTER a seven-byte message, so "
             "finding it at all is what the atom padding decides");
       check(secondBack, "…the seven-byte SysEx in front of it survives too");
+      check(ordered, "…and the sequence is in time order, SysEx and notes interleaved");
+      check(shortLengths, "…every short message exactly as long as its status says");
     }
   }
 
@@ -959,6 +1264,13 @@ int main(int argc, char** argv) {
     const size_t paramsOnly = 12 /* sizeof SNRS header */ + sizeof(float) * controlInputs;
     check(blobBytes > paramsOnly,
           "the saved blob carries the whole session (bag/bypass/preset/editor), not just params");
+    // Not PORTABLE. state.h: a portable value "MUST NOT depend on ...
+    // endianness" and "MUST NOT contain filenames" -- and the blob is a
+    // native struct dump whose bag can hold a sampler's absolute path. Flagged
+    // portable, a host may carry it to another machine as if it were neither.
+    const uint32_t blobFlags = store.flags.empty() ? 0u : store.flags.begin()->second;
+    check((blobFlags & LV2_STATE_IS_PORTABLE) == 0,
+          "...and is not declared portable, which a blob holding file paths is not");
   }
 
   // \u2500\u2500 The interface's atom protocol \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -1019,6 +1331,33 @@ int main(int argc, char** argv) {
     descriptor->run(handle, kFrames);
     check(notifySeq->atom.size == (uint32_t) sizeof(LV2_Atom_Sequence_Body),
           "\u2026and nothing is sent again until something changes or asks");
+
+    // ...or until a second of audio has run. A host may not carry an
+    // interface's request at all -- REAPER delivered one per editor opened at
+    // best, in some sessions none, and that page never had the state -- so
+    // the plugin puts its state out again once a second, unasked. Once a
+    // second, not every block: 1.1 s of 512-frame blocks at 48 kHz, with no
+    // request in any of them, sends it exactly once.
+    {
+      int sends = 0;
+      const int blocks = (int) (1.1 * 48000.0 / kFrames);
+      for (int b = 0; b < blocks; ++b) {
+        notifySeq->atom.size = (uint32_t) sizeof(uiNotifyBuffer) - (uint32_t) sizeof(LV2_Atom);
+        descriptor->run(handle, kFrames);
+        const auto* nb = (const uint8_t*) &notifySeq->body;
+        uint32_t off = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
+        while (off + sizeof(LV2_Atom_Event) <= notifySeq->atom.size) {
+          const auto* ev = (const LV2_Atom_Event*) (nb + off);
+          if (ev->body.type == uridJson) ++sends;
+          off += (uint32_t) sizeof(LV2_Atom_Event) + ((ev->body.size + 7u) & ~7u);
+        }
+      }
+      char line[160];
+      std::snprintf(line, sizeof(line),
+                    "\u2026and once a second of audio it goes out again unasked, once (%d sends in "
+                    "%d blocks)", sends, blocks);
+      check(sends == 1, line);
+    }
 
     // \u2500\u2500 A file the interface picked \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     //

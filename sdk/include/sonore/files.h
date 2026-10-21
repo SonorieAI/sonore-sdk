@@ -28,13 +28,19 @@
 // fails. Sample libraries have accented names constantly. So the Windows path
 // here is entirely wide, converted at the edges, and the existing narrow scan
 // in host.h has the same bug waiting for the first user outside an English
-// locale.
+// locale. Wide through pathio::widenPath, too, which adds the long-path prefix
+// a host without a long-path manifest needs: with the plain conversion a
+// folder about 258 characters deep listed as empty, and nothing under it could
+// be reached -- in the file chooser and the browser alike -- while the files
+// themselves opened fine.
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include "path_io.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -58,7 +64,10 @@ struct FileEntry {
   std::string name;
   /** The whole path, which is what to open. */
   std::string path;
+  /** A folder rather than a file. */
   bool isDirectory = false;
+  /** The file's size. For a directory the number means nothing: 0 on
+   *  Windows, whatever the filesystem says elsewhere. */
   uint64_t sizeInBytes = 0;
   /** Seconds since the Unix epoch, or 0 where the platform did not say.
    *  Enough to sort by age, which is what a preset browser wants. */
@@ -72,10 +81,17 @@ inline char asciiLowerChar(char c) {
   return (c >= 'A' && c <= 'Z') ? (char) (c - 'A' + 'a') : c;
 }
 
+/** `a` before `b` with ASCII letters compared case-insensitively and every
+ *  other byte by value, so the order is the same on every platform and in
+ *  every locale; a prefix sorts first. The order listDirectory() uses. */
 inline bool asciiLess(const std::string& a, const std::string& b) {
   const size_t n = a.size() < b.size() ? a.size() : b.size();
   for (size_t i = 0; i < n; ++i) {
-    const char x = asciiLowerChar(a[i]), y = asciiLowerChar(b[i]);
+    // Compared as UNSIGNED bytes. Whether `char` is signed is the platform's
+    // choice -- it is not on Linux aarch64 -- so a UTF-8 name like "\xc3\x89cho"
+    // sorted before "Apple" on Windows and after it there.
+    const unsigned char x = (unsigned char) asciiLowerChar(a[i]);
+    const unsigned char y = (unsigned char) asciiLowerChar(b[i]);
     if (x != y) return x < y;
   }
   return a.size() < b.size();
@@ -93,8 +109,13 @@ inline char pathSeparator() {
 #endif
 }
 
+/** True for '/' and for '\\', on every platform. */
 inline bool isSeparator(char c) { return c == '/' || c == '\\'; }
 
+/** `directory` and `name` with one separator between, the platform's own
+ *  unless `directory` already ends in either. An empty part gives the other
+ *  unchanged. Nothing is normalised: ".." and doubled separators in either
+ *  part are kept. */
 inline std::string joinPath(const std::string& directory, const std::string& name) {
   if (directory.empty()) return name;
   if (name.empty()) return directory;
@@ -203,18 +224,21 @@ inline int64_t toUnixSeconds(const FILETIME& ft) {
 } // namespace pathdetail
 #endif
 
+/** True if something is at the UTF-8 `path` -- a file or a directory. */
 inline bool fileExists(const std::string& path) {
 #if defined(_WIN32)
-  return GetFileAttributesW(pathdetail::widen(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+  return GetFileAttributesW(pathio::widenPath(path.c_str()).c_str()) != INVALID_FILE_ATTRIBUTES;
 #else
   struct stat info{};
   return stat(path.c_str(), &info) == 0;
 #endif
 }
 
+/** True if the UTF-8 `path` names a directory; false for a file or
+ *  nothing. */
 inline bool isDirectory(const std::string& path) {
 #if defined(_WIN32)
-  const DWORD attributes = GetFileAttributesW(pathdetail::widen(path).c_str());
+  const DWORD attributes = GetFileAttributesW(pathio::widenPath(path.c_str()).c_str());
   return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
   struct stat info{};
@@ -243,7 +267,7 @@ inline std::vector<FileEntry> listDirectory(const std::string& directory,
   if (directory.empty()) return out;
 
 #if defined(_WIN32)
-  std::wstring pattern = pathdetail::widen(directory);
+  std::wstring pattern = pathio::widenPath(directory.c_str());
   if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') pattern += L'\\';
   pattern += L'*';
 

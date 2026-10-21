@@ -24,8 +24,11 @@
 //       GtkPlug INTO a parent window and never exposes an id of its own;
 //       LV2's X11 UI works the other way round, handing the host a window it
 //       will reparent. Bridging the two is a small change and an untestable
-//       one: WSL has no display.
-//   Cocoa (ui:CocoaUI): macOS, same argument.
+//       one: WSL has no display, so it would ship having never been opened.
+//       The rest of this SDK does not claim what it has not run, and neither
+//       does this.
+//   Cocoa (ui:CocoaUI): macOS, same argument, and macOS is unverified here
+//       for the separate reason that CI cannot run at all.
 //
 // SONORE_LV2_UI is the one switch. Where it is undefined the plugin builds
 // exactly as it did before this file existed and its manifest promises no
@@ -62,7 +65,7 @@ using clapwrap::uiHtml;
 //
 // Declared here rather than vendored. The extension's own header is not part
 // of the core LV2 package this SDK carries, and these five types are the
-// entire surface a host uses: transcribing a whole upstream file to reach
+// entire surface a host uses; transcribing a whole upstream file to reach
 // them would add more to go wrong than it removes.
 
 #define SONORE_LV2_UI_URI "http://lv2plug.in/ns/extensions/ui"
@@ -79,11 +82,19 @@ using Lv2UiController = void*;
 using Lv2UiWriteFunction = void (*)(Lv2UiController controller, uint32_t portIndex,
                                     uint32_t bufferSize, uint32_t format, const void* buffer);
 
+/** LV2_Feature, transcribed: one capability the host offers, named by URI,
+ *  with data whose meaning that URI defines. A host hands instantiate() a
+ *  null-terminated array of pointers to these, valid for that call; anything
+ *  kept must be copied. The layout is the C ABI's and must not change. */
 struct Lv2Feature {
   const char* URI;
   void* data;
 };
 
+/** LV2UI_Descriptor, transcribed: what lv2ui_descriptor() returns to the host
+ *  -- the UI's URI and the four entry points. The layout is the C ABI's and
+ *  must not change; this module's one instance is static and lives as long as
+ *  the library. */
 struct Lv2UiDescriptor {
   const char* URI;
   Lv2UiHandle (*instantiate)(const struct Lv2UiDescriptor* descriptor, const char* pluginUri,
@@ -103,13 +114,67 @@ struct Lv2UiIdleInterface {
   int (*idle)(Lv2UiHandle ui);
 };
 
+/** LV2UI_Resize, transcribed: the ui:resize feature. A host that offers it
+ *  is told the interface's size through ui_resize(handle, width, height); a
+ *  host that does not simply takes the window at the size it is made. */
 struct Lv2UiResize {
   void* handle;
   int (*ui_resize)(void* handle, int width, int height);
 };
 
+#define SONORE_LV2_OPTIONS__options "http://lv2plug.in/ns/ext/options#options"
+#define SONORE_LV2_UI__scaleFactor SONORE_LV2_UI_URI "#scaleFactor"
+
+namespace detail {
+/** One entry of the options feature's array (LV2_Options_Option), ended by
+ *  an entry whose key is 0 and value null. The context is a C enum, which is
+ *  an int's size on every compiler this builds with. */
+struct Lv2Option {
+  uint32_t context;
+  uint32_t subject;
+  LV2_URID key;
+  uint32_t size;
+  LV2_URID type;
+  const void* value;
+};
+
+/** The host's ui:scaleFactor -- device pixels per logical pixel -- from the
+ *  options it handed instantiate(), or 1 when it gave none. It is how LV2
+ *  says what CLAP's set_scale and VST3's setContentScaleFactor say. */
+inline double hostScaleFactor(const Lv2Feature* const* features, LV2_URID_Map* map) {
+  if (!map || !map->map) return 1.0;
+  const LV2_URID key = map->map(map->handle, SONORE_LV2_UI__scaleFactor);
+  const LV2_URID atomFloat = map->map(map->handle, LV2_ATOM__Float);
+  const LV2_URID atomDouble = map->map(map->handle, LV2_ATOM__Double);
+  for (const Lv2Feature* const* f = features; f && *f; ++f) {
+    if (std::strcmp((*f)->URI, SONORE_LV2_OPTIONS__options) != 0 || !(*f)->data) continue;
+    // Bounded: a host that forgot the terminator must not walk us off the end.
+    const auto* o = (const Lv2Option*) (*f)->data;
+    for (int i = 0; i < 256 && (o[i].key != 0 || o[i].value != nullptr); ++i) {
+      if (o[i].key != key || !o[i].value) continue;
+      double v = 0.0;
+      if (o[i].type == atomFloat && o[i].size == sizeof(float)) v = *(const float*) o[i].value;
+      else if (o[i].type == atomDouble && o[i].size == sizeof(double)) v = *(const double*) o[i].value;
+      if (v > 0.0 && v <= 8.0) return v; // the range guiSetScale accepts
+    }
+  }
+  return 1.0;
+}
+} // namespace detail
+
 // ── One open interface ───────────────────────────────────────────────────────
 
+/**
+ * One open LV2 interface, the handle instantiate() returns to the host: the
+ * webview, the host's write_function, and what the page and the plugin have
+ * said to each other that has not been delivered yet.
+ *
+ * Shares nothing with the plugin instance (see the file comment): parameters
+ * arrive through port_event and leave through write_function, the state and
+ * notes as atoms. Every call on it is the host's UI thread -- instantiate,
+ * port_event, idle, cleanup -- and the host deletes it through cleanup(),
+ * except while a file dialog is open (see dialogsOpen).
+ */
 struct UiInstance {
   PlatformWebView webview;
   Lv2UiWriteFunction write = nullptr;
@@ -146,6 +211,34 @@ struct UiInstance {
    *  already prepared the buffers for. */
   bool needState = true;
   int requestsSent = 0;
+
+  /** The page's document is up: its bridge said "ready". Before that a
+   *  script runs in the blank document the navigation then replaces, and is
+   *  gone -- and a host sends every control's value right after
+   *  instantiate(), and the plugin answers the first state request within a
+   *  run() or two, both long before WebView2 has started. So what arrives
+   *  early is held here and pushed on ready. */
+  bool pageUp = false;
+  float latest[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
+  bool haveLatest[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
+  std::string pendingState;
+  std::string pendingNotes;
+  /** The plugin's state as it last arrived, JSON. The plugin sends it again
+   *  every second of audio (lv2_wrapper.h's writeUiNotify), so the page is
+   *  handed a state only when it differs from this one or when the page is
+   *  new -- a document after a reload gets it from here, with no request. */
+  std::string lastState;
+  /** The meter call the page last ran: a plugin at rest is not news, and
+   *  each call wakes the renderer (see Instance::uiLastMeter). */
+  std::string lastMeter;
+
+  /** File dialogs open on the stack. The dialog is modal and runs a message
+   *  loop of its own, and the host's messages are dispatched by it -- so the
+   *  host can call cleanup() before the dialog returns. While one is open,
+   *  cleanup() closes the page and leaves the instance to be deleted by the
+   *  dialog's caller, which would otherwise come back to freed memory. */
+  int dialogsOpen = 0;
+  bool cleanedUp = false;
 };
 
 /**
@@ -160,7 +253,16 @@ struct UiInstance {
  */
 inline void chooseFileForPage(UiInstance* ui, const BridgeMessage& m) {
   void* parent = ui->webview.nativeWindow();
+  ++ui->dialogsOpen;
   const std::string path = FileDialog::byMode(m.mode, parent);
+  --ui->dialogsOpen;
+  if (ui->cleanedUp) {
+    // The host closed the interface while the dialog was up: there is no
+    // page to answer and no host to write to. The last dialog out deletes
+    // it; nothing between here and the webview's own handler touches it.
+    if (ui->dialogsOpen == 0) delete ui;
+    return;
+  }
 
   // The plugin first, then the page -- the same order the other formats use,
   // and for the same reason: a filename on screen for a sample that has not
@@ -175,21 +277,17 @@ inline void chooseFileForPage(UiInstance* ui, const BridgeMessage& m) {
     payload.insert(payload.end(), path.begin(), path.end());
     payload.push_back(0);
 
-    std::vector<uint8_t> buffer(sizeof(LV2_Atom_Sequence) + sizeof(LV2_Atom_Event) +
-                                lv2::atomPad((uint32_t) payload.size()));
-    auto* seq = (LV2_Atom_Sequence*) buffer.data();
-    seq->atom.type = ui->uridAtomSequence;
-    seq->body.unit = 0;
-    seq->body.pad = 0;
-    auto* ev = (LV2_Atom_Event*) ((uint8_t*) &seq->body + sizeof(LV2_Atom_Sequence_Body));
-    ev->time.frames = 0;
-    ev->body.size = (uint32_t) payload.size();
-    ev->body.type = ui->uridLoadFile;
-    std::memcpy((uint8_t*) ev + sizeof(LV2_Atom_Event), payload.data(), payload.size());
-    seq->atom.size = (uint32_t) (sizeof(LV2_Atom_Sequence_Body) + sizeof(LV2_Atom_Event) +
-                                 lv2::atomPad((uint32_t) payload.size()));
-    ui->write(ui->controller, (uint32_t) lv2::portUiControl(),
-              (uint32_t) (sizeof(LV2_Atom) + seq->atom.size), ui->uridEventTransfer, seq);
+    // ONE atom, which is what atom:eventTransfer carries: the host makes it
+    // an event in the plugin's input sequence. A whole Sequence written here
+    // arrived as an event whose body was a Sequence, and the plugin, looking
+    // for a load-file event, never saw one.
+    std::vector<uint8_t> buffer(sizeof(LV2_Atom) + payload.size());
+    auto* atom = (LV2_Atom*) buffer.data();
+    atom->size = (uint32_t) payload.size();
+    atom->type = ui->uridLoadFile;
+    std::memcpy(buffer.data() + sizeof(LV2_Atom), payload.data(), payload.size());
+    ui->write(ui->controller, (uint32_t) lv2::portUiControl(), (uint32_t) buffer.size(),
+              ui->uridEventTransfer, atom);
     // The plugin's state has moved, so ask for it again -- the answer is what
     // puts the filename in front of the user.
     ui->needState = true;
@@ -199,9 +297,55 @@ inline void chooseFileForPage(UiInstance* ui, const BridgeMessage& m) {
   ui->webview.eval(fileAnswerScript(m.purpose, path));
 }
 
+/** The page's bridge came up in a real document: everything it missed. On a
+ *  reload too, which is why the state is asked for again once the held
+ *  answer has been spent. */
+inline void pageUp(UiInstance* ui) {
+  ui->pageUp = true;
+  ui->lastMeter.clear(); // a new document has seen none
+  std::string js;
+  for (int i = 0; i < kDesc.numParams; ++i) {
+    if (!ui->haveLatest[i]) continue;
+    char number[40], call[96];
+    jsNumber(number, sizeof(number), (double) ui->latest[i]);
+    std::snprintf(call, sizeof(call), "window.sonore.__update(%d,%s);", i, number);
+    js += call;
+    ui->echoed[i] = ui->latest[i];
+  }
+  js += ui->pendingNotes;
+  if (!ui->pendingState.empty()) {
+    js += ui->pendingState;
+    ui->pendingState.clear();
+  } else if (!ui->lastState.empty()) {
+    // A new document (a reload) and a state already here: its own, now.
+    js += "window.sonore.__state(" + ui->lastState + ");";
+  } else if (ui->uridStateRequest) {
+    ui->needState = true;
+    ui->requestsSent = 0;
+  }
+  if (!js.empty()) ui->webview.eval(js);
+}
+
 inline void onBridgeMessage(UiInstance* ui, const BridgeMessage& m) {
+  // Nothing an interface may not write: out of range, or a parameter the
+  // plugin REPORTS (readOnly). See uiMayWrite.
+  if ((m.kind == BridgeMessage::Kind::Set || m.kind == BridgeMessage::Kind::GestureBegin ||
+       m.kind == BridgeMessage::Kind::GestureEnd) &&
+      !uiMayWrite(kDesc, m.index))
+    return;
   UiEventQueue::Event e{};
   switch (m.kind) {
+    case BridgeMessage::Kind::Ready:
+      pageUp(ui);
+      return;
+    case BridgeMessage::Kind::CaptureKeys:
+      // Straight onto the webview, as CLAP and VST3 do. Dropped here, the
+      // flag stayed false, so every key WebView2 reports as an accelerator
+      // -- Backspace, Delete, the arrows, Ctrl+C and Ctrl+V -- went to the
+      // host even while a text field in the page had focus and had asked
+      // for the keyboard.
+      ui->webview.captureKeys = m.value >= 0.5;
+      return;
     case BridgeMessage::Kind::ChooseFile:
       // On this thread and blocking, which is what a modal dialog is. The
       // audio thread is the host's and keeps running throughout.
@@ -267,7 +411,18 @@ inline Lv2UiHandle instantiate(const Lv2UiDescriptor*, const char* /*pluginUri*/
   }
   ui->webview.onMessage = [ui](const BridgeMessage& m) { onBridgeMessage(ui, m); };
 
-  const uint32_t width = 720, height = 480;
+  // The size every other format opens at: the plugin's own (SONORE_UI_WIDTH
+  // x SONORE_UI_HEIGHT, inside its editorLimits) in logical pixels, times
+  // the host's scale -- the webview draws each CSS pixel as that many device
+  // pixels, so the window must be that much bigger (guiSetScale in
+  // clap_wrapper.h). It was a fixed 720x480 device pixels for every plugin:
+  // in REAPER at 125% the showcase opened at 780x500 as CLAP and VST3 and at
+  // 576x384 as LV2, and a plugin with a larger minimum opened below it.
+  uint32_t width = SONORE_UI_WIDTH, height = SONORE_UI_HEIGHT;
+  clapwrap::clampEditorSize(&width, &height);
+  const double scale = detail::hostScaleFactor(features, map);
+  width = (uint32_t) ((double) width * scale + 0.5);
+  height = (uint32_t) ((double) height * scale + 0.5);
   const bool created =
       ui->webview.create((HWND) parent, width, height, uiHtml(), bridgeScript(kDesc), kDesc.id);
   if (!created) {
@@ -292,6 +447,14 @@ inline void cleanup(Lv2UiHandle handle) {
   auto* ui = (UiInstance*) handle;
   if (!ui) return;
   ui->webview.destroy();
+  if (ui->dialogsOpen > 0) {
+    // Called from inside the file dialog's message loop: chooseFileForPage()
+    // is still on the stack below us and deletes the instance when it
+    // returns. The host's write function is not to be used after this.
+    ui->write = nullptr;
+    ui->cleanedUp = true;
+    return;
+  }
   delete ui;
 }
 
@@ -311,29 +474,51 @@ inline void portEvent(Lv2UiHandle handle, uint32_t portIndex, uint32_t bufferSiz
     // The plugin's answer. Anything that is not our own message type is
     // somebody else's business and is left alone rather than guessed at.
     if (format != ui->uridEventTransfer || !ui->uridStateJson) return;
-    const auto* seq = (const LV2_Atom_Sequence*) buffer;
-    if (seq->atom.type != ui->uridAtomSequence) return;
-    lv2::forEachAtomEvent(seq, [ui](const LV2_Atom_Event* ev) {
-      if (ev->body.type == ui->uridNotes && ev->body.size == 4 * sizeof(uint32_t)) {
+    // The host says how many bytes it handed over, and the atom's own size
+    // has to fit inside them: everything below trusts that one number.
+    if (bufferSize < sizeof(LV2_Atom)) return;
+    const auto* atom = (const LV2_Atom*) buffer;
+    if (atom->size > bufferSize - sizeof(LV2_Atom)) return;
+    // One message: its type, its size and its bytes.
+    auto deliver = [ui](uint32_t type, uint32_t size, const uint8_t* body) {
+      if (type == ui->uridNotes && size == 4 * sizeof(uint32_t)) {
         // Four 32-bit words, straight through to the page. Not one 128-bit
         // number and not two 64-bit ones: a JavaScript number is a double and
         // holds integers exactly only to 2^53, so anything wider arrives
         // rounded and keys light at random.
         uint32_t words[4];
-        std::memcpy(words, (const uint8_t*) ev + sizeof(LV2_Atom_Event), sizeof(words));
+        std::memcpy(words, body, sizeof(words));
         char call[128];
         std::snprintf(call, sizeof(call), "window.sonore.__notes(%u,%u,%u,%u);", words[0],
                       words[1], words[2], words[3]);
-        ui->webview.eval(call);
-      } else if (ev->body.type == ui->uridStateJson) {
-        const char* json = (const char*) ev + sizeof(LV2_Atom_Event);
-        std::string call = "window.sonore.__state(";
-        call.append(json, ev->body.size);
-        call += ");";
-        ui->webview.eval(call);
+        ui->pendingNotes = call; // the latest, for a page that is not up yet
+        if (ui->pageUp) ui->webview.eval(call);
+      } else if (type == ui->uridStateJson) {
         ui->needState = false;
+        // The second-by-second repeat of a state the page has: nothing new.
+        if (ui->lastState.size() == size && std::memcmp(ui->lastState.data(), body, size) == 0)
+          return;
+        ui->lastState.assign((const char*) body, size);
+        std::string call = "window.sonore.__state(";
+        call += ui->lastState;
+        call += ");";
+        if (ui->pageUp) ui->webview.eval(call);
+        else ui->pendingState = std::move(call);
       }
-    });
+    };
+    // eventTransfer hands over ONE event's atom at a time -- jalv, Carla,
+    // Ardour and REAPER all deliver it so, and the state arriving that way
+    // was dropped here, because only a whole Sequence was read: the page
+    // never had the plugin's state. A Sequence is still read, event by
+    // event, for a host that forwards the port's whole buffer.
+    if (atom->type == ui->uridAtomSequence) {
+      if (bufferSize < sizeof(LV2_Atom_Sequence)) return;
+      lv2::forEachAtomEvent((const LV2_Atom_Sequence*) buffer, [&deliver](const LV2_Atom_Event* ev) {
+        deliver(ev->body.type, ev->body.size, (const uint8_t*) ev + sizeof(LV2_Atom_Event));
+      });
+    } else {
+      deliver(atom->type, atom->size, (const uint8_t*) buffer + sizeof(LV2_Atom));
+    }
     return;
   }
 
@@ -354,6 +539,9 @@ inline void portEvent(Lv2UiHandle handle, uint32_t portIndex, uint32_t bufferSiz
   if (portIndex >= (uint32_t) kDesc.numParams) return; // not one of ours
 
   const float value = *(const float*) buffer;
+  ui->latest[portIndex] = value;
+  ui->haveLatest[portIndex] = true;
+  if (!ui->pageUp) return; // pushed by pageUp() when the document is there
   // A host echoes back every change including the one the page just made.
   // Re-sending it would move the control under the mouse that is dragging it.
   if (ui->echoValid && ui->echoed[portIndex] == value) return;
@@ -377,29 +565,38 @@ inline int idle(Lv2UiHandle handle) {
   // that never forwards the reply must not have this repeat for ever.
   if (ui->needState && ui->write && ui->uridStateRequest && ui->requestsSent < 40) {
     ++ui->requestsSent;
+    // One bare atom, as eventTransfer is specified and as every host delivers
+    // it: wrapped in a Sequence it reached the plugin as an event of type
+    // Sequence and was never taken for a request. In REAPER the page asked
+    // 88 times and was answered none.
+    // With a body: the request's number, which the plugin does not read. An
+    // atom with an empty body is legal, and REAPER dropped every one -- the
+    // page asked fourteen times and the plugin heard nothing.
     struct {
-      LV2_Atom_Sequence seq;
-      LV2_Atom_Event ev;
-    } message{};
-    message.seq.atom.type = ui->uridAtomSequence;
-    message.seq.atom.size = (uint32_t) (sizeof(LV2_Atom_Sequence_Body) + sizeof(LV2_Atom_Event));
-    message.ev.time.frames = 0;
-    message.ev.body.size = 0;
-    message.ev.body.type = ui->uridStateRequest;
-    ui->write(ui->controller, (uint32_t) lv2::portUiControl(), (uint32_t) sizeof(message),
-              ui->uridEventTransfer, &message);
+      LV2_Atom atom;
+      uint64_t number;
+    } request{};
+    request.atom.size = (uint32_t) sizeof(request.number);
+    request.atom.type = ui->uridStateRequest;
+    request.number = (uint64_t) ui->requestsSent;
+    ui->write(ui->controller, (uint32_t) lv2::portUiControl(), (uint32_t) sizeof(request),
+              ui->uridEventTransfer, &request);
   }
 
-  // The needle, on the interface's own clock. A host calls idle() at roughly
-  // the rate it repaints, which is what the ballistics are written against.
+  // The needle, on the interface's own clock. A host calls idle() at the
+  // rate it likes, so the ballistics are advanced by the time that passed
+  // rather than by a 30 Hz tick the host never promised.
   if (ui->webview.ready()) {
-    ui->meter.tick(0.033);
+    ui->meter.tickNow();
     char lv[40], db[40], vu[40], call[160];
     jsNumber(lv, sizeof(lv), (double) ui->meter.level());
     jsNumber(db, sizeof(db), (double) ui->meter.db());
     jsNumber(vu, sizeof(vu), (double) ui->meter.vu());
     std::snprintf(call, sizeof(call), "window.sonore.__meter(%s,%s,%s);", lv, db, vu);
-    ui->webview.eval(call);
+    if (ui->lastMeter != call) {
+      ui->lastMeter = call;
+      ui->webview.eval(call);
+    }
   }
   // Nothing is pumped here. The WebView's messages are dispatched by the
   // host's own message loop -- the same loop that calls idle() -- and a
@@ -426,9 +623,29 @@ inline int idle(Lv2UiHandle handle) {
   return 0;
 }
 
+/** ui:resize as the interface's own: the host tells it the size its window
+ *  now is -- a plugin window dragged larger -- and the page follows, within
+ *  the plugin's editor limits. A plugin whose editor resizes on neither axis
+ *  refuses. Without it the page stayed the size it opened at inside a host
+ *  window of any size. The handle field is the host's to ignore here: the
+ *  interface's own handle is the first argument. */
+inline int uiResize(void* handle, int width, int height) {
+  auto* ui = (UiInstance*) handle;
+  if (!ui || width <= 0 || height <= 0) return 1;
+  if (!kDesc.editorLimits.resizableHorizontally && !kDesc.editorLimits.resizableVertically) return 1;
+  uint32_t w = (uint32_t) width, h = (uint32_t) height;
+  clapwrap::clampEditorSize(&w, &h);
+  ui->webview.setSize(w, h);
+  return 0;
+}
+
 inline const void* extensionData(const char* uri) {
   if (uri && std::strcmp(uri, SONORE_LV2_UI__idleInterface) == 0) {
     static const Lv2UiIdleInterface iface = {idle};
+    return &iface;
+  }
+  if (uri && std::strcmp(uri, SONORE_LV2_UI__resize) == 0) {
+    static const Lv2UiResize iface = {nullptr, uiResize};
     return &iface;
   }
   return nullptr;

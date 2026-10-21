@@ -5,9 +5,14 @@
 // Every other example exercises one thing. This one is here because the unit
 // tests cannot catch what happens when the pieces MEET: a sample loaded by
 // audiofile.h, played by SampleVoice through VoiceManager, shaped by ADSR,
-// remembered across sessions by StateBag, and drawn in the page from
-// WaveformPeaks. If any of those contracts disagree, it shows up here rather
+// remembered across sessions by StateBag, and outlined by WaveformPeaks for a
+// page to draw. If any of those contracts disagree, it shows up here rather
 // than in a customer's session.
+//
+// A file reaches it through the wrapper's loadFile(purpose, path) hook, which
+// is what a page's `sonore.chooseFile('sample')` delivers to, and through a
+// saved session. This example has no page of its own -- it gets the native
+// editor -- so it plays its demo sample unless a session names a file.
 //
 // It ships with a procedurally generated sample so it makes sound with no file
 // at all: an instrument whose demo requires the user to find a WAV first is an
@@ -15,6 +20,8 @@
 #define SONORE_NUM_PARAMS 4
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -45,9 +52,34 @@ struct Voice {
     p.release = release;
     env.setParameters(p);
   }
-  void setTune(float semitones) { player.setPitchOffset(semitones); }
+  /** The pitch offset is two things added: the Tune control, the same for
+   *  every voice, and this note's own bend from expression. Held apart, so
+   *  that either can move without taking the other with it -- set as one
+   *  number, a Tune control moved (or automated, every block) wiped every
+   *  sounding note's bend back to nothing. */
+  void setTune(float semitones) {
+    tune_ = semitones;
+    player.setPitchOffset(tune_ + bend_);
+  }
+  void setBend(float semitones) {
+    bend_ = semitones;
+    player.setPitchOffset(tune_ + bend_);
+  }
 
   void noteOn(int note, float velocity) {
+    // A REUSED voice forgets the previous note's bend: a voice bent by
+    // expression otherwise stayed bent, and the next note on it was out of
+    // tune. Found by turning on VST3 note expression, where the next
+    // measurement started at 123.4 Hz instead of 110.
+    bend_ = 0.0f;
+    player.setPitchOffset(tune_);
+    // A voice that had fallen silent starts from silence. ADSR retriggers
+    // from the level it is at, which is right for a voice stolen while it
+    // sounds -- but a one-shot that ENDS while its key is held frees the
+    // voice with the envelope still up at its sustain, and the next note on
+    // it started there: its attack skipped, at full level from the first
+    // sample, however slow the Attack knob said.
+    if (!isActive()) env.reset();
     velocity_ = velocity;
     player.noteOn(note);
     env.noteOn();
@@ -67,15 +99,17 @@ struct Voice {
    *  finished envelope. Getting this wrong either cuts tails or leaks voices. */
   bool isActive() const { return env.isActive() && player.isActive(); }
 
-  float render(size_t channel) {
-    const float s = player.renderChannel(channel);
-    if (channel == 0) gain_ = env.getNextSample() * velocity_;
-    return s * gain_;
-  }
+  /** One envelope step per FRAME, before its channels are read. It used to
+   *  step inside render(0) -- and a mono sample is read through channel 0
+   *  twice per frame, once for each side, so on a mono file every attack and
+   *  release ran at twice the speed its knob said. */
+  void beginFrame() { gain_ = env.getNextSample() * velocity_; }
+  float render(size_t channel) { return player.renderChannel(channel) * gain_; }
   void advance() { player.advance(); }
 
 private:
   float velocity_ = 1.0f, gain_ = 0.0f;
+  float tune_ = 0.0f, bend_ = 0.0f; // semitones: the Tune control, and this note's bend
 };
 
 } // namespace
@@ -91,24 +125,29 @@ struct SonoreDsp {
    *  and the example a generated sampler is modelled on broke it. */
   struct Bank {
     std::vector<float> storage;
+    /** The built-in demo's samples, in place of `storage`: the same 1.2 s
+     *  in every instance, made once and shared read-only (buildDemoBank). */
+    std::shared_ptr<const std::vector<float>> shared;
     sonore::SampleData data;
     sonore::WaveformPeaks peaks;
     std::string path; // empty means the built-in demo sample
     Bank* next = nullptr; // link in the retired stack
 
-    /** Point `data` at `storage` and rebuild the outline the interface draws.
-     *  After ANY change to the storage, because a stale pointer here is a
-     *  crash rather than a wrong sound. */
+    /** Point `data` at the samples and rebuild the outline the interface
+     *  draws. After ANY change to the storage, because a stale pointer here
+     *  is a crash rather than a wrong sound. */
     void bind() {
-      data.interleaved = storage.data();
-      data.numFrames = data.numChannels > 0 ? storage.size() / data.numChannels : 0;
+      const std::vector<float>& samples = shared ? *shared : storage;
+      data.interleaved = samples.data();
+      data.numFrames = data.numChannels > 0 ? samples.size() / data.numChannels : 0;
       data.looping = data.loopEnd > data.loopStart && data.loopEnd <= data.numFrames;
-      peaks.build(storage.data(), data.numFrames, data.numChannels, 256);
+      peaks.build(samples.data(), data.numFrames, data.numChannels, 256);
     }
   };
 
   sonore::VoiceManager<Voice, 8> voices;
   sonore::Smooth levelSm;
+  bool levelArrived = false; // the smoother has been put on the control
   float lastAttack = -1.0f, lastRelease = -1.0f, lastTune = -1000.0f;
   double hostRate = 48000.0;
 
@@ -161,9 +200,16 @@ struct SonoreDsp {
   void prepare(const sonore::ProcessSpec& spec) {
     hostRate = spec.sampleRate;
     const float sr = (float) spec.sampleRate;
-    for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setSampleRate(sr);
+    // Every voice silenced, as in the synth: the wrapper prepares a DSP with
+    // no reset() of its own in place of one, and a reset promises the host
+    // that no note it started is still sounding. A looped note kept was a
+    // note no note-off would ever end.
+    for (int i = 0; i < voices.kNumVoices; ++i) {
+      voices.voice(i).kill();
+      voices.voice(i).setSampleRate(sr);
+    }
     levelSm.setup(sr, 15.0f);
-    levelSm.snap(1.0f);
+    levelArrived = false; // it lands on the control in the next block
     lastAttack = lastRelease = -1.0f;
     lastTune = -1000.0f;
   }
@@ -188,18 +234,34 @@ struct SonoreDsp {
     const size_t loopFinish = cycle * 30;
     const size_t frames = (size_t) (rate * 1.2);
     Bank* b = new Bank;
-    b->storage.assign(frames, 0.0f);
+    {
+      // Rendered once, and shared by every bank that plays it. The samples
+      // are the same in every instance and never written once made, so a
+      // copy each was 211 KB of a sampler's 262 for nothing -- 10 MB of a
+      // session of fifty. Held weakly here: they live while some bank plays
+      // them and go with the last, deleted on the main thread as every bank
+      // is. The lock is for two hosts' threads making instances at once;
+      // the audio thread never comes here.
+      static std::mutex lock;
+      static std::weak_ptr<const std::vector<float>> made;
+      std::lock_guard<std::mutex> hold(lock);
+      b->shared = made.lock();
+      if (!b->shared) {
+        std::vector<float> samples(frames, 0.0f);
+        for (size_t i = 0; i < frames; ++i) {
+          const double t = (double) i / rate;
+          double v = 0.0;
+          for (int h = 1; h <= 6; ++h)
+            v += std::sin(2.0 * 3.14159265358979 * f0 * (double) h * t) / (double) (h * h);
 
-    for (size_t i = 0; i < frames; ++i) {
-      const double t = (double) i / rate;
-      double v = 0.0;
-      for (int h = 1; h <= 6; ++h)
-        v += std::sin(2.0 * 3.14159265358979 * f0 * (double) h * t) / (double) (h * h);
-
-      double amplitude = 1.0;
-      if (i < loopBegin) amplitude = (double) i / (double) loopBegin; // attack
-      else if (i > loopFinish) amplitude = std::exp(-3.0 * (t - (double) loopFinish / rate));
-      b->storage[i] = (float) (v * amplitude * 0.5);
+          double amplitude = 1.0;
+          if (i < loopBegin) amplitude = (double) i / (double) loopBegin; // attack
+          else if (i > loopFinish) amplitude = std::exp(-3.0 * (t - (double) loopFinish / rate));
+          samples[i] = (float) (v * amplitude * 0.5);
+        }
+        b->shared = std::make_shared<const std::vector<float>>(std::move(samples));
+        made = b->shared;
+      }
     }
 
     b->data.sampleRate = rate;
@@ -251,11 +313,29 @@ struct SonoreDsp {
     }
   }
 
+  /** [main thread] The wrapper's file hook: a page's chooseFile() answered.
+   *  An empty path is a cancel. The host is told the state changed, or it
+   *  would close the session without asking and the choice would be lost.
+   *
+   *  This was a loadFile(path, rootNote) -- not the hook's signature, so the
+   *  wrapper never found it and nothing a page did could load a sample. */
+  void loadFile(const char* /*purpose*/, const char* path) {
+    // At middle C, as loadState() assumes for a file saved without one. It
+    // took the previous bank's root, and on a fresh instance that is the
+    // demo's A: a sample recorded at C played nine semitones flat, and
+    // played in tune again after the session was reopened.
+    if (path && path[0] && loadSample(path, kFileRootNote))
+      stateDirty.store(true, std::memory_order_release);
+  }
+  static constexpr int kFileRootNote = 60;
+  bool consumeStateDirty() { return stateDirty.exchange(false, std::memory_order_acq_rel); }
+  std::atomic<bool> stateDirty{false};
+
   /** [main thread] Load a file, resampled to nothing: SampleVoice corrects for
    *  the file's rate itself, so the samples are kept as recorded and only the
    *  rate is remembered. Resampling here would throw away quality for no
    *  reason. */
-  bool loadFile(const char* path, int rootNote) {
+  bool loadSample(const char* path, int rootNote) {
     sonore::WavData file;
     if (!path || !path[0] || !sonore::readAudioFile(path, &file) || file.samples.empty())
       return false;
@@ -283,7 +363,8 @@ struct SonoreDsp {
   void loadState(const sonore::StateBag& bag) {
     const std::string path = bag.getString("samplePath", "");
     // An unknown recording is assumed to sound middle C.
-    if (!path.empty() && loadFile(path.c_str(), (int) bag.getInt("rootNote", 60))) return;
+    if (!path.empty() && loadSample(path.c_str(), (int) bag.getInt("rootNote", kFileRootNote)))
+      return;
     // Back to the demo, but only if something else is loaded: a session that
     // saved the demo must come back as the demo, and one that saved a file
     // this machine no longer has is told so by the sound rather than by
@@ -320,14 +401,17 @@ struct SonoreDsp {
     const sonore::NoteExpressionBuffer::Entry* exprEnd =
         ctx.expression ? ctx.expression->end() : nullptr;
 
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float levelTarget = sonore::dbToGain(p[3]);
+    // The first block after prepare() lands on the control, as in the synth:
+    // it was snapped to unity there, and a bounce that began on a note
+    // glided down to the Level control through its first 50 ms.
+    if (!levelArrived) {
+      levelSm.snap(levelTarget);
+      levelArrived = true;
+    }
     for (size_t i = 0; i < n; ++i) {
-      while (expr != exprEnd && (size_t) expr->samplePosition <= i) {
-        if (expr->expression == sonore::kExprTuning) {
-          const int v = voices.voiceForNote(expr->key, expr->channel);
-          if (v >= 0) voices.voice(v).setTune(p[2] + expr->value);
-        }
-        ++expr;
-      }
       while (event != end && (size_t) event->samplePosition <= i) {
         const sonore::MidiMessage& m = event->getMessage();
         // The pedals first: a damper held while the hands lift is the
@@ -336,33 +420,32 @@ struct SonoreDsp {
           ++event;
           continue;
         }
-        if (m.isNoteOn()) {
+        // A reused voice forgets the previous note's bend in its own noteOn,
+        // now that it holds the Tune control's half of its pitch itself.
+        if (m.isNoteOn())
           voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), m.getChannel() - 1);
-          // A REUSED voice must forget the previous note's bend.
-          //
-          // The synth resets bendSemis inside its own noteOn; this voice
-          // cannot, because its base pitch lives in a parameter that only
-          // process() can see. Without this line a voice bent by expression
-          // stayed bent: play a bent note, release it, play another, and the
-          // new note is out of tune, and the Tune control could not rescue
-          // it either, because line 227 only pushes p[2] to the voices when
-          // the control MOVES.
-          //
-          // Found by turning on VST3 note expression: the section that runs
-          // before the pitch-bend one left a voice bent, and the next
-          // measurement started at 123.4 Hz instead of 110.
-          const int v = voices.voiceForNote(m.getNoteNumber(), m.getChannel() - 1);
-          if (v >= 0) voices.voice(v).setTune(p[2]);
-        }
         else if (m.isNoteOff()) voices.noteOff(m.getNoteNumber(), m.getChannel() - 1);
         ++event;
       }
+      // Expression AFTER the notes at the same frame. An MPE controller sends
+      // a note's initial pitch offset in the same instant as the note-on;
+      // handled first, it found no voice (or retuned the previous, releasing
+      // one) and the note-on then reset the tune, so the note started in the
+      // wrong place. The synth example has always done it in this order.
+      while (expr != exprEnd && (size_t) expr->samplePosition <= i) {
+        if (expr->expression == sonore::kExprTuning) {
+          const int v = voices.voiceForNote(expr->key, expr->channel);
+          if (v >= 0) voices.voice(v).setBend(expr->value);
+        }
+        ++expr;
+      }
 
-      const float gain = levelSm.next(sonore::dbToGain(p[3]));
+      const float gain = levelSm.next(levelTarget);
       float left = 0.0f, right = 0.0f;
       for (int v = 0; v < voices.kNumVoices; ++v) {
         Voice& voice = voices.voice(v);
         if (!voice.isActive()) continue;
+        voice.beginFrame();
         left += voice.render(0);
         right += voice.render(playing->data.numChannels > 1 ? 1 : 0);
         voice.advance();
@@ -409,23 +492,6 @@ static const sonore::PluginDescriptor kDesc = {
 // says so with this macro. A real build never defines it.
 #if !defined(SONORE_EXAMPLE_DSP_ONLY)
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as
 
 #endif // !SONORE_EXAMPLE_DSP_ONLY

@@ -37,6 +37,39 @@
 // Inside this file every X11 type is spelled ::Window, ::Font and so on. A file
 // that says `using namespace sonore::gfx` AND includes this one has to spell
 // ours out the same way. There is no version of this that costs nothing.
+//
+// ── Input methods (XIM) -- compiled, not run ────────────────────────────────
+//
+// As of 2026-10-14 the XIM half of this file has been compiled against the
+// real Xlib.h and never run: there is no X server here, and the CI that runs
+// x11_window_test under Xvfb has no input method server either. What a Linux
+// developer runs to see it work is tests/x11_input_selftest.cpp.
+//
+// Opened LAZILY, the first time a text field takes the focus: an editor of
+// knobs never talks to an input method server at all. Then:
+//
+//  - XOpenIM after XSetLocaleModifiers(""), which is how XMODIFIERS
+//    (@im=ibus, @im=fcitx) picks the server. No server means no XIM; the
+//    peer says so, registers to be told when one starts, and types as before.
+//  - XCreateIC with the first style the server offers, in this order:
+//    on-the-spot (XIMPreeditCallbacks) -- the composition drawn in the field
+//    through gfx/text_input.h, as on macOS -- then over-the-spot
+//    (XIMPreeditPosition: the server draws it at XNSpotLocation, the caret),
+//    then root-window (XIMPreeditNothing: the server's own window). In a
+//    locale that is not UTF-8 over-the-spot comes first: Xlib converts the
+//    preedit into the locale's encoding before the callbacks see it, and
+//    Japanese does not survive the C locale. SONORE_XIM_STYLE overrides the
+//    order (callbacks, position, nothing); SONORE_X11_NO_IME turns it off.
+//  - XFilterEvent on every event first, as the protocol requires, and
+//    Xutf8LookupString for committed text -- which arrives as a KeyPress the
+//    server sends back, and may be a whole word.
+//  - XSetICFocus while a text field has the focus and the window has the X
+//    focus; XUnsetICFocus otherwise, so the input method does not compose
+//    over a knob's shortcuts.
+//
+// Every failure is reported in inputMethodStatus() and, once per process, on
+// stderr: an input method that silently does nothing is indistinguishable
+// from one nobody wrote.
 #pragma once
 
 #if defined(__linux__) && defined(__has_include)
@@ -48,11 +81,19 @@
 #if defined(SONORE_X11_HEADERS)
 
 #include <dlfcn.h>
+#include <langinfo.h>
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
+#include <algorithm>
+#include <cctype>
+#include <clocale>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <functional>
 #include <string>
 #include <vector>
@@ -86,6 +127,8 @@ constexpr unsigned long kNoneResource = None;
 #include "component.h"
 #include "displays.h"
 #include "graphics.h"
+#include "vblank.h"
+#include "text_input.h"
 
 namespace sonore {
 namespace gfx {
@@ -158,6 +201,39 @@ struct XlibApi {
                             unsigned long*, unsigned long*, unsigned char**) = nullptr;
   int (*XSendEvent)(::Display*, ::Window, Bool, long, ::XEvent*) = nullptr;
   int (*XConvertSelection)(::Display*, ::Atom, ::Atom, ::Atom, ::Window, ::Time) = nullptr;
+
+  // ── Input methods (XIM) ──
+  //
+  // OPTIONAL, like XResourceManagerString: every libX11 since X11R6 has them,
+  // but a peer that could draw and click without them must not be refused
+  // over them. hasInputMethods() is the question; a peer without them says
+  // so in inputMethodStatus() and types as it always did.
+  ::XIM (*XOpenIM)(::Display*, struct _XrmHashBucketRec*, char*, char*) = nullptr;
+  Status (*XCloseIM)(::XIM) = nullptr;
+  char* (*XGetIMValues)(::XIM, ...) = nullptr;
+  char* (*XSetIMValues)(::XIM, ...) = nullptr;
+  ::XIC (*XCreateIC)(::XIM, ...) = nullptr;
+  void (*XDestroyIC)(::XIC) = nullptr;
+  void (*XSetICFocus)(::XIC) = nullptr;
+  void (*XUnsetICFocus)(::XIC) = nullptr;
+  char* (*XSetICValues)(::XIC, ...) = nullptr;
+  char* (*XGetICValues)(::XIC, ...) = nullptr;
+  char* (*Xutf8ResetIC)(::XIC) = nullptr;
+  Bool (*XFilterEvent)(::XEvent*, ::Window) = nullptr;
+  int (*Xutf8LookupString)(::XIC, ::XKeyPressedEvent*, char*, int, ::KeySym*, Status*) = nullptr;
+  ::XVaNestedList (*XVaCreateNestedList)(int, ...) = nullptr;
+  char* (*XSetLocaleModifiers)(const char*) = nullptr;
+  Bool (*XSupportsLocale)() = nullptr;
+  Bool (*XRegisterIMInstantiateCallback)(::Display*, struct _XrmHashBucketRec*, char*, char*,
+                                         ::XIDProc, ::XPointer) = nullptr;
+  Bool (*XUnregisterIMInstantiateCallback)(::Display*, struct _XrmHashBucketRec*, char*, char*,
+                                           ::XIDProc, ::XPointer) = nullptr;
+
+  bool hasInputMethods() const {
+    return XOpenIM && XCloseIM && XGetIMValues && XCreateIC && XDestroyIC && XSetICFocus &&
+           XUnsetICFocus && XSetICValues && XGetICValues && XFilterEvent && Xutf8LookupString &&
+           XVaCreateNestedList;
+  }
 };
 
 inline const XlibApi& xlib() {
@@ -221,6 +297,30 @@ inline const XlibApi& xlib() {
     bind("XGetWindowProperty", &a.XGetWindowProperty);
     bind("XSendEvent", &a.XSendEvent);
     bind("XConvertSelection", &a.XConvertSelection);
+    // Not through bind(): see the note on the struct. A missing one leaves its
+    // slot null and hasInputMethods() false.
+    auto optional = [&](const char* name, void* slot) {
+      void* sym = dlsym(lib, name);
+      std::memcpy(slot, &sym, sizeof(sym));
+    };
+    optional("XOpenIM", &a.XOpenIM);
+    optional("XCloseIM", &a.XCloseIM);
+    optional("XGetIMValues", &a.XGetIMValues);
+    optional("XSetIMValues", &a.XSetIMValues);
+    optional("XCreateIC", &a.XCreateIC);
+    optional("XDestroyIC", &a.XDestroyIC);
+    optional("XSetICFocus", &a.XSetICFocus);
+    optional("XUnsetICFocus", &a.XUnsetICFocus);
+    optional("XSetICValues", &a.XSetICValues);
+    optional("XGetICValues", &a.XGetICValues);
+    optional("Xutf8ResetIC", &a.Xutf8ResetIC);
+    optional("XFilterEvent", &a.XFilterEvent);
+    optional("Xutf8LookupString", &a.Xutf8LookupString);
+    optional("XVaCreateNestedList", &a.XVaCreateNestedList);
+    optional("XSetLocaleModifiers", &a.XSetLocaleModifiers);
+    optional("XSupportsLocale", &a.XSupportsLocale);
+    optional("XRegisterIMInstantiateCallback", &a.XRegisterIMInstantiateCallback);
+    optional("XUnregisterIMInstantiateCallback", &a.XUnregisterIMInstantiateCallback);
     a.ok = all;
     return a;
   }();
@@ -292,14 +392,6 @@ public:
   std::function<void()> onTick;
 
   /**
-   * Open inside a host's window.
-   *
-   * `parent` carries an X window id THROUGH a pointer, which is how both CLAP
-   * and VST3 hand one over -- it is an integer, not an address, and casting it
-   * as if it were one is the classic way to get a window that never appears.
-   * Null makes a top-level window, which is what the tests use.
-   */
-  /**
    * Open as a POPUP: an override-redirect window at desktop coordinates,
    * above everything, holding the pointer until it is dismissed.
    *
@@ -309,9 +401,13 @@ public:
    * puts the plugin's menu in its own tile.
    */
   bool openPopup(Component& content, int screenX, int screenY, int width, int height,
-                 bool grabMouse = true) {
+                 bool grabMouse = true, float scale = 0.0f) {
     isPopup_ = true;
     grabsMouse_ = grabMouse;
+    // The scale of the editor that opened it, when it has one, as on Win32: a
+    // host that set the editor's scale itself is not the desktop, and a menu
+    // at the desktop's would not be the size of the control that opened it.
+    popupScale_ = scale;
     const bool ok = open(nullptr, content, width, height, screenX, screenY);
     if (!ok) {
       isPopup_ = false;
@@ -444,6 +540,13 @@ public:
     *height = x.XDisplayHeight(display_, screen);
   }
 
+  /** Open inside a host's window.
+   *
+   *  `parent` carries an X window id THROUGH a pointer, which is how both
+   *  CLAP and VST3 hand one over -- it is an integer, not an address, and
+   *  casting it as if it were one is the classic way to get a window that
+   *  never appears. Null makes a top-level window, which is what the tests
+   *  use. */
   bool open(void* parent, Component& content, int width, int height) {
     return open(parent, content, width, height, 0, 0);
   }
@@ -465,7 +568,7 @@ public:
     // created: a window created at the wrong size and corrected afterwards is a
     // visible jump on every editor that opens on a scaled desktop.
     if (display_) {
-      openScale_ = desktopScale(display_);
+      openScale_ = isPopup_ && popupScale_ > 0.0f ? popupScale_ : desktopScale(display_);
       logicalWidth_ = (float) width;
       logicalHeight_ = (float) height;
       width = Backing::toDevice(logicalWidth_, openScale_);
@@ -489,8 +592,12 @@ public:
     // SelectionRequest and SelectionNotify arrive regardless of the event mask
     // -- they are addressed to the window rather than selected for -- which is
     // why the clipboard needs no bit here.
+    // FocusChange, so an input method's context can be focused only while the
+    // window has the keyboard (see syncInputMethod).
     attrs.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-                       LeaveWindowMask | EnterWindowMask | StructureNotifyMask | KeyPressMask;
+                       LeaveWindowMask | EnterWindowMask | StructureNotifyMask | KeyPressMask |
+                       FocusChangeMask;
+    baseEventMask_ = attrs.event_mask;
     // No background pixel: every pixel comes from the bitmap, and letting the
     // server paint one first is a flash of flat colour on every resize -- the
     // same reason the Win32 class has no background brush.
@@ -546,15 +653,23 @@ public:
     // selection belongs to a WINDOW. So the open window installs itself, and
     // TextEditor's copy and paste reach the desktop rather than an in-process
     // string.
+    //
+    // Not a popup. A menu or a tooltip installed itself too, and its close()
+    // then uninstalled the clipboard for the editor it had opened over: copy
+    // and paste in the plugin went dead after the first tooltip. A text field
+    // inside a popup is served by the editor's window, which outlives it.
     refreshDisplays();
-    activeForClipboard() = this;
-    *Clipboard::setter() = [](const std::string& text) {
-      if (NativeWindowX11* peer = activeForClipboard()) peer->setClipboardText(text);
-    };
-    *Clipboard::getter() = [](std::string* out) {
-      NativeWindowX11* peer = activeForClipboard();
-      return peer != nullptr && peer->getClipboardText(out);
-    };
+    if (!isPopup_) {
+      clipboardWindows().push_back(this);
+      activeForClipboard() = this;
+      *Clipboard::setter() = [](const std::string& text) {
+        if (NativeWindowX11* peer = activeForClipboard()) peer->setClipboardText(text);
+      };
+      *Clipboard::getter() = [](std::string* out) {
+        NativeWindowX11* peer = activeForClipboard();
+        return peer != nullptr && peer->getClipboardText(out);
+      };
+    }
 
     content_->repaint();
     render();
@@ -563,6 +678,14 @@ public:
 
   void close() {
     const x11::XlibApi& x = x11::xlib();
+    // Handed on BEFORE the window goes, while it can still be asked whether it
+    // owns the selection, and so the next copy never reaches a peer whose
+    // display has been closed.
+    releaseClipboard();
+    // The input context and method before the window and the display they
+    // belong to -- and the instantiate callback unregistered, or Xlib would
+    // call into a peer that is gone the next time a server starts.
+    closeInputMethod();
     if (display_) {
       if (image_) {
         // XDestroyImage would free the pixel buffer with it, and that buffer is
@@ -586,13 +709,6 @@ public:
       }
       closeDisplay();
     }
-    // Uninstalled BEFORE the window goes, or the next copy reaches a peer whose
-    // display has been closed.
-    if (activeForClipboard() == this) {
-      activeForClipboard() = nullptr;
-      *Clipboard::setter() = nullptr;
-      *Clipboard::getter() = nullptr;
-    }
     delete router_;
     router_ = nullptr;
     content_ = nullptr;
@@ -603,6 +719,11 @@ public:
     // dispatches WM_SIZE synchronously, so the second open() of a reused editor
     // painted through the first one's freed viewport before it had returned.
     backing_.setContent(nullptr);
+    // And its pixels, with the BGRA copy the XImage wrapped (detached above).
+    // This object outlives the window, so what it holds now it holds until
+    // the plugin is unloaded; the next open() allocates both again.
+    backing_.release();
+    std::vector<uint8_t>().swap(scratch_);
     isPopup_ = false;
   }
 
@@ -611,6 +732,39 @@ public:
   static NativeWindowX11*& activeForClipboard() {
     static NativeWindowX11* active = nullptr;
     return active;
+  }
+
+  /** Every open window that can serve it, newest last: closing one of two
+   *  editors used to leave the other with no clipboard at all. */
+  static std::vector<NativeWindowX11*>& clipboardWindows() {
+    static std::vector<NativeWindowX11*> open;
+    return open;
+  }
+
+  /** Out of the list, and if this window was serving, hand the clipboard to
+   *  the newest one left -- with the text, when this window owned the
+   *  selection: on X11 a selection dies with its owner, and closing one
+   *  editor would otherwise empty the clipboard the user had just copied to
+   *  from it. */
+  void releaseClipboard() {
+    std::vector<NativeWindowX11*>& open = clipboardWindows();
+    for (size_t i = 0; i < open.size(); ++i)
+      if (open[i] == this) {
+        open.erase(open.begin() + (std::ptrdiff_t) i);
+        break;
+      }
+    if (activeForClipboard() != this) return;
+    const x11::XlibApi& x = x11::xlib();
+    const bool owned = display_ && window_ && x.XGetSelectionOwner &&
+                       x.XGetSelectionOwner(display_, xdnd_.clipboard) == window_;
+    NativeWindowX11* heir = open.empty() ? nullptr : open.back();
+    activeForClipboard() = heir;
+    if (!heir) {
+      *Clipboard::setter() = nullptr;
+      *Clipboard::getter() = nullptr;
+      return;
+    }
+    if (owned) heir->setClipboardText(clipboardText_);
   }
 
   void* handle() const { return (void*) (uintptr_t) window_; }
@@ -683,7 +837,31 @@ public:
       handleEvent(event);
     }
     if (onTick) onTick();
+    // X11 has no display link: VBlankAttachments here run from a timer at the
+    // monitor's rate, checked on every pump (vblank.h says what that costs).
+    VBlankAttachment::pumpTimerFallback();
     renderIfDirty();
+    syncInputMethod();
+  }
+
+  /** The input method, in words: the style negotiated and with what, or why
+   *  there is none. Empty until a text field first takes the focus -- the
+   *  input method is opened then and not before. */
+  const std::string& inputMethodStatus() const { return imeStatus_; }
+
+  /** Whether an input context is open: keys go through the input method. */
+  bool inputMethodActive() const { return ic_ != nullptr; }
+
+  /** The XIMPreedit* bit of the style in use, 0 with none. */
+  unsigned long inputMethodPreeditStyle() const { return (unsigned long) (imStyle_ & 0xffu); }
+
+  /** Where the input method was last told the caret is (XNSpotLocation), in
+   *  device pixels of this window; false before it has been told. */
+  bool inputMethodSpot(int* x, int* y) const {
+    if (!spotSent_ || !x || !y) return false;
+    *x = spot_.x;
+    *y = spot_.y;
+    return true;
   }
 
   /** Repaint if anything asked to be. */
@@ -821,6 +999,11 @@ private:
         found.push_back(d);
       }
     }
+    // X has one scale for the desktop, the one this peer's windows take
+    // (desktopScale): every screen gets it. It was never set, so scaleAt()
+    // said 1 on a desktop at 200%.
+    const float scale = desktopScale(display_);
+    for (Display& d : found) d.scale = scale;
     if (!found.empty()) Displays::set(std::move(found));
   }
 
@@ -917,6 +1100,8 @@ private:
    *  that header for thirteen constants would add another file to the list a
    *  build has to have. */
   static int namedKey(::KeySym sym) {
+    // XK_F1 (0xffbe) to XK_F12 (0xffc9), consecutive in keysymdef.h.
+    if (sym >= 0xffbe && sym <= 0xffc9) return KeyPress::F1 + (int) (sym - 0xffbe);
     switch (sym) {
       case 0xff08: return KeyPress::Backspace; // XK_BackSpace
       case 0xff09: return KeyPress::Tab;       // XK_Tab
@@ -1247,6 +1432,9 @@ private:
   static bool altHeld(unsigned state) { return (state & Mod1Mask) != 0; }
 
   void handleEvent(const ::XEvent& event) {
+    // The input method sees EVERY event first -- its own protocol messages
+    // arrive on this connection too -- and an event it filters is its own.
+    if (ic_ && filterForInputMethod(event)) return;
     switch (event.type) {
       case Expose:
         // Only on the LAST of a burst: the server sends one per exposed
@@ -1336,8 +1524,19 @@ private:
         ::XKeyEvent copy = event.xkey; // XLookupString takes a non-const pointer
         char buffer[32] = {0};
         ::KeySym keysym = 0;
-        const int n = x11::xlib().XLookupString(&copy, buffer, (int) sizeof(buffer) - 1, &keysym,
-                                                nullptr);
+        int n = 0;
+        if (ic_) {
+          // Through the input context: the text is whatever the input method
+          // made of the key -- a whole committed word, sometimes -- and is
+          // UTF-8 whatever the locale.
+          std::string text;
+          if (!lookupWithInputMethod(copy, &keysym, &text)) return;
+          if (deliverCommittedText(text, copy.state)) return;
+          n = (int) (std::min)(text.size(), sizeof(buffer) - 1);
+          std::memcpy(buffer, text.data(), (size_t) n);
+        } else {
+          n = x11::xlib().XLookupString(&copy, buffer, (int) sizeof(buffer) - 1, &keysym, nullptr);
+        }
         KeyPress key;
         key.keyCode = namedKey(keysym);
         key.shiftDown = shiftHeld(copy.state);
@@ -1372,6 +1571,17 @@ private:
         }
         return;
       }
+
+      // The window gained or lost the keyboard. NotifyPointer is the server
+      // telling the window under the pointer about somebody ELSE's focus,
+      // and is not this window's.
+      case FocusIn:
+      case FocusOut:
+        if (event.xfocus.detail != NotifyPointer) {
+          xFocused_ = event.type == FocusIn;
+          syncInputMethod();
+        }
+        return;
 
       case ClientMessage:
         handleXdnd(event.xclient);
@@ -1438,6 +1648,536 @@ private:
     }
   }
 
+  // ── The input method ─────────────────────────────────────────────────────
+
+  /** Said once per process on stderr, and always in inputMethodStatus(). */
+  void reportInputMethod(const std::string& status, bool failure) {
+    imeStatus_ = status;
+    static bool said = false;
+    if (failure && !said) {
+      said = true;
+      std::fprintf(stderr, "[sonore] X11 input method: %s\n", status.c_str());
+    }
+  }
+
+  static std::string localeDescription() {
+    const char* ctype = std::setlocale(LC_CTYPE, nullptr);
+    const char* codeset = nl_langinfo(CODESET);
+    const char* modifiers = std::getenv("XMODIFIERS");
+    std::string out = "locale ";
+    out += ctype ? ctype : "(none)";
+    out += " (";
+    out += codeset ? codeset : "?";
+    out += "), XMODIFIERS=";
+    out += modifiers ? modifiers : "(unset)";
+    return out;
+  }
+
+  static bool localeIsUtf8() {
+    const char* codeset = nl_langinfo(CODESET);
+    if (!codeset) return false;
+    std::string c;
+    for (const char* p = codeset; *p; ++p)
+      if (*p != '-' && *p != '_') c.push_back((char) std::tolower((unsigned char) *p));
+    return c == "utf8";
+  }
+
+  static const char* styleName(::XIMStyle style) {
+    if (style & XIMPreeditCallbacks) return "on-the-spot (XIMPreeditCallbacks): the field draws the composition";
+    if (style & XIMPreeditPosition) return "over-the-spot (XIMPreeditPosition): the input method draws it at the caret";
+    if (style & XIMPreeditNothing) return "root-window (XIMPreeditNothing): the input method draws it in its own window";
+    return "no preedit (XIMPreeditNone)";
+  }
+
+  /**
+   * Open the input method and an input context, the first time a text field
+   * has the focus. Every way this can fail is reported, and every one leaves
+   * the peer typing as it did without an input method.
+   */
+  void openInputMethod() {
+    imTried_ = true;
+    const x11::XlibApi& x = x11::xlib();
+    if (const char* off = std::getenv("SONORE_X11_NO_IME"))
+      if (*off && !(off[0] == '0' && off[1] == 0)) {
+        reportInputMethod("turned off by SONORE_X11_NO_IME", false);
+        return;
+      }
+    if (!x.hasInputMethods()) {
+      reportInputMethod("this libX11 lacks the XIM entry points; typing without an input method", true);
+      return;
+    }
+    if (x.XSupportsLocale && !x.XSupportsLocale()) {
+      reportInputMethod("Xlib does not support " + localeDescription() +
+                            "; typing without an input method",
+                        true);
+      return;
+    }
+    // "" reads XMODIFIERS, which is how @im=ibus or @im=fcitx names the
+    // server. Process-wide in Xlib, as GTK and Qt also set it.
+    if (x.XSetLocaleModifiers) x.XSetLocaleModifiers("");
+    im_ = x.XOpenIM(display_, nullptr, nullptr, nullptr);
+    if (!im_) {
+      std::string status = "XOpenIM found no input method for " + localeDescription();
+      // Told when one starts: the user may log in before their input method
+      // daemon is up, and an editor opened in that second should not be
+      // without one for its whole life.
+      if (x.XRegisterIMInstantiateCallback &&
+          x.XRegisterIMInstantiateCallback(display_, nullptr, nullptr, nullptr, &imInstantiated,
+                                           (::XPointer) this)) {
+        imWaiting_ = true;
+        status += "; waiting for one to start";
+      }
+      reportInputMethod(status, true);
+      return;
+    }
+    // The server can die (or restart) under us. Xlib then calls this, and
+    // the XIM and every XIC on it are gone -- not to be closed or destroyed.
+    destroyCallback_.client_data = (::XPointer) this;
+    destroyCallback_.callback = &imDestroyed;
+    if (x.XSetIMValues) x.XSetIMValues(im_, XNDestroyCallback, &destroyCallback_, (void*) nullptr);
+
+    ::XIMStyles* styles = nullptr;
+    if (x.XGetIMValues(im_, XNQueryInputStyle, &styles, (void*) nullptr) != nullptr || !styles) {
+      x.XCloseIM(im_);
+      im_ = nullptr;
+      reportInputMethod("the input method lists no input styles (" + localeDescription() + ")", true);
+      return;
+    }
+
+    // The preference order, by preedit style; any status style the server
+    // pairs with it that needs nothing from us (Nothing, None) will do.
+    std::vector<::XIMStyle> order;
+    if (const char* forced = std::getenv("SONORE_XIM_STYLE")) {
+      if (std::strcmp(forced, "callbacks") == 0) order.push_back(XIMPreeditCallbacks);
+      else if (std::strcmp(forced, "position") == 0) order.push_back(XIMPreeditPosition);
+      else if (std::strcmp(forced, "nothing") == 0) order.push_back(XIMPreeditNothing);
+    }
+    const bool utf8 = localeIsUtf8();
+    for (::XIMStyle s : {utf8 ? (::XIMStyle) XIMPreeditCallbacks : (::XIMStyle) XIMPreeditPosition,
+                         utf8 ? (::XIMStyle) XIMPreeditPosition : (::XIMStyle) XIMPreeditCallbacks,
+                         (::XIMStyle) XIMPreeditNothing, (::XIMStyle) XIMPreeditNone})
+      order.push_back(s);
+
+    std::string refused;
+    for (::XIMStyle preedit : order) {
+      for (unsigned short i = 0; i < styles->count_styles && !ic_; ++i) {
+        const ::XIMStyle s = styles->supported_styles[i];
+        const ::XIMStyle status = s & 0xff00u;
+        if ((s & 0xffu) != preedit || (status != XIMStatusNothing && status != XIMStatusNone)) continue;
+        if (!createInputContext(s)) {
+          if (!refused.empty()) refused += ", ";
+          refused += styleName(s);
+        }
+      }
+      if (ic_) break;
+    }
+    x.XFree(styles);
+
+    if (!ic_) {
+      x.XCloseIM(im_);
+      im_ = nullptr;
+      reportInputMethod("the input method offered no style this peer can use" +
+                            (refused.empty() ? std::string() : " (XCreateIC refused: " + refused + ")") +
+                            "; " + localeDescription(),
+                        true);
+      return;
+    }
+    // The events the input method needs to see on this window -- usually
+    // KeyRelease as well as KeyPress -- added to what the window selects.
+    unsigned long filter = 0;
+    if (x.XGetICValues(ic_, XNFilterEvents, &filter, (void*) nullptr) != nullptr) filter = 0;
+    x.XSelectInput(display_, window_, baseEventMask_ | (long) filter);
+    reportInputMethod(std::string("XIM ") + styleName(imStyle_) + "; " + localeDescription() +
+                          (!utf8 && (imStyle_ & XIMPreeditCallbacks)
+                               ? "; the locale is not UTF-8, so characters outside it are lost from the composition"
+                               : ""),
+                      !utf8 && (imStyle_ & XIMPreeditCallbacks));
+  }
+
+  bool createInputContext(::XIMStyle style) {
+    const x11::XlibApi& x = x11::xlib();
+    placeSpot();
+    ::XVaNestedList preedit = nullptr;
+    if (style & XIMPreeditCallbacks) {
+      // The callbacks are handed over by ADDRESS and kept by the context, so
+      // they live in this object rather than on the stack.
+      preeditStart_.client_data = preeditDone_.client_data = (::XPointer) this;
+      preeditDraw_.client_data = preeditCaret_.client_data = (::XPointer) this;
+      // XIMProc is declared void(XIM, ...); the start callback returns an int
+      // (the longest composition wanted) and the rest take the XIC. The XIM
+      // specification defines them so, and Xlib calls them so. Cast through
+      // void(*)(void), which GCC and clang accept as "any function", because
+      // the mismatch is the specification's and not a mistake to warn about.
+      preeditStart_.callback = reinterpret_cast<::XIMProc>(reinterpret_cast<void (*)(void)>(&preeditStartProc));
+      preeditDone_.callback = reinterpret_cast<::XIMProc>(reinterpret_cast<void (*)(void)>(&preeditDoneProc));
+      preeditDraw_.callback = reinterpret_cast<::XIMProc>(reinterpret_cast<void (*)(void)>(&preeditDrawProc));
+      preeditCaret_.callback = reinterpret_cast<::XIMProc>(reinterpret_cast<void (*)(void)>(&preeditCaretProc));
+      preedit = x.XVaCreateNestedList(0, XNSpotLocation, &spot_, XNPreeditStartCallback, &preeditStart_,
+                                      XNPreeditDoneCallback, &preeditDone_, XNPreeditDrawCallback,
+                                      &preeditDraw_, XNPreeditCaretCallback, &preeditCaret_,
+                                      (void*) nullptr);
+    } else if (style & XIMPreeditPosition) {
+      preedit = x.XVaCreateNestedList(0, XNSpotLocation, &spot_, (void*) nullptr);
+    }
+    if (preedit) {
+      ic_ = x.XCreateIC(im_, XNInputStyle, style, XNClientWindow, window_, XNFocusWindow, window_,
+                        XNPreeditAttributes, preedit, (void*) nullptr);
+      x.XFree(preedit);
+    } else {
+      ic_ = x.XCreateIC(im_, XNInputStyle, style, XNClientWindow, window_, XNFocusWindow, window_,
+                        (void*) nullptr);
+    }
+    if (!ic_) return false;
+    imStyle_ = style;
+    icFocused_ = false;
+    spotSent_ = (style & (XIMPreeditCallbacks | XIMPreeditPosition)) != 0;
+    return true;
+  }
+
+  void closeInputMethod() {
+    const x11::XlibApi& x = x11::xlib();
+    if (imWaiting_ && display_ && x.XUnregisterIMInstantiateCallback)
+      x.XUnregisterIMInstantiateCallback(display_, nullptr, nullptr, nullptr, &imInstantiated,
+                                         (::XPointer) this);
+    imWaiting_ = false;
+    if (ic_) {
+      if (icFocused_) x.XUnsetICFocus(ic_);
+      x.XDestroyIC(ic_);
+      ic_ = nullptr;
+    }
+    if (im_) {
+      x.XCloseIM(im_);
+      im_ = nullptr;
+    }
+    imTried_ = false;
+    icFocused_ = false;
+    xFocused_ = false;
+    imStyle_ = 0;
+    imeTarget_ = nullptr;
+    preeditActive_ = false;
+    preeditFeedback_.clear();
+    spotSent_ = false;
+    imeStatus_.clear();
+  }
+
+  /** Where the caret is, in device pixels of this window: its bottom-left,
+   *  the baseline an over-the-spot composition is drawn on and the corner a
+   *  candidate list hangs from. */
+  bool caretSpot(::XPoint* out) const {
+    Rect caret;
+    if (!focusedCaretInRoot(router_, &caret) || !content_) return false;
+    const float scale = backing_.scale();
+    out->x = (short) std::lround((caret.x + content_->bounds().x) * scale);
+    out->y = (short) std::lround((caret.y + caret.h + content_->bounds().y) * scale);
+    return true;
+  }
+
+  void placeSpot() {
+    ::XPoint p{0, 0};
+    if (caretSpot(&p)) spot_ = p;
+  }
+
+  /** Tell the input method the caret moved -- only when it did: each is a
+   *  round trip to the server. */
+  void updateSpot() {
+    if (!ic_ || !(imStyle_ & (XIMPreeditCallbacks | XIMPreeditPosition))) return;
+    ::XPoint p{0, 0};
+    if (!caretSpot(&p) || (spotSent_ && p.x == spot_.x && p.y == spot_.y)) return;
+    spot_ = p;
+    const x11::XlibApi& x = x11::xlib();
+    ::XVaNestedList preedit = x.XVaCreateNestedList(0, XNSpotLocation, &spot_, (void*) nullptr);
+    if (!preedit) return;
+    if (const char* failed = x.XSetICValues(ic_, XNPreeditAttributes, preedit, (void*) nullptr)) {
+      if (!spotRefused_) {
+        spotRefused_ = true;
+        reportInputMethod(imeStatus_ + "; the input method refused " + failed +
+                              ", so its window may not follow the caret",
+                          true);
+      }
+    }
+    x.XFree(preedit);
+    spotSent_ = true;
+  }
+
+  /** Drop whatever the input method is composing. Its answer -- the text it
+   *  had -- is not used: the field committed its own copy when it lost the
+   *  focus or was clicked. Callbacks it makes meanwhile are ignored. */
+  void resetInputContext() {
+    const x11::XlibApi& x = x11::xlib();
+    preeditActive_ = false;
+    preeditFeedback_.clear();
+    if (!ic_ || !x.Xutf8ResetIC) return;
+    resettingIc_ = true;
+    if (char* left = x.Xutf8ResetIC(ic_)) x.XFree(left);
+    resettingIc_ = false;
+  }
+
+  /**
+   * Keep the input method in step with the editor: opened the first time a
+   * text field has the focus, focused while one does and the window has the
+   * keyboard, reset when the field changes or stops composing behind its
+   * back, and told where the caret is.
+   */
+  void syncInputMethod() {
+    if (!isOpen() || !router_) return;
+    TextInputTarget* target = focusedTextInputTarget(router_);
+    const bool typing = target && !target->isInputReadOnly();
+    if (typing && !ic_ && !im_ && !imTried_) openInputMethod();
+    if (!ic_) {
+      imeTarget_ = target;
+      return;
+    }
+    if (target != imeTarget_) {
+      if (imeTarget_ || preeditActive_) resetInputContext();
+      imeTarget_ = target; // compared, never followed: it may be gone
+    } else if (preeditActive_ && (!target || !target->composition().isActive())) {
+      // The field committed the composition itself -- a click in it, a key
+      // that reached it -- and the input method still thinks it is composing.
+      resetInputContext();
+    }
+    const x11::XlibApi& x = x11::xlib();
+    const bool wanted = typing && xFocused_;
+    if (wanted != icFocused_) {
+      if (wanted) x.XSetICFocus(ic_);
+      else x.XUnsetICFocus(ic_);
+      icFocused_ = wanted;
+    }
+    if (typing) updateSpot();
+  }
+
+  /** XFilterEvent, with the context focused first when a key arrives: a key
+   *  arriving IS the window having the keyboard, whatever FocusIn said. */
+  bool filterForInputMethod(const ::XEvent& event) {
+    if (event.type == x11::kKeyPressEvent || event.type == x11::kKeyReleaseEvent) {
+      xFocused_ = true;
+      syncInputMethod();
+      if (!ic_) return false;
+    }
+    ::XEvent copy = event;
+    return x11::xlib().XFilterEvent(&copy, 0) != 0;
+  }
+
+  /** Xutf8LookupString, growing the buffer when it says it overflowed.
+   *  False when the input method made nothing of the key. */
+  bool lookupWithInputMethod(::XKeyEvent& key, ::KeySym* keysym, std::string* text) {
+    const x11::XlibApi& x = x11::xlib();
+    char buffer[64];
+    Status status = 0;
+    int n = x.Xutf8LookupString(ic_, &key, buffer, (int) sizeof(buffer), keysym, &status);
+    if (status == XBufferOverflow && n > 0) {
+      std::vector<char> big((size_t) n + 1);
+      n = x.Xutf8LookupString(ic_, &key, big.data(), n, keysym, &status);
+      if (n > 0) text->assign(big.data(), (size_t) n);
+    } else if (n > 0) {
+      text->assign(buffer, (size_t) n);
+    }
+    if (status == XLookupNone) return false;
+    if (status == XLookupChars) *keysym = 0; // text only: no key to name
+    if (status == XLookupKeySym) text->clear();
+    return true;
+  }
+
+  /**
+   * Committed text that cannot go through the one-character KeyPress path:
+   * more than one character (a converted word), or any text while the field
+   * shows a composition -- the commit REPLACES the composition, where a
+   * KeyPress would make the field commit the composition and then type the
+   * character after it, twice over. True when it was delivered here.
+   */
+  bool deliverCommittedText(const std::string& text, unsigned state) {
+    if (text.empty() || ctrlHeld(state) || altHeld(state)) return false;
+    const std::vector<uint32_t> chars = detail::textInputDecode(text);
+    if (chars.empty() || chars[0] < 0x20 || chars[0] == 0x7f) return false;
+    TextInputTarget* target = focusedTextInputTarget(router_);
+    const bool composing = target && target->composition().isActive();
+    if (chars.size() == 1 && !composing) return false;
+    if (target) {
+      TextInputSession::insertText(*target, text, TextRange16{});
+    } else {
+      for (uint32_t c : chars) {
+        KeyPress key;
+        key.character = c;
+        router_->keyPressed(key);
+      }
+    }
+    preeditActive_ = false;
+    preeditFeedback_.clear();
+    renderIfDirty();
+    return true;
+  }
+
+  /** An XIMText's characters. Wide characters are UCS-4 on every Linux.
+   *  Multibyte text is in the input method's locale: UTF-8 when it decodes
+   *  as UTF-8, else through the C library in the current locale, a byte as
+   *  Latin-1 when even that fails. */
+  static std::vector<uint32_t> ximCharacters(const ::XIMText& text) {
+    std::vector<uint32_t> out;
+    if (text.encoding_is_wchar) {
+      if (!text.string.wide_char) return out;
+      for (unsigned short i = 0; i < text.length; ++i) {
+        const uint32_t c = (uint32_t) text.string.wide_char[i];
+        out.push_back(c <= 0x10FFFFu && !(c >= 0xD800u && c <= 0xDFFFu) ? c : 0xFFFDu);
+      }
+      return out;
+    }
+    const char* bytes = text.string.multi_byte;
+    if (!bytes) return out;
+    const std::string raw(bytes);
+    const std::vector<uint32_t> asUtf8 = detail::textInputDecode(raw);
+    bool clean = true;
+    for (uint32_t c : asUtf8)
+      if (c == 0xFFFDu) clean = false;
+    if (clean) return asUtf8;
+    std::mbstate_t state{};
+    size_t i = 0;
+    while (i < raw.size()) {
+      wchar_t wc = 0;
+      const size_t used = std::mbrtowc(&wc, raw.data() + i, raw.size() - i, &state);
+      if (used == (size_t) -1 || used == (size_t) -2 || used == 0) {
+        out.push_back((unsigned char) raw[i]);
+        state = std::mbstate_t{};
+        ++i;
+        continue;
+      }
+      out.push_back((uint32_t) wc);
+      i += used;
+    }
+    return out;
+  }
+
+  /** The clause being converted: the first run the input method marks as
+   *  reversed or highlighted. */
+  void applyClause(TextInputTarget& target) {
+    size_t start = 0, end = 0;
+    for (size_t i = 0; i < preeditFeedback_.size(); ++i)
+      if (preeditFeedback_[i] & (XIMReverse | XIMHighlight)) {
+        start = i;
+        end = i + 1;
+        while (end < preeditFeedback_.size() && (preeditFeedback_[end] & (XIMReverse | XIMHighlight))) ++end;
+        break;
+      }
+    TextInputSession::setClause(target, start, end);
+  }
+
+  static NativeWindowX11* peerOf(::XPointer client) { return reinterpret_cast<NativeWindowX11*>(client); }
+
+  /** The field the preedit callbacks write into -- none while a reset is
+   *  replaying the input method's state into nobody. */
+  TextInputTarget* preeditTarget() const {
+    if (resettingIc_) return nullptr;
+    TextInputTarget* target = focusedTextInputTarget(router_);
+    return target && !target->isInputReadOnly() ? target : nullptr;
+  }
+
+  static int preeditStartProc(::XIC, ::XPointer client, ::XPointer) {
+    NativeWindowX11* self = peerOf(client);
+    if (TextInputTarget* target = self ? self->preeditTarget() : nullptr) {
+      TextInputSession::preeditStart(*target);
+      self->preeditActive_ = true;
+      self->preeditFeedback_.clear();
+      self->renderIfDirty();
+    }
+    return -1; // no limit on the composition's length
+  }
+
+  static void preeditDoneProc(::XIC, ::XPointer client, ::XPointer) {
+    NativeWindowX11* self = peerOf(client);
+    if (!self) return;
+    self->preeditActive_ = false;
+    self->preeditFeedback_.clear();
+    if (TextInputTarget* target = self->preeditTarget()) {
+      TextInputSession::preeditDone(*target);
+      self->renderIfDirty();
+    }
+  }
+
+  static void preeditDrawProc(::XIC, ::XPointer client, ::XPointer data) {
+    NativeWindowX11* self = peerOf(client);
+    const ::XIMPreeditDrawCallbackStruct* draw = reinterpret_cast<const ::XIMPreeditDrawCallbackStruct*>(data);
+    TextInputTarget* target = self ? self->preeditTarget() : nullptr;
+    if (!target || !draw) return;
+    const size_t first = draw->chg_first > 0 ? (size_t) draw->chg_first : 0;
+    const size_t length = draw->chg_length > 0 ? (size_t) draw->chg_length : 0;
+    const size_t caret = draw->caret > 0 ? (size_t) draw->caret : 0;
+    std::vector<unsigned long>& feedback = self->preeditFeedback_;
+    const ::XIMText* text = draw->text;
+    const bool hasCharacters =
+        text && (text->encoding_is_wchar ? text->string.wide_char != nullptr : text->string.multi_byte != nullptr);
+    if (text && !hasCharacters) {
+      // Only the look of `length` characters changed, not the text.
+      for (unsigned short i = 0; text->feedback && i < text->length; ++i)
+        if (first + i < feedback.size()) feedback[first + i] = text->feedback[i];
+      applyClauseAndCaret(self, *target, caret);
+      return;
+    }
+    const std::vector<uint32_t> inserted = hasCharacters ? ximCharacters(*text) : std::vector<uint32_t>();
+    // The same splice on the feedback, so it stays one entry per character.
+    const size_t from = (std::min)(first, feedback.size());
+    feedback.erase(feedback.begin() + (std::ptrdiff_t) from,
+                   feedback.begin() + (std::ptrdiff_t) (std::min)(from + length, feedback.size()));
+    std::vector<unsigned long> added(inserted.size(), 0ul);
+    for (size_t i = 0; text && text->feedback && i < added.size() && i < text->length; ++i)
+      added[i] = text->feedback[i];
+    feedback.insert(feedback.begin() + (std::ptrdiff_t) from, added.begin(), added.end());
+    TextInputSession::preeditDraw(*target, first, length, hasCharacters ? &inserted : nullptr, caret);
+    self->preeditActive_ = target->composition().isActive();
+    applyClauseAndCaret(self, *target, caret);
+  }
+
+  static void applyClauseAndCaret(NativeWindowX11* self, TextInputTarget& target, size_t caret) {
+    if (target.composition().isActive()) {
+      self->applyClause(target);
+      TextInputSession::preeditCaret(target, TextInputSession::CaretMove::Absolute, caret);
+    }
+    self->renderIfDirty();
+  }
+
+  static void preeditCaretProc(::XIC, ::XPointer client, ::XPointer data) {
+    NativeWindowX11* self = peerOf(client);
+    ::XIMPreeditCaretCallbackStruct* move = reinterpret_cast<::XIMPreeditCaretCallbackStruct*>(data);
+    TextInputTarget* target = self ? self->preeditTarget() : nullptr;
+    if (!target || !move) return;
+    move->position = (int) TextInputSession::preeditCaret(
+        *target, (TextInputSession::CaretMove) move->direction,
+        move->position > 0 ? (size_t) move->position : 0);
+    self->renderIfDirty();
+  }
+
+  /** XNDestroyCallback: the server is gone, and with it the XIM and the XIC
+   *  -- Xlib has freed them, so they are forgotten, not closed. */
+  static void imDestroyed(::XIM, ::XPointer client, ::XPointer) {
+    NativeWindowX11* self = peerOf(client);
+    if (!self) return;
+    self->ic_ = nullptr;
+    self->im_ = nullptr;
+    self->icFocused_ = false;
+    self->preeditActive_ = false;
+    self->preeditFeedback_.clear();
+    if (TextInputTarget* target = focusedTextInputTarget(self->router_)) target->commitComposition();
+    const x11::XlibApi& x = x11::xlib();
+    std::string status = "the input method server went away";
+    if (x.XRegisterIMInstantiateCallback &&
+        x.XRegisterIMInstantiateCallback(self->display_, nullptr, nullptr, nullptr, &imInstantiated,
+                                         (::XPointer) self)) {
+      self->imWaiting_ = true;
+      status += "; waiting for it to return";
+    }
+    self->reportInputMethod(status, true);
+  }
+
+  /** An input method server started: try again. */
+  static void imInstantiated(::Display*, ::XPointer client, ::XPointer) {
+    NativeWindowX11* self = peerOf(client);
+    if (!self) return;
+    const x11::XlibApi& x = x11::xlib();
+    if (self->imWaiting_ && x.XUnregisterIMInstantiateCallback)
+      x.XUnregisterIMInstantiateCallback(self->display_, nullptr, nullptr, nullptr, &imInstantiated,
+                                         (::XPointer) self);
+    self->imWaiting_ = false;
+    self->imTried_ = false;
+    self->syncInputMethod();
+  }
+
   ::Display* display_ = nullptr;
   ::Window window_ = 0;
   ::Visual* visual_ = nullptr;
@@ -1458,6 +2198,7 @@ private:
   bool grabsMouse_ = true;
   MouseCursor currentCursor_ = MouseCursor::Default;
   std::string clipboardText_;   // what we serve, while we own the selection
+  float popupScale_ = 0.0f;     // the opening editor's, for a popup; 0 = the desktop's
   std::string clipboardResult_; // what a paste got back
   bool clipboardPending_ = false;
   Point lastMouse_;
@@ -1468,7 +2209,32 @@ private:
   bool dragHasUriList_ = false;
   ::Time lastClickTime_ = 0;
   int lastClickX_ = 0, lastClickY_ = 0;
+
+  // The input method. See the header comment and syncInputMethod().
+  long baseEventMask_ = 0;
+  ::XIM im_ = nullptr;
+  ::XIC ic_ = nullptr;
+  ::XIMStyle imStyle_ = 0;
+  bool imTried_ = false;      // opened, or failed and said why
+  bool imWaiting_ = false;    // an instantiate callback is registered
+  bool xFocused_ = false;     // the window has the keyboard
+  bool icFocused_ = false;    // XSetICFocus is in force
+  bool preeditActive_ = false;
+  bool resettingIc_ = false;
+  bool spotSent_ = false, spotRefused_ = false;
+  ::XPoint spot_{0, 0};
+  std::string imeStatus_;
+  const TextInputTarget* imeTarget_ = nullptr; // compared, never followed
+  std::vector<unsigned long> preeditFeedback_; // one per composed character
+  // Handed to Xlib by address and kept by it: members, not locals.
+  ::XIMCallback destroyCallback_{}, preeditStart_{}, preeditDone_{}, preeditDraw_{}, preeditCaret_{};
 };
+
+static_assert((int) XIMForwardChar == (int) TextInputSession::CaretMove::ForwardChar &&
+                  (int) XIMLineEnd == (int) TextInputSession::CaretMove::LineEnd &&
+                  (int) XIMAbsolutePosition == (int) TextInputSession::CaretMove::Absolute &&
+                  (int) XIMDontChange == (int) TextInputSession::CaretMove::DontChange,
+              "TextInputSession::CaretMove must follow XIMCaretDirection's order");
 
 } // namespace gfx
 } // namespace sonore

@@ -88,26 +88,33 @@ inline float fastExp(float x) {
 }
 
 /**
- * sin, to within 1.1e-5 over [-pi, pi].
+ * sin, to within 3e-7 over [-pi, pi] (measured 1.8e-7).
  *
- * A seven-term odd polynomial -- odd because sin is, so the approximation
+ * A five-term odd polynomial -- odd because sin is, so the approximation
  * cannot drift asymmetric and put a DC offset into an oscillator that should
- * have none.
+ * have none -- fitted to minimise the worst error over [0, pi/2], and only
+ * ever evaluated there: sin(pi - x) == sin(x) folds the rest of the circle in.
+ * Unfolded, the same series run out to pi was 6.9e-3 off, about -43 dB of
+ * harmonic distortion on a held sine.
  *
  * Outside the range it WRAPS rather than clamping: an oscillator's phase is
  * unbounded and a sine that flattened past pi would be a square wave with
- * extra steps.
+ * extra steps. The wrap costs what the float's resolution of x costs -- at
+ * x = 1000 that is 6e-5 -- so keep a phase small and it stays exact.
  */
 inline float fastSin(float x) {
   constexpr float pi = 3.14159265358979f;
   constexpr float twoPi = 6.28318530717959f;
+  constexpr float halfPi = 1.57079632679490f;
   // Wrapped first. std::floor rather than fmod: fmod on a large phase is
   // itself a slow call, which would give back what the approximation saved.
   x -= twoPi * std::floor((x + pi) * (1.0f / twoPi));
+  if (x > halfPi) x = pi - x;
+  else if (x < -halfPi) x = -pi - x;
 
   const float x2 = x * x;
-  return x * (1.0f + x2 * (-0.16666667f +
-                           x2 * (0.00833333f + x2 * (-0.00019841f + x2 * 2.7557e-6f))));
+  return x * (1.0f + x2 * (-0.16666648f +
+                           x2 * (0.0083329007f + x2 * (-0.00019800923f + x2 * 2.5905390e-6f))));
 }
 
 /** cos, to the same accuracy as fastSin, by the identity that defines it. */
@@ -117,33 +124,47 @@ inline float fastCos(float x) {
 }
 
 /**
- * A logarithm, to within 3e-6 relative over the whole positive range.
+ * A natural logarithm, to within 1e-5 absolute over every positive normal
+ * float, and 2e-6 between 1e-6 and 1e6 (measured 7.9e-6 and 1.0e-6). What is
+ * left is the float's own resolution of the answer: ln(1e38) is 87.5, where
+ * one step of a float is 7.6e-6.
  *
  * The exponent comes straight out of the float's bits -- exact, and free --
- * and only the mantissa needs a polynomial. Zero and negatives return the
- * lowest finite float rather than -infinity or a NaN: a NaN in an audio buffer
- * propagates through every subsequent sample and every mix bus it reaches, and
- * a very negative decibel value is what a caller asking for the log of silence
+ * and the mantissa is brought into [sqrt(1/2), sqrt(2)), where
+ * ln(m) = 2 atanh((m - 1) / (m + 1)) and the atanh series converges after
+ * five terms. A Taylor series of ln(1 + m) taken to m = 1, which is what
+ * this was, converges there hardly at all: 0.076 off, 0.66 dB in
+ * fastGainToDb.
+ *
+ * Zero, negatives, NaN and subnormals return the log of the smallest normal
+ * float rather than -infinity or a NaN: a NaN in an audio buffer propagates
+ * through every subsequent sample and every mix bus it reaches, and a very
+ * negative decibel value is what a caller asking for the log of silence
  * meant.
  */
 inline float fastLog(float x) {
-  if (!(x > 0.0f)) return -87.3365f; // ln of the smallest normal float
+  if (!(x >= 1.17549435e-38f)) return -87.3365f; // ln of the smallest normal float
   int32_t bits;
   std::memcpy(&bits, &x, sizeof(bits));
-  const int32_t exponent = ((bits >> 23) & 0xFF) - 127;
-  // The mantissa put back into [1, 2), where a short polynomial is accurate.
+  int32_t exponent = ((bits >> 23) & 0xFF) - 127;
+  // The mantissa put back into [1, 2)...
   bits = (bits & 0x007FFFFF) | 0x3F800000;
-  float mantissa;
-  std::memcpy(&mantissa, &bits, sizeof(mantissa));
-
-  const float m = mantissa - 1.0f;
+  float m;
+  std::memcpy(&m, &bits, sizeof(m));
+  // ...and then into [sqrt(1/2), sqrt(2)), so s below stays under 0.172.
+  if (m > 1.41421356f) {
+    m *= 0.5f;
+    ++exponent;
+  }
+  const float s = (m - 1.0f) / (m + 1.0f);
+  const float s2 = s * s;
   const float poly =
-      m * (1.0f + m * (-0.5f + m * (0.33333333f + m * (-0.25f + m * (0.2f + m * -0.16666667f)))));
+      s * (2.0f + s2 * (0.66666667f + s2 * (0.4f + s2 * (0.28571429f + s2 * 0.22222222f))));
   return poly + (float) exponent * 0.69314718f;
 }
 
-/** Decibels from a gain, through fastLog. The shape a meter needs sixty times
- *  a second and does not need to eight decimal places. */
+/** Decibels from a gain, through fastLog: within 2e-5 dB from -100 to +12 dB.
+ *  The shape a meter needs sixty times a second. */
 inline float fastGainToDb(float gain) { return 8.6858896f * fastLog(gain); }
 
 /** And back. 1/20 * ln(10) folded into the constant. */

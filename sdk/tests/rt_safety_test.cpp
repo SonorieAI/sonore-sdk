@@ -22,7 +22,7 @@
 //     that remains an argument rather than a measurement.
 //   * the GUI thread, which is main-thread by contract and allowed to allocate.
 //
-// Allocation during activate() and prepare() is CORRECT and expected, that is
+// Allocation during activate() and prepare() is CORRECT and expected: that is
 // what those calls are for. The counter is armed only around the calls CLAP
 // marks [audio-thread].
 
@@ -563,7 +563,11 @@ int main() {
         bool finite = true;
         for (uint32_t b = 0; b < 24; ++b) {
           // The declared maximum, and sizes below it: a host is allowed both.
-          const uint32_t frames = (b % 3 == 0) ? block : 1 + (b * 37) % block;
+          // And now and then MORE than it declared, as a host rendering
+          // offline may hand over: process() cuts that into pieces the DSP
+          // was prepared for, and must not allocate doing it.
+          uint32_t frames = (b % 3 == 0) ? block : 1 + (b * 37) % block;
+          if (b % 8 == 7 && block < kBig) frames = block * 3 + 5 < kBig ? block * 3 + 5 : kBig;
           big.frames_count = frames;
           fillEvents(b);
           for (uint32_t port = 0; port < nInPorts; ++port)

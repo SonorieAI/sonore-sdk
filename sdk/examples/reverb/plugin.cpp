@@ -18,6 +18,7 @@
 // numbers this plugin actually produces.
 #define SONORE_NUM_PARAMS 4
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -34,8 +35,30 @@
 using RoomConvolver = sonore::Convolver<512, 48>;
 
 struct SonoreDsp {
-  RoomConvolver left, right;
+  /** The two convolvers, as ONE object the audio thread can be handed whole.
+   *
+   *  A state load is [main-thread] and may come while process() runs -- CLAP
+   *  and VST3 both allow it, and a host loading a preset does it. Loading an
+   *  impulse rewrites a convolver's spectra and resets its history, so doing
+   *  that to the pair process() is reading was a race: a torn impulse, a
+   *  burst of garbage on somebody else's machine. So a new impulse is loaded
+   *  into a Room of its own on the main thread and PUBLISHED; process() adopts
+   *  it at the top of a block and hands the old one back to be freed. The
+   *  sampler example's bank handover, for the same reason. */
+  struct Room {
+    RoomConvolver left, right;
+  };
+  Room* room = nullptr;                // process()'s, between prepares
+  std::atomic<Room*> pending{nullptr}; // main -> audio, at most one waiting
+  std::atomic<Room*> retired{nullptr}; // audio -> main, freed on the next load
+  /** The response being loaded, between a build or a file read and the Room
+   *  it goes into: loadInto() lets the samples go once the convolvers hold
+   *  them as spectra, and keeps only the length. Held after that, they were
+   *  the instance's third-largest buffer and read by nothing -- 0.45 s of
+   *  stereo at the session's rate, 691 KB at 192 kHz, of which the room
+   *  plays the first 24576 frames. */
   sonore::ImpulseResponse impulse;
+  size_t impulseLength = 0; // of the response the room was last loaded with
   sonore::WaveformPeaks peaks;
   // Compensated, because the convolver answers a block late: see the comment
   // on CompensatedDryWetMixer for what mixing a late wet against an undelayed
@@ -43,6 +66,10 @@ struct SonoreDsp {
   // it is the creative offset, not the technical one.
   sonore::CompensatedDryWetMixer<2, 1024> mixer;
   sonore::Smooth outSm;
+  // Pre-delay and send glide too: the read point jumping to a new delay was a
+  // click at every automation step, and the send a zipper.
+  sonore::Smooth preDelaySm, sendSm;
+  bool snapControls = true; // the first block after a (re)start lands on them
   // 48000 samples covers the 200 ms control even at 192 kHz, and the line is
   // a fixed-size member: sizing it for a rate no one runs would cost every
   // instance the memory whether or not the control is ever moved.
@@ -55,26 +82,58 @@ struct SonoreDsp {
    *  ever prepares, and state that depends on when it was asked for is state a
    *  host cannot trust. The sampler example learned this from clap-validator. */
   SonoreDsp() {
+    room = new Room();
     buildDemoImpulse(48000.0);
-    loadIntoConvolvers();
+    loadInto(*room);
   }
+  ~SonoreDsp() {
+    delete room;
+    delete pending.exchange(nullptr);
+    delete retired.exchange(nullptr);
+  }
+  SonoreDsp(const SonoreDsp&) = delete;
+  SonoreDsp& operator=(const SonoreDsp&) = delete;
 
   void prepare(const sonore::ProcessSpec& spec) {
+    // Never concurrent with process(), so whatever is in flight is settled
+    // here directly.
+    if (Room* next = pending.exchange(nullptr)) {
+      delete room;
+      room = next;
+    }
+    delete retired.exchange(nullptr);
     // An impulse recorded at one rate and played at another is TRANSPOSED, so
     // the response is rebuilt whenever the session rate changes.
-    if (spec.sampleRate != hostRate || impulse.length() == 0) {
+    if (spec.sampleRate != hostRate || impulseLength == 0) {
       hostRate = spec.sampleRate;
       if (impulsePath.empty()) buildDemoImpulse(hostRate);
       else if (!impulse.loadFromFile(impulsePath.c_str(), hostRate)) buildDemoImpulse(hostRate);
-      loadIntoConvolvers();
+      loadInto(*room);
     }
-    left.reset();
-    right.reset();
+    room->left.reset();
+    room->right.reset();
     preDelayL.reset();
     preDelayR.reset();
     outSm.setup((float) spec.sampleRate, 12.0f);
     outSm.snap(1.0f);
+    preDelaySm.setup((float) spec.sampleRate, 60.0f);
+    sendSm.setup((float) spec.sampleRate, 20.0f);
+    snapControls = true;
+    mixer.setSampleRate((float) spec.sampleRate);
     mixer.setWetLatency((int) RoomConvolver::latency());
+  }
+
+  /** A host's "start over", on the audio thread: forget what is ringing and
+   *  keep the room. Without this the wrappers call prepare() there, which
+   *  settles a pending room -- a delete -- and may rebuild the impulse. */
+  void reset() {
+    room->left.reset();
+    room->right.reset();
+    preDelayL.reset();
+    preDelayR.reset();
+    mixer.reset();
+    outSm.snap(1.0f);
+    snapControls = true;
   }
 
   /** A synthetic room: an early reflection pattern over an exponentially
@@ -116,11 +175,27 @@ struct SonoreDsp {
     impulsePath.clear();
   }
 
-  void loadIntoConvolvers() {
+  void loadInto(Room& target) {
     if (impulse.length() == 0) return;
-    left.loadImpulse(impulse.channel(0), impulse.length());
-    right.loadImpulse(impulse.channel(impulse.numChannels() > 1 ? 1 : 0), impulse.length());
+    target.left.loadImpulse(impulse.channel(0), impulse.length());
+    target.right.loadImpulse(impulse.channel(impulse.numChannels() > 1 ? 1 : 0),
+                             impulse.length());
     peaks.build(impulse.channel(0), impulse.length(), 1, 256);
+    impulseLength = impulse.length();
+    impulse = sonore::ImpulseResponse();
+  }
+
+  /** [main-thread] Load the current impulse into a fresh Room and hand it to
+   *  the audio thread. The Room retired by the LAST handover is freed first,
+   *  so the audio thread always finds that slot empty when it retires one --
+   *  it never has to free anything itself. */
+  void publishImpulse() {
+    delete retired.exchange(nullptr, std::memory_order_acq_rel);
+    Room* next = new Room();
+    loadInto(*next);
+    // One still waiting was never seen by the audio thread -- the exchange is
+    // the proof -- so it is this thread's to free.
+    delete pending.exchange(next, std::memory_order_acq_rel);
   }
 
   /** What the host must compensate for. One block, because that is what a
@@ -148,7 +223,12 @@ struct SonoreDsp {
    *  find a bug. */
   int tailSamples() const {
     const size_t maxPreDelay = (size_t) (0.200 * hostRate); // the control's top end
-    return (int) (maxPreDelay + impulse.length() + 2 * RoomConvolver::latency());
+    // What the convolver plays, which is less than the impulse when the
+    // impulse is longer than it holds (past half a second at 48 kHz).
+    const size_t played = impulseLength < RoomConvolver::maxImpulseLength()
+                              ? impulseLength
+                              : RoomConvolver::maxImpulseLength();
+    return (int) (maxPreDelay + played + 2 * RoomConvolver::latency());
   }
 
   void saveState(sonore::StateBag& bag) const { bag.setString("impulsePath", impulsePath); }
@@ -158,25 +238,43 @@ struct SonoreDsp {
     if (path == impulsePath) return; // nothing changed; do not rebuild
     if (!path.empty() && impulse.loadFromFile(path.c_str(), hostRate)) {
       impulsePath = path;
-      loadIntoConvolvers();
+      publishImpulse();
       return;
     }
     // The file moved, or the session came from another machine. The built-in
     // room means the plugin still reverberates, which beats a bypass the user
     // cannot diagnose.
     buildDemoImpulse(hostRate);
-    loadIntoConvolvers();
+    publishImpulse();
   }
 
   void process(sonore::AudioBlock<float>& io, const float* p) {
+    // A new impulse, if the main thread published one. Adopted whole at a
+    // block boundary; the old Room goes back to be freed there, not here.
+    if (Room* next = pending.exchange(nullptr, std::memory_order_acq_rel)) {
+      Room* old = room;
+      room = next;
+      // Always empty: publishImpulse() frees the previous one before it
+      // publishes, and only a publish leads here.
+      retired.exchange(old, std::memory_order_acq_rel);
+    }
+    RoomConvolver& left = room->left;
+    RoomConvolver& right = room->right;
     const size_t n = io.getNumSamples();
     float* L = io.getChannelPointer(0);
     float* R = io.getNumChannels() > 1 ? io.getChannelPointer(1) : L;
 
-    const float preDelaySamples =
-        1.0f + (float) (p[0] * 0.001 * hostRate); // milliseconds to samples
+    const float preDelayTarget = 1.0f + (float) (p[0] * 0.001 * hostRate); // milliseconds to samples
+    if (snapControls) {
+      preDelaySm.snap(preDelayTarget);
+      sendSm.snap(p[2]);
+      snapControls = false;
+    }
     mixer.setMix(p[1] * 0.01f);
 
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float outTarget = sonore::dbToGain(p[3]);
     for (size_t i = 0; i < n; ++i) {
       const float dryL = L[i], dryR = R[i];
 
@@ -185,18 +283,25 @@ struct SonoreDsp {
       // would just push the dry signal late too.
       preDelayL.write(dryL);
       preDelayR.write(dryR);
+      const float preDelaySamples = preDelaySm.next(preDelayTarget);
       const float sendL = preDelayL.readCubic(preDelaySamples);
       const float sendR = preDelayR.readCubic(preDelaySamples);
 
       const float wetL = left.process(sendL);
       const float wetR = right.process(sendR);
 
-      const float gain = outSm.next(sonore::dbToGain(p[3]));
-      L[i] = mixer.process(0, dryL, wetL * p[2]) * gain;
-      R[i] = mixer.process(1, dryR, wetR * p[2]) * gain;
+      const float gain = outSm.next(outTarget);
+      const float send = sendSm.next(p[2]);
+      L[i] = mixer.process(0, dryL, wetL * send) * gain;
+      R[i] = mixer.process(1, dryR, wetR * send) * gain;
     }
   }
 };
+
+// A test may want the DSP WITHOUT the wrappers -- tests/reverb_stress_test.cpp
+// drives this struct from two threads to prove the impulse handover -- and it
+// says so with this macro. A real build never defines it.
+#if !defined(SONORE_EXAMPLE_DSP_ONLY)
 
 #include <sonore/plugin.h>
 
@@ -222,21 +327,6 @@ static const sonore::PluginDescriptor kDesc = {
     "reverb",
 };
 
-#include <sonore/clap_wrapper.h>
+#include <sonore/formats.h> // CLAP, and every format this target is built as
 
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#endif // !SONORE_EXAMPLE_DSP_ONLY

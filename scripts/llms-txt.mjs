@@ -85,9 +85,9 @@ function publicTypes(text) {
 // writing by hand, and they are short on purpose.
 
 const SHAPE = `\`\`\`cpp
-// One file is a whole plugin. This builds a .clap, and the same source builds
-// every other format by defining SONORE_BUILD_<FORMAT> and including one more
-// header at the bottom.
+// One file is a whole plugin. The same source builds every format: the build
+// defines SONORE_BUILD_<FORMAT> for each one it makes (sonore_add_plugin does),
+// and formats.h at the bottom includes what each of them needs.
 
 #define SONORE_NUM_PARAMS 2
 #include <sonore/dsp.h>
@@ -104,11 +104,13 @@ struct SonoreDsp {
   void process(sonore::AudioBlock<float>& io, const float* p) {
     for (size_t i = 0; i < io.getNumSamples(); ++i) {
       const float g = gainSm.next(sonore::dbToGain(p[0]));
-      for (int c = 0; c < io.getNumChannels(); ++c)
+      for (size_t c = 0; c < io.getNumChannels(); ++c)
         io.getChannelPointer(c)[i] *= g;
     }
   }
 };
+
+#include <sonore/plugin.h>
 
 // id, label, unit, min, max, default, stepCount
 static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
@@ -125,21 +127,7 @@ static const sonore::PluginDescriptor kDesc = {
     "utility",                   // category
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as
 \`\`\``;
 
 const RULES = [
@@ -168,10 +156,10 @@ const RULES = [
    "does. Keep the last value and compare, as the examples do."],
 
   ["Big objects are members, never locals.",
-   "`FdnReverb` is around 320 KB, `Convolver<256,32>` around 400 KB, " +
-   "`StereoDelay` about 1.5 MB. The WebAssembly stack is 64 KB, so one of " +
-   "these as a local variable crashes the browser build while the native one " +
-   "looks fine."],
+   "`FdnReverb<>` is about 1.1 MB, `StereoDelay<>` about 1.5 MB, " +
+   "`Convolver<256,32>` about 140 KB. Emscripten's default stack is 64 KB, so " +
+   "one of these as a local variable crashes the browser build while the " +
+   "native one looks fine."],
 
   ["Parameters are plain values, in the order of the table.",
    "`p[0]` is the first row of `kParamTable`. Not normalised: if the row says " +

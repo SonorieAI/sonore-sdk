@@ -72,10 +72,19 @@ namespace sonore {
  */
 class ScopedNoDenormals {
 public:
+  /** [audio-thread] Save the calling thread's floating-point control
+   *  register and turn flushing on: flush-to-zero and denormals-are-zero on
+   *  x86, FZ on AArch64, nothing on a target with neither. A register read
+   *  and a write; no allocation, no lock. Only this thread is affected. */
   ScopedNoDenormals() : saved_(readState()) { writeState(flushingState(saved_)); }
+  /** Put back exactly the register saved at construction, so the host's own
+   *  mode survives the block. */
   ~ScopedNoDenormals() { writeState(saved_); }
 
+  /** Not copyable: each guard restores what it saved once, on the thread
+   *  and in the scope that made it. */
   ScopedNoDenormals(const ScopedNoDenormals&) = delete;
+  /** Not assignable, for the same reason. */
   ScopedNoDenormals& operator=(const ScopedNoDenormals&) = delete;
 
   /** What the control register held before this scope. Public so a test can
@@ -108,6 +117,9 @@ public:
 #endif
   }
 
+  /** The calling thread's floating-point control register as it is now:
+   *  MXCSR on x86, sticky status flags included (see modeOf()); FPCR on
+   *  AArch64; 0 on a target with neither. */
   static uintptr_t readState() {
 #if defined(SONORE_DENORMALS_SSE)
     return (uintptr_t) _mm_getcsr();
@@ -122,6 +134,8 @@ public:
 #endif
   }
 
+  /** Load `state`, a value readState() returned, into the calling thread's
+   *  control register. Does nothing on a target with neither register. */
   static void writeState(uintptr_t state) {
 #if defined(SONORE_DENORMALS_SSE)
     _mm_setcsr((unsigned int) state);

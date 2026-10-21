@@ -15,13 +15,6 @@
 
 #if defined(_WIN32)
 
-#include <audioclient.h>
-#include <mmdeviceapi.h>
-// PKEY_Device_FriendlyName lives here, and this header needs the property-key
-// machinery declared FIRST or every key expands to an undeclared identifier.
-#include <propsys.h>
-#include <propkeydef.h>
-#include <functiondiscoverykeys_devpkey.h>
 // windows.h defines min and max as MACROS, which turn any later std::min or
 // std::max into a syntax error -- and only when this header happens to be
 // included FIRST. That made it an include-order landmine rather than a bug:
@@ -37,6 +30,15 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+// Before the FIRST Windows header: audioclient.h includes windows.h itself,
+// and with these defined after it, min and max were already macros.
+#include <audioclient.h>
+#include <mmdeviceapi.h>
+// PKEY_Device_FriendlyName lives here, and this header needs the property-key
+// machinery declared FIRST or every key expands to an undeclared identifier.
+#include <propsys.h>
+#include <propkeydef.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <windows.h>
 
 #include <cstring>
@@ -49,21 +51,44 @@
 namespace sonore {
 namespace standalone {
 
+/**
+ * One output device in WASAPI shared mode: the standalone's speakers on
+ * Windows. See the file comment for why it is shared mode and output only.
+ *
+ * Three steps, all from the MAIN thread: open() picks the device
+ * (setDeviceIndex first; 0 is the system default) and learns the rate and
+ * channel count of its mix, which the device chooses; the caller prepares its
+ * DSP at sampleRate(); run() starts a render thread of its own, which calls
+ * the RenderFn with interleaved 32-bit float in as many channels as the mix
+ * has -- not always two. stop() and the destructor join that thread and
+ * release everything, on the thread that called open(), whose COM
+ * initialisation they balance.
+ *
+ * A device that goes away ends the render thread and sets takeDeviceLost();
+ * the owner polls it and opens again, since nothing reopens itself.
+ */
 class WasapiOutput {
 public:
   /** Fill `interleaved` with `frames` frames of `channels` channels. Called on
    *  the audio thread; everything real-time-unsafe is someone else's problem. */
   using RenderFn = std::function<void(float* interleaved, uint32_t frames, uint32_t channels)>;
 
+  /** stop(), on the thread that called open(). */
   ~WasapiOutput() { stop(); }
 
+  /** The device mix's rate in Hz, what the DSP is prepared at; 48000 before
+   *  open(). */
   double sampleRate() const { return sampleRate_; }
+  /** The mix's channel count, what the RenderFn is handed: not always 2. */
   uint32_t channels() const { return channels_; }
+  /** Why the last open() or run() failed, with the system's code. */
   const std::string& error() const { return error_; }
 
-  /** Negotiate the device and learn its rate. No audio flows yet: the caller
-   *  prepares the DSP at sampleRate() BEFORE run(), or the first callback
-   *  races an unprepared processor. */
+  /** True once since the device went away -- unplugged, disabled, or taken
+   *  by an exclusive-mode app -- and the stream stopped. Polled from the UI
+   *  thread, which reopens something; the render thread only says so. */
+  bool takeDeviceLost() { return lost_.exchange(false, std::memory_order_acq_rel); }
+
   /** The output devices the machine has, in enumeration order. Index 0 is
    *  always the system DEFAULT, so a caller that never chooses still gets the
    *  device the user's OS settings point at. */
@@ -81,8 +106,17 @@ public:
         UINT count = 0;
         collection->GetCount(&count);
         for (UINT i = 0; i < count; ++i) {
+          // Every endpoint gets an entry, named or not: open() counts every
+          // active endpoint, and a list that skipped one whose name could not
+          // be read numbered everything after it one short -- picking a
+          // device opened its neighbour. One that cannot even be fetched
+          // keeps its place too.
           IMMDevice* dev = nullptr;
-          if (FAILED(collection->Item(i, &dev)) || !dev) continue;
+          if (FAILED(collection->Item(i, &dev)) || !dev) {
+            names.push_back("(unnamed device)");
+            continue;
+          }
+          std::string name = "(unnamed device)";
           IPropertyStore* props = nullptr;
           if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
             PROPVARIANT value;
@@ -92,11 +126,12 @@ public:
               char utf8[256] = {0};
               WideCharToMultiByte(CP_UTF8, 0, value.pwszVal, -1, utf8, sizeof(utf8) - 1, nullptr,
                                   nullptr);
-              names.push_back(utf8);
+              name = utf8;
             }
             PropVariantClear(&value);
             props->Release();
           }
+          names.push_back(name);
           dev->Release();
         }
         collection->Release();
@@ -111,9 +146,21 @@ public:
    *  Set before open(); changing it afterwards does nothing, which is why the
    *  standalone re-opens rather than pretending it can switch live. */
   void setDeviceIndex(int index) { deviceIndex_ = index; }
+  /** The device open() opened, by its friendly name, UTF-8. */
   const std::string& deviceName() const { return deviceName_; }
 
+  /** Negotiate the device and learn its rate. No audio flows yet: the caller
+   *  prepares the DSP at sampleRate() BEFORE run(), or the first callback
+   *  races an unprepared processor. */
   bool open(RenderFn render) {
+    // Whatever was open goes first, as ASIO's open() does. A second open()
+    // overwrote client_ -- the first IAudioClient, its render client and its
+    // event leaked -- and its CoInitializeEx was a second initialisation that
+    // the one stop() never balanced, so COM stayed up on the thread for
+    // good. A running stream is stopped too, rather than having render_
+    // replaced under its thread. And the last failure is not this one's.
+    stop();
+    error_.clear();
     render_ = std::move(render);
 
     // APARTMENTTHREADED, deliberately: open() runs on the MAIN thread, and the
@@ -213,7 +260,19 @@ public:
   /** Start the stream. Only after the DSP is prepared. */
   bool run() {
     if (!client_ || !renderClient_) return false;
+    // A thread already started. Assigning a new std::thread over it while it
+    // is joinable is std::terminate, and it stays joinable after its loop
+    // ends on a lost device until stop() -- so run() twice, or run() to
+    // restart a stream whose device went away, ended the process. Still
+    // rendering: nothing to do. Ended: joined, and the stream asked for
+    // again, which a device that is really gone refuses through Start().
+    if (thread_.joinable()) {
+      if (looping_.load(std::memory_order_acquire)) return true;
+      thread_.join();
+    }
+    lost_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
+    looping_.store(true, std::memory_order_release);
     thread_ = std::thread([this] { renderLoop(); });
     const HRESULT hr = client_->Start();
     if (FAILED(hr)) {
@@ -223,6 +282,9 @@ public:
     return true;
   }
 
+  /** Stop the render thread and join it, then release the stream; on the
+   *  thread that called open(), whose COM initialisation it balances.
+   *  Harmless when nothing is open. */
   void stop() {
     if (running_.exchange(false)) {
       if (event_) SetEvent(event_); // wake the loop so it can exit
@@ -248,6 +310,13 @@ public:
   }
 
 private:
+  friend struct WasapiOutputTest; // the device-loss test drives the loop with fakes
+
+  /** The failures that mean the endpoint is not coming back on its own. */
+  static bool deviceGone(HRESULT hr) {
+    return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING;
+  }
+
   bool fail(const char* what, HRESULT hr) {
     char buf[160];
     std::snprintf(buf, sizeof(buf), "%s (0x%08lx)", what, (unsigned long) hr);
@@ -266,7 +335,7 @@ private:
    *  loop as before. */
   static void becomeAudioThread(HANDLE* taskOut) {
     *taskOut = nullptr;
-    HMODULE avrt = LoadLibraryW(L"avrt.dll");
+    HMODULE avrt = LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!avrt) return;
     using SetFn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
     auto setFn = (SetFn) (void*) GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
@@ -287,21 +356,53 @@ private:
   void renderLoop() {
     HANDLE mmcss = nullptr;
     becomeAudioThread(&mmcss);
+    bool gone = false;
     while (running_.load(std::memory_order_acquire)) {
-      if (WaitForSingleObject(event_, 200) != WAIT_OBJECT_0) continue;
+      if (WaitForSingleObject(event_, 200) != WAIT_OBJECT_0) {
+        // No wake for 200 ms. An endpoint that goes away -- unplugged, its
+        // format changed in Sound settings, taken in exclusive mode -- stops
+        // its stream, and the stream's event with it, so a loop that only
+        // asked on a wake never asked again: silent and "open" until the
+        // user picked a device by hand. Asked on the timeout too.
+        UINT32 waiting = 0;
+        if (running_.load(std::memory_order_acquire) && deviceGone(client_->GetCurrentPadding(&waiting))) {
+          gone = true;
+          break;
+        }
+        continue;
+      }
       if (!running_.load(std::memory_order_acquire)) break;
 
+      // A device that is GONE fails every call from here on. Retrying it
+      // every wake, as any failure used to be, is a stream that stays open
+      // and silent until the user notices and picks a device by hand; it is
+      // reported instead, and the loop ends.
       UINT32 padding = 0;
-      if (FAILED(client_->GetCurrentPadding(&padding))) continue;
+      HRESULT hr = client_->GetCurrentPadding(&padding);
+      if (deviceGone(hr)) {
+        gone = true;
+        break;
+      }
+      if (FAILED(hr)) continue;
       const UINT32 frames = bufferFrames_ - padding;
       if (frames == 0) continue;
 
       BYTE* buffer = nullptr;
-      if (FAILED(renderClient_->GetBuffer(frames, &buffer)) || !buffer) continue;
+      hr = renderClient_->GetBuffer(frames, &buffer);
+      if (deviceGone(hr)) {
+        gone = true;
+        break;
+      }
+      if (FAILED(hr) || !buffer) continue;
       render_((float*) buffer, frames, channels_);
       renderClient_->ReleaseBuffer(frames, 0);
     }
     resignAudioThread(mmcss);
+    // Out of the loop BEFORE the loss is told: an owner that hears of it and
+    // calls run() at once must find this thread done, or run() would take it
+    // for one still rendering and leave a stream that never restarts.
+    looping_.store(false, std::memory_order_release);
+    if (gone) lost_.store(true, std::memory_order_release);
   }
 
   RenderFn render_;
@@ -312,6 +413,9 @@ private:
   HANDLE event_ = nullptr;
   std::thread thread_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> lost_{false};
+  /** The render thread is still in its loop; false once it has left it. */
+  std::atomic<bool> looping_{false};
   double sampleRate_ = 48000.0;
   uint32_t channels_ = 2;
   UINT32 bufferFrames_ = 0;

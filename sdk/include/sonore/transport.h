@@ -20,22 +20,43 @@ namespace sonore {
 
 /** What the host knows about musical time at the start of this block. */
 struct TransportInfo {
+  /** The host's transport is running. False when the host says nothing, which
+   *  is how a free-running host (or one that sends no transport) reads. */
   bool isPlaying = false;
+  /** The host is recording. Reported by CLAP, VST3 and AU; LV2 leaves it false. */
   bool isRecording = false;
+  /** The host's loop (cycle) is switched on. Where it is lies in
+   *  `loopStartBeats` and `loopEndBeats`, valid when `hasLoop`. */
   bool isLooping = false;
   /** Beats per minute. Valid only when `hasTempo`. */
   double tempo = 120.0;
+  /** `tempo` is the host's. When false it is the 120 BPM default, which is
+   *  also what secondsPerBeat() falls back to. */
   bool hasTempo = false;
   /** Position in quarter notes from the song start. Valid when `hasBeats`. */
   double positionBeats = 0.0;
+  /** `positionBeats` is the host's. barStartBeats and barNumber have no flag
+   *  of their own: they stay 0 when the host does not give them. */
   bool hasBeats = false;
   /** Position in seconds from the song start. Valid when `hasSeconds`. */
   double positionSeconds = 0.0;
+  /** `positionSeconds` is the host's, or derived from its sample position. */
   bool hasSeconds = false;
   /** Quarter-note position where the current bar began. */
   double barStartBeats = 0.0;
+  /** The bar that began there, counted from 0 at the song's start. */
   int32_t barNumber = 0;
+  /** The host's loop, in quarter notes, when it says (`hasLoop`): what a
+   *  looper or a synced delay needs to wrap WITH the host rather than a beat
+   *  after it. `isLooping` says whether it is on; these say where it is. */
+  double loopStartBeats = 0.0, loopEndBeats = 0.0; ///< End of the host's loop, in quarter notes; valid when `hasLoop`.
+  /** The host reported a loop whose end is after its start, so
+   *  `loopStartBeats` and `loopEndBeats` are its; when false both are 0. */
+  bool hasLoop = false;
+  /** Time signature, beats per bar as written (the 6 of 6/8). 4/4 when the
+   *  host gives none; beatsPerBar() turns the pair into quarter notes. */
   int timeSigNumerator = 4;
+  /** Time signature, the note value of one beat (the 8 of 6/8). */
   int timeSigDenominator = 4;
 
   /** Seconds per quarter note. Falls back to 120 BPM when the host said
@@ -46,11 +67,26 @@ struct TransportInfo {
     return 60.0 / bpm;
   }
 
+  /** A bar, in QUARTER NOTES -- which is what `positionBeats` counts.
+   *
+   *  Six eight is six eighths, and an eighth is half a quarter, so the bar is
+   *  THREE and not six. Reading the numerator as the bar length is the mistake
+   *  that puts every bar-synced shape a third out in three four and twice out
+   *  in six eight, and it is a mistake worth having one place to make.
+   *
+   *  It was inline in barPhase() and nowhere else, so the wasm ABI -- which
+   *  builds barNumber and barStartBeats -- had its own copy that said four,
+   *  always. */
+  double beatsPerBar() const {
+    const int d = timeSigDenominator > 0 ? timeSigDenominator : 4;
+    const int n = timeSigNumerator > 0 ? timeSigNumerator : 4;
+    return (double) n * (4.0 / (double) d);
+  }
+
   /** How far into the current bar we are, 0..1. Useful for bar-synced shapes. */
   double barPhase() const {
     if (!hasBeats) return 0.0;
-    const double beatsPerBar =
-        (double) timeSigNumerator * (4.0 / (double) (timeSigDenominator > 0 ? timeSigDenominator : 4));
+    const double beatsPerBar = this->beatsPerBar();
     if (beatsPerBar <= 0.0) return 0.0;
     const double into = positionBeats - barStartBeats;
     const double phase = into / beatsPerBar;
@@ -60,7 +96,11 @@ struct TransportInfo {
 
 /** A musical division. `Straight` is the plain note, `Dotted` is 1.5x,
  *  `Triplet` is 2/3: the three every synced control offers. */
-enum class NoteFlavour { Straight, Dotted, Triplet };
+enum class NoteFlavour {
+  Straight, ///< the plain note: a 1/8 is half a beat
+  Dotted,   ///< one and a half times the plain note
+  Triplet   ///< two thirds of the plain note: three in the time of two
+};
 
 /**
  * Musical note lengths in beats. A quarter note is 1 beat by definition, so
@@ -110,6 +150,8 @@ inline double noteRateInHz(const TransportInfo& t, int denominator,
  */
 class SyncedLfo {
 public:
+  /** The rate nextPhase() advances at, in Hz. A rate of 1 or less is taken
+   *  as 48000. Takes effect at the next update(). */
   void setSampleRate(double sr) { sampleRate_ = sr > 1.0 ? sr : 48000.0; }
 
   /** Call once per block. `beatsPerCycle` comes from noteLengthInBeats(). */
@@ -152,6 +194,7 @@ public:
    *  one call per sample, no multiply by 2*pi, no library sine. */
   inline float nextSine() { return fastmath::sinTurns(nextPhase()); }
 
+  /** Triangle, -1 at the start of the cycle, +1 halfway, back to -1. */
   inline float nextTriangle() {
     const float p = nextPhase();
     // Up from -1 to +1 over the first half, back down over the second.
@@ -168,7 +211,11 @@ public:
    *  make on their behalf. */
   inline float nextSquare() { return nextPhase() < 0.5f ? 1.0f : -1.0f; }
 
+  /** True when the last update() saw the host playing with a beat position,
+   *  so the phase follows the timeline; false while it free-runs. */
   bool isLocked() const { return locked_; }
+  /** Phase back to the start of the cycle. While locked, the next update()
+   *  sets the phase from the transport anyway; this matters for free-running. */
   void reset() { phase_ = 0.0; }
 
 private:

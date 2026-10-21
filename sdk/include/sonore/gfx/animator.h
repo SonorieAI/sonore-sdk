@@ -18,10 +18,13 @@
 //
 // ── What it does not do ─────────────────────────────────────────────────────
 //
-// No spring physics, no keyframes, no property animation beyond bounds and
-// alpha. A plugin animates a panel sliding, a meter's ballistics (which belong
-// in the meter, not here) and nothing else. Component animators elsewhere are
-// the same shape for the same reason.
+// No keyframes, and no property animation beyond bounds and numbers. A plugin
+// animates a panel sliding, a meter's ballistics (which belong in the meter,
+// not here) and little else. Component animators elsewhere are the same shape
+// for the same reason. Springs are here as an easing CURVE
+// (SpringEasingOptions) on a fixed duration, which is how a duration-based
+// animator takes one; a free-running integrator with momentum is
+// AnimatedPosition, in animated_position.h.
 #pragma once
 
 #include <cmath>
@@ -29,6 +32,7 @@
 #include <vector>
 
 #include <functional>
+#include <memory>
 
 #include "component.h"
 
@@ -37,13 +41,13 @@ namespace gfx {
 
 /** How the value moves between its ends. */
 enum class Easing {
-  Linear,
+  Linear,  ///< constant speed
   /** Slow to start. For something leaving: it looks like it is being let go. */
   In,
   /** Slow to stop. For something ARRIVING, which is most things -- an object
    *  that decelerates into place reads as having weight. */
   Out,
-  InOut,
+  InOut,  ///< slow at both ends: for something moving from one place to another
   /** Overshoots and comes back. For something appearing that should feel
    *  eager -- a popover, a badge. Wrong for anything the user is watching a
    *  value on, because the overshoot LIES about the value for a moment. */
@@ -54,6 +58,57 @@ enum class Easing {
   /** Falls and bounces. Same caveat as Back, more so. */
   Bounce,
 };
+
+/** The curve every animator here follows, by name: 0 at t = 0, 1 at t = 1,
+ *  and between them whatever the name says -- Back and Elastic overshoot,
+ *  Bounce lands in steps. One function, so the bounds animator and the value
+ *  animator cannot disagree about what a name means; the bounds animator had
+ *  its own copy that knew four of the seven and ran the rest linearly. */
+inline double easeCurve(double t, Easing easing) {
+  if (t <= 0.0) return 0.0;
+  if (t >= 1.0) return 1.0;
+  switch (easing) {
+    case Easing::Linear: return t;
+    case Easing::In: return t * t;
+    case Easing::Out: return 1.0 - (1.0 - t) * (1.0 - t);
+    case Easing::InOut: return t < 0.5 ? 2.0 * t * t : 1.0 - 2.0 * (1.0 - t) * (1.0 - t);
+    case Easing::Back: {
+      // 1.70158 is the constant that gives roughly a ten percent overshoot,
+      // which is the one every animation library uses because it reads as
+      // deliberate rather than as a bug.
+      const double c = 1.70158;
+      const double u = t - 1.0;
+      return u * u * ((c + 1.0) * u + c) + 1.0;
+    }
+    case Easing::Elastic: {
+      // The phase is in t itself. Written with t - 1 inside the sine, as the
+      // ease-IN form has it, the oscillation started 1/0.3 periods out of
+      // step and the curve leapt to 1.5 in its first instant.
+      const double period = 0.3;
+      return std::pow(2.0, -10.0 * t) * std::sin((t - period / 4.0) * 6.28318530718 / period) +
+             1.0;
+    }
+    case Easing::Bounce: {
+      // The textbook form writes `7.5625 * (u -= a) * u`, which modifies u
+      // and reads it in the same unsequenced expression -- undefined
+      // behaviour that gcc flags, and that an optimiser is free to evaluate
+      // in either order. The shift is a statement of its own here.
+      double u = t;
+      if (u < 1.0 / 2.75) return 7.5625 * u * u;
+      if (u < 2.0 / 2.75) {
+        u -= 1.5 / 2.75;
+        return 7.5625 * u * u + 0.75;
+      }
+      if (u < 2.5 / 2.75) {
+        u -= 2.25 / 2.75;
+        return 7.5625 * u * u + 0.9375;
+      }
+      u -= 2.625 / 2.75;
+      return 7.5625 * u * u + 0.984375;
+    }
+  }
+  return t;
+}
 
 /**
  * A cubic Bézier easing, in CSS's parameterisation.
@@ -70,9 +125,13 @@ enum class Easing {
  */
 class CubicBezierEasing {
 public:
+  /** CSS's cubic-bezier(x1, y1, x2, y2). The x values are clamped to 0..1, which
+   *  keeps the curve a function of time; the y values are not, so a curve may
+   *  overshoot. */
   CubicBezierEasing(double x1, double y1, double x2, double y2)
       : x1_(clamp01(x1)), y1_(y1), x2_(clamp01(x2)), y2_(y2) {}
 
+  /** The eased value at progress `x`: 0 at or below 0, 1 at or above 1. */
   double operator()(double x) const {
     if (x <= 0.0) return 0.0;
     if (x >= 1.0) return 1.0;
@@ -126,11 +185,198 @@ private:
 };
 
 /**
+ * A spring, as an easing curve.
+ *
+ * ── Why a spring when Elastic and Back already overshoot ──
+ *
+ * Those are fixed shapes; a spring is a family with physical meaning, and it
+ * is what a designer specifying motion in a modern tool hands over -- "a
+ * response of 0.4 s with 20 % bounce", or a mass, a stiffness and a damping.
+ * The curve is the exact step response of a damped harmonic oscillator that
+ * starts at rest: 0 at the start, zero initial velocity, and for an
+ * underdamped spring a first overshoot of exp(-pi * zeta / sqrt(1 - zeta^2)),
+ * the textbook figure, which is what a test can hold it to.
+ *
+ * ── The reference's options, and the physical ones ──
+ *
+ * withFrequency, withAttenuation and withExtraAttenuationRange are the
+ * reference's parameterisation, with its defaults (3, 3, 0.25): FREQUENCY is
+ * how many oscillations fit in the animation's duration, ATTENUATION the
+ * exponential decay rate of their envelope over that duration. The last
+ * fraction of the duration -- the extra attenuation range -- is blended onto
+ * 1, so the animation ENDS on its target however lively the spring: a
+ * duration-based animator has to land when its time is up.
+ *
+ * fromPhysical(mass, stiffness, damping, seconds) and fromResponse(response,
+ * bounce, seconds) map a physical spring onto the same curve for an animation
+ * of the given length; settlingTime() says how long that spring actually
+ * takes, which is the duration to give it if it should not be cut short.
+ * Over- and critically-damped springs are handled exactly too -- they just
+ * never overshoot.
+ */
+class SpringEasingOptions {
+public:
+  /** The reference's defaults: frequency 3, attenuation 3, extra attenuation
+   *  range 0.25. */
+  SpringEasingOptions() { setFromReference(); }
+
+  /** A copy with `cyclesPerAnimation` oscillations inside the animation's
+   *  duration; a negative count is 0. */
+  SpringEasingOptions withFrequency(float cyclesPerAnimation) const {
+    SpringEasingOptions o = *this;
+    o.frequency_ = cyclesPerAnimation > 0.0f ? cyclesPerAnimation : 0.0f;
+    o.setFromReference();
+    return o;
+  }
+  /** A copy whose oscillations decay at `decayPerAnimation`, the exponential
+   *  rate over the whole duration; a negative rate is 0. */
+  SpringEasingOptions withAttenuation(float decayPerAnimation) const {
+    SpringEasingOptions o = *this;
+    o.attenuation_ = decayPerAnimation > 0.0f ? decayPerAnimation : 0.0f;
+    o.setFromReference();
+    return o;
+  }
+  /** Clamped to 0.05 .. 0.98, as the reference clamps it. */
+  SpringEasingOptions withExtraAttenuationRange(float range) const {
+    SpringEasingOptions o = *this;
+    o.extraRange_ = range < 0.05f ? 0.05f : (range > 0.98f ? 0.98f : range);
+    return o;
+  }
+
+  /** Oscillations per animation. */
+  float getFrequency() const { return frequency_; }
+  /** The envelope's decay rate per animation. */
+  float getAttenuation() const { return attenuation_; }
+  /** The closing fraction of the duration blended onto the target, 0.05..0.98. */
+  float getExtraAttenuationRange() const { return extraRange_; }
+
+  /** The damping ratio: below 1 it overshoots, 1 is critical, above is
+   *  sluggish. */
+  double dampingRatio() const { return zeta_; }
+
+  /**
+   * A mass on a spring with a damper, run for `seconds`.
+   *
+   * zeta = damping / (2 sqrt(stiffness * mass)), omega0 = sqrt(stiffness /
+   * mass); time is normalised by `seconds`, so the same spring given a longer
+   * animation simply has more of its motion inside it.
+   */
+  static SpringEasingOptions fromPhysical(double mass, double stiffness, double damping,
+                                          double seconds) {
+    SpringEasingOptions o;
+    if (!(mass > 0.0) || !(stiffness > 0.0) || !(seconds > 0.0)) return o;
+    const double omega0 = std::sqrt(stiffness / mass);
+    o.setFromPhysics(omega0 * seconds, (damping > 0.0 ? damping : 0.0) / (2.0 * std::sqrt(stiffness * mass)));
+    return o;
+  }
+
+  /**
+   * The designer's parameterisation: `response` is the undamped period in
+   * seconds, `bounce` 0 for no overshoot up to nearly 1 for a lot (negative
+   * is over-damped) -- zeta = 1 - bounce.
+   */
+  static SpringEasingOptions fromResponse(double response, double bounce, double seconds) {
+    SpringEasingOptions o;
+    if (!(response > 0.0) || !(seconds > 0.0)) return o;
+    const double b = bounce < -1.0 ? -1.0 : (bounce > 0.99 ? 0.99 : bounce);
+    o.setFromPhysics(6.283185307179586 / response * seconds, 1.0 - b);
+    return o;
+  }
+
+  /** How long a physical spring takes to stay within `tolerance` of its
+   *  target -- the duration that falls out of the physics. */
+  static double settlingTime(double mass, double stiffness, double damping,
+                             double tolerance = 0.001) {
+    if (!(mass > 0.0) || !(stiffness > 0.0) || !(damping > 0.0)) return 0.0;
+    const double omega0 = std::sqrt(stiffness / mass);
+    const double zeta = damping / (2.0 * std::sqrt(stiffness * mass));
+    const double tol = tolerance > 1e-12 ? tolerance : 1e-12;
+    // The slower of the decay rates bounds it: the envelope for an
+    // underdamped spring, the slow real root for an overdamped one.
+    const double rate =
+        zeta < 1.0 ? zeta * omega0 : omega0 * (zeta - std::sqrt(zeta * zeta - 1.0));
+    return std::log(1.0 / tol) / rate;
+  }
+
+  /** For an underdamped spring, how far past the target the first swing goes,
+   *  as a fraction of the distance; 0 for one that does not overshoot. Ignores
+   *  the extra attenuation range, which only touches the end. */
+  double overshoot() const {
+    if (!(zeta_ < 1.0)) return 0.0;
+    return std::exp(-3.141592653589793 * zeta_ / std::sqrt(1.0 - zeta_ * zeta_));
+  }
+
+  /** Where the first overshoot peaks, in normalised time; -1 if none. */
+  double peakTime() const {
+    if (!(zeta_ < 1.0)) return -1.0;
+    return 3.141592653589793 / (omega0_ * std::sqrt(1.0 - zeta_ * zeta_));
+  }
+
+  /** The curve: 0 at 0, exactly 1 at 1. */
+  double operator()(double t) const {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    const double raw = physical(t);
+    const double from = 1.0 - (double) extraRange_;
+    if (t <= from) return raw;
+    // Smoothstep onto the target over the last stretch: continuous in value
+    // and slope where it starts, and exactly 1 where it ends.
+    const double u = (t - from) / (double) extraRange_;
+    const double s = u * u * (3.0 - 2.0 * u);
+    return raw + (1.0 - raw) * s;
+  }
+
+private:
+  /** frequency (cycles per duration) and attenuation (decay per duration)
+   *  as an oscillator: omega_d = 2 pi f, zeta omega0 = a. */
+  void setFromReference() {
+    const double wd = 6.283185307179586 * (double) frequency_;
+    const double a = (double) attenuation_;
+    omega0_ = std::sqrt(wd * wd + a * a);
+    zeta_ = omega0_ > 0.0 ? a / omega0_ : 1.0;
+  }
+
+  /** And the other way, so the getters describe a physical spring too. */
+  void setFromPhysics(double omega0, double zeta) {
+    omega0_ = omega0 > 0.0 ? omega0 : 0.0;
+    zeta_ = zeta > 0.0 ? zeta : 0.0;
+    attenuation_ = (float) (zeta_ * omega0_);
+    frequency_ = zeta_ < 1.0
+                     ? (float) (omega0_ * std::sqrt(1.0 - zeta_ * zeta_) / 6.283185307179586)
+                     : 0.0f;
+  }
+
+  /** The step response of x'' + 2 zeta w0 x' + w0^2 x = w0^2, from rest. */
+  double physical(double t) const {
+    const double w0 = omega0_, z = zeta_;
+    if (!(w0 > 0.0)) return t; // no spring at all: linear rather than nothing
+    if (z < 1.0 - 1e-9) {
+      const double wd = w0 * std::sqrt(1.0 - z * z);
+      const double decay = std::exp(-z * w0 * t);
+      return 1.0 - decay * (std::cos(wd * t) + (z * w0 / wd) * std::sin(wd * t));
+    }
+    if (z <= 1.0 + 1e-9) return 1.0 - std::exp(-w0 * t) * (1.0 + w0 * t);
+    const double root = std::sqrt(z * z - 1.0);
+    const double r1 = w0 * (-z + root), r2 = w0 * (-z - root);
+    return 1.0 + (r2 * std::exp(r1 * t) - r1 * std::exp(r2 * t)) / (r1 - r2);
+  }
+
+  float frequency_ = 3.0f;
+  float attenuation_ = 3.0f;
+  float extraRange_ = 0.25f;
+  double omega0_ = 0.0;
+  double zeta_ = 1.0;
+};
+
+/**
  * Moves components' bounds over time.
  *
- * Holds raw pointers and does not own anything, like every other container
- * here. A component destroyed mid-flight must be removed with cancel() -- the
- * same contract MouseRouter::forget has, and for the same reason.
+ * Does not own anything, like every other container here. A component
+ * destroyed mid-flight is dropped at the next tick: each animation watches its
+ * component (detail::DeletionWatch). It used to be the caller's job to call
+ * cancel() first -- the contract MouseRouter::forget once had, and as easy to
+ * miss: a notice closed while it slid in, a panel deleted as it animated out,
+ * and the next tick set the bounds of freed memory and called its resized().
  */
 class Animator {
 public:
@@ -152,6 +398,7 @@ public:
     }
     Animation a;
     a.component = component;
+    a.alive = std::make_shared<detail::DeletionWatch>(component);
     a.from = component->bounds();
     a.to = target;
     a.startTime = now;
@@ -160,13 +407,27 @@ public:
     animations_.push_back(a);
   }
 
+  /** The same, moved by a spring. */
+  void animateBounds(Component* component, const Rect& target, double seconds, double now,
+                     const SpringEasingOptions& spring) {
+    animateBounds(component, target, seconds, now, Easing::Linear);
+    for (Animation& a : animations_)
+      if (a.component == component) {
+        a.spring = spring;
+        a.hasSpring = true;
+      }
+  }
+
+  /** Whether `component` has an animation in flight. */
   bool isAnimating(const Component* component) const {
     for (const Animation& a : animations_)
       if (a.component == component) return true;
     return false;
   }
 
+  /** Whether anything is in flight. */
   bool isAnimating() const { return !animations_.empty(); }
+  /** How many components are in flight; one animation each at most. */
   int count() const { return (int) animations_.size(); }
 
   /**
@@ -190,16 +451,23 @@ public:
       }
       const Rect to = animations_[i].to;
       Component* c = animations_[i].component;
+      const bool gone = animations_[i].gone();
       animations_.erase(animations_.begin() + (long) i);
-      if (moveToEnd && c) c->setBounds(to);
+      if (moveToEnd && c && !gone) c->setBounds(to);
     }
   }
 
+  /** Stop every animation: each component lands on its target if `moveToEnd`,
+   *  else stays where it is. A component destroyed in flight is not touched. */
   void cancelAll(bool moveToEnd) {
+    // Off the list first, as in cancel(): each setBounds runs resized(),
+    // which may start animations and reallocate the vector being walked.
+    // Whatever those callbacks start is theirs, and stays.
+    std::vector<Animation> ending;
+    ending.swap(animations_);
     if (moveToEnd)
-      for (Animation& a : animations_)
-        if (a.component) a.component->setBounds(a.to);
-    animations_.clear();
+      for (const Animation& a : ending)
+        if (a.component && !a.gone()) a.component->setBounds(a.to);
   }
 
   /**
@@ -227,7 +495,9 @@ public:
       auto it = std::find_if(animations_.begin(), animations_.end(),
                              [key](const Animation& a) { return a.component == key; });
       if (it == animations_.end()) continue; // cancelled by an earlier callback
-      if (!it->component) {
+      // Destroyed since the last tick, or by an earlier callback in this one:
+      // dropped, never touched.
+      if (!it->component || it->gone()) {
         animations_.erase(it);
         continue;
       }
@@ -240,7 +510,7 @@ public:
       const bool finished = t >= 1.0;
       if (finished) t = 1.0;
 
-      const float f = (float) ease(t, it->easing);
+      const float f = (float) (it->hasSpring ? it->spring(t) : ease(t, it->easing));
       Component* comp = it->component;
       const Rect to = it->to;
       const Rect now_ = Rect(lerp(it->from.x, it->to.x, f), lerp(it->from.y, it->to.y, f),
@@ -266,27 +536,27 @@ public:
     return moved;
   }
 
-  static double ease(double t, Easing easing) {
-    if (t <= 0.0) return 0.0;
-    if (t >= 1.0) return 1.0;
-    switch (easing) {
-      case Easing::In: return t * t;
-      case Easing::Out: return 1.0 - (1.0 - t) * (1.0 - t);
-      case Easing::InOut:
-        return t < 0.5 ? 2.0 * t * t : 1.0 - 2.0 * (1.0 - t) * (1.0 - t);
-      default: return t;
-    }
-  }
+  /** easeCurve, by the name this class has always had for it. */
+  static double ease(double t, Easing easing) { return easeCurve(t, easing); }
 
 private:
   static float lerp(float from, float to, float f) { return from + (to - from) * f; }
 
+  /** One component in flight: its bounds when it started and where it is
+   *  going, in seconds on the caller's clock, shaped by `easing` -- or by
+   *  `spring` when hasSpring is set. At most one per component. */
   struct Animation {
     Component* component = nullptr;
+    /** Marked if `component` is destroyed; shared so an Animator stays
+     *  copyable. */
+    std::shared_ptr<detail::DeletionWatch> alive;
+    bool gone() const { return alive && alive->deleted; }
     Rect from, to;
     double startTime = 0.0;
     double duration = 0.0;
     Easing easing = Easing::Out;
+    SpringEasingOptions spring;
+    bool hasSpring = false;
   };
 
   std::vector<Animation> animations_;
@@ -360,18 +630,34 @@ public:
     return id;
   }
 
+  /** With a spring: overshoots as the spring says and still lands exactly on
+   *  `to` when `duration` is up. */
+  int animateWithSpring(Setter setter, double from, double to, double duration, double now,
+                        const SpringEasingOptions& spring, double delay = 0.0) {
+    const int id = animate(std::move(setter), from, to, duration, now, Easing::Linear, delay);
+    for (Running& running : animations_)
+      if (running.id == id) {
+        running.spring = spring;
+        running.hasSpring = true;
+      }
+    return id;
+  }
+
   /** Told when one finishes, by handle. What chains a callback onto the end
    *  without a sequence type. */
   std::function<void(int id)> onFinished;
 
+  /** Whether anything is running or waiting out its delay. */
   bool isAnimating() const { return !animations_.empty(); }
 
+  /** Whether the animation with handle `id` is still running or delayed. */
   bool isAnimating(int id) const {
     for (const Running& running : animations_)
       if (running.id == id) return true;
     return false;
   }
 
+  /** How many are running or delayed. */
   int numAnimating() const { return (int) animations_.size(); }
 
   /**
@@ -394,6 +680,8 @@ public:
     }
   }
 
+  /** Stop every animation: each setter is given its target if `moveToEnd`, else
+   *  nothing more. onFinished is not called. */
   void cancelAll(bool moveToEnd) {
     // Over a COPY, because a setter can start another animation -- which is
     // how a caller chains one onto the end -- and that would grow the vector
@@ -438,8 +726,9 @@ public:
       const double elapsed = now - it->start;
       double progress = elapsed / it->duration;
       if (progress > 1.0) progress = 1.0;
-      const double shaped =
-          it->hasCurve ? it->curve(progress) : ease(progress, it->easing);
+      const double shaped = it->hasSpring  ? it->spring(progress)
+                            : it->hasCurve ? it->curve(progress)
+                                           : ease(progress, it->easing);
       const double value = it->from + (it->to - it->from) * shaped;
 
       auto setter = it->setter;
@@ -447,11 +736,12 @@ public:
       const bool done = progress >= 1.0;
 
       if (done) {
-        // Off the list first, exact target second -- Back and Elastic do not
-        // end at exactly 1, and the erase-before-callback keeps a re-entrant
-        // setter from dangling this entry.
+        // Off the list first, then the exact target -- once. The interpolated
+        // value at the end is the target up to rounding (0.1 + 0.2 is not
+        // 0.3), and calling the setter with both sent a parameter-writing
+        // setter's host two edits for one landing. The erase-before-callback
+        // keeps a re-entrant setter from dangling this entry.
         animations_.erase(it);
-        if (setter) setter(value);
         if (setter) setter(to);
         finished.push_back(id);
       } else if (setter) {
@@ -468,51 +758,12 @@ public:
   }
 
   /** The curve alone, for anything drawing its own interpolation. */
-  static double ease(double t, Easing easing) {
-    if (t <= 0.0) return 0.0;
-    if (t >= 1.0) return 1.0;
-    switch (easing) {
-      case Easing::Linear: return t;
-      case Easing::In: return t * t;
-      case Easing::Out: return 1.0 - (1.0 - t) * (1.0 - t);
-      case Easing::InOut: return t < 0.5 ? 2.0 * t * t : 1.0 - 2.0 * (1.0 - t) * (1.0 - t);
-      case Easing::Back: {
-        // 1.70158 is the constant that gives roughly a ten percent overshoot,
-        // which is the one every animation library uses because it reads as
-        // deliberate rather than as a bug.
-        const double c = 1.70158;
-        const double u = t - 1.0;
-        return u * u * ((c + 1.0) * u + c) + 1.0;
-      }
-      case Easing::Elastic: {
-        const double period = 0.3;
-        const double u = t - 1.0;
-        return std::pow(2.0, -10.0 * t) * std::sin((u - period / 4.0) * 6.28318530718 / period) +
-               1.0;
-      }
-      case Easing::Bounce: {
-        // The textbook form writes `7.5625 * (u -= a) * u`, which modifies u
-        // and reads it in the same unsequenced expression -- undefined
-        // behaviour that gcc flags, and that an optimiser is free to evaluate
-        // in either order. The shift is a statement of its own here.
-        double u = t;
-        if (u < 1.0 / 2.75) return 7.5625 * u * u;
-        if (u < 2.0 / 2.75) {
-          u -= 1.5 / 2.75;
-          return 7.5625 * u * u + 0.75;
-        }
-        if (u < 2.5 / 2.75) {
-          u -= 2.25 / 2.75;
-          return 7.5625 * u * u + 0.9375;
-        }
-        u -= 2.625 / 2.75;
-        return 7.5625 * u * u + 0.984375;
-      }
-    }
-    return t;
-  }
+  static double ease(double t, Easing easing) { return easeCurve(t, easing); }
 
 private:
+  /** One value in flight, known by the id animate() returned. `start` already
+   *  includes the delay. The shape is the spring if hasSpring, else the curve
+   *  if hasCurve, else `easing`. */
   struct Running {
     int id = 0;
     Setter setter;
@@ -521,6 +772,8 @@ private:
     Easing easing = Easing::Out;
     CubicBezierEasing curve{0.25, 0.1, 0.25, 1.0};
     bool hasCurve = false;
+    SpringEasingOptions spring;
+    bool hasSpring = false;
   };
 
   std::vector<Running> animations_;

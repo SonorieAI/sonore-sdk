@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Sonore SDK example: a sidechain ducker, the classic "kick pushes the bass
-// down" tool. Its whole reason to exist is the THIRD process() argument: the
+// down" tool. Its whole reason to exist is the SECOND process() argument: the
 // key input arrives on a second stereo bus that every format wrapper grows
 // automatically when the DSP declares the sidechain signature. No custom UI on
-// purpose: this example also proves the generated fallback faceplate.
+// purpose: this example also proves the SDK-drawn native editor, which is
+// what a plugin without a page of its own gets.
 #define SONORE_NUM_PARAMS 4
 
 #include <string>
@@ -62,9 +63,12 @@ struct SonoreDsp {
       lastRelease = p[2];
     }
 
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float outTarget = sonore::dbToGain(p[3]);
     for (size_t i = 0; i < n; ++i) {
       const float amount = duckSm.next(p[0] * 0.01f); // percentage control
-      const float outGain = outSm.next(sonore::dbToGain(p[3]));
+      const float outGain = outSm.next(outTarget);
       const float key =
           scL ? (std::fabs(scL[i]) > std::fabs(scR[i]) ? scL[i] : scR[i]) : 0.0f;
       // The louder the key, the further the main signal ducks. env is a peak
@@ -101,21 +105,4 @@ static const sonore::PluginDescriptor kDesc = {
     "dynamics", // -> lv2:DynamicsPlugin and friends per format
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

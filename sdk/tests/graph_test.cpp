@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -52,6 +53,53 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 using sonore::host::PluginGraph;
+
+/** A real plugin that refuses to prepare past a block size, the way one with a
+ *  fixed-size internal buffer does. Everything else is passed straight to it. */
+struct RefusesLargeBlocks : sonore::host::HostedPlugin {
+  std::unique_ptr<sonore::host::HostedPlugin> p;
+  uint32_t limit;
+  RefusesLargeBlocks(std::unique_ptr<sonore::host::HostedPlugin> inner, uint32_t maxBlock)
+      : p(std::move(inner)), limit(maxBlock) {}
+
+  bool prepare(double rate, uint32_t block, uint32_t channels) override {
+    return block <= limit && p->prepare(rate, block, channels);
+  }
+  const sonore::host::PluginDescription& description() const override { return p->description(); }
+  bool isValid() const override { return p->isValid(); }
+  void release() override { p->release(); }
+  void reset() override { p->reset(); }
+  void process(sonore::AudioBlock<float>& io, const sonore::MidiBuffer* midi) override {
+    p->process(io, midi);
+  }
+  uint32_t latencySamples() const override { return p->latencySamples(); }
+  uint32_t tailSamples() const override { return p->tailSamples(); }
+  bool acceptsMidi() const override { return p->acceptsMidi(); }
+  bool hasAudioInput() const override { return p->hasAudioInput(); }
+  int numParameters() const override { return p->numParameters(); }
+  const sonore::host::HostedParam& parameter(int i) const override { return p->parameter(i); }
+  double parameterValue(int i) const override { return p->parameterValue(i); }
+  bool setParameterValue(int i, double v) override { return p->setParameterValue(i, v); }
+  std::string parameterText(int i, double v) const override { return p->parameterText(i, v); }
+  bool saveState(std::vector<uint8_t>& out) const override { return p->saveState(out); }
+  bool loadState(const uint8_t* d, size_t n) override { return p->loadState(d, n); }
+  const sonore::MidiBuffer& producedMidi() const override { return p->producedMidi(); }
+  bool setBypassed(bool b) override { return p->setBypassed(b); }
+  bool isBypassed() const override { return p->isBypassed(); }
+  bool hasBypass() const override { return p->hasBypass(); }
+  int numPresets() const override { return p->numPresets(); }
+  std::string presetName(int i) const override { return p->presetName(i); }
+  bool loadPreset(int i) override { return p->loadPreset(i); }
+  size_t drainParameterEdits(std::vector<sonore::host::ParamEdit>& out) override {
+    return p->drainParameterEdits(out);
+  }
+  bool hasEditor() const override { return p->hasEditor(); }
+  bool openEditor(void* parent) override { return p->openEditor(parent); }
+  void closeEditor() override { p->closeEditor(); }
+  void idleEditor() override { p->idleEditor(); }
+  bool editorSize(uint32_t& w, uint32_t& h) const override { return p->editorSize(w, h); }
+  bool setEditorScale(double s) override { return p->setEditorScale(s); }
+};
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -338,6 +386,51 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ── A block that is not processed hands on no MIDI ────────────────────────
+  //
+  // producedMidi() is "cleared and refilled every block". A CLAP block that
+  // returned before reaching the plugin -- longer than prepared, or empty --
+  // left the last processed block's notes there, and a graph handed them to
+  // the next node again.
+  {
+    const sonore::host::PluginDescription* arp = nullptr;
+    for (const auto& d : found)
+      if (!arp && d.name.find("Arp") != std::string::npos) arp = &d;
+    if (arp) {
+      auto plugin = sonore::host::loadPlugin(*arp);
+      const bool prepared = plugin && plugin->prepare(48000.0, 64, 2);
+      std::vector<float> left(128, 0.0f), right(128, 0.0f);
+      float* ch[2] = {left.data(), right.data()};
+      sonore::MidiBuffer held;
+      held.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+      int emitted = 0;
+      for (int i = 0; prepared && i < 400 && emitted == 0; ++i) {
+        sonore::AudioBlock<float> io(ch, 2, 64);
+        plugin->process(io, i == 0 ? &held : nullptr);
+        emitted = plugin->producedMidi().getNumEvents();
+      }
+      int afterLong = -1, afterEmpty = -1;
+      if (emitted > 0) {
+        sonore::AudioBlock<float> tooLong(ch, 2, 128);
+        plugin->process(tooLong, nullptr);
+        afterLong = plugin->producedMidi().getNumEvents();
+        // Back to a block that emits, so the empty one has something to clear.
+        for (int i = 0; i < 400; ++i) {
+          sonore::AudioBlock<float> io(ch, 2, 64);
+          plugin->process(io, nullptr);
+          if (plugin->producedMidi().getNumEvents() > 0) break;
+        }
+        sonore::AudioBlock<float> empty(ch, 2, 0);
+        plugin->process(empty, nullptr);
+        afterEmpty = plugin->producedMidi().getNumEvents();
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "an arpeggiator's notes are not handed on again by a block "
+                    "too long (%d left) or empty (%d left)", afterLong, afterEmpty);
+      check(emitted > 0 && afterLong == 0 && afterEmpty == 0, line);
+    }
+  }
+
   // ── An empty graph is silent, not broken ──────────────────────────────────
   {
     PluginGraph empty;
@@ -349,6 +442,36 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < block; ++i)
       if (l[i] != 0.0f) silent = false;
     check(silent, "…and passes nothing, because nothing connects its input to its output");
+  }
+
+  // ── A re-prepare one plugin refuses leaves the graph unprepared ───────────
+  //
+  // The block size changed before the nodes were asked and the buffers were
+  // only re-sized after, so a refusal left the old prepare's flag standing and
+  // process() walked buffers sized for 256 at a stride of 1024 -- off the end
+  // of the heap block at ANY block size. Refused means not running: the block
+  // comes out SILENT, as it does from a graph never prepared at all. (It used
+  // to pass untouched, which sent the dry input out as the graph's answer.)
+  {
+    PluginGraph graph;
+    const auto picky = graph.addNode(
+        std::make_unique<RefusesLargeBlocks>(sonore::host::loadPlugin(*plain), block));
+    const auto after = graph.addNode(sonore::host::loadPlugin(*plain));
+    graph.connect(PluginGraph::kInput, picky);
+    graph.connect(picky, after);
+    graph.connect(after, PluginGraph::kOutput);
+    check(graph.prepare(48000.0, block, 2), "a graph prepares at a size every node accepts");
+    check(!graph.prepare(48000.0, block * 4, 2),
+          "…and re-preparing at a size one node refuses says so");
+
+    fill(11u);
+    sonore::AudioBlock<float> io(channels, 2, block);
+    graph.process(io, nullptr);
+    bool silent = true;
+    for (float v : l) silent = silent && v == 0.0f;
+    check(silent, "…and the refused graph does not run on its old buffers at the new "
+                  "stride: the block comes out silent");
+    check(graph.prepare(48000.0, block, 2), "preparing again at the accepted size recovers it");
   }
 
   // ── process() allocates nothing ───────────────────────────────────────────

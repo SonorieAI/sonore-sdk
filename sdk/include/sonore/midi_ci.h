@@ -2,7 +2,7 @@
 // Sonore SDK: MIDI Capability Inquiry.
 //
 // How a MIDI 2.0 device and a plugin introduce themselves: who are you, what
-// can you do, and, the part that is actually useful, hand me your parameter
+// can you do, and (the part that is actually useful) hand me your parameter
 // list so I can map my knobs to it without the user doing it by hand.
 //
 // This is the MESSAGE LAYER only, and deliberately so. Every CI message is a
@@ -29,12 +29,12 @@ namespace midici {
 
 /** The message types this SDK models. The numbering is the specification's. */
 enum class MessageType : uint8_t {
-  Discovery = 0x70,
-  DiscoveryReply = 0x71,
-  InvalidateMuid = 0x7E,
-  Nak = 0x7F,
-  PropertyCapabilitiesInquiry = 0x30,
-  PropertyCapabilitiesReply = 0x31,
+  Discovery = 0x70,                   ///< "Who is there?", with the sender's identity.
+  DiscoveryReply = 0x71,              ///< The answer, with the replier's identity.
+  InvalidateMuid = 0x7E,              ///< A MUID is no longer in use.
+  Nak = 0x7F,                         ///< A refusal; also what an unparsed Message holds.
+  PropertyCapabilitiesInquiry = 0x30, ///< Property exchange: what can you do?
+  PropertyCapabilitiesReply = 0x31,   ///< ...and the answer.
 };
 
 /** Broadcast destination: every device answers. */
@@ -43,16 +43,27 @@ constexpr uint32_t kBroadcastMuid = 0x0FFFFFFF;
 /** The CI version this SDK speaks. */
 constexpr uint8_t kCiVersion = 0x02; // MIDI-CI 1.2
 
+/** Discovery's category bits, as the specification numbers them. Bit 0 is
+ *  reserved, and bit 1 is NOT property exchange: claiming it said "protocol
+ *  negotiation" and nothing else, so a controller never asked for the
+ *  parameter list it was meant to fetch. */
+constexpr uint8_t kCategoryProtocolNegotiation = 0x02;
+constexpr uint8_t kCategoryProfiles = 0x04;         ///< Profile configuration.
+constexpr uint8_t kCategoryPropertyExchange = 0x08; ///< Property exchange: the parameter list a controller fetches.
+constexpr uint8_t kCategoryProcessInquiry = 0x10;   ///< Process inquiry.
+
 /** A device's identity, as it appears in Discovery and its reply. */
 struct DeviceIdentity {
-  uint32_t muid = 0;                 // 28 bits: the sender's temporary identity
-  uint8_t manufacturer[3] = {0, 0, 0};
-  uint16_t family = 0;
-  uint16_t model = 0;
-  uint8_t version[4] = {0, 0, 0, 0};
-  /** Bit 1 = property exchange, bit 2 = profile configuration. */
+  uint32_t muid = 0;                   ///< 28 bits: the sender's temporary identity.
+  uint8_t manufacturer[3] = {0, 0, 0}; ///< The SysEx manufacturer ID, three seven-bit bytes.
+  uint16_t family = 0;                 ///< Device family, 14 bits.
+  uint16_t model = 0;                  ///< Model within the family, 14 bits.
+  uint8_t version[4] = {0, 0, 0, 0};   ///< Software revision, four seven-bit bytes.
+  /** The specification's "Capability Inquiry Category Supported" bitmap:
+   *  kCategoryProtocolNegotiation (deprecated in 1.2), kCategoryProfiles,
+   *  kCategoryPropertyExchange, kCategoryProcessInquiry. */
   uint8_t categories = 0;
-  uint32_t maxSysExSize = 512;
+  uint32_t maxSysExSize = 512; ///< The longest SysEx it accepts, in bytes; 28 bits on the wire.
 };
 
 namespace detail {
@@ -164,13 +175,13 @@ inline std::vector<uint8_t> encodeInvalidateMuid(uint32_t sourceMuid, uint32_t t
 
 /** What a parsed message carries. */
 struct Message {
-  MessageType type = MessageType::Nak;
-  uint8_t ciVersion = 0;
-  uint8_t deviceId = 0x7f;
-  uint32_t sourceMuid = 0;
-  uint32_t destinationMuid = 0;
-  DeviceIdentity identity; // filled for Discovery and its reply
-  std::vector<uint8_t> payload; // whatever followed the header, unparsed
+  MessageType type = MessageType::Nak; ///< Its type byte, which may be one this SDK does not model.
+  uint8_t ciVersion = 0;               ///< The sender's MIDI-CI version byte.
+  uint8_t deviceId = 0x7f;             ///< The device ID byte: 0x7F is the whole function block.
+  uint32_t sourceMuid = 0;             ///< Who sent it, 28 bits.
+  uint32_t destinationMuid = 0;        ///< Who it is for; kBroadcastMuid for everyone.
+  DeviceIdentity identity;             ///< Filled for Discovery and its reply.
+  std::vector<uint8_t> payload;        ///< Whatever followed the header, unparsed, F7 not included.
 };
 
 /**
@@ -226,7 +237,7 @@ inline DeviceIdentity makeIdentity(uint32_t muid, const char* manufacturerId = "
   identity.muid = muid & 0x0FFFFFFF;
   for (int i = 0; i < 3; ++i)
     identity.manufacturer[i] = (uint8_t) (manufacturerId[i] & 0x7f);
-  identity.categories = 0x02; // property exchange
+  identity.categories = kCategoryPropertyExchange;
   identity.maxSysExSize = 512;
   return identity;
 }

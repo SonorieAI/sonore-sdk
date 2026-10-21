@@ -31,6 +31,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "tone.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -91,6 +94,8 @@ inline void bilinear(int order, const double* b, const double* a, double fs, dou
  */
 class TiltEq {
 public:
+  /** The rate in Hz; one of 1 or less, or NaN, is taken as 48000. The two
+   *  shelves are designed again for it, pivot and tilt kept. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     low_.setSampleRate(sr_);
@@ -101,16 +106,21 @@ public:
   void setPivot(float hz) { pivot_ = clampf(hz, 50.0f, 10000.0f); update(); }
   /** Total tilt in dB, end to end: the extremes move by half of this each. */
   void setTilt(float db) { tiltDb_ = clampf(db, -24.0f, 24.0f); update(); }
+  /** Clear the two shelves' state; the settings stay. */
   void reset() { low_.reset(); high_.reset(); }
 
+  /** [audio-thread] One sample through the low shelf and then the high one.
+   *  Allocation-free. */
   inline float process(float x) { return high_.process(low_.process(x)); }
 
 private:
   void update() {
-    low_.lowShelf(pivot_, 0.7071f, -tiltDb_ * 0.5f);
-    high_.highShelf(pivot_, 0.7071f, tiltDb_ * 0.5f);
+    low_.lowShelf(pivot_, 0.7071, -tiltDb_ * 0.5);
+    high_.highShelf(pivot_, 0.7071, tiltDb_ * 0.5);
   }
-  Biquad low_, high_;
+  // Double: in float sections a 50 Hz pivot at 384 kHz moved itself by
+  // 1.1 dB and the 20 Hz end by another 1.2 (see IirSection).
+  IirSection low_, high_;
   float sr_ = 48000.0f, pivot_ = 1000.0f, tiltDb_ = 0.0f;
 };
 
@@ -127,42 +137,62 @@ public:
    *  the pots, cBass across each half of the bass pot, cTreble in series with
    *  each end of the treble pot, rTrebleEnd the stop that bounds the treble. */
   struct Components {
-    float rIn = 10e3f, rFeedback = 10e3f;
-    float rBass = 100e3f, cBass = 22e-9f;
-    float rTreble = 100e3f, cTreble = 4.7e-9f, rTrebleEnd = 2.2e3f;
+    /** Ohms: the input arm's fixed resistor. */
+    float rIn = 10e3f, rFeedback = 10e3f; ///< ohms: the feedback arm's fixed resistor
+    /** The bass pot's whole track, in ohms. */
+    float rBass = 100e3f, cBass = 22e-9f; ///< farads, across each half of the bass pot
+    /** The treble pot's whole track, in ohms. */
+    float rTreble = 100e3f, cTreble = 4.7e-9f, /**< farads, at each end of the treble pot */ rTrebleEnd = 2.2e3f; ///< ohms in series with each treble arm, bounding its boost and cut
   };
 
+  /** The rate in Hz; one of 1 or less, or NaN, is taken as 48000. The pots
+   *  keep their positions, and setBass()/setTreble() placed them on the
+   *  response at the rate of the time: set the rate first, or call those
+   *  again after it, for the readings they promise. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     update();
   }
+  /** Other parts: a different flavour of the same network. Nothing checks
+   *  them, so give positive values. The pots keep their positions, which with
+   *  other parts read other decibels: call setBass()/setTreble() again to
+   *  keep a level. */
   void setComponents(const Components& c) {
     parts_ = c;
     update();
   }
   /** Pot positions, 0..1: cut, flat at 0.5, boost. */
   void setBassPot(float p) { bass_ = clampf(p, 0.0f, 1.0f); update(); }
+  /** The treble pot, 0..1 the same way. */
   void setTreblePot(float p) { treble_ = clampf(p, 0.0f, 1.0f); update(); }
-  /** Decibels AT 30 Hz: the pot is placed by bisection on the circuit's own
+  /** Decibels AT 30 Hz: the pot is placed by bisection on the filter's own
    *  response, so the number on the knob is what a meter reads at the bottom
    *  of the band rather than an asymptote the shelf never quite reaches. The
    *  response is monotone in the pot, which is what makes bisection exact. */
   void setBass(float db) { bass_ = seek(true, clampf(db, -30.0f, 30.0f), 30.0); update(); }
   /** Decibels at 15 kHz, the same way. */
   void setTreble(float db) { treble_ = seek(false, clampf(db, -30.0f, 30.0f), 15000.0); update(); }
+  /** The bass pot's position, 0..1 (0.5 flat): as set, or where setBass()
+   *  placed it. */
   float bassPot() const { return bass_; }
+  /** The treble pot's position, 0..1 (0.5 flat): as set, or where
+   *  setTreble() placed it. */
   float treblePot() const { return treble_; }
+  /** Clear the filter's state; parts and pots stay. */
   void reset() { z1_ = z2_ = z3_ = z4_ = 0.0; }
 
+  /** [audio-thread] One sample through the network, in double.
+   *  Allocation-free. A non-finite result comes out as 0, and the state drops
+   *  the NaN, so the next finite input is filtered normally. */
   inline float process(float x) {
     // Fourth-order transposed direct form II, in double.
     const double in = x;
     const double y = b_[0] * in + z1_;
-    z1_ = b_[1] * in - a_[1] * y + z2_;
-    z2_ = b_[2] * in - a_[2] * y + z3_;
-    z3_ = b_[3] * in - a_[3] * y + z4_;
-    z4_ = b_[4] * in - a_[4] * y;
-    return (float) y;
+    z1_ = keep(b_[1] * in - a_[1] * y + z2_);
+    z2_ = keep(b_[2] * in - a_[2] * y + z3_);
+    z3_ = keep(b_[3] * in - a_[3] * y + z4_);
+    z4_ = keep(b_[4] * in - a_[4] * y);
+    return std::isfinite(y) ? (float) y : 0.0f;
   }
 
   /** |H(jw)| of the circuit in dB, from the same polynomials the digital
@@ -186,16 +216,23 @@ public:
   }
 
 private:
-  /** The pot position at which the circuit reads `db` at `hz`, by bisection
-   *  on the analogue polynomials (the other pot held where it is). */
+  /** The pot position at which the FILTER reads `db` at `hz`, by bisection
+   *  (the other pot held where it is). On the digital response, not the
+   *  analogue one: the bilinear transform squeezes the top octave toward
+   *  Nyquist, so a pot placed on the circuit read +10.98 for +10 at 15 kHz
+   *  at 44.1 kHz and +10.05 at 192. Prewarping at 15 kHz would fix the top
+   *  and move the bass turnover by 0.59 at 44.1, so it is the placement that
+   *  answers to the digital filter instead. */
   float seek(bool bassPot, float db, double hz) {
     const float keepBass = bass_, keepTreble = treble_;
     double lo = 0.0, hi = 1.0;
+    double b[5], a[5];
     for (int i = 0; i < 40; ++i) {
       const double mid = 0.5 * (lo + hi);
       if (bassPot) bass_ = (float) mid; else treble_ = (float) mid;
       buildAnalog();
-      if (analogMagnitudeDb(hz) < (double) db) lo = mid; else hi = mid;
+      tonedetail::bilinear(4, sb_, sa_, (double) sr_, 0.0, b, a);
+      if (digitalMagnitudeDb(b, a, hz) < (double) db) lo = mid; else hi = mid;
     }
     bass_ = keepBass;
     treble_ = keepTreble;
@@ -206,6 +243,21 @@ private:
     buildAnalog();
     // The amplifier inverts; a tone control in a plugin should not.
     tonedetail::bilinear(4, sb_, sa_, (double) sr_, 0.0, b_, a_);
+  }
+
+  /** |H(e^jw)| in dB of fourth-order coefficients, at `hz` and this rate. */
+  double digitalMagnitudeDb(const double* b, const double* a, double hz) const {
+    const double w = 2.0 * 3.14159265358979323846 * hz / (double) sr_;
+    double nr = 0.0, ni = 0.0, dr = 0.0, di = 0.0;
+    for (int k = 0; k <= 4; ++k) {
+      const double c = std::cos(w * k), s = -std::sin(w * k); // z^-k
+      nr += b[k] * c;
+      ni += b[k] * s;
+      dr += a[k] * c;
+      di += a[k] * s;
+    }
+    const double mag = std::sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+    return 20.0 * std::log10(mag > 1e-12 ? mag : 1e-12);
   }
 
   void buildAnalog() {
@@ -240,6 +292,15 @@ private:
   float sr_ = 48000.0f, bass_ = 0.5f, treble_ = 0.5f;
   double sb_[5]{}, sa_[5]{};
   double b_[5] = {1, 0, 0, 0, 0}, a_[5] = {1, 0, 0, 0, 0};
+  /** State to zero once it is too small to matter, and when it is not a
+   *  number at all: as IirSection keeps its own. Kept, a decaying tail went
+   *  on into the float range's subnormals -- about 1,200 subnormal samples
+   *  after every stop -- which cost nothing here and slowed whatever
+   *  processed this output next; and one NaN in stayed in for good. */
+  static double keep(double z) {
+    const double m = std::fabs(z);
+    return (m >= 1e-30 && m <= 1e300) ? z : 0.0;
+  }
   double z1_ = 0, z2_ = 0, z3_ = 0, z4_ = 0;
 };
 

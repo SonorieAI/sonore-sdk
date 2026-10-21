@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 
+#include "path_io.h"
+
 namespace sonore {
 
 /** What came out of a .vstpreset: which plugin it is for, and its state. */
@@ -39,12 +41,18 @@ struct Vst3PresetFile {
    *  not an error to read and IS an error to apply, so the two are separate
    *  steps and this is what a caller compares. */
   std::string classId;
+  /** The "Comp" chunk: the bytes the plugin's getState() wrote, to hand to
+   *  its setState(). Never empty after a successful read. */
   std::vector<uint8_t> componentState;
+  /** The "Cont" chunk, the controller's own state; empty when the file has
+   *  none, which this SDK's writer never adds. */
   std::vector<uint8_t> controllerState;
 };
 
+/** The byte order of the container: every integer little-endian. */
 namespace presetfile {
 
+/** Append `v` as four little-endian bytes. */
 inline void putU32(std::vector<uint8_t>& out, uint32_t v) {
   out.push_back((uint8_t) (v & 0xff));
   out.push_back((uint8_t) ((v >> 8) & 0xff));
@@ -52,15 +60,18 @@ inline void putU32(std::vector<uint8_t>& out, uint32_t v) {
   out.push_back((uint8_t) ((v >> 24) & 0xff));
 }
 
+/** Append `v` as eight little-endian bytes. */
 inline void putU64(std::vector<uint8_t>& out, uint64_t v) {
   for (int i = 0; i < 8; ++i) out.push_back((uint8_t) ((v >> (i * 8)) & 0xff));
 }
 
+/** Four little-endian bytes at `p`. Not bounds-checked: the caller has. */
 inline uint32_t getU32(const uint8_t* p) {
   return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) |
          ((uint32_t) p[3] << 24);
 }
 
+/** Eight little-endian bytes at `p`. Not bounds-checked: the caller has. */
 inline uint64_t getU64(const uint8_t* p) {
   uint64_t v = 0;
   for (int i = 0; i < 8; ++i) v |= (uint64_t) p[i] << (i * 8);
@@ -107,12 +118,16 @@ inline bool writeVstPreset(const char* path, const std::string& classId,
 
   for (int i = 0; i < 8; ++i) out[listOffsetAt + (size_t) i] = (uint8_t) ((listOffset >> (i * 8)) & 0xff);
 
-  std::FILE* file = std::fopen(path, "wb");
+  std::FILE* file = ::sonore::pathio::open(path, "wb");
   if (!file) return false;
   const size_t written = std::fwrite(out.data(), 1, out.size(), file);
   std::fclose(file);
   return written == out.size();
 }
+
+/** The largest .vstpreset readVstPreset reads: the same 256 MB a preset of
+ *  the SDK's own format may be. */
+constexpr uint64_t kMaxVstPresetBytes = 256ull * 1024ull * 1024ull;
 
 /**
  * Read a .vstpreset.
@@ -123,21 +138,32 @@ inline bool writeVstPreset(const char* path, const std::string& classId,
  * applied is worse than one not applied, because the user cannot tell which
  * half.
  */
-inline bool readVstPreset(const char* path, Vst3PresetFile* out) {
+inline bool readVstPreset(const char* path, Vst3PresetFile* out,
+                          uint64_t maxBytes = kMaxVstPresetBytes) {
   if (!path || !out) return false;
   using namespace presetfile;
   out->classId.clear();
   out->componentState.clear();
   out->controllerState.clear();
 
-  std::FILE* file = std::fopen(path, "rb");
+  std::FILE* file = ::sonore::pathio::open(path, "rb");
   if (!file) return false;
   std::vector<uint8_t> bytes;
   char buffer[8192];
   size_t got = 0;
-  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0)
+  // Bounded: a file chosen in an import dialog is anything the user picked,
+  // and read whole it could be gigabytes -- all of it held in memory before
+  // the first check could refuse it.
+  bool tooBig = false;
+  while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    if ((uint64_t) bytes.size() + got > maxBytes) {
+      tooBig = true;
+      break;
+    }
     bytes.insert(bytes.end(), buffer, buffer + got);
+  }
   std::fclose(file);
+  if (tooBig) return false;
 
   // 4 magic + 4 version + 32 class id + 8 offset.
   if (bytes.size() < 48) return false;

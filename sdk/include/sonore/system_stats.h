@@ -65,12 +65,15 @@ namespace sonore {
 /** What the CPU can do, as it is RIGHT NOW rather than as the binary was
  *  built. See the header for why the two are different questions. */
 struct CpuFeatures {
-  bool sse2 = false;
-  bool sse41 = false;
-  bool avx = false;
-  bool avx2 = false;
+  bool sse2 = false;  ///< SSE2 (x86)
+  bool sse41 = false; ///< SSE4.1 (x86)
+  bool avx = false;   ///< AVX, and the OS saves the AVX registers (x86)
+  bool avx2 = false;  ///< AVX2; only ever true when avx is (x86)
+  /** FMA3 (x86); only ever true when avx is. FMA3 works on the AVX
+   *  registers, so it faults where the OS does not save them, whatever the
+   *  CPU reports. */
   bool fma = false;
-  bool neon = false;
+  bool neon = false;  ///< NEON: true for a build that targets it, which every arm64 build does
 };
 
 namespace statsdetail {
@@ -92,6 +95,8 @@ inline void cpuid(int leaf, int subleaf, int out[4]) {
 
 } // namespace statsdetail
 
+/** Asks the CPU at run time, with cpuid on x86. Where this build cannot
+ *  ask, everything but neon is false. */
 inline CpuFeatures cpuFeatures() {
   CpuFeatures out;
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(_M_ARM64)
@@ -109,7 +114,6 @@ inline CpuFeatures cpuFeatures() {
     statsdetail::cpuid(1, 0, info);
     out.sse2 = (info[3] & (1 << 26)) != 0;
     out.sse41 = (info[2] & (1 << 19)) != 0;
-    out.fma = (info[2] & (1 << 12)) != 0;
     // AVX needs the OS to have enabled the wider registers as well as the CPU
     // to have them: OSXSAVE, then XCR0's low two bits. A plugin that used AVX
     // on the strength of the CPU bit alone would fault on a machine whose
@@ -126,6 +130,9 @@ inline CpuFeatures cpuFeatures() {
 #endif
       out.avx = (xcr0 & 0x6) == 0x6;
     }
+    // FMA3 is an AVX instruction set: the same registers, the same fault
+    // where the OS does not save them. The CPU's bit alone said yes there.
+    out.fma = out.avx && (info[2] & (1 << 12)) != 0;
   }
   if (highestLeaf >= 7 && out.avx) {
     statsdetail::cpuid(7, 0, info);
@@ -206,6 +213,8 @@ inline int memorySizeMb() {
 #endif
 }
 
+/** "Windows", "macOS", "Linux" or "Unknown": the platform this was built
+ *  for. osVersion() has the version. */
 inline std::string osName() {
 #if defined(_WIN32)
   return "Windows";

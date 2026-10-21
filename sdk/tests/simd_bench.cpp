@@ -30,7 +30,7 @@ static double seconds(Clock::time_point a, Clock::time_point b) {
 }
 
 int main() {
-  std::printf("Sonore SIMD bench: backend: %s\n\n", sonore::simd::backend());
+  std::printf("Sonore SIMD bench (backend: %s)\n\n", sonore::simd::backend());
 
   const double sr = 48000.0;
   const size_t n = 48000 * 20; // 20 seconds of audio

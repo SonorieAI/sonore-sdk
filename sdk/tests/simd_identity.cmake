@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# The vector build and the SONORE_NO_SIMD build of simd_identity must print the
+# same hash: the same float bits out of every SIMD helper and the DSP on them.
+#
+#   cmake -DVECTOR=<simd_identity> -DSCALAR=<simd_identity_scalar> -P simd_identity.cmake
+foreach(which VECTOR SCALAR)
+  execute_process(COMMAND "${${which}}" OUTPUT_VARIABLE out_${which} RESULT_VARIABLE rc)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "${which} build exited ${rc}")
+  endif()
+  string(REGEX MATCH "backend ([a-z0-9-]+)" _ "${out_${which}}")
+  set(backend_${which} "${CMAKE_MATCH_1}")
+  string(REGEX MATCH "HASH ([0-9a-f]+)" _ "${out_${which}}")
+  set(hash_${which} "${CMAKE_MATCH_1}")
+endforeach()
+if(NOT backend_SCALAR STREQUAL "scalar")
+  message(FATAL_ERROR "the reference build is not scalar (${backend_SCALAR})")
+endif()
+if(backend_VECTOR STREQUAL "scalar")
+  message(WARNING "no vector unit on this target: comparing scalar with scalar")
+endif()
+if(NOT hash_VECTOR STREQUAL hash_SCALAR)
+  message(FATAL_ERROR "${backend_VECTOR} and scalar differ: ${hash_VECTOR} against ${hash_SCALAR}")
+endif()
+message(STATUS "${backend_VECTOR} and scalar agree bit for bit: ${hash_VECTOR}")

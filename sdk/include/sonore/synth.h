@@ -20,6 +20,9 @@
 //
 // Included by dsp.h. Uses Oscillator, Fft, DelayLine, OnePole, WhiteNoise.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "synth.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include <cstddef>
 #include "audio.h"
@@ -53,7 +56,10 @@ class Wavetable {
   static_assert(Mips >= 1, "at least one level");
 
 public:
+  /** Samples in one cycle: the template's Size, a power of two. */
   static constexpr size_t size() { return Size; }
+  /** Band-limited levels kept: mip m holds the harmonics up to
+   *  (Size/2) / 2^m. */
   static constexpr int mips() { return Mips; }
 
   /** Build from one cycle of Size samples. Runs at prepare() time. */
@@ -92,6 +98,8 @@ public:
     build(re_);
   }
 
+  /** Whether build() or buildAdditive() has run. Until one has, every read
+   *  is 0. */
   bool isBuilt() const { return built_; }
 
   /** Which mip an oscillator at `phaseIncrement` cycles/sample should read:
@@ -107,12 +115,19 @@ public:
     return m;
   }
 
-  /** Linear-interpolated read of one mip at a phase in turns. */
+  /** Linear-interpolated read of one mip at a phase in turns.
+   *
+   *  The index is WRAPPED, not trusted. A phase a hair below zero -- which
+   *  phase modulation produces in ordinary use -- leaves phase - floor(phase)
+   *  at 1 - 1e-9, which rounds to exactly 1.0f, so p came out as Size and t[p]
+   *  read one past the table: the next mip's first sample, or past the last
+   *  mip altogether. The same rounding DelayLine documents having fixed. */
   inline float read(int mip, float phase) const {
     const float p = (phase - std::floor(phase)) * (float) Size;
-    const size_t i0 = (size_t) p;
+    const size_t whole = (size_t) p;
+    const float frac = p - (float) whole;
+    const size_t i0 = whole & (Size - 1);
     const size_t i1 = (i0 + 1) & (Size - 1);
-    const float frac = p - (float) i0;
     const float* t = table_[mip];
     return t[i0] + frac * (t[i1] - t[i0]);
   }
@@ -128,15 +143,26 @@ private:
 template <typename Table = Wavetable<>>
 class WavetableOscillator {
 public:
+  /** The table to read, not owned: it must outlive every next() that reads
+   *  it. Null (the default) makes next() return 0. Changing it keeps the
+   *  phase. */
   void setTable(const Table* table) { table_ = table; }
+  /** Sample rate in Hz; 1 or less means 48 kHz. Does not recompute the
+   *  increment: call setFreq() after it. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Pitch in Hz, held to 0 .. half the sample rate (NaN reads as 0), and
+   *  the mip that keeps it alias-free. Cheap enough to call every sample. */
   inline void setFreq(float hz) {
     inc_ = clampf(hz, 0.0f, sr_ * 0.5f) / sr_;
     mip_ = Table::mipFor(inc_);
   }
+  /** Restart at `phase`, in turns (0..1). */
   void reset(float phase = 0.0f) { phase_ = phase; }
+  /** Where in the cycle the next sample is read, in turns, 0..1. */
   float phase() const { return phase_; }
 
+  /** The next sample: the chosen mip read at the phase, linearly
+   *  interpolated, then the phase advanced. No allocation. */
   inline float next() {
     if (!table_) return 0.0f;
     const float y = table_->read(mip_, phase_);
@@ -165,26 +191,51 @@ class UnisonOscillator {
   static_assert(MaxVoices >= 1 && MaxVoices <= 32, "1..32 voices");
 
 public:
-  enum class Shape { Saw, Square };
+  /** What each voice plays. */
+  enum class Shape {
+    Saw,   ///< polyBLEP sawtooth, the default: the supersaw
+    Square ///< polyBLEP square at 50% duty
+  };
 
+  /** Spread from the start, as reset() spreads them: only reset() did, and a
+   *  fresh supersaw's voices began in phase, 6 dB hot for its first 20 ms. */
+  UnisonOscillator() { reset(); }
+
+  /** Sample rate in Hz (1 or less means 48 kHz); retunes every voice. Call
+   *  it before the first render(): until it, setVoices(), setDetune() or
+   *  setSpread() has run, the pan gains are zero and the output is silent. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     for (int i = 0; i < MaxVoices; ++i) osc_[i].setSampleRate(sr_);
     update();
   }
+  /** Saw or square for every voice, from the next sample. */
   void setShape(Shape s) { shape_ = s; }
+  /** How many voices sound, clamped to 1..MaxVoices (1 by default). Places
+   *  them across the detune and the spread again, so it computes a pow, a
+   *  sine and a cosine per voice: a setting, not a per-sample call. */
   void setVoices(int n) { voices_ = n < 1 ? 1 : (n > MaxVoices ? MaxVoices : n); update(); }
   /** Total detune width in cents, outermost voice to outermost voice. */
   void setDetune(float cents) { detune_ = clampf(cents, 0.0f, 200.0f); update(); }
   /** 0 = all centred, 1 = outer voices hard left and right. */
   void setSpread(float s) { spread_ = clampf(s, 0.0f, 1.0f); update(); }
-  void setFreq(float hz) { freq_ = hz; update(); }
+  /** Cheap enough to call every sample (glide, pitch bend): one multiply per
+   *  voice. The detune ratios and pan gains depend only on the voice count,
+   *  the detune and the spread, and are kept from when those last changed --
+   *  recomputed here, they were 21 transcendentals a sample at seven voices,
+   *  13x the cost of rendering them. */
+  void setFreq(float hz) {
+    freq_ = hz;
+    for (int i = 0; i < voices_; ++i) osc_[i].setFreq(freq_ * ratio_[i]);
+  }
   /** Voices start at distinct phases so they do not stack into one saw for
    *  the first cycle and then drift apart audibly. */
   void reset() {
     for (int i = 0; i < MaxVoices; ++i) osc_[i].reset((float) i / (float) MaxVoices);
   }
 
+  /** One stereo sample: the voices panned and summed, scaled by
+   *  1/sqrt(voices). No allocation. */
   inline void render(float& left, float& right) {
     float l = 0.0f, r = 0.0f;
     for (int i = 0; i < voices_; ++i) {
@@ -203,7 +254,8 @@ private:
       // -1..+1 across the voices; a single voice sits at 0.
       const float pos = voices_ > 1 ? 2.0f * (float) i / (float) (voices_ - 1) - 1.0f : 0.0f;
       const float cents = pos * detune_ * 0.5f;
-      osc_[i].setFreq(freq_ * std::pow(2.0f, cents / 1200.0f));
+      ratio_[i] = std::pow(2.0f, cents / 1200.0f);
+      osc_[i].setFreq(freq_ * ratio_[i]);
       // Constant-power pan.
       const float pan = pos * spread_;                   // -1..+1
       const float angle = (pan + 1.0f) * 0.25f * kPi;    // 0..pi/2
@@ -213,6 +265,7 @@ private:
   }
 
   Oscillator osc_[MaxVoices];
+  float ratio_[MaxVoices]{};
   float gainL_[MaxVoices]{}, gainR_[MaxVoices]{};
   Shape shape_ = Shape::Saw;
   float sr_ = 48000.0f, freq_ = 440.0f, detune_ = 20.0f, spread_ = 0.7f, norm_ = 1.0f;
@@ -237,7 +290,12 @@ private:
  */
 class HardSyncOscillator {
 public:
+  /** Sample rate in Hz (1 or less means 48 kHz); re-applies the master
+   *  frequency. Call it, or setMasterFreq(), before the first next(): until
+   *  then nothing advances and the output is a constant -1. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; setMasterFreq(masterHz_); }
+  /** The pitch heard, in Hz (220 by default), held to 0 .. half the sample
+   *  rate; the slave runs at this times the ratio, held there too. */
   void setMasterFreq(float hz) {
     masterHz_ = clampf(hz, 0.0f, sr_ * 0.5f);
     masterInc_ = masterHz_ / sr_;
@@ -247,8 +305,21 @@ public:
   void setRatio(float ratio) { ratio_ = ratio < 0.0f ? 0.0f : ratio; setMasterFreq(masterHz_); }
   /** Off = the naive reset, for comparison. On is the default. */
   void setBandLimited(bool on) { blep_ = on; }
-  void reset() { master_ = 0.0f; slave_ = 0.0f; }
+  /** A fresh oscillator: the pending sync and wrap corrections too. Left
+   *  set, the first samples after a reset were corrected for a reset that
+   *  never happened -- up to 0.10 away from a fresh one. */
+  void reset() {
+    master_ = 0.0f;
+    slave_ = 0.0f;
+    syncHeight_ = 0.0f;
+    afterSync_ = 0.0f;
+    afterWrap_ = 0.0f;
+    justSynced_ = false;
+    justWrapped_ = false;
+  }
 
+  /** The next sample of the synced saw, -1..1 before the band-limiting
+   *  corrections. No allocation. */
   inline float next() {
     // Will the master wrap inside the NEXT sample? Then the reset is
     // imminent and this sample gets the "before" half of the residual.
@@ -274,7 +345,7 @@ public:
         const float x = afterSync_; // 0..1: how far after
         y -= 0.5f * syncHeight_ * (x + x - x * x - 1.0f);
       } else if (justWrapped_) {
-        const float x = slave_ / slaveInc_;
+        const float x = afterWrap_; // 0..1: how far after
         y -= x + x - x * x - 1.0f;
       }
     }
@@ -293,7 +364,17 @@ public:
       justSynced_ = true;
     } else {
       slave_ += slaveInc_;
-      if (slave_ >= 1.0f) { slave_ -= 1.0f; justWrapped_ = true; }
+      if (slave_ >= 1.0f) {
+        slave_ -= 1.0f;
+        // How far past the wrap, measured in the step that wrapped -- kept
+        // now, as afterSync_ is. Worked out on the next sample from the
+        // increment in force THEN, a pitch that fell in between (a legato
+        // note two octaves down) put it at up to 4 where the residual
+        // polynomial holds for 0..1, and the sample came out at 5.7; a
+        // ratio or a pitch set to 0 divided by zero and it came out NaN.
+        afterWrap_ = slave_ / slaveInc_;
+        justWrapped_ = true;
+      }
     }
     return y;
   }
@@ -301,7 +382,7 @@ public:
 private:
   float sr_ = 48000.0f, masterHz_ = 220.0f, ratio_ = 1.5f;
   float masterInc_ = 0.0f, slaveInc_ = 0.0f, master_ = 0.0f, slave_ = 0.0f;
-  float syncHeight_ = 0.0f, afterSync_ = 0.0f;
+  float syncHeight_ = 0.0f, afterSync_ = 0.0f, afterWrap_ = 0.0f;
   bool blep_ = true, justSynced_ = false, justWrapped_ = false;
 };
 
@@ -318,7 +399,12 @@ private:
  */
 class FmOperator {
 public:
+  /** Sample rate in Hz (1 or less means 48 kHz); re-applies the frequency.
+   *  Call it, or setFreq(), before the first render(): until then the phase
+   *  does not move. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; setFreq(hz_); }
+  /** Frequency in Hz (440 by default), held to 0 .. half the sample rate.
+   *  The request is kept and fitted again when the rate changes. */
   void setFreq(float hz) { hz_ = hz; inc_ = clampf(hz, 0.0f, sr_ * 0.5f) / sr_; }
   /** Self-modulation index in radians, 0..1.5. At 1 the loop is Tomisawa's
    *  feedback sawtooth -- the largest index for which sin(theta + beta y) is
@@ -328,9 +414,15 @@ public:
    *  the DX7's top feedback level is exactly that gritty and people use it;
    *  the first version allowed pi and called it "a saw". */
   void setFeedback(float radians) { feedback_ = clampf(radians, 0.0f, 1.5f); }
+  /** Linear output gain (1 by default), not clamped. A modulator's level is
+   *  part of the index it hands the next operator. */
   void setLevel(float level) { level_ = level; }
+  /** Restart at `phase`, in turns (0..1), with the feedback history empty. */
   void reset(float phase = 0.0f) { phase_ = phase; last1_ = last2_ = 0.0f; }
 
+  /** The next sample: sin(2 pi phase + phaseModRadians + feedback) times the
+   *  level, then the phase advanced. Pass another operator's output, scaled
+   *  by the modulation index, as `phaseModRadians`. No allocation. */
   inline float render(float phaseModRadians = 0.0f) {
     // The feedback is the AVERAGE of the last two outputs, which is how the
     // DX7 does it and the reason it has to: one sample of feedback at a high
@@ -362,20 +454,55 @@ private:
  */
 class Dahdsr {
 public:
+  /** The six settings: delay, attack, hold, decay and release in seconds
+   *  (each at least one sample long), sustain a level 0..1. The attack is a
+   *  straight ramp to 1 from wherever the level is; decay and release are
+   *  the times to fall 60 dB. */
   struct Parameters {
+    ///@{
+    /** In declaration order: delay, attack, hold, decay and release in
+     *  seconds; sustain a level, 0..1 and not clamped. */
     float delay = 0.0f, attack = 0.01f, hold = 0.0f, decay = 0.1f, sustain = 0.8f, release = 0.2f;
+    ///@}
   };
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
-  void setParameters(const Parameters& p) { p_ = p; }
+  /** Idle, with the default Parameters at 48 kHz. */
+  Dahdsr() { updateCoefficients(); }
+  /** Sample rate in Hz (1 or less means 48 kHz). The times are converted
+   *  at the new rate from the next sample, mid-note too. */
+  void setSampleRate(float sr) {
+    sr_ = sr > 1.0f ? sr : 48000.0f;
+    updateCoefficients();
+  }
+  /** Takes a copy; a sustain that is not finite becomes 0. Applies from the
+   *  next sample, to a sounding note too. Computes two exponentials: call
+   *  it when a setting changes, not every sample. */
+  void setParameters(const Parameters& p) {
+    p_ = p;
+    // A sustain that is not finite is none, as in ADSR: a NaN level never
+    // settles or falls idle, and the voice held NaN until reset().
+    if (!std::isfinite(p_.sustain)) p_.sustain = 0.0f;
+    updateCoefficients();
+  }
+  /** Start again from the delay stage. The level is kept, so a retrigger
+   *  ramps up from where the envelope was instead of stepping to 0. */
   void noteOn() { stage_ = Delay; counter_ = 0; }
+  /** Release from the current level, whatever the stage; idle stays idle. */
   void noteOff() { if (stage_ != Idle) stage_ = Release; }
+  /** False once the release has fallen below 1e-4 (-80 dB), or after
+   *  reset(): the voice can be freed. */
   bool isActive() const { return stage_ != Idle; }
+  /** Idle at 0 at once, with no release. */
   void reset() { stage_ = Idle; level_ = 0.0f; counter_ = 0; }
 
+  /** Advance one sample and return the level: 0..1 for a sustain in 0..1.
+   *  No allocation. */
   inline float getNextSample() {
     switch (stage_) {
       case Delay:
-        level_ = 0.0f;
+        // The level is HELD, not zeroed: from idle it is zero already, and a
+        // retrigger -- the same key again, a stolen voice -- starts from where
+        // the envelope is, as ADSR does. Zeroing it here was a step from
+        // sustain to silence in one sample.
         if (++counter_ >= samples(p_.delay)) { stage_ = Attack; counter_ = 0; }
         break;
       case Attack:
@@ -387,14 +514,14 @@ public:
         if (++counter_ >= samples(p_.hold)) { stage_ = Decay; counter_ = 0; }
         break;
       case Decay:
-        level_ = p_.sustain + decayK() * (level_ - p_.sustain);
+        level_ = p_.sustain + decayK_ * (level_ - p_.sustain);
         if (std::fabs(level_ - p_.sustain) < 1e-4f) { level_ = p_.sustain; stage_ = Sustain; }
         break;
       case Sustain:
         level_ = p_.sustain;
         break;
       case Release:
-        level_ *= releaseK();
+        level_ *= releaseK_;
         if (level_ < 1e-4f) { level_ = 0.0f; stage_ = Idle; }
         break;
       case Idle:
@@ -410,16 +537,27 @@ private:
   static constexpr float kDecay60 = 6.907755f; // ln(1000): the -60 dB convention
 
   int samples(float seconds) const {
-    const int n = (int) (seconds * sr_);
-    return n < 1 ? 1 : n;
+    // Held in float before the conversion: a NaN time fails every
+    // comparison, and a time of hours overflows an int, and either makes
+    // the cast undefined behaviour -- which x86 happens to turn into one
+    // sample and another target need not. A billion samples is over five
+    // hours even at 48 kHz.
+    const float n = seconds * sr_;
+    if (!(n >= 1.0f)) return 1;
+    if (n >= 1.0e9f) return 1000000000;
+    return (int) n;
   }
-  float decayK() const { return std::exp(-kDecay60 / (float) samples(p_.decay)); }
-  float releaseK() const { return std::exp(-kDecay60 / (float) samples(p_.release)); }
+  /** When the settings or the rate change, not per sample per voice. */
+  void updateCoefficients() {
+    decayK_ = std::exp(-kDecay60 / (float) samples(p_.decay));
+    releaseK_ = std::exp(-kDecay60 / (float) samples(p_.release));
+  }
 
   Stage stage_ = Idle;
   float sr_ = 48000.0f, level_ = 0.0f;
   int counter_ = 0;
   Parameters p_{};
+  float decayK_ = 0.0f, releaseK_ = 0.0f;
 };
 
 // ── Karplus-Strong ───────────────────────────────────────────────────────────
@@ -442,10 +580,18 @@ private:
  * loop gain is raised by that loss (Jaffe & Smith's compensation) so the
  * declared decay is the measured one at every damping -- capped just under
  * unity, because a loop gain above one at DC is an oscillator.
+ *
+ * MaxDelay is the longest period, so it sets the lowest note: the default
+ * 16384 holds 20 Hz at every rate up to 327 kHz. It was 4096, which is 47 Hz
+ * at 192 kHz -- every bass note below that sounded AT 47 Hz. A note below
+ * what the line can hold is now clamped to it in noteOn, where it is visible,
+ * rather than in the delay, where it was not.
  */
-template <int MaxDelay = 4096>
+template <int MaxDelay = 16384>
 class KarplusStrong {
 public:
+  /** Sample rate in Hz (1 or less means 48 kHz); re-designs the damping
+   *  filter and retunes the string. lowestHz() moves with it. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     damp_.setSampleRate(sr_);
@@ -461,20 +607,66 @@ public:
     retune();
   }
 
+  /** The lowest note the line holds at the current rate, never under 20 Hz. */
+  float lowestHz() const {
+    const float fits = sr_ / (float) (MaxDelay - 8);
+    return fits > 20.0f ? fits : 20.0f;
+  }
+
+  /** Pluck at `hz`, held to lowestHz() .. 0.45 x the sample rate, with
+   *  `velocity` as the linear level of the burst (0..1 is the usual range).
+   *  Empties the string first, then writes one period of noise into it:
+   *  that much work in this call, and no allocation. */
   void noteOn(float hz, float velocity) {
-    hz_ = clampf(hz, 20.0f, sr_ * 0.45f);
+    hz_ = clampf(hz, lowestHz(), sr_ * 0.45f);
     retune();
     // A period of noise, scaled by velocity, is the pluck.
+    //
+    // Scaled by the rate too. Each harmonic of a period of white noise
+    // carries 1/sqrt(period) of it, and the period in samples grows with the
+    // rate: the same note was 3 dB quieter at every doubling, 11 dB from
+    // 48 kHz to 384. sqrt(rate / 48 kHz) puts every harmonic a 48 kHz pluck
+    // has at the level it has there. Above 48 kHz the noise is first held to
+    // what a 48 kHz pluck contains -- a fourth-order lowpass at 24 kHz --
+    // or the scale would raise the first period's peak with ultrasound.
     line_.reset();
     damp_.reset();
+    const float scale = std::sqrt(sr_ / 48000.0f);
+    const bool limit = sr_ > 48000.0f;
+    SvfSection band[2];
+    for (SvfSection& b : band) {
+      b.setSampleRate(sr_);
+      b.lowpass(24000.0, 0.70710678);
+    }
     const int fill = (int) (sr_ / hz_) + 1;
-    for (int i = 0; i < fill && i < MaxDelay - 4; ++i) line_.write(noise_.next() * velocity);
+    for (int i = 0; i < fill && i < MaxDelay - 4; ++i) {
+      float v = noise_.next();
+      if (limit) v = band[1].process(band[0].process(v));
+      line_.write(v * scale * velocity);
+    }
     env_ = velocity;
+    // A new note is not releasing, whatever the last one on this voice did.
+    // Never cleared, every note after a voice's first note-off decayed with
+    // the release damping: 78 dB/s where the decay setting said 37.
+    releasing_ = false;
   }
+  /** Damp the string: the loop loses an extra 0.5% per pass, so it dies
+   *  faster than the decay says, until isActive() turns false. */
   void noteOff() { releasing_ = true; }
+  /** Whether a slow follower on the output is still above 1e-4 (-80 dB):
+   *  false once the string has rung out, or after reset(). */
   bool isActive() const { return env_ > 1e-4f; }
-  void reset() { line_.reset(); damp_.reset(); env_ = 0.0f; releasing_ = false; }
+  /** Silence at once, and the noise generator restarted, so the next noteOn
+   *  of a note plucks exactly as the first did. */
+  void reset() {
+    line_.reset();
+    damp_.reset();
+    noise_.reset(); // the same pluck again, for the same note
+    env_ = 0.0f;
+    releasing_ = false;
+  }
 
+  /** The next sample of the string. No allocation. */
   inline float render() {
     const float y = line_.readCubic(delay_);
     // A release just shortens the decay: the string is damped by a hand.
@@ -523,22 +715,34 @@ private:
 template <int MaxModes = 8>
 class ModalResonator {
 public:
+  /** Sample rate in Hz (1 or less means 48 kHz); redesigns every mode from
+   *  the frequencies and decays it was given. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     for (int i = 0; i < MaxModes; ++i) design(i);
   }
+  /** How many modes sound, from index 0: clamped to 0..MaxModes. It is 0
+   *  until set, and then the resonator is silent. Modes past it keep their
+   *  settings. */
   void setNumModes(int n) { modes_ = n < 0 ? 0 : (n > MaxModes ? MaxModes : n); }
+  /** Mode `index` (0-based; out of range is ignored): its frequency in Hz,
+   *  held to 1 Hz .. 0.49 x the sample rate; its -60 dB time in seconds, at
+   *  least 1 ms; and the peak of its impulse response, linear. Keeps the
+   *  mode's ringing. It only sounds if `index` is below setNumModes(). */
   void setMode(int index, float hz, float decaySeconds, float amplitude) {
     if (index < 0 || index >= MaxModes) return;
-    hz_[index] = clampf(hz, 1.0f, sr_ * 0.49f);
+    hz_[index] = hz > 1.0f ? hz : 1.0f; // the request; design() fits it to the rate
     decay_[index] = decaySeconds > 0.001f ? decaySeconds : 0.001f;
     amp_[index] = amplitude;
     design(index);
   }
+  /** Stops every mode ringing; the settings are kept. */
   void reset() {
     for (int i = 0; i < MaxModes; ++i) y1_[i] = y2_[i] = 0.0f;
   }
 
+  /** One sample of excitation in, the sum of the sounding modes out. An
+   *  impulse of 1 rings each mode at its amplitude. No allocation. */
   inline float process(float x) {
     float out = 0.0f;
     for (int i = 0; i < modes_; ++i) {
@@ -552,7 +756,12 @@ public:
 
 private:
   void design(int i) {
-    const float w = kTwoPi * hz_[i] / sr_;
+    // Clamped HERE, at the rate in force, not once when the mode was set: a
+    // 30 kHz mode set at 96 kHz and then moved to 44.1 rang at 14.1 kHz, its
+    // angle past pi and folded down. The request is kept, so going back up
+    // brings it back.
+    const float hz = clampf(hz_[i], 1.0f, sr_ * 0.49f);
+    const float w = kTwoPi * hz / sr_;
     const float r = std::pow(10.0f, -3.0f / (decay_[i] * sr_));
     b0_[i] = amp_[i] * std::sin(w);
     a1_[i] = 2.0f * r * std::cos(w);

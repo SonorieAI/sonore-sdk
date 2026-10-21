@@ -1,0 +1,76 @@
+// @NAME@ -- an effect built on the Sonore SDK.
+//
+// A plugin is a SonoreDsp struct, a parameter table, a descriptor and one
+// include at the end; the same file builds the CLAP, VST3, AU, LV2 and the
+// standalone app (see CMakeLists.txt). This one is a filter with a gain, to be
+// replaced by your own DSP.
+#define SONORE_NUM_PARAMS 2
+#include <sonore/dsp.h>
+
+struct SonoreDsp {
+  sonore::SVF filter[2]; // one per channel: a filter is its state
+  sonore::Smooth cutoffSm, gainSm;
+  bool fresh = true;
+
+  // Called before audio starts and whenever the rate or block size changes.
+  // It may also run on the audio thread (see the SDK README, "What runs
+  // where"), so it allocates nothing.
+  void prepare(const sonore::ProcessSpec& spec) {
+    for (auto& f : filter) {
+      f.setSampleRate((float) spec.sampleRate);
+      f.reset();
+    }
+    cutoffSm.setup((float) spec.sampleRate, 20.0f);
+    gainSm.setup((float) spec.sampleRate, 20.0f);
+    fresh = true;
+  }
+
+  // The audio thread: no allocation, no locks, no files.
+  void process(sonore::AudioBlock<float>& io, const float* p) {
+    const float gain = sonore::dbToGain(p[1]);
+    if (fresh) { // the first block starts AT the settings, not gliding in
+      cutoffSm.snap(p[0]);
+      gainSm.snap(gain);
+      fresh = false;
+    }
+    const size_t channels = io.getNumChannels() < 2 ? io.getNumChannels() : 2;
+    for (size_t i = 0; i < io.getNumSamples(); ++i) {
+      // Every control that reaches a coefficient or a gain is smoothed, or
+      // automation zippers.
+      const float hz = cutoffSm.next(p[0]), g = gainSm.next(gain);
+      for (size_t c = 0; c < channels; ++c) {
+        float& x = io.getChannelPointer(c)[i];
+        filter[c].set(hz, 0.707f);
+        filter[c].process(x);
+        x = filter[c].lp * g;
+      }
+    }
+  }
+};
+
+#include <sonore/plugin.h>
+
+// POSITIONAL: a parameter's index is its identity in every saved session.
+// Once this ships, only ever append rows.
+static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
+    // id, name, unit, min, max, default -- then the knob's skew, which puts
+    // 1 kHz at the middle of its travel instead of five per cent along.
+    {"cutoff", "Cutoff", "Hz", 20.0f, 20000.0f, 1000.0f, 0, nullptr, nullptr, 0, true, false, false,
+     sonore::skewForCentre(20.0f, 20000.0f, 1000.0f)},
+    {"gain", "Gain", "dB", -24.0f, 24.0f, 0.0f},
+};
+
+static const sonore::PluginDescriptor kDesc = {
+    // The id is this plugin's identity to every host and session: unique
+    // per product, and never changed once shipped. Keep the version equal
+    // to VERSION in CMakeLists.txt.
+    "@ID@", "@NAME@", "@VENDOR@", "@VERSION@",
+    "@DESCRIPTION@",
+    "@URL@",
+    false, // an effect
+    kParamTable, SONORE_NUM_PARAMS,
+    nullptr, 0, // no factory presets
+    "filter",   // the category hosts file it under
+};
+
+#include <sonore/formats.h> // CLAP, and every format this target is built as

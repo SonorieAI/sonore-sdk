@@ -56,6 +56,10 @@ set(_units
 
 set(_include_flags)
 foreach(_dir IN LISTS INCLUDES)
+  # An empty entry would become a bare "/I" that swallows the next flag.
+  if(_dir STREQUAL "")
+    continue()
+  endif()
   list(APPEND _include_flags "/I${_dir}")
 endforeach()
 list(APPEND _include_flags "/I${SDK}/third_party/vst3" "/I${SDK}/third_party/lv2/include")

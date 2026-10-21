@@ -7,8 +7,8 @@ the License in the LICENSE file at the root of this repository, or at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-The framework's own source — everything under sdk/include/sonore, sdk/examples
-and sdk/tests — is original work. Its DSP is implemented from published
+The framework's own source (everything under sdk/include/sonore, sdk/examples
+and sdk/tests) is original work. Its DSP is implemented from published
 mathematics (RBJ, Zavalishin, Jot, Dattorro, Yeh, BS.1770 and the papers each
 header cites) rather than adapted from any other framework's source.
 
@@ -19,4 +19,4 @@ purposes of section 4(d) of the License.
 
 Some plugin formats this SDK can build carry obligations from their format
 owners that no software licence can grant. Those are listed in
-THIRD_PARTY_NOTICES.md too — read it before shipping a commercial product.
+THIRD_PARTY_NOTICES.md too. Read it before shipping a commercial product.

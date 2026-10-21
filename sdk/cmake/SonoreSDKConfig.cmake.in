@@ -1,0 +1,52 @@
+# SonoreSDKConfig.cmake: what find_package(SonoreSDK) loads.
+#
+#   find_package(SonoreSDK 1.0 REQUIRED)
+#   sonore_add_clap(MyPlugin SOURCES plugin.cpp)
+#   sonore_add_vst3(MyPluginVST3 SOURCES plugin.cpp)
+#
+# The helpers are the same file the SDK's own build uses; the only thing this
+# file adds is WHERE things are (SONORE_SDK_DIR), the WebView2 fetch on
+# Windows, and the plain `sonore_sdk` name the helpers link against.
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/SonoreSDKTargets.cmake")
+
+# From the install prefix, not by counting directories up from this file: it
+# assumed the library directory was one level deep, and a multiarch layout
+# (lib/x86_64-linux-gnu) or a packager that moves this file found no helpers.
+set_and_check(SONORE_SDK_DIR "@PACKAGE_SONORE_DATA_DIR@")
+set(SONORE_SDK_DIR "${SONORE_SDK_DIR}" CACHE INTERNAL "Sonore SDK data root (installed)")
+
+# The helpers say `sonore_sdk`; the export says `SonoreSDK::sonore_sdk`.
+if(NOT TARGET sonore_sdk)
+  add_library(sonore_sdk ALIAS SonoreSDK::sonore_sdk)
+endif()
+
+# MSVC's flags, by THIS project's compiler rather than the one that built the
+# install (see the SDK's CMakeLists): /utf-8 so UTF-8 literals survive, /bigobj
+# so a Debug object can hold every inline function. MSVC is set for clang-cl
+# too, which takes both; a GNU-style compiler gets neither.
+if(MSVC)
+  target_compile_options(SonoreSDK::sonore_sdk INTERFACE /utf-8 /bigobj)
+endif()
+
+# WebView2 is not in the export set on purpose (see the SDK's CMakeLists):
+# fetch it into this build, exactly as the SDK does into its own -- and, as
+# there, not with -DSONORE_GUI=OFF, which this file ignored, so an offline
+# configure failed on a download the consumer had switched off.
+#
+# The fetch once per build, the link once per find_package: the imported
+# target is made afresh in each directory that asks, and a second directory
+# found the fetched target already there, skipped both, and built its plugin
+# without the webview and without a word.
+if(WIN32 AND (NOT DEFINED SONORE_GUI OR SONORE_GUI))
+  if(NOT TARGET sonore_webview2)
+    include("${SONORE_SDK_DIR}/cmake/FetchWebView2.cmake")
+  endif()
+  if(TARGET sonore_webview2)
+    set_property(TARGET SonoreSDK::sonore_sdk APPEND PROPERTY
+                 INTERFACE_LINK_LIBRARIES sonore_webview2)
+  endif()
+endif()
+
+include("${SONORE_SDK_DIR}/cmake/SonoreSDKHelpers.cmake")

@@ -10,7 +10,9 @@
 #pragma once
 
 #include <cmath>
+#include <complex>
 #include <cstdlib>
+#include <limits>
 
 // fastTanh lives there; tanhApprox below is the same rational function under
 // the name the toolkit already used, and forwards rather than repeating it.
@@ -33,7 +35,12 @@ namespace special {
 inline double besselI0(double x) {
   double sum = 1.0, term = 1.0;
   const double half = x * 0.5;
-  for (int k = 1; k < 64; ++k) {
+  // The terms grow until k passes x/2 and only then fall, so the number
+  // needed grows with x. 64 was enough for any window and silently wrong
+  // past x = 70 (I0(80) 5e-7 low, I0(100) 0.4% low); 400 covers everything up to
+  // where I0 overflows a double, near 713. The break below stops far
+  // sooner for the arguments a window uses.
+  for (int k = 1; k < 400; ++k) {
     // Each term is the previous one times (x/2k)^2, which keeps the
     // factorials out of it -- writing the series literally overflows long
     // before it converges.
@@ -56,7 +63,147 @@ inline double kaiser(double r, double beta) {
   return besselI0(beta * std::sqrt(arg)) / besselI0(beta);
 }
 
+// ── Elliptic functions ───────────────────────────────────────────────────────
+//
+// An elliptic (Cauer) filter is the steepest of its order -- equiripple in
+// both bands -- and its poles and zeros are values of the Jacobi elliptic
+// functions. These are the four that design needs, in the conventions of
+// Orfanidis's published lecture notes on elliptic filter design, which the
+// reference follows too: the modulus k (not the parameter m = k^2), and the
+// argument of cd, sn and their inverse in units of the quarter period K, so
+// cde(1, k) is cd(K, k) = 0 for every k. Normalising by K is what makes the
+// design equations modulus-free, which is why the notes chose it.
+//
+// Everything rests on the descending Landen transformation: from k it builds
+// a sequence of moduli k1, k2, ... falling to zero quadratically (five or six
+// steps from any k a filter uses). At modulus zero, sn and cd ARE sin and cos;
+// each step back up is the Gauss transformation
+//     w(n-1) = (1 + k(n)) w(n) / (1 + k(n) w(n)^2),
+// which holds for sn and cd alike, and for complex arguments, which the
+// design needs because the poles are off the real axis.
+//
+// The modulus must be in [0, 1). k = 1 is the limit where K is infinite and
+// the functions degenerate to hyperbolic ones; ellipticK says so (infinity)
+// and cde, sne and asne return NaN there, rather than a number from a
+// Landen sequence that never converged.
+
+namespace detail {
+
+constexpr double kHalfPi = 1.57079632679489661923;
+
+/** The descending Landen moduli of k. No allocation: sixteen slots is more
+ *  than k = 1 - 1e-15 needs. */
+struct LandenSequence {
+  double k[16];
+  int count = 0;
+
+  explicit LandenSequence(double modulus) {
+    double kk = modulus;
+    // Carry the complement too, k' = sqrt(1 - k^2), each step by its own
+    // recurrence: forming 1 - k^2 from a k near 1 cancels every digit, and
+    // forming k(n) = (1 - k')/(1 + k') from a k' near 1 does the same at the
+    // other end. These two are well conditioned throughout.
+    double kp = std::sqrt((1.0 - modulus) * (1.0 + modulus));
+    while (count < 16) {
+      const double r = kk / (1.0 + kp);
+      kk = r * r;
+      kp = 2.0 * std::sqrt(kp) / (1.0 + kp);
+      k[count++] = kk;
+      // At the bottom sn is taken to be sin, which is wrong by O(k^2): below
+      // 1e-9 that is under a double's resolution.
+      if (kk < 1e-9) break;
+    }
+  }
+};
+
+inline bool validModulus(double k) { return k >= 0.0 && k < 1.0; }
+
+} // namespace detail
+
+/** K(k), the complete elliptic integral of the first kind -- the quarter
+ *  period -- by the arithmetic-geometric mean: K = pi / (2 AGM(1, k')).
+ *  The AGM converges quadratically, so this is exact to the last digit in a
+ *  handful of iterations. Infinite at k = 1. */
+inline double ellipticK(double k) {
+  if (!(k >= 0.0 && k <= 1.0)) return std::numeric_limits<double>::quiet_NaN();
+  double a = 1.0, g = std::sqrt((1.0 - k) * (1.0 + k));
+  if (g == 0.0) return std::numeric_limits<double>::infinity();
+  for (int i = 0; i < 32 && std::fabs(a - g) > 1e-16 * a; ++i) {
+    const double next = 0.5 * (a + g);
+    g = std::sqrt(a * g);
+    a = next;
+  }
+  return detail::kHalfPi / a;
+}
+
+/** K(k) and K'(k) = K(k'), together: the ratio K'/K is the imaginary
+ *  period that the elliptic design's degree equation is written in. */
+inline void ellipticIntegralK(double k, double& K, double& Kprime) {
+  K = ellipticK(k);
+  Kprime = ellipticK(std::sqrt((1.0 - k) * (1.0 + k)));
+}
+
+/** cd(u K, k): the Jacobi cd function, argument in quarter periods. */
+inline std::complex<double> cde(std::complex<double> u, double k) {
+  if (!detail::validModulus(k)) return {std::numeric_limits<double>::quiet_NaN(), 0.0};
+  const detail::LandenSequence landen(k);
+  std::complex<double> w = std::cos(u * detail::kHalfPi);
+  for (int n = landen.count; n-- > 0;) w = (1.0 + landen.k[n]) * w / (1.0 + landen.k[n] * w * w);
+  return w;
+}
+
+/** sn(u K, k): the Jacobi sn function, argument in quarter periods. */
+inline std::complex<double> sne(std::complex<double> u, double k) {
+  if (!detail::validModulus(k)) return {std::numeric_limits<double>::quiet_NaN(), 0.0};
+  const detail::LandenSequence landen(k);
+  std::complex<double> w = std::sin(u * detail::kHalfPi);
+  for (int n = landen.count; n-- > 0;) w = (1.0 + landen.k[n]) * w / (1.0 + landen.k[n] * w * w);
+  return w;
+}
+
+/**
+ * The inverse of sne: a u with sn(u K, k) = w.
+ *
+ * Each Gauss step is inverted on the way DOWN the sequence -- the quadratic
+ * k(n) w^2 s^2 - (1 + k(n)) s + w = 0 solved for s, in the rationalised form
+ * that does not divide by w -- and at the bottom u = (2/pi) asin. sn is
+ * doubly periodic, so there are infinitely many answers; this is the one the
+ * principal square roots and arcsine lead to, which for real w in [-1, 1] is
+ * the real u in [-1, 1], and for real w in (1, 1/k] -- the stopband the
+ * design maps -- is 1 + i v with v in [0, K'/K].
+ */
+inline std::complex<double> asne(std::complex<double> w, double k) {
+  if (!detail::validModulus(k)) return {std::numeric_limits<double>::quiet_NaN(), 0.0};
+  const detail::LandenSequence landen(k);
+  double previous = k;
+  for (int n = 0; n < landen.count; ++n) {
+    w = 2.0 * w / ((1.0 + landen.k[n]) * (1.0 + std::sqrt(1.0 - previous * previous * w * w)));
+    previous = landen.k[n];
+  }
+  return std::asin(w) / detail::kHalfPi;
+}
+
 } // namespace special
+
+/**
+ * The special functions under the reference's names, so a design written
+ * against those reads the same here. Static forwarders: the free functions
+ * in sonore::special are the implementation, and the only copy.
+ */
+struct SpecialFunctions {
+  /** Modified Bessel function of the first kind, order zero. */
+  static double besselI0(double x) { return special::besselI0(x); }
+  /** K(k) and K'(k), modulus k. */
+  static void ellipticIntegralK(double k, double& K, double& Kprime) {
+    special::ellipticIntegralK(k, K, Kprime);
+  }
+  /** cd(u K, k), u in quarter periods. */
+  static std::complex<double> cde(std::complex<double> u, double k) { return special::cde(u, k); }
+  /** sn(u K, k), u in quarter periods. */
+  static std::complex<double> sne(std::complex<double> u, double k) { return special::sne(u, k); }
+  /** u such that sn(u K, k) = w. */
+  static std::complex<double> asne(std::complex<double> w, double k) { return special::asne(w, k); }
+};
 
 // ── Fast approximations ──────────────────────────────────────────────────────
 //

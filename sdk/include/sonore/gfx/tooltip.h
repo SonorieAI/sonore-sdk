@@ -65,6 +65,7 @@ public:
       target_ = hovered;
       pending_ = std::move(wanted);
       since_ = now;
+      spent_ = false;
       // Anything showing goes away the moment the pointer moves to something
       // else, without waiting for the delay again -- a tooltip left over from
       // the previous control is worse than none.
@@ -75,7 +76,7 @@ public:
       return false;
     }
 
-    if (pending_.empty()) return false;
+    if (pending_.empty() || spent_) return false;
 
     if (visible_.empty()) {
       if (now - since_ < kDelaySeconds) return false;
@@ -86,7 +87,12 @@ public:
     }
 
     if (now - shownSince_ >= kHoldSeconds) {
+      // Spent until the pointer moves or the target changes. Clearing only
+      // the text left the delay's clock long past, so the next tick showed
+      // it again -- six seconds up, one frame down, for as long as the mouse
+      // rested there.
       visible_.clear();
+      spent_ = true;
       return true;
     }
     return false;
@@ -97,12 +103,15 @@ public:
   bool clear() {
     target_ = nullptr;
     pending_.clear();
+    spent_ = false;
     if (visible_.empty()) return false;
     visible_.clear();
     return true;
   }
 
+  /** Whether a tooltip should be on screen now. */
   bool isVisible() const { return !visible_.empty(); }
+  /** What it says; empty when none is showing. */
   const std::string& text() const { return visible_; }
   /** Where the pointer was when it appeared, in root coordinates. It does NOT
    *  follow the pointer: a tooltip that moved would be a thing to chase. */
@@ -117,7 +126,9 @@ public:
                                                              : 20.0f};
   }
 
+  /** Space left and right of the text, logical pixels. */
   static constexpr float kPaddingX = 8.0f;
+  /** Space above and below the text, logical pixels. */
   static constexpr float kPaddingY = 4.0f;
   /** How far the pointer may drift and still count as still. A mouse held by a
    *  human is never perfectly still, and a tolerance of zero means a tooltip
@@ -140,6 +151,7 @@ private:
   std::string pending_, visible_;
   Point lastPosition_, shownAt_;
   double since_ = 0.0, shownSince_ = 0.0;
+  bool spent_ = false; // shown and timed out; nothing again until a move
 };
 
 /**
@@ -152,12 +164,14 @@ private:
  */
 class BoundsConstrainer {
 public:
-  float minWidth = 1.0f, minHeight = 1.0f;
+  float minWidth = 1.0f, /**< logical pixels */ minHeight = 1.0f; ///< logical pixels
   /** Zero means unbounded. */
-  float maxWidth = 0.0f, maxHeight = 0.0f;
+  float maxWidth = 0.0f, maxHeight = 0.0f;  ///< zero means unbounded
   /** Zero means free. Set it and the height follows the width. */
   float aspectRatio = 0.0f;
 
+  /** All four limits at once, logical pixels; a maximum of 0 is unbounded. The
+   *  values are not checked against each other. */
   void setSizeLimits(float minW, float minH, float maxW, float maxH) {
     minWidth = minW;
     minHeight = minH;
@@ -196,6 +210,8 @@ public:
     *height = h;
   }
 
+  /** Whether both maxima are set and equal to the minima, so no size but one
+   *  is allowed. */
   bool isFixedSize() const {
     return maxWidth > 0.0f && maxHeight > 0.0f && maxWidth == minWidth && maxHeight == minHeight;
   }
@@ -211,13 +227,18 @@ public:
  */
 class ResizableCorner : public Widget {
 public:
+  /** The grip's side, logical pixels. */
   static constexpr float kSize = 16.0f;
 
   /** Called with the size the user is asking for, already constrained. */
   std::function<void(float width, float height)> onResize;
 
+  /** What a drag is held to before onResize; at least 1 by 1 and otherwise
+   *  free by default. */
   BoundsConstrainer constrainer;
 
+  /** A grip with the diagonal resize cursor. Placing it, kSize square in the
+   *  bottom-right corner, is the owner's job. */
   ResizableCorner() { setCursor(MouseCursor::ResizeCorner); }
 
   /** The size the editor is now, which a drag is relative to. */

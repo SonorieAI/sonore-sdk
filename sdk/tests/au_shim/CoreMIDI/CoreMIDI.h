@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // See ../README.md. The AU wrapper names CoreMIDI types for its MIDI output
-// callback; it does not open a CoreMIDI port itself.
+// callback; it does not open a CoreMIDI port itself. midi_input.h and
+// midi_output.h, which do, are checked against the rest.
 #pragma once
 #include <CoreFoundation/CoreFoundation.h>
 
@@ -51,3 +52,10 @@ OSStatus MIDIPortConnectSource(MIDIPortRef, MIDIEndpointRef, void*);
 OSStatus MIDIPortDisconnectSource(MIDIPortRef, MIDIEndpointRef);
 OSStatus MIDIObjectGetStringProperty(MIDIObjectRef, CFStringRef, CFStringRef*);
 const MIDIPacket* MIDIPacketNext(const MIDIPacket*);
+
+// The output side, for midi_output.h's CoreMIDI sink.
+typedef UInt8 Byte;
+ItemCount MIDIGetNumberOfDestinations(void);
+MIDIEndpointRef MIDIGetDestination(ItemCount);
+OSStatus MIDIOutputPortCreate(MIDIClientRef, CFStringRef, MIDIPortRef*);
+OSStatus MIDISend(MIDIPortRef, MIDIEndpointRef, const MIDIPacketList*);

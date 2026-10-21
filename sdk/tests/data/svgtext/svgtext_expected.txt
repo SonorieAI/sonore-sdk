@@ -1,0 +1,9 @@
+# made by make_svgtext.py: resvg 0.48.1 draws each of these. Do not edit.
+svg basic.svg basic.png 200 40 569
+svg anchor.svg anchor.png 180 90 486
+svg tspans.svg tspans.png 220 50 435
+svg whitespace.svg whitespace.png 220 96 1218
+svg weights.svg weights.png 230 120 2654
+svg styled.svg styled.png 220 110 1471
+svg fallback.svg fallback.png 220 70 1016
+svg clip.svg clip.png 160 50 544

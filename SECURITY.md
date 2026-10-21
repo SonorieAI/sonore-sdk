@@ -31,7 +31,8 @@ reaching a host process**:
   interface is model-authored HTML in an OS webview.
 - **Anything reached over a network**: the OSC codec and transport, and the
   licence activation path in `license_runtime.h`.
-- **The image, font and archive readers** under `sdk/include/sonore/gfx`.
+- **The image and font readers** under `sdk/include/sonore/gfx`, and the
+  archive reader, `sdk/include/sonore/zip.h`.
 
 ## What is out of scope
 
@@ -47,5 +48,7 @@ reaching a host process**:
 
 ## Supported versions
 
-The SDK is pre-1.0 and header-only: fixes land on `main`, and there are no
-backported release branches yet. Pin a commit if you need reproducibility.
+The SDK is header-only and has no tagged release yet (`<sonore/version.h>`
+says 1.0.0, the version the first one will carry): fixes land on `main`, and
+there are no backported release branches. Pin a commit if you need
+reproducibility.

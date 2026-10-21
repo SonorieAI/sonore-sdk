@@ -52,6 +52,9 @@ namespace gfx {
  */
 class Overlay : public Widget {
 public:
+  /** Hidden until a subclass's show(). It covers its parent, so it is added
+   *  to the editor's root after the controls it covers: the last child is
+   *  drawn, and hit-tested, on top. */
   Overlay() { setVisible(false); }
 
   /** How dark the editor behind goes. Dimmed rather than hidden so the user can
@@ -71,12 +74,15 @@ public:
     if (Component* p = parent()) setBounds({0.0f, 0.0f, p->bounds().w, p->bounds().h});
   }
 
+  /** The dim: black at the dim alpha over the whole overlay, nothing at 0.
+   *  A subclass calls it first and draws its panel over it. */
   void paint(Graphics& g) override {
     if (dim_ > 0) g.fillAll(Colour(0, 0, 0, dim_));
   }
 
-  // Every pointer event stops here, including the ones that hit nothing.
+  /** Every pointer event stops here, including the ones that hit nothing. */
   void mouseDown(const MouseEvent&) override {}
+  /** Swallowed too, so a release never reaches the editor behind. */
   void mouseUp(const MouseEvent&) override {}
   /** Returns TRUE -- "handled" -- so it does not bubble. A wheel that reached
    *  the editor underneath would scroll a viewport behind a question. */
@@ -93,6 +99,7 @@ public:
   }
 
 protected:
+  /** The dim's alpha, 0 (none) to 255 (black); setDimAlpha sets it. */
   uint8_t dim_ = 120;
 };
 
@@ -106,6 +113,8 @@ protected:
  */
 class AlertOverlay : public Overlay {
 public:
+  /** Hidden. While shown it holds the keyboard focus, and a dismissal
+   *  (Escape) answers with the cancel button's index. */
   AlertOverlay() {
     setWantsKeyboardFocus(true);
     onDismiss = [this]() { choose(cancelIndex()); };
@@ -145,9 +154,15 @@ public:
     repaint();
   }
 
+  /** The button Return presses: a 0-based index into show()'s `buttons`, or
+   *  -1 for none. Call it after show(), which resets it to 0. The index is
+   *  not checked: onChoice is handed whatever was set. */
   void setDefaultButton(int index) { defaultButton_ = index; }
+  /** The index Escape and onDismiss answer with, 0-based. Call it after
+   *  show(), which resets it to the last button (-1 when there are none). */
   void setCancelButton(int index) { cancelButton_ = index; }
 
+  /** True from show() until an answer is chosen. */
   bool isShowing() const { return isVisible(); }
 
   /** A Dialog, named by its title and reading its message. Which is the whole
@@ -169,6 +184,8 @@ public:
     return {(b.w - w) * 0.5f, (b.h - h) * 0.5f, w, h};
   }
 
+  /** Lays the buttons along the panel's bottom edge, right-aligned, the first
+   *  leftmost; each is as wide as its label plus padding, at least 72. */
   void resized() override {
     const Rect panel = panelBounds();
     // Right to left from the panel's corner, so the FIRST button ends up
@@ -182,6 +199,8 @@ public:
     }
   }
 
+  /** The dim, then the panel: the title on one line and the message wrapped
+   *  to the panel's width under it. */
   void paint(Graphics& g) override {
     Overlay::paint(g);
     LookAndFeel& lf = lookAndFeel();
@@ -214,9 +233,15 @@ public:
     return Overlay::keyPressed(key);
   }
 
+  /** The panel's widest, in logical pixels; narrower when 80% of the overlay
+   *  is less. Its height follows the wrapped message. */
   static constexpr float kMaxWidth = 360.0f;
+  /** The panel's inner margin and the gap between its title, message and
+   *  buttons. */
   static constexpr float kPad = 14.0f;
+  /** Each button's height. */
   static constexpr float kButtonHeight = 26.0f;
+  /** The panel's corner radius. */
   static constexpr float kCorner = 6.0f;
 
 private:
@@ -227,11 +252,15 @@ private:
     setVisible(false);
     if (MouseRouter* r = routerFor(this))
       if (r->focused() == this) r->setFocus(nullptr);
+    repaint();
     // The callback LAST, and after the overlay is already down: a handler that
     // opens another question would otherwise be showing it into an overlay
-    // that is about to hide itself.
-    if (onChoice_) onChoice_(index);
-    repaint();
+    // that is about to hide itself. Moved out before it runs, because asking
+    // that question is a show(), which replaces onChoice_ -- and replacing
+    // the function that is executing destroys it, captures and all, mid-call.
+    std::function<void(int)> handler = std::move(onChoice_);
+    onChoice_ = nullptr;
+    if (handler) handler(index);
   }
 
   float buttonWidth(const std::string& label) const {
@@ -267,6 +296,8 @@ private:
  */
 class CallOutBox : public Overlay {
 public:
+  /** Hidden and not dimmed. While shown it holds the keyboard focus, and
+   *  Escape dismisses it. */
   CallOutBox() {
     // Not dimmed. A call-out explains the thing it points at, and darkening
     // that thing is the opposite of what it is for.
@@ -284,6 +315,10 @@ public:
    * put away and brought back.
    */
   void show(Component* content, Rect target, float width, float height) {
+    // Shown again with other content while still up: the old content is the
+    // caller's again, and left attached it painted and took clicks under the
+    // new one.
+    if (content_ && content_ != content) removeChild(content_);
     content_ = content;
     target_ = target;
     coverParent();
@@ -298,6 +333,8 @@ public:
     repaint();
   }
 
+  /** Hide it and give the content back -- taken out of the bubble, not
+   *  deleted -- then fire onDismissed. Does nothing while hidden. */
   void dismiss() {
     if (!isVisible()) return;
     setVisible(false);
@@ -311,6 +348,8 @@ public:
     repaint();
   }
 
+  /** After the call-out went away by any route: a click outside, Escape, or
+   *  dismiss(). The content is already removed when it runs. */
   std::function<void()> onDismissed;
 
   /** A Group rather than a Dialog: a call-out explains something, it does not
@@ -318,17 +357,22 @@ public:
    *  something they are not. */
   AccessibleInfo accessibleInfo() const override { return baseInfo(AccessibleRole::Group); }
 
+  /** Where the last show() put the bubble, in the overlay's coordinates,
+   *  without the arrow. */
   Rect bubbleBounds() const { return bubble_; }
   /** Which way the arrow points: true when the bubble sits ABOVE its target,
    *  which happens when there is no room below. */
   bool pointsDown() const { return above_; }
 
+  /** A press outside the bubble dismisses it. */
   void mouseDown(const MouseEvent& e) override {
     // Outside the bubble dismisses. Inside is the content's business, and the
     // content is a child, so this is only reached when nothing took it.
     if (!bubble_.contains(e.position)) dismiss();
   }
 
+  /** The bubble and its arrow, the arrow's tip under (or over) the target's
+   *  horizontal centre, kept clear of the bubble's rounded corners. */
   void paint(Graphics& g) override {
     Overlay::paint(g);
     LookAndFeel& lf = lookAndFeel();
@@ -361,8 +405,13 @@ public:
     g.strokePath(arrow, 1.0f);
   }
 
+  /** The space between the bubble's edge and the content, in logical pixels.
+   *  The bubble is also held to the overlay's size less twice this. */
   static constexpr float kPad = 10.0f;
+  /** The arrow's length, which is also the gap between target and bubble,
+   *  and half the width of its base. */
   static constexpr float kArrow = 8.0f;
+  /** The bubble's corner radius. */
   static constexpr float kCorner = 5.0f;
 
 private:

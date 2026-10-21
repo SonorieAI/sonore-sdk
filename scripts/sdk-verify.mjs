@@ -52,7 +52,11 @@ if (!run("cmake", ["--build", `"${build}"`, "--config", "Release"])) {
 }
 
 log("\n── tests (DSP units + CLAP host, effect and instrument) ──────────────────");
-run("ctest", ["--test-dir", `"${build}"`, "-C", "Release", "--output-on-failure"]);
+// `--repeat until-pass:2`: a test that fails once and passes on its rerun is
+// reported as passed. Only two tests here can do that, and both for the same
+// reason -- they touch the real desktop (its clipboard, its modifier keys).
+// A red run that reproduces is still red twice.
+run("ctest", ["--test-dir", `"${build}"`, "-C", "Release", "--output-on-failure", "--repeat", "until-pass:2"]);
 
 log("\n── feature map (what we claim against the reference, checked) ─────────────");
 // Cheap, and it fails when a capability this project says it has stops being
@@ -88,26 +92,75 @@ run("node", [`"${join(root, "scripts", "reference-parity.mjs")}"`]);
 
 // ── au_wrapper.h, read by a compiler ────────────────────────────────────────
 //
-// The AU wrapper is the one format nothing here can build; macOS CI builds and
-// validates it on every push. This leg compiles it against a shim of Apple's
-// declarations, so a typo is caught here in seconds instead of a CI round
-// trip. It proves internal consistency, NOT that the ABI is right; see
-// sdk/tests/au_shim/README.md. The first successful parse found a genuine
-// error: the factory referring to a type declared inside a namespace it was
-// not in, which is exactly the class of error a syntax check is for.
+// The AU wrapper is the one format nothing here can build. macOS CI is the
+// only machine that could, and it has not started a job since the account's
+// spending limit was reached -- so this file was edited for many weeks with
+// no compiler ever looking at it, and every blind edit stacked on the last.
+//
+// This compiles it against a shim of Apple's declarations. It proves internal
+// consistency, NOT that the ABI is right; see sdk/tests/au_shim/README.md.
+// The first successful parse found a genuine error -- the factory referring to
+// a type declared inside a namespace it was not in -- which is the class of
+// thing that accumulates in code nobody compiles.
+//
+// The parser is g++ where there is one, else clang++, else the clang-tidy
+// Visual Studio ships -- clang's own front end, run for the compiler's
+// diagnostics (an error is "clang-diagnostic-error" and a non-zero exit; it
+// insists on one check being on, and objc-* has nothing to say about C++).
+// None of them: the three legs are SKIPPED, saying so. They used to run g++
+// regardless, so on a Windows machine without MinGW this whole verify ended
+// FAILED on three commands that never started -- and printed "ok" under
+// each, because the line was logged whether the parse had passed or not.
+function findSyntaxChecker() {
+  const answers = (cmd) => spawnSync(cmd, ["--version"], { shell: true, stdio: "ignore" }).status === 0;
+  if (answers("g++")) return { kind: "compiler", cmd: "g++" };
+  if (answers("clang++")) return { kind: "compiler", cmd: "clang++" };
+  if (answers("clang-tidy")) return { kind: "tidy", cmd: "clang-tidy" };
+  if (process.platform === "win32") {
+    for (const programs of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]) {
+      const vs = programs && join(programs, "Microsoft Visual Studio");
+      if (!vs || !existsSync(vs)) continue;
+      for (const version of readdirSync(vs).sort().reverse()) {
+        let editions = [];
+        try {
+          editions = readdirSync(join(vs, version));
+        } catch {}
+        for (const edition of editions) {
+          const tidy = join(vs, version, edition, "VC", "Tools", "Llvm", "x64", "bin", "clang-tidy.exe");
+          if (existsSync(tidy)) return { kind: "tidy", cmd: `"${tidy}"` };
+        }
+      }
+    }
+  }
+  return null;
+}
+const syntaxChecker = findSyntaxChecker();
+function appleSyntax(file, extraIncludes = []) {
+  const flags = [
+    "-std=c++17", "-fsyntax-only", "-DSONORE_APPLE_SYNTAX_CHECK",
+    `-I"${join(sdk, "include")}"`,
+    ...extraIncludes,
+    `-I"${join(sdk, "tests", "au_shim")}"`,
+    // The dlfcn shim exists only where there is no real one. On Linux the
+    // genuine header is used, because a shim shadowing a truth that was
+    // available is the whole failure mode this directory has to avoid.
+    ...(process.platform === "win32" ? [`-I"${join(sdk, "tests", "au_shim", "win")}"`] : []),
+  ];
+  const path = `"${join(sdk, "tests", file)}"`;
+  if (syntaxChecker.kind === "tidy")
+    return run(syntaxChecker.cmd, ["--quiet", '"-checks=-*,objc-*"', path, "--", ...flags]);
+  return run(syntaxChecker.cmd, [...flags, path]);
+}
+
 log("\n── au_wrapper.h, compiled against a shim of Apple\'s headers ──");
-run("g++", [
-  "-std=c++17", "-fsyntax-only", "-DSONORE_APPLE_SYNTAX_CHECK",
-  `-I"${join(sdk, "include")}"`,
-  `-I"${join(sdk, "third_party", "clap", "include")}"`,
-  `-I"${join(sdk, "tests", "au_shim")}"`,
-  // The dlfcn shim exists only where there is no real one. On Linux the
-  // genuine header is used, because a shim shadowing a truth that was
-  // available is the whole failure mode this directory has to avoid.
-  ...(process.platform === "win32" ? [`-I"${join(sdk, "tests", "au_shim", "win")}"`] : []),
-  `"${join(sdk, "tests", "au_syntax.cpp")}"`,
-]);
-log("  ok   it parses, and every name it uses exists");
+if (!syntaxChecker) {
+  log("  SKIPPED: no g++, clang++ or clang-tidy to parse the Apple code with. The MSVC");
+  log("            build still compiles the wrappers' Mac halves (sonore_mac_syntax_*).");
+} else {
+  log(`  parsed by ${syntaxChecker.cmd}`);
+  if (appleSyntax("au_syntax.cpp", [`-I"${join(sdk, "third_party", "clap", "include")}"`]))
+    log("  ok   it parses, and every name it uses exists");
+}
 
 // The macOS DEVICE backends, same technique. CoreAudio output and input and
 // the CoreMIDI branch of midi_input.h are another ~600 lines nothing had
@@ -117,14 +170,7 @@ log("  ok   it parses, and every name it uses exists");
 // The platform selection is forced: midi_input.h picks _WIN32 first, so the
 // first version of this check compiled the WINDOWS backend and reported
 // success for CoreMIDI code it had never read.
-run("g++", [
-  "-std=c++17", "-fsyntax-only", "-DSONORE_APPLE_SYNTAX_CHECK",
-  `-I"${join(sdk, "include")}"`,
-  `-I"${join(sdk, "tests", "au_shim")}"`,
-  ...(process.platform === "win32" ? [`-I"${join(sdk, "tests", "au_shim", "win")}"`] : []),
-  `"${join(sdk, "tests", "apple_syntax.cpp")}"`,
-]);
-log("  ok   CoreAudio and CoreMIDI parse too");
+if (syntaxChecker && appleSyntax("apple_syntax.cpp")) log("  ok   CoreAudio and CoreMIDI parse too");
 
 // The macOS UI files. webview_cocoa.h is what every Mac plugin's editor is
 // made of today and window_cocoa.h is the native peer meant to replace it;
@@ -132,17 +178,11 @@ log("  ok   CoreAudio and CoreMIDI parse too");
 //
 // au_view.h is NOT in this check: it needs clap_wrapper.h, which selects its
 // webview backend and window API on _WIN32 first, so the chain would compile
-// the Windows branches and report success for macOS code it never read. Named
-// here rather than quietly counted -- see the note at the top of
-// cocoa_syntax.cpp.
-run("g++", [
-  "-std=c++17", "-fsyntax-only", "-DSONORE_APPLE_SYNTAX_CHECK",
-  `-I"${join(sdk, "include")}"`,
-  `-I"${join(sdk, "tests", "au_shim")}"`,
-  ...(process.platform === "win32" ? [`-I"${join(sdk, "tests", "au_shim", "win")}"`] : []),
-  `"${join(sdk, "tests", "cocoa_syntax.cpp")}"`,
-]);
-log("  ok   the Cocoa peer and the WKWebView host parse (au_view.h still does not)");
+// the Windows branches and report success for macOS code it never read. The
+// MSVC build compiles it, with the wrappers' Mac halves and the standalone,
+// in the sonore_mac_syntax_* targets -- see tests/mac_syntax_plugin.cpp.
+if (syntaxChecker && appleSyntax("cocoa_syntax.cpp"))
+  log("  ok   the Cocoa peer and the WKWebView host parse (au_view.h: the MSVC build's sonore_mac_syntax_plugin)");
 
 // A rule no compiler reports until an unrelated include reorders the world:
 // windows.h defines min and max as MACROS, so a header that includes it without
@@ -165,8 +205,8 @@ run("node", [`"${join(root, "scripts", "namespace-rules.mjs")}"`]);
 
 log("\n── clang-cl (LLVM's MSVC mode -- the compiler the Windows build farm uses) ──");
 // The marketplace's Windows binaries are cross-built with clang-cl + lld-link,
-// not MSVC, so the suite is built and run with that compiler too. Portable
-// LLVM in C:\\dev\\llvm (or SONORE_LLVM_DIR, or
+// not MSVC, and until this leg existed the SDK had never been compiled by that
+// compiler on this box. Portable LLVM in C:\\dev\\llvm (or SONORE_LLVM_DIR, or
 // on PATH), Ninja in C:\\dev\\ninja (or SONORE_NINJA, or on PATH), and the
 // MSVC headers and libraries through vcvars64 of the newest Visual Studio.
 // Skips loudly naming what is missing; SONORE_SKIP_CLANGCL=1 skips it on
@@ -210,7 +250,11 @@ if (process.platform !== "win32") {
   if (!ninjaDir) missing.push("ninja (C:\\dev\\ninja\\ninja.exe, SONORE_NINJA, or PATH)");
   if (!vcvars || !existsSync(vcvars)) missing.push("vcvars64.bat (a Visual Studio with the C++ workload)");
   if (missing.length) {
-    log("  SKIPPED: missing: " + missing.join("; "));
+    log("  SKIPPED. Missing: " + missing.join("; "));
+    // Without clang-cl, clang can still judge the code: Visual Studio's own
+    // clang-tidy is its front end, and verify:clang runs it over every TU.
+    log("  so: clang's front end over every translation unit instead (npm run verify:clang)");
+    run("node", [`"${join(root, "scripts", "clang-check.mjs")}"`]);
   } else {
     const buildClang = join(sdk, "build-clangcl");
     const cmd = join(sdk, "build", "clangcl-leg.cmd");
@@ -228,7 +272,7 @@ if (process.platform !== "win32") {
     log(`  clang-cl from ${llvmBin}`);
     if (run("cmd", ["/c", `"${cmd}"`])) {
       log("  ok   every target builds with clang-cl + lld-link");
-      if (run("ctest", ["--test-dir", `"${buildClang}"`, "--output-on-failure"]))
+      if (run("ctest", ["--test-dir", `"${buildClang}"`, "--output-on-failure", "--repeat", "until-pass:2"]))
         log("  ok   and the whole suite passes against that build");
     }
   }
@@ -425,7 +469,8 @@ if (process.platform === "win32") {
             : ['echo "  x11: SKIPPED -- no <X11/Xlib.h>. apt-get install libx11-dev, or apt-get download it and dpkg-deb -x into ~/xdev/root"']),
       // ── JACK, against a real server ──────────────────────────────────────
       //
-      // The label matters most on a backend like this one, because
+      // This row used to read "written, never run against a live JACK server".
+      // It is the label that matters most on a backend like this one, because
       // JACK inverts the shape of every other output we have: there is no
       // render loop and no thread of ours -- the server calls US, on a thread
       // it created, and being late xruns every client in the graph. Nothing
@@ -584,22 +629,32 @@ if (process.platform === "win32") {
     // latency that moves, a tail that moves. Those are exactly what a
     // validator is for, and the plugin exercising them was the one plugin
     // never handed to one.
+    // Preset discovery INCLUDED. It was excluded while the factory presets
+    // were declared as one container inside the plugin: clap-validator 0.4.1
+    // deadlocks on the second preset of any container (its begin_preset()
+    // holds a MutexGuard on `result` and calls flush_preset(), which locks
+    // the same mutex again). The provider now declares them as files, one
+    // preset per file (user_presets.h, syncFactoryPresetFiles), beside the
+    // user's own folder, and the validator crawls and loads every one.
+    //
+    // One more thing it needs on Windows: it refuses a FILE location that
+    // does not begin with '/' ("should be an absolute path") -- which every
+    // drive-letter path fails, and which a Mac or Linux path never does. So
+    // the presets go under a preset root of this run's own, spelled
+    // //?/C:/..., a form Windows opens like any other. A host is handed the
+    // ordinary C:\... path the CLAP spec asks for; only this run moves them.
+    const presetRoot = join(tmpdir(), `sonore-validator-presets-${process.pid}`);
+    mkdirSync(presetRoot, { recursive: true });
+    const validatorEnv = { ...process.env, SONORE_PRESET_ROOT: "//?/" + presetRoot.replace(/\\/g, "/") };
     for (const name of ["SonoreSaturator", "SonoreSynth", "SonoreDucker", "SonoreTrim",
                         "SonoreSplitter", "SonoreArp", "SonoreSampler", "SonoreReverb",
-                        "SonoreGuiProbe"]) {
-      // preset-discovery-crawl/load are EXCLUDED, and not because we fail them:
-      // clap-validator 0.4.1 deadlocks itself on any provider that declares
-      // more than one preset. Its begin_preset() holds a MutexGuard on
-      // `result` and then calls flush_preset(), which locks the same
-      // non-reentrant mutex, so the second preset hangs the validator, not
-      // the plugin. Verified by declaring a single preset: the same test
-      // passes in 1 ms. Drop this exclusion once the tool is fixed upstream.
+                        "SonoreGuiProbe", "SonoreShowcase"]) {
       run(`"${clapValidator}"`, [
         "validate",
-        "-x", '"preset-discovery-(crawl|load)"',
         `"${join(build, "Release", name + ".clap")}"`,
-      ]);
+      ], { env: validatorEnv });
     }
+    rmSync(presetRoot, { recursive: true, force: true });
   } else {
     log("  SKIPPED clap-validator: sdk/tools/clap-validator.exe not found.");
   }
@@ -640,7 +695,8 @@ if (process.platform === "win32") {
     } catch {}
     for (const name of ["SonoreSaturatorVST3", "SonoreSynthVST3", "SonoreDuckerVST3",
                         "SonoreTrimVST3", "SonoreSplitterVST3", "SonoreArpVST3",
-                        "SonoreSamplerVST3", "SonoreReverbVST3", "SonoreGuiProbeVST3"]) {
+                        "SonoreSamplerVST3", "SonoreReverbVST3", "SonoreGuiProbeVST3",
+                        "SonoreShowcaseVST3"]) {
       const staged = join(stage, name + ".vst3");
       cpSync(join(build, "Release", name + ".vst3.bundle"), staged, { recursive: true });
       run(`"${pluginval}"`, ["--strictness-level", "10", "--validate", `"${staged}"`]);

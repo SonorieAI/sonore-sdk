@@ -1,11 +1,13 @@
 # Sonore SDK: build and test on all three desktop platforms.
 #
-# Linux and Windows are also proven locally on the dev box, Windows natively
-# and Linux through WSL. This workflow runs the SAME tests on all three
-# platforms rather than a reduced set on any of them, because a per-platform
-# gap is invisible until the code is compiled for that platform: an early
-# `nativeWindowApi()` returned "win32" on Linux, which would have meant no
-# exported Linux plugin ever showed a UI.
+# The dev box is Windows with a WSL cross-check, so Linux and Windows are proven
+# locally. macOS is not: nothing on that machine can compile a single line of
+# Cocoa or AudioUnit code. This workflow is how the macOS half stops being
+# unverified, and it is why it runs the SAME tests, not a reduced set.
+#
+# The one bug this class of gap already produced: `nativeWindowApi()` returned
+# "win32" on Linux, which would have meant no exported Linux plugin ever showed
+# a UI. It was invisible until the code was actually compiled for Linux.
 name: SDK
 
 on:
@@ -25,6 +27,84 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The map and rule checks verify:sdk runs before it compiles anything. Plain
+  # Node, seconds to run -- and until this job existed CI ran none of them, so
+  # a public type added without a feature-map row went green twice
+  # (eae6154, and SonoreHasLatency after a1af8d9) and was found only when
+  # someone happened to run the gate by hand.
+  gates:
+    name: Gates (maps and rules)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run verify:features
+      - run: npm run verify:unclaimed
+      - run: npm run verify:parity
+      - run: npm run verify:headers
+      - run: npm run verify:namespaces
+      - run: npm run verify:rt
+      - run: npm run verify:bridge
+      - run: npm run verify:bridge-types
+      - run: npm run verify:backends
+      # llms.txt and llms-full.txt are generated FROM the headers, which is the
+      # only reason they can be trusted: a hand-written index of an API drifts
+      # from the API, and an agent that reads a class which no longer exists
+      # writes code that cannot compile and does it confidently.
+      - run: npm run verify:llms
+
+  # The API reference and the guides (sdk/docs), built with Doxygen. Fails on a
+  # warning about the public headers or the guides -- a comment Doxygen cannot
+  # parse renders wrong -- and on a guide naming an API that does not exist;
+  # the undocumented classes are a report, kept with the HTML. Doxygen from
+  # apt is 1.9.8 on this image, the version scripts/fetch-doxygen.mjs pins on
+  # Windows, so the warnings mean the same thing in both places. The guides'
+  # code is not built here: tests/doc_snippets.cmake builds it with the suite.
+  docs:
+    name: Docs (API reference and guides)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends doxygen
+          doxygen --version
+      - run: npm run docs
+      - name: Keep the HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonore-sdk-docs
+          path: |
+            sdk/build/docs/html
+            sdk/build/docs/warnings.log
+            sdk/build/docs/undocumented.txt
+            sdk/build/docs/joined-comments.txt
+          if-no-files-found: warn
+
+  # The browser ABI: every example compiled through emscripten and driven the
+  # way the AudioWorklet host drives it. The leg verify:sdk skips on a machine
+  # without the emsdk -- which was every CI run, while wasm_abi.h was the
+  # header changing most.
+  wasm:
+    name: wasm (browser ABI)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+      - run: node sdk/tests/wasm_build_test.mjs
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -44,6 +124,13 @@ jobs:
           - name: Windows-clangcl
             os: windows-2022
             configure: -T ClangCL
+          # Debug is what Visual Studio builds when no configuration is named,
+          # so it is what a contributor builds first -- and it had never been
+          # built here until the suite stopped compiling in it (C1128) and an
+          # audio-thread test counted allocations only checked iterators make.
+          - name: Windows-Debug
+            os: windows-2022
+            config: Debug
 
     steps:
       - uses: actions/checkout@v4
@@ -58,20 +145,20 @@ jobs:
             libgtk-3-0 libwebkit2gtk-4.1-0 libx11-dev xvfb
 
       - name: Configure
-        run: cmake -S sdk -B sdk/build -DCMAKE_BUILD_TYPE=Release ${{ matrix.configure }}
+        run: cmake -S sdk -B sdk/build -DCMAKE_BUILD_TYPE=${{ matrix.config || 'Release' }} ${{ matrix.configure }}
 
       - name: Build
-        run: cmake --build sdk/build --config Release
+        run: cmake --build sdk/build --config ${{ matrix.config || 'Release' }}
 
       # A desktop session the editor can attach to. Without one the GUI tests
       # skip, and a green run would mean less than it appears to.
       - name: Test (Linux, virtual display)
         if: runner.os == 'Linux'
-        run: xvfb-run -a ctest --test-dir sdk/build -C Release --output-on-failure
+        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
 
       - name: Test
         if: runner.os != 'Linux'
-        run: ctest --test-dir sdk/build -C Release --output-on-failure
+        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
 
       # Apple's own validator - the gate Logic and GarageBand apply before
       # they will even list a plugin. auval only sees INSTALLED and REGISTERED
@@ -119,6 +206,75 @@ jobs:
           auval -v aufx Spl1 Sonr
           auval -v aumu Arp1 Sonr
 
+      # The format owners' validators, beside auval above: clap-validator
+      # (free-audio) on the CLAP builds and pluginval (Tracktion, strictness 10)
+      # on the VST3 ones -- the checks a host vendor or a store runs first --
+      # over every example and the GUI probe, the list verify:sdk runs locally
+      # (the probe carries the awkward declarations no example has). On
+      # Windows all of them pass there, pluginval's editor tests included;
+      # Linux skips those, as a virtual display makes them a test of xvfb.
+      #
+      # Preset discovery is included. It was left out while factory presets
+      # were one container inside the plugin: the validator's metadata
+      # receiver deadlocks on the SECOND begin_preset of a container (0.4.1
+      # and master as of 2026-10). The provider now declares them as files,
+      # one preset each, beside the user's folder (user_presets.h). The
+      # presets go under a root of this job's own -- on Windows spelled
+      # //?/C:/..., because the validator refuses a FILE location that does
+      # not begin with '/', which every drive-letter path fails.
+      #
+      # ADVISORY while they are new here: continue-on-error, so a first red run
+      # reads as a list of findings rather than a broken build. Drop it once
+      # both have been green on every platform. The release assets are found
+      # by pattern through gh rather than by exact file name, and the binaries
+      # by searching what was unpacked, because neither layout is promised.
+      # The time limit is for a validator that hangs: without one, the job
+      # waits out GitHub's six hours.
+      - name: clap-validator and pluginval (advisory)
+        if: runner.os != 'macOS' && matrix.name != 'Windows-clangcl' && matrix.name != 'Windows-Debug'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          root="$PWD"
+          mkdir -p "$RUNNER_TEMP/validators" && cd "$RUNNER_TEMP/validators"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            gh release download --repo free-audio/clap-validator --pattern '*ubuntu*' --clobber
+            gh release download --repo Tracktion/pluginval --pattern 'pluginval_Linux.zip' --clobber
+            run="xvfb-run -a"
+            gui="--skip-gui-tests"
+          else
+            gh release download --repo free-audio/clap-validator --pattern '*windows*' --clobber
+            gh release download --repo Tracktion/pluginval --pattern 'pluginval_Windows.zip' --clobber
+            run=""
+            gui=""
+          fi
+          ls -la
+          for a in *.tar.gz; do [ -f "$a" ] && tar xzf "$a"; done
+          for a in *.zip; do [ -f "$a" ] && 7z x -y "$a" >/dev/null; done
+          clapv=$(find . -type f \( -name clap-validator -o -name clap-validator.exe \) | head -1)
+          pluginval=$(find . -type f \( -name pluginval -o -name pluginval.exe \) | head -1)
+          chmod +x "$clapv" "$pluginval" 2>/dev/null || true
+          status=0
+          mkdir -p "$RUNNER_TEMP/presets"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export SONORE_PRESET_ROOT="//?/$(cygpath -m "$RUNNER_TEMP/presets")"
+          else
+            export SONORE_PRESET_ROOT="$RUNNER_TEMP/presets"
+          fi
+          for name in SonoreArp SonoreDucker SonoreReverb SonoreSampler SonoreSaturator \
+                      SonoreSplitter SonoreSynth SonoreTrim SonoreGuiProbe SonoreShowcase; do
+            clap=$(find "$root/sdk/build" -name "$name.clap" | head -1)
+            vst3=$(find "$root/sdk/build" -maxdepth 4 -name "${name}VST3.vst3" | head -1)
+            [ -n "$clap" ] && { "$clapv" validate "$clap" || status=1; }
+            [ -n "$vst3" ] && { $run "$pluginval" --strictness-level 10 $gui \
+                                 --validate-in-process --validate "$vst3" || status=1; }
+          done
+          exit $status
+
       # The artifacts a human can actually load into a DAW to check by hand.
       - name: Collect plugins
         if: always()
@@ -143,15 +299,3 @@ jobs:
       - uses: actions/checkout@v4
       - name: ASan+UBSan on every wrapper, the suites and the fuzzer; TSan on the handover
         run: npm run verify:sanitize
-
-  # llms.txt and llms-full.txt are generated FROM the headers, which is the only
-  # reason they can be trusted: a hand-written index of an API drifts from the
-  # API, and an agent that reads a class which no longer exists writes code that
-  # cannot compile and does it confidently. This check costs seconds and is what
-  # makes "generated, so it cannot be wrong" a fact rather than an intention.
-  docs:
-    name: Agent docs are current
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm run verify:llms

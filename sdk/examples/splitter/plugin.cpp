@@ -82,18 +82,32 @@ struct SonoreDsp {
       for (int c = 0; c < 2; ++c) highSplit[c].reset();
     upperWasNeeded = needUpper;
 
-    for (size_t c = 0; c < nch && c < 2; ++c) {
-      float* io = ctx.main.getChannelPointer(c);
-      float* midCh = c < mid.getNumChannels() ? mid.getChannelPointer(c) : nullptr;
-      float* highCh = c < high.getNumChannels() ? high.getChannelPointer(c) : nullptr;
-      for (size_t i = 0; i < n; ++i) {
-        const float g = outSm.next(sonore::dbToGain(p[2]));
+    const size_t chans = nch < 2 ? nch : 2;
+    float* io[2] = {nullptr, nullptr};
+    float* midCh[2] = {nullptr, nullptr};
+    float* highCh[2] = {nullptr, nullptr};
+    for (size_t c = 0; c < chans; ++c) {
+      io[c] = ctx.main.getChannelPointer(c);
+      midCh[c] = c < mid.getNumChannels() ? mid.getChannelPointer(c) : nullptr;
+      highCh[c] = c < high.getNumChannels() ? high.getChannelPointer(c) : nullptr;
+    }
+    // Once per block: the smoother does the ramp, so the dB-to-gain power
+    // need not run per sample.
+    const float target = sonore::dbToGain(p[2]);
+    // Frames outside, channels inside, so the smoother takes ONE step per
+    // frame and both channels share it. Stepped inside a per-channel loop it
+    // advanced twice per frame -- left took the first half of the ramp, right
+    // the second, and every block skipped as many steps as it had frames: a
+    // zipper whenever the output moved, and a stereo image wobbling with it.
+    for (size_t i = 0; i < n; ++i) {
+      const float g = outSm.next(target);
+      for (size_t c = 0; c < chans; ++c) {
         float low = 0.0f, rest = 0.0f, midBand = 0.0f, highBand = 0.0f;
-        lowSplit[c].process(io[i], low, rest);
+        lowSplit[c].process(io[c][i], low, rest);
         if (needUpper) highSplit[c].process(rest, midBand, highBand);
-        io[i] = low * g;
-        if (midCh) midCh[i] = midBand * g;
-        if (highCh) highCh[i] = highBand * g;
+        io[c][i] = low * g;
+        if (midCh[c]) midCh[c][i] = midBand * g;
+        if (highCh[c]) highCh[c][i] = highBand * g;
       }
     }
   }
@@ -134,21 +148,4 @@ static const sonore::PluginDescriptor kDesc = {
     (int) (sizeof(kAuxOutputs) / sizeof(kAuxOutputs[0])),
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

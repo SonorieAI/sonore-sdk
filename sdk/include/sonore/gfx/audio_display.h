@@ -35,7 +35,7 @@ namespace sonore {
 namespace gfx {
 
 /**
- * A scrolling oscilloscope.
+ * A scrolling oscilloscope: a view onto an AudioScopeBuffer.
  *
  * Each column is one BUCKET -- the minimum and maximum of however many samples
  * fell into it -- rather than one sample. A scope that plotted individual
@@ -43,9 +43,6 @@ namespace gfx {
  * five samples a cycle, and picking every Nth one draws a slow wobble that is
  * not in the audio. Min and max over the group draws the envelope, which is
  * what an analogue scope shows and what people expect.
- */
-/**
- * A view onto an AudioScopeBuffer.
  *
  * The buffer is NOT owned, and that is the whole point of the split: it is fed
  * by the audio thread and has to exist whether or not an editor is open, so a
@@ -55,11 +52,15 @@ namespace gfx {
  */
 class AudioVisualiser : public Widget {
 public:
+  /** Show `buffer`, which is not owned and must outlive this view or be
+   *  replaced first; null draws an empty scope. The audio thread may go on
+   *  writing it while this paints. */
   void setBuffer(const AudioScopeBuffer* buffer) {
     buffer_ = buffer;
     repaint();
   }
 
+  /** The buffer shown, or null. */
   const AudioScopeBuffer* buffer() const { return buffer_; }
 
   void paint(Graphics& g) override {
@@ -95,11 +96,14 @@ private:
  */
 class WaveformView : public Widget {
 public:
+  /** Show `thumb`, which is not owned and must outlive this view or be
+   *  replaced first; null draws no waveform. */
   void setThumbnail(const AudioThumbnail* thumb) {
     thumb_ = thumb;
     repaint();
   }
 
+  /** The thumbnail shown, or null. */
   const AudioThumbnail* thumbnail() const { return thumb_; }
 
   /** 0..1 along the waveform, or negative for none. */
@@ -109,6 +113,7 @@ public:
     repaint();
   }
 
+  /** 0..1 along the waveform, or negative for none. */
   float playhead() const { return playhead_; }
 
   /** A highlighted region, 0..1. An empty one is drawn as nothing rather than
@@ -119,12 +124,18 @@ public:
     repaint();
   }
 
+  /** The selection's start, 0..1. */
   float selectionFrom() const { return selectionFrom_; }
+  /** The selection's end, 0..1; equal to selectionFrom when empty. */
   float selectionTo() const { return selectionTo_; }
+  /** Whether a region of more than zero width is selected. */
   bool hasSelection() const { return selectionTo_ > selectionFrom_; }
 
   /** Clicking scrubs, dragging selects. Fired with 0..1 positions. */
   std::function<void(float position)> onClick;
+  /** The new selection, 0..1, on each move of a drag. The press itself
+   *  empties the selection and calls onClick instead; setSelection calls
+   *  neither. */
   std::function<void(float from, float to)> onSelectionChange;
 
   void mouseDown(const MouseEvent& e) override {

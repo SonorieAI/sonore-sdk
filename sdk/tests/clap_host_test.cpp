@@ -11,6 +11,7 @@
 // runtime, so what is tested is the SHIPPED artifact, not a second build of the
 // same source.
 #include <sonore/midi_ci.h>
+#include <sonore/files.h>
 #include <clap/clap.h>
 #include <clap/factory/preset-discovery.h>
 
@@ -89,7 +90,22 @@ static void hostParamsRescan(const clap_host_t*, clap_param_rescan_flags flags) 
   g_rescanFlags |= flags;
 }
 static void hostParamsClear(const clap_host_t*, clap_id, clap_param_clear_flags) {}
-static void hostParamsRequestFlush(const clap_host_t*) {}
+// An editor edit made while nothing is processing has no other way to reach
+// the host, so the GUI test below counts these.
+static int g_flushRequests = 0;
+
+#if defined(_WIN32)
+// The host window's own procedure, wrapped to count the keys the editor hands
+// back: a webview with focus keeps every keystroke unless it passes them on.
+static int g_spaceDown = 0, g_spaceUp = 0;
+static WNDPROC g_parentProc = nullptr;
+static LRESULT CALLBACK countKeysProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_KEYDOWN && w == VK_SPACE) ++g_spaceDown;
+  if (m == WM_KEYUP && w == VK_SPACE) ++g_spaceUp;
+  return CallWindowProcW(g_parentProc, h, m, w, l);
+}
+#endif
+static void hostParamsRequestFlush(const clap_host_t*) { ++g_flushRequests; }
 static const clap_host_params_t kHostParams = {hostParamsRescan, hostParamsClear,
                                                hostParamsRequestFlush};
 
@@ -286,6 +302,16 @@ static EmittedMidi g_emitted;
  *  pointer would be testing its own bug rather than the plugin's. */
 static std::vector<std::vector<uint8_t>> g_emittedSysex;
 
+/** The last value each parameter was reported at through an output queue. */
+static double g_reportedParam[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+static bool paramTryPush(const clap_output_events_t*, const clap_event_header_t* h) {
+  if (h && h->type == CLAP_EVENT_PARAM_VALUE && h->space_id == CLAP_CORE_EVENT_SPACE_ID) {
+    const auto* v = reinterpret_cast<const clap_event_param_value_t*>(h);
+    if (v->param_id < 8) g_reportedParam[v->param_id] = v->value;
+  }
+  return true;
+}
+
 static bool outTryPush(const clap_output_events_t*, const clap_event_header_t* h) {
   if (h && h->type == CLAP_EVENT_MIDI && h->space_id == CLAP_CORE_EVENT_SPACE_ID) {
     const auto* m = reinterpret_cast<const clap_event_midi_t*>(h);
@@ -309,16 +335,27 @@ struct PresetCrawl {
   std::vector<std::string> loadKeys;
   int locations = 0;
   bool sawPluginId = false;
+  /** Per declared location: its kind, its flags and its path. */
+  std::vector<uint32_t> kinds, flags;
+  std::vector<std::string> paths;
+  /** The file types declared, with their dots. */
+  std::vector<std::string> extensions;
 };
 static PresetCrawl g_crawl;
 
 static bool idxDeclareFiletype(const clap_preset_discovery_indexer_t*,
-                               const clap_preset_discovery_filetype_t*) {
+                               const clap_preset_discovery_filetype_t* t) {
+  if (t && t->file_extension && t->file_extension[0])
+    g_crawl.extensions.push_back(std::string(".") + t->file_extension);
   return true;
 }
 static bool idxDeclareLocation(const clap_preset_discovery_indexer_t*,
                                const clap_preset_discovery_location_t* l) {
-  if (l) ++g_crawl.locations;
+  if (!l) return true;
+  ++g_crawl.locations;
+  g_crawl.kinds.push_back(l->kind);
+  g_crawl.flags.push_back(l->flags);
+  g_crawl.paths.push_back(l->location ? l->location : "");
   return true;
 }
 static bool idxDeclareSoundpack(const clap_preset_discovery_indexer_t*,
@@ -349,6 +386,33 @@ static void rxSetTimestamps(const clap_preset_discovery_metadata_receiver_t*, cl
 static void rxAddFeature(const clap_preset_discovery_metadata_receiver_t*, const char*) {}
 static void rxAddExtraInfo(const clap_preset_discovery_metadata_receiver_t*, const char*,
                            const char*) {}
+
+/** Whether the plugin's preset provider declares FACTORY content -- what
+ *  "this plugin ships presets" means now that preset-load is offered by every
+ *  plugin (a user preset is a file any plugin can have). */
+static bool declaresFactoryPresets(const clap_plugin_entry_t* entry) {
+  const auto* pf = static_cast<const clap_preset_discovery_factory_t*>(
+      entry->get_factory(CLAP_PRESET_DISCOVERY_FACTORY_ID));
+  if (!pf || pf->count(pf) == 0) return false;
+  const auto* pd = pf->get_descriptor(pf, 0);
+  clap_preset_discovery_indexer_t indexer{};
+  indexer.clap_version = CLAP_VERSION;
+  indexer.name = "Sonore SDK Test Host";
+  indexer.declare_filetype = idxDeclareFiletype;
+  indexer.declare_location = idxDeclareLocation;
+  indexer.declare_soundpack = idxDeclareSoundpack;
+  indexer.get_extension = idxGetExtension;
+  g_crawl = PresetCrawl{};
+  const auto* provider = pd ? pf->create(pf, &indexer, pd->id) : nullptr;
+  bool factory = false;
+  if (provider) {
+    if (provider->init(provider))
+      for (uint32_t f : g_crawl.flags) factory = factory || (f & CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT) != 0;
+    provider->destroy(provider);
+  }
+  g_crawl = PresetCrawl{};
+  return factory;
+}
 
 /** A version this build cannot possibly understand. Named rather than written
  *  inline, so that when the format really does reach it the test fails loudly
@@ -395,6 +459,12 @@ int main(int argc, char** argv) {
   int expectChanMin = 0, expectChanMax = 0; // 0 = fixed-stereo expectations
   int expectAuxOuts = -1;                   // -1 = no expectation
   bool expectMidiOut = false;
+  /** Both channels are processed alike, so identical input must give
+   *  identical output -- while a parameter ramps, too. */
+  bool expectLinkedStereo = false;
+  /** The 64-bit fixture (tests/double_fixture.cpp): its double-precision
+   *  block must have every consequence a float block has. */
+  bool expect64Parity = false;
   // Which editor this plugin should open. A plugin that defines SONORE_UI_HTML
   // asked for a page; one that does not gets the SDK's own controls. The test
   // is told which to expect so it can measure rather than accept whatever
@@ -407,6 +477,8 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[i], "--expect-bridge") == 0) expectBridge = true;
     if (std::strcmp(argv[i], "--expect-sidechain") == 0) expectSidechain = true;
     if (std::strcmp(argv[i], "--expect-midi-out") == 0) expectMidiOut = true;
+    if (std::strcmp(argv[i], "--expect-64bit-parity") == 0) expect64Parity = true;
+    if (std::strcmp(argv[i], "--expect-linked-stereo") == 0) expectLinkedStereo = true;
     if (std::strcmp(argv[i], "--expect-aux-outs") == 0 && i + 1 < argc) {
       expectAuxOuts = std::atoi(argv[i + 1]);
       ++i;
@@ -602,7 +674,6 @@ int main(int argc, char** argv) {
   inBufs[0].channel_count = 2;
   inBufs[1].data32 = scPtrs;
   inBufs[1].channel_count = 2;
-  clap_audio_buffer_t& inBuf = inBufs[0];
   // Aux output buses get real, separately identifiable buffers: a wrapper
   // that routed a band to the wrong bus, or to the main out, fails below.
   constexpr int kMaxTestAux = 4;
@@ -684,6 +755,22 @@ int main(int argc, char** argv) {
     // Note on -> it must sound.
     events.storage.clear();
     events.addNote(CLAP_EVENT_NOTE_ON, 69, 1.0, 0); // A4
+    if (expectMidiOut) {
+      // The first step lands ON the key, not one step after it. The step
+      // clock started from zero, so the first note came a whole step late --
+      // two seconds at the slowest rate, which a player reads as a dead key.
+      run(1, true);
+      int firstOnAt = -1;
+      for (const auto& e : g_emitted.events)
+        if ((e.data[0] & 0xf0) == 0x90 && e.data[2] > 0) {
+          firstOnAt = (int) e.time;
+          break;
+        }
+      char line[160];
+      std::snprintf(line, sizeof(line), "a note effect answers the key in the block it went down "
+                    "in, at its frame (first note-on at frame %d)", firstOnAt);
+      check(firstOnAt == 0, line);
+    }
     const Result playing = run(oneSecond / 2, true);
     check(!playing.errored && playing.finite, "a held note stays finite");
     if (expectMidiOut) {
@@ -791,6 +878,66 @@ int main(int argc, char** argv) {
       const Result afterPanic = run(oneSecond / 4, true); // then measure a fresh window
       check(afterPanic.peak < 1e-3,
             "a wildcard note-off (key -1) releases every voice, not one masked note");
+    }
+
+    // reset() KILLS every voice -- CLAP says so in as many words -- and a host
+    // that has called it sends no note-off for a note it started before: as
+    // far as the host knows, that note is gone. The wrapper's own key tally
+    // forgets it too. A DSP with no reset() of its own is prepared again
+    // instead, and both example instruments kept their voices through that:
+    // a held note went on sounding for ever, 0.14 out of the synth and 0.50
+    // out of the sampler two seconds after the reset.
+    if (!expectMidiOut) {
+      events.storage.clear();
+      events.addNote(CLAP_EVENT_NOTE_ON, 69, 1.0, 0);
+      run(oneSecond / 4, true);
+      events.storage.clear();
+      plugin->reset(plugin);
+      run(oneSecond * 3, true); // longer than any release
+      const Result afterReset = run(oneSecond / 4, true);
+      char line[160];
+      std::snprintf(line, sizeof(line), "reset() silences a note still held, which no note-off "
+                    "will ever end (peak %.4f after it)", afterReset.peak);
+      check(afterReset.peak < 1e-3, line);
+    }
+
+    // The first note after a reset plays at the level the Level control
+    // says. Both example instruments snapped their output smoother to a fixed
+    // number in prepare() -- which is also what answers a reset and the
+    // switch to offline rendering -- and glided from there to the control
+    // for the first 50 ms: a bounce that starts on a note, at a level of
+    // -40 dB, began 30 times too loud. The note's first 10 ms after the
+    // reset against the same note's first 10 ms later on.
+    if (!expectMidiOut) {
+      clap_param_info_t level{};
+      bool hasLevel = false;
+      for (uint32_t i = 0; i < nParams && !hasLevel; ++i)
+        if (params->get_info(plugin, i, &level) && std::strcmp(level.name, "Level") == 0) hasLevel = true;
+      if (hasLevel) {
+        auto firstTenMs = [&]() {
+          events.addNote(CLAP_EVENT_NOTE_ON, 69, 1.0, 0);
+          const Result r = run((int) (sampleRate * 0.01 / blockSize) + 1, true);
+          events.storage.clear();
+          events.addNote(CLAP_EVENT_NOTE_OFF, 69, 0.0, 0);
+          run(oneSecond * 3, true);
+          return r.peak;
+        };
+        events.storage.clear();
+        events.addParam(level.id, level.min_value, 0);
+        run(oneSecond, true); // the control has long since arrived
+        plugin->reset(plugin);
+        events.storage.clear();
+        const double afterReset = firstTenMs();
+        const double later = firstTenMs();
+        char line[200];
+        std::snprintf(line, sizeof(line), "the first note after a reset plays at the Level control's "
+                      "level (first 10 ms peak %.5f, the same note later %.5f)", afterReset, later);
+        check(later > 0.0 && afterReset < later * 1.2, line);
+        events.storage.clear();
+        events.addParam(level.id, level.default_value, 0);
+        run(oneSecond / 4, true);
+        events.storage.clear();
+      }
     }
 
     // Raw MIDI is the other dialect the port advertises: it must work too.
@@ -1127,6 +1274,16 @@ int main(int argc, char** argv) {
               check(parsed == 1.0, "…as the step it names");
               check(params->text_to_value(plugin, switchId, "Short", &parsed) && parsed == 0.0,
                     "…both ways round");
+
+              // A choice whose every step is named is an ENUM to the host,
+              // which can then offer a menu rather than a knob.
+              bool isEnum = false;
+              for (uint32_t i = 0; i < nParams; ++i) {
+                clap_param_info_t info{};
+                if (params->get_info(plugin, i, &info) && info.id == switchId)
+                  isEnum = (info.flags & CLAP_PARAM_IS_ENUM) != 0 && (info.flags & CLAP_PARAM_IS_STEPPED) != 0;
+              }
+              check(isEnum, "…and the host is told it is a choice (CLAP_PARAM_IS_ENUM)");
             }
 
             // ── The tail, announced the other way round ─────────────
@@ -1255,8 +1412,8 @@ int main(int argc, char** argv) {
           }
         }
       } else {
-        // Any value is legitimate: the saturator oversamples and so genuinely
-        // delays, but it has to be a plausible one. An absurd number here means
+        // Any value is legitimate (the saturator oversamples and so genuinely
+        // delays) but it has to be a plausible one. An absurd number here means
         // the wrapper is reporting something other than the DSP's own answer.
         check(reported < 10000, "the reported latency is plausible");
       }
@@ -1429,16 +1586,21 @@ int main(int argc, char** argv) {
                     (unsigned) info.voice_count, (unsigned) info.voice_capacity,
                     (unsigned long long) info.flags);
         check(info.voice_capacity > 0, "…with a real capacity");
-        check(info.voice_count <= info.voice_capacity,
-              "…and never more sounding than it can hold");
-        // The flag means two notes on the SAME KEY may sound at once, which is
-        // what MPE does when two fingers land on one pitch. It was not true
-        // until the VoiceManager learned to tell fingers apart by channel, so
-        // an expressive instrument must claim it and a plain one must not.
+        // voice_count is the voices the patch CAN use: at least 1, and not the
+        // number sounding, which the extension says it must not be confused
+        // with. It was that number -- 0 at rest, below the extension's floor,
+        // and 1 under one held note, which a host may read as a mono patch.
+        check(info.voice_count >= 1 && info.voice_count == info.voice_capacity,
+              "…and says every one of them is usable, whatever is sounding");
+        // The flag lets a host send two notes on the same channel AND key,
+        // told apart by note_id alone. Notes reach the DSP as MIDI, and voices
+        // are found by key and channel, so a note-off for one released both
+        // and the note still held went silent. Not claimed; MPE's two fingers
+        // on one pitch are on two channels and never needed it.
         const bool overlapping =
             (info.flags & CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES) != 0;
-        check(overlapping,
-              "…and an expressive instrument accepts two notes on one key");
+        check(!overlapping,
+              "…and does not invite two notes on one key and channel, which it cannot tell apart");
       }
     } else {
       check(voiceInfo == nullptr,
@@ -1481,18 +1643,23 @@ int main(int argc, char** argv) {
         // mode while the transport runs. The wrapper used to re-prepare the
         // DSP right there, on the main thread, under a running process() --
         // ThreadSanitizer saw every filter's coefficients being rewritten
-        // while the audio thread read them. So it now records the mode and
-        // asks for a restart, the way the latency change does, and the host
-        // does what a host does: deactivate, activate, and prepare() runs
-        // with the new mode on the one thread that is allowed to.
+        // while the audio thread read them. Then it asked for a restart
+        // instead, and scripts/reaper-host-test.mjs found what a host does
+        // with that: REAPER sets offline mode as a render STARTS and restarts
+        // the plugin whenever it gets round to it, partway through the bounce
+        // -- voices cut, filters and the reverb's tail reset mid-file. So the
+        // mode is only recorded; nothing is asked of the host.
         g_restartRequests = 0;
         check(render->set(plugin, CLAP_RENDER_OFFLINE), "offline mode is accepted");
-        check(g_restartRequests > 0,
-              "...and, being active, the plugin asks for a restart rather than re-preparing "
-              "under the audio thread");
+        check(g_restartRequests == 0,
+              "...and, being active, the plugin does NOT ask for a restart (a DAW honours it "
+              "mid-render)");
+        // A DSP that never sees a ProcessContext learns the mode from
+        // prepare(), at its next activation -- as a VST3 one does from
+        // setupProcessing, which is only ever called while deactivated.
         plugin->stop_processing(plugin);
         plugin->deactivate(plugin);
-        check(plugin->activate(plugin, sampleRate, 1, blockSize), "the host restarts it");
+        check(plugin->activate(plugin, sampleRate, 1, blockSize), "the host reactivates it");
         check(plugin->start_processing(plugin), "...and resumes processing");
         telemetry();
         const double offline = telemetry();
@@ -1501,7 +1668,7 @@ int main(int argc, char** argv) {
                   "the offline flag reached a DSP that never sees a ProcessContext");
         g_restartRequests = 0;
         check(render->set(plugin, CLAP_RENDER_REALTIME), "and back to realtime");
-        check(g_restartRequests > 0, "...which asks for a restart too");
+        check(g_restartRequests == 0, "...again without asking for a restart");
         plugin->stop_processing(plugin);
         plugin->deactivate(plugin);
         plugin->activate(plugin, sampleRate, 1, blockSize);
@@ -1676,7 +1843,7 @@ int main(int argc, char** argv) {
   {
     const auto* presets = static_cast<const clap_plugin_preset_load_t*>(
         plugin->get_extension(plugin, CLAP_EXT_PRESET_LOAD));
-    if (presets) {
+    if (presets && declaresFactoryPresets(entry)) {
       std::printf("  ---- this plugin ships factory presets ----\n");
       // Move every control away from the preset first, so a pass cannot be an
       // accident of the defaults.
@@ -1706,7 +1873,7 @@ int main(int argc, char** argv) {
       check(!presets->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "999"),
             "an out-of-range preset index is refused");
       check(!presets->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_FILE, "/x", "0"),
-            "a file location is refused (presets live inside the plugin)");
+            "a preset file that is not there is refused");
       check(!presets->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "junk"),
             "a non-numeric load key is refused, not guessed at");
     }
@@ -1779,6 +1946,46 @@ int main(int argc, char** argv) {
     const auto high = energies(12000.0);
     check(high.second > 1e-3, "a high tone reaches the AUX bus");
     check(high.first < high.second * 0.01, "…and stays off the main bus");
+  }
+
+  // ── Both channels ramp together ───────────────────────────────────────────
+  //
+  // A smoother stepped inside the per-channel loop advances once per sample
+  // PER CHANNEL: left gets the first half of the ramp, right the second, and
+  // each block skips as many steps as it takes. Identical input then comes
+  // out different on the two sides while a knob moves -- a zipper, and a
+  // stereo image that wobbles with automation.
+  if (expectLinkedStereo) {
+    clap_id gainId = CLAP_INVALID_ID;
+    double gainMin = 0.0;
+    for (uint32_t i = 0; i < nParams; ++i) {
+      clap_param_info_t info{};
+      if (params->get_info(plugin, i, &info) && std::strcmp(info.name, "Output") == 0) {
+        gainId = info.id;
+        gainMin = info.min_value;
+      }
+    }
+    check(gainId != CLAP_INVALID_ID, "the plugin has an Output control to move");
+    if (gainId != CLAP_INVALID_ID) {
+      run(oneSecond / 4, false);
+      events.addParam(gainId, gainMin, 0);
+      double worst = 0.0;
+      static int ph = 0;
+      for (int b = 0; b < 8; ++b) {
+        for (uint32_t i = 0; i < blockSize; ++i) {
+          inL[i] = inR[i] = 0.25f * (float) std::sin(2.0 * 3.14159265358979 * 440.0 * ph / 48000.0);
+          ++ph;
+        }
+        plugin->process(plugin, &process);
+        events.storage.clear();
+        for (uint32_t i = 0; i < blockSize; ++i)
+          if (std::fabs(outL[i] - outR[i]) > worst) worst = std::fabs(outL[i] - outR[i]);
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "identical input stays identical on both sides while "
+                    "the output gain ramps (worst difference %.2e)", worst);
+      check(worst < 1e-6, line);
+    }
   }
 
   // ── Per-note expression (MPE) ─────────────────────────────────────────────
@@ -1882,6 +2089,111 @@ int main(int argc, char** argv) {
       // wrong" alike.
       const double ratio = plain > 0.0 ? bent / plain : 0.0;
       std::printf("  ---- measured pitch: %.1f Hz -> %.1f Hz ----\n", plain, bent);
+
+      // ── A tuning sent WITH its note-on ───────────────────────────────────
+      //
+      // An MPE controller sends a note's initial pitch offset in the same
+      // instant as the note itself -- the finger landed off-centre. Handled
+      // before the notes at the same frame, it found no voice (or retuned the
+      // previous, releasing one), and the note-on then reset the tune: the
+      // note started in the wrong place.
+      {
+        events.storage.clear();
+        events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0);
+        run(oneSecond, true);
+        events.storage.clear();
+        events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0);
+        events.push(&bend, sizeof(bend)); // same frame, after the note-on
+        capture(oneSecond / 4);
+        capture(oneSecond / 4);
+        const double landed = pitchOf(captured);
+        char line[200];
+        std::snprintf(line, sizeof(line), "a tuning sent in the same frame as its note-on is "
+                      "heard (%.1f Hz, want about %.1f)", landed, plain * 1.1225);
+        check(plain > 0.0 && landed > plain * 1.08 && landed < plain * 1.17, line);
+        events.storage.clear();
+        events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0);
+        run(oneSecond, true);
+        events.storage.clear();
+      }
+
+      // ── Pressure ends with its note ──────────────────────────────────────
+      //
+      // A voice is reused, and the next note on it starts unpressed. The
+      // synth zeroed its pressure at a note-on and left its filter leant
+      // open by the last note's press -- four times the cutoff -- and an
+      // incoming pressure of 0 changed nothing, so the note after a pressed
+      // one played the whole note as bright as the press. Brightness is the
+      // first difference's energy over the signal's: the same note, never
+      // pressed and then after a pressed one, must read the same.
+      {
+        auto brightness = [](const std::vector<float>& s) {
+          double e = 0.0, d = 0.0;
+          for (size_t i = 1; i < s.size(); ++i) {
+            e += (double) s[i] * s[i];
+            d += (double) (s[i] - s[i - 1]) * (s[i] - s[i - 1]);
+          }
+          return e > 0.0 ? d / e : 0.0;
+        };
+        auto playOnce = [&](bool press) {
+          events.storage.clear();
+          events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0);
+          if (press) {
+            clap_event_note_expression_t p = bend;
+            p.expression_id = CLAP_NOTE_EXPRESSION_PRESSURE;
+            p.value = 1.0;
+            events.push(&p, sizeof(p));
+          }
+          capture(oneSecond / 4);
+          capture(oneSecond / 4);
+          const double b = brightness(captured);
+          events.storage.clear();
+          events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0);
+          run(oneSecond * 2, true);
+          return b;
+        };
+        const double fresh = playOnce(false);
+        const double pressed = playOnce(true);
+        const double after = playOnce(false);
+        char line[200];
+        std::snprintf(line, sizeof(line), "a note after a pressed one starts unpressed (brightness "
+                      "%.6f never pressed, %.6f pressed, %.6f after)", fresh, pressed, after);
+        check(fresh > 0.0 && std::fabs(after - fresh) < 0.02 * fresh, line);
+        events.storage.clear();
+
+        // A control moved under a note still pressed keeps the press. The
+        // synth's Cutoff set the filter plain, so nudging it by a hertz --
+        // or automating it, a new value every block -- closed the filter
+        // under the finger until the pressure next moved.
+        clap_param_info_t cutoff{};
+        bool hasCutoff = false;
+        for (uint32_t i = 0; i < nParams && !hasCutoff; ++i)
+          if (params->get_info(plugin, i, &cutoff) && std::strcmp(cutoff.name, "Cutoff") == 0)
+            hasCutoff = true;
+        if (hasCutoff) {
+          events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0);
+          clap_event_note_expression_t p = bend;
+          p.expression_id = CLAP_NOTE_EXPRESSION_PRESSURE;
+          p.value = 1.0;
+          events.push(&p, sizeof(p));
+          capture(oneSecond / 4);
+          capture(oneSecond / 4);
+          const double held = brightness(captured);
+          events.storage.clear();
+          events.addParam(cutoff.id, cutoff.default_value + 1.0, 0);
+          capture(oneSecond / 4);
+          capture(oneSecond / 4);
+          const double nudged = brightness(captured);
+          std::snprintf(line, sizeof(line), "a control moved under a pressed note keeps the press "
+                        "(brightness %.6f pressed, %.6f after Cutoff +1 Hz)", held, nudged);
+          check(held > 0.0 && std::fabs(nudged - held) < 0.05 * held, line);
+          events.storage.clear();
+          events.addParam(cutoff.id, cutoff.default_value, 0);
+          events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0);
+          run(oneSecond * 2, true);
+          events.storage.clear();
+        }
+      }
 
       // ── The bend range the controller announces ──────────────────────────
       //
@@ -2109,8 +2421,8 @@ int main(int argc, char** argv) {
       // literal on purpose: bumping the format is a decision, and a test that
       // read the constant back out of the SDK would agree with any change
       // including an accidental one.
-      check(withBag.bytes.size() > 8 && withBag.bytes[4] == 5,
-            "...and the header declares state version 5");
+      check(withBag.bytes.size() > 8 && withBag.bytes[4] == 6,
+            "...and the header declares state version 6");
     }
 
     // Garbage must be refused, not half-applied.
@@ -2150,7 +2462,8 @@ int main(int argc, char** argv) {
         clap_istream_t ms{};
         ms.ctx = &mutated;
         ms.read = MemStream::readCb;
-        if (!state->load(plugin, &ms)) {
+        const bool loaded = state->load(plugin, &ms);
+        if (!loaded) {
           // Refused means UNTOUCHED. The loader used to write each value as
           // it was read, so a blob cut off at the fourth value was "refused"
           // with three already applied -- exactly the half-applied session
@@ -2166,9 +2479,25 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < blockSize; ++i)
           if (!std::isfinite(outL[i]) || !std::isfinite(outR[i])) finiteAfterAll = false;
         ++loads;
+        return loaded;
       };
+      // Every truncation refused -- the DSP's own bag included. A bag cut
+      // short failed to parse and was dropped, and the load reported success
+      // with every parameter applied: 191 of the 228 cuts of the GUI probe's
+      // blob loaded, 40 of the sampler's 81. One cut may: exactly where the
+      // bag starts, which reads as a session saved before the DSP had one,
+      // and has to keep loading.
+      int truncationsLoaded = 0;
       for (size_t len = 0; len < good.size(); ++len)
-        tryLoad(std::vector<uint8_t>(good.begin(), good.begin() + (long) len));
+        if (tryLoad(std::vector<uint8_t>(good.begin(), good.begin() + (long) len)))
+          ++truncationsLoaded;
+      {
+        char cut[200];
+        std::snprintf(cut, sizeof(cut),
+                      "a state blob cut short anywhere is refused (%d of %zu cuts loaded; one may)",
+                      truncationsLoaded, good.size());
+        check(truncationsLoaded <= 1, cut);
+      }
       for (int it = 0; it < 400 && !good.empty(); ++it) {
         std::vector<uint8_t> b = good;
         const int flips = 1 + (int) (rng() % 6);
@@ -2459,16 +2788,27 @@ int main(int argc, char** argv) {
       }
     }
     check(bypassId != CLAP_INVALID_ID, "an effect exposes a parameter flagged as THE bypass");
+    // Fixed, not one past the table: a version that appended a parameter
+    // moved it, and saved bypass automation drove the new parameter.
+    check(bypassId == 0x62797073u, "...under a fixed id ('byps') that appending cannot move");
 
     if (bypassId != CLAP_INVALID_ID) {
       const auto* latencyExt = static_cast<const clap_plugin_latency_t*>(
           plugin->get_extension(plugin, CLAP_EXT_LATENCY));
       const uint32_t L = latencyExt ? latencyExt->get(plugin) : 0;
 
+      // Every control at its maximum, so the processed signal is NOT the dry
+      // one: at the defaults Trim and the ducker are exactly transparent, and
+      // a bypass that let the wet leak through measured clean. It did leak --
+      // the crossfade ran 1, 1 - step, 1, ... once engaged: 2.6e-4 of the
+      // reverb to 4e-3 of the saturator, driven. Fully bypassed is a copy,
+      // so all that is left is the float rounding of the input (7.5e-9).
       events.storage.clear();
       for (uint32_t i = 0; i < nParams; ++i) {
         clap_param_info_t info{};
-        if (params->get_info(plugin, i, &info)) events.addParam(info.id, info.default_value, 0);
+        if (!params->get_info(plugin, i, &info)) continue;
+        if (info.flags & CLAP_PARAM_IS_BYPASS) continue;
+        events.addParam(info.id, info.max_value, 0);
       }
       events.addParam(bypassId, 1.0, 0); // engage
       plugin->reset(plugin);
@@ -2497,7 +2837,7 @@ int main(int argc, char** argv) {
       }
       std::printf("  ---- bypassed output vs input, aligned to %u samples: %.3g ----\n",
                   (unsigned) L, worst);
-      check(worst < 1e-3, "bypassed output IS the input, delayed by the reported latency");
+      check(worst < 1e-6, "bypassed output IS the input, delayed by the reported latency");
 
       // …and releasing it puts the processing back, or the button is a mute.
       //
@@ -2545,6 +2885,15 @@ int main(int argc, char** argv) {
       checkNear(readBack, 0.0, 1e-6, "…which the host can read back off the parameter");
 
       char text[64] = {};
+      // Typed back in: a switch position, or refused. Anything that was not
+      // "On" or "1" was read as off, so "bypassed" switched the bypass OFF.
+      {
+        double on = -1.0, off = -1.0, junk = -1.0;
+        check(params->text_to_value(plugin, bypassId, " on ", &on) && on == 1.0 &&
+                  params->text_to_value(plugin, bypassId, "Off", &off) && off == 0.0 &&
+                  !params->text_to_value(plugin, bypassId, "bypassed", &junk),
+              "the bypass reads \"on\" and \"Off\" and refuses \"bypassed\"");
+      }
       check(params->value_to_text(plugin, bypassId, 1.0, text, sizeof(text)) &&
                 std::strcmp(text, "On") == 0,
             "…and it prints as a switch, not as a number");
@@ -2635,7 +2984,7 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> v2on = buildBlob(2, nParamsNow, marks, true, true);
       check(loadBlob(v2on), "a v2 blob loads");
       std::vector<uint8_t> v1 = buildBlob(1, nParamsNow, marks, false, false);
-      check(loadBlob(v1), "a v1 blob, the oldest format that ever shipped, still loads");
+      check(loadBlob(v1), "a v1 blob (the oldest format that ever shipped) still loads");
       // v1 predates the bypass, so it means "not bypassed" rather than "do not
       // mention it". A restore that left the plugin silent because the
       // instance happened to be bypassed is a bug a user cannot explain.
@@ -2745,6 +3094,17 @@ int main(int argc, char** argv) {
                       "at 2x scale the size survives a set/get round trip: %ux%u -> %ux%u, "
                       "not doubled", d1, e1, d2, e2);
         check(d2 == d1 && e2 == e1, note);
+        // And the floor adjust_size enforces, in DEVICE pixels, is twice the
+        // 1x one. It clamped the host's device numbers against the logical
+        // limits, approving half the size set_size then produced.
+        uint32_t floor2W = 10, floor2H = 10;
+        gui->adjust_size(plugin, &floor2W, &floor2H);
+        gui->set_scale(plugin, 1.0);
+        uint32_t floor1W = 10, floor1H = 10;
+        gui->adjust_size(plugin, &floor1W, &floor1H);
+        std::snprintf(note, sizeof(note), "at 2x adjust_size's floor is %ux%u device pixels, twice "
+                      "the 1x %ux%u", floor2W, floor2H, floor1W, floor1H);
+        check(floor2W == 2 * floor1W && floor2H == 2 * floor1H, note);
         gui->set_scale(plugin, 1.0);        // leave it where the rest expects
       }
 
@@ -2925,7 +3285,10 @@ int main(int argc, char** argv) {
       clap_window_t window{};
       window.api = CLAP_WINDOW_API_WIN32;
       window.win32 = parent;
+      g_spaceDown = g_spaceUp = 0;
+      g_parentProc = (WNDPROC) SetWindowLongPtrW(parent, GWLP_WNDPROC, (LONG_PTR) countKeysProc);
       check(gui->set_parent(plugin, &window), "the gui embeds into the host window");
+      g_flushRequests = 0;
       check(gui->show(plugin), "the gui shows");
 
       // Which editor ACTUALLY opened, read off the child window's class name
@@ -2984,6 +3347,48 @@ int main(int argc, char** argv) {
       // lock-free queue and was applied on the audio thread. No contract check
       // can substitute for it: a silently blank webview passes them all.
       if (expectBridge) {
+        // Before ANY process() call. The page's edit has to reach the host
+        // with nothing processing -- transport stopped, track asleep -- and
+        // until the host answers it has to read the new value back. Only the
+        // page's echo was written and nothing asked for a flush, so the host
+        // went on showing (and saving) the old value until audio ran.
+        for (int i = 0; i < 400 && g_flushRequests == 0; ++i) {
+          while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+          }
+          Sleep(5);
+        }
+        check(g_flushRequests > 0, "the page's edit asked the host for a flush");
+        {
+          // The probe's page presses the spacebar and does nothing with it.
+          // WebView2 reports only modifier combinations and keys with no
+          // character to the accelerator handler, so space -- transport, in
+          // every DAW -- stopped at the page.
+          char line[200];
+          std::snprintf(line, sizeof(line), "a space the page did not use reaches the host window "
+                        "(%d down, %d up)", g_spaceDown, g_spaceUp);
+          check(g_spaceDown >= 1 && g_spaceUp >= 1, line);
+        }
+        {
+          double unprocessed = 0.0;
+          params->get_value(plugin, 1, &unprocessed);
+          char line[200];
+          std::snprintf(line, sizeof(line), "a value the page set reads back at once, with no "
+                        "audio processed (%.4f, want 0.777)", unprocessed);
+          check(std::fabs(unprocessed - 0.777) < 1e-3, line);
+
+          // ...and the flush the host schedules reports it, as process would.
+          for (double& v : g_reportedParam) v = -1.0;
+          EventList none;
+          clap_output_events_t report{};
+          report.try_push = paramTryPush;
+          params->flush(plugin, none.events(), &report);
+          std::snprintf(line, sizeof(line), "the flush reports the page's edit to the host "
+                        "(%.4f, want 0.777)", g_reportedParam[1]);
+          check(std::fabs(g_reportedParam[1] - 0.777) < 1e-3, line);
+        }
+
         double probe = 0.0;
         for (int i = 0; i < 200; ++i) {
           while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -3085,6 +3490,7 @@ int main(int argc, char** argv) {
         check(GetWindow(parent, GW_CHILD) == nullptr,
               "past the grace period a hidden editor has GIVEN BACK its webview");
 
+        const int spaceBeforeRebuild = g_spaceDown;
         check(gui->show(plugin), "showing the parked editor rebuilds it");
         double probe2 = 0.0;
         for (int i = 0; i < 600; ++i) {
@@ -3100,6 +3506,84 @@ int main(int argc, char** argv) {
         checkNear(probe2, 0.777, 1e-4,
                   "…and the rebuilt page drove the parameter again -- the whole bridge came "
                   "back, not just a window");
+        {
+          // The first page took the keyboard for a text field and still had
+          // it when it went. Whether the keyboard is the page's is the
+          // page's to say, and the rebuilt page has said nothing: its space
+          // is the host's. It was kept, so the space stopped at the page.
+          for (int i = 0; i < 200 && g_spaceDown == spaceBeforeRebuild; ++i) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+              TranslateMessage(&msg);
+              DispatchMessageW(&msg);
+            }
+            Sleep(10);
+          }
+          char line[200];
+          std::snprintf(line, sizeof(line),
+                        "a page that took the keyboard does not keep it for the next one "
+                        "(%d space(s) from the rebuilt page, want 1)",
+                        g_spaceDown - spaceBeforeRebuild);
+          check(g_spaceDown - spaceBeforeRebuild == 1, line);
+        }
+
+        // ── A quick hide and show ──────────────────────────────────
+        //
+        // Hidden for well under the 150 ms grace, so the webview stays: a
+        // user flicking between two plugin windows. The host moves Gain
+        // while it is hidden. eval() is silent then, and the tick went on
+        // marking every value delivered, so the page never heard of it --
+        // the probe page answers on the probe parameter when it does.
+        check(gui->hide(plugin), "the gui hides for a quick hide and show");
+        {
+          EventList write;
+          write.addParam(0, 0.4321, 0);
+          clap_output_events_t sink{};
+          sink.ctx = nullptr;
+          sink.try_push = outTryPush;
+          params->flush(plugin, write.events(), &sink);
+        }
+        const DWORD hiddenUntil = GetTickCount() + 80;
+        while (GetTickCount() < hiddenUntil) {
+          while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+          }
+          Sleep(5);
+        }
+        const bool stayed = GetWindow(parent, GW_CHILD) != nullptr;
+        check(gui->show(plugin), "…and shows again");
+        // Gain is held at 0.4321 while the answer is awaited. The rebuilt
+        // page's state handler writes Gain = 1.25 whenever a state push
+        // reaches it, and the push its 'ready' triggered can land after the
+        // change above and before the first tick: the change was then
+        // replaced before anything could send it, and the page never saw it
+        // -- a race in this test, which the parallel suite lost now and then.
+        double answer = 0.0;
+        for (int i = 0; i < 1000; ++i) {
+          while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+          }
+          plugin->process(plugin, &process);
+          double gain = 0.0;
+          params->get_value(plugin, 0, &gain);
+          if (std::fabs(gain - 0.4321) > 1e-4) {
+            EventList again;
+            again.addParam(0, 0.4321, 0);
+            clap_output_events_t sink{};
+            sink.ctx = nullptr;
+            sink.try_push = outTryPush;
+            params->flush(plugin, again.events(), &sink);
+          }
+          params->get_value(plugin, 1, &answer);
+          if (std::fabs(answer - 0.5) < 1e-4) break;
+          Sleep(10);
+        }
+        std::printf("  ---- quick hide: the webview %s ----\n",
+                    stayed ? "stayed (the path under test)" : "was parked (rebuilt on show)");
+        checkNear(answer, 0.5, 1e-4,
+                  "a host change made while the editor was hidden reaches the page when it is "
+                  "shown again");
       }
 
       check(gui->hide(plugin), "the gui hides");
@@ -3203,7 +3687,7 @@ int main(int argc, char** argv) {
   // this SDK was designed while looking at that number. The rates below are
   // the ones that break such designs:
   //
-  //   8 kHz: Nyquist is 4 kHz, so a tone control that goes to 18 kHz is
+  //   8 kHz:   Nyquist is 4 kHz, so a tone control that goes to 18 kHz is
   //            asking for a cutoff above half the sample rate. A filter that
   //            does not clamp produces NaN on its first sample, and the plugin
   //            is silent forever after.
@@ -3393,9 +3877,35 @@ int main(int argc, char** argv) {
           if (err > worst) worst = err;
         }
         // Float would round this to about 1e-8; genuine double keeps it.
-        check(worst < 1e-12, "unity through the 64-bit path preserves double precision");
-        const double floatRounded = std::fabs((double) (float) fine - fine);
-        check(floatRounded > 1e-12, "…and the probe really is beyond float's reach");
+        // An EFFECT's unity, that is: an instrument writes its own output and
+        // owes its input nothing.
+        if (!isInstrument) {
+          check(worst < 1e-12, "unity through the 64-bit path preserves double precision");
+          const double floatRounded = std::fabs((double) (float) fine - fine);
+          check(floatRounded > 1e-12, "…and the probe really is beyond float's reach");
+        }
+
+        // Everything AFTER the DSP, at 64 bits. The double path returned as
+        // soon as the meters were fed, so it never sent the DSP's MIDI out,
+        // never asked for the restart a latency change needs, never announced
+        // a tail change and never asked for the callback that marks the
+        // session dirty -- the float path's last four jobs. One block that
+        // flips the fixture's switch must cause all four.
+        if (expect64Parity) {
+          g_emitted.clear();
+          g_restartRequests = 0;
+          g_tailChanged = 0;
+          g_callbackRequests = 0;
+          EventList flip;
+          flip.addParam(0, 1.0, 0);
+          clap_process_t q = p;
+          q.in_events = flip.events();
+          p64->process(p64, &q);
+          check(!g_emitted.events.empty(), "a 64-bit block sends the DSP's MIDI out");
+          check(g_restartRequests > 0, "…asks for a restart when the DSP's latency moved");
+          check(g_tailChanged > 0, "…announces the tail that changed");
+          check(g_callbackRequests > 0, "…and asks for the callback that marks the session dirty");
+        }
 
         p64->stop_processing(p64);
         p64->deactivate(p64);
@@ -3435,7 +3945,13 @@ int main(int argc, char** argv) {
             "…and an unknown provider id is refused");
       if (provider) {
         check(provider->init(provider), "the provider initialises");
-        check(g_crawl.locations == 1, "…declaring exactly one location to crawl");
+        check(g_crawl.locations >= 1 && g_crawl.locations <= 2,
+              "…declaring its factory location, and the user's folder when there is one");
+        bool factoryLocation = false, userLocation = false;
+        for (uint32_t f : g_crawl.flags) {
+          factoryLocation = factoryLocation || (f & CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT) != 0;
+          userLocation = userLocation || (f & CLAP_PRESET_DISCOVERY_IS_USER_CONTENT) != 0;
+        }
 
         clap_preset_discovery_metadata_receiver_t rx{};
         rx.on_error = rxOnError;
@@ -3448,9 +3964,30 @@ int main(int argc, char** argv) {
         rx.set_timestamps = rxSetTimestamps;
         rx.add_feature = rxAddFeature;
         rx.add_extra_info = rxAddExtraInfo;
-        check(provider->get_metadata(provider, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr,
-                                     &rx),
-              "the built-in location yields its metadata");
+        // Crawled as an indexer crawls: a PLUGIN location is one container, a
+        // FILE location a folder whose files of the declared types are asked
+        // about one at a time -- one preset each, and no load key.
+        std::vector<std::string> presetFiles;
+        bool allYielded = true, oneEach = true;
+        const PresetCrawl declared = g_crawl;
+        for (size_t k = 0; k < declared.kinds.size(); ++k) {
+          if (declared.kinds[k] == CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN) {
+            allYielded = provider->get_metadata(provider, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, &rx) &&
+                         allYielded;
+            continue;
+          }
+          const std::string folder = declared.paths[k];
+          for (const sonore::FileEntry& e : sonore::listDirectory(folder, declared.extensions, false)) {
+            const size_t before = g_crawl.names.size();
+            allYielded = provider->get_metadata(provider, CLAP_PRESET_DISCOVERY_LOCATION_FILE, e.path.c_str(), &rx) &&
+                         allYielded;
+            oneEach = oneEach && g_crawl.names.size() == before + 1 && g_crawl.loadKeys.back().empty();
+            presetFiles.push_back(e.path);
+          }
+        }
+        check(factoryLocation || userLocation, "…factory content, the user's own, or both");
+        check(allYielded, "every location yields its metadata");
+        check(oneEach, "…a preset file being one preset with no load key");
         check(!g_crawl.names.empty(), "…listing at least one preset");
         check(g_crawl.sawPluginId, "…each tagged with this plugin's own CLAP id");
 
@@ -3459,15 +3996,22 @@ int main(int argc, char** argv) {
           if (n.empty()) named = false;
         check(named, "…every preset named");
 
-        // The point of the whole exercise: a key from the browser must load.
-        if (presetLoad && !g_crawl.loadKeys.empty()) {
+        // The point of the whole exercise: what the browser found must load.
+        if (presetLoad && !presetFiles.empty()) {
+          bool loaded = true;
+          for (const std::string& f : presetFiles)
+            loaded = presetLoad->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_FILE, f.c_str(), nullptr) &&
+                     loaded;
+          check(loaded, "every preset file the crawl found actually loads");
+        }
+        if (presetLoad && !g_crawl.loadKeys.empty() && !g_crawl.loadKeys[0].empty()) {
           check(presetLoad->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr,
                                           g_crawl.loadKeys[0].c_str()),
                 "a load key the crawl produced actually loads");
-          check(!presetLoad->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN,
-                                           nullptr, "9999"),
-                "…and an out-of-range key is refused");
         }
+        if (presetLoad)
+          check(!presetLoad->from_location(plugin, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr, "9999"),
+                "…and an out-of-range key is refused");
         provider->destroy(provider);
       }
     } else {

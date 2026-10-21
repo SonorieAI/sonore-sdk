@@ -61,6 +61,11 @@ public:
   }
 
   bool open(RenderFn render) {
+    // Both backends stopped, and the last fallback's reason dropped: this
+    // open() says its own, and a stale "falling back to ALSA" from an
+    // earlier one outlived every later open, since error() prefers it.
+    stop();
+    error_.clear();
     if (useJack_) {
       if (jack_.open(render)) return true;
       // A JACK server that went away between listing and opening is a real
@@ -76,6 +81,9 @@ public:
   }
 
   bool run() { return useJack_ ? jack_.run() : alsa_.run(); }
+  /** The active backend's report: JACK's server shutting down, or an ALSA
+   *  device that cannot be recovered. Polled by the standalone's UI tick. */
+  bool takeDeviceLost() { return useJack_ ? jack_.takeDeviceLost() : alsa_.takeDeviceLost(); }
 
   void stop() {
     jack_.stop();

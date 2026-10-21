@@ -17,7 +17,10 @@ struct SonoreDsp {
   int held[16] = {};
   int numHeld = 0;
   int step = 0;
-  double phase = 0.0;   // 0..1 through the current step
+  // 0..1 through the current step. Armed at ONE while nothing is held, so the
+  // first step fires on the frame the key goes down: started from zero, the
+  // first note came a whole step late -- two seconds at the slowest rate.
+  double phase = 1.0;
   double sr = 48000.0;
   int soundingNote = -1;
 
@@ -25,7 +28,7 @@ struct SonoreDsp {
     sr = spec.sampleRate > 0.0 ? spec.sampleRate : 48000.0;
     numHeld = 0;
     step = 0;
-    phase = 0.0;
+    phase = 1.0;
     soundingNote = -1;
   }
 
@@ -96,7 +99,7 @@ struct SonoreDsp {
           ctx.midiOut.addEvent(sonore::MidiMessage::noteOff(0, soundingNote), (int) i);
           soundingNote = -1;
         }
-        phase = 0.0;
+        phase = 1.0;
         step = 0;
         continue;
       }
@@ -157,21 +160,4 @@ static const sonore::PluginDescriptor kDesc = {
     true, // …but it DOES emit MIDI
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

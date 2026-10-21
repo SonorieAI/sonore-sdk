@@ -29,9 +29,10 @@
 // comment was wrong and the test that caught it was the second one written.
 //
 // What is genuinely absent, and named rather than left to be found: the other
-// five align-content values, order, and content-based sizing -- `auto` tracks
-// in Grid divide evenly because there is nothing here to measure a component
-// against.
+// five align-content values, order, and content-based sizing. There is nothing
+// here to measure a component against, so an `auto` Grid track is sized the
+// way the reference sizes it -- by the width or height an item in it was
+// GIVEN -- and never by what the component inside would draw.
 #pragma once
 
 #include <algorithm>
@@ -44,33 +45,42 @@ namespace gfx {
 
 /** How the free space along the main axis is spent. */
 enum class Justify2 {
-  Start,
-  End,
-  Centre,
-  SpaceBetween, // first at the start, last at the end, gaps equal
-  SpaceAround,  // equal space around each, so the ends get half a gap
-  SpaceEvenly,  // equal space everywhere, ends included
+  Start,  ///< packed against the start: left in a row, top in a column, mirrored when reversed
+  End,  ///< packed against the end
+  Centre,  ///< packed in the middle
+  SpaceBetween, ///< first at the start, last at the end, gaps equal
+  SpaceAround,  ///< equal space around each, so the ends get half a gap
+  SpaceEvenly,  ///< equal space everywhere, ends included
 };
 
 /** How an item sits across the axis it is not flowing along. */
 enum class AlignItems {
-  Stretch, // fill the cross axis -- flexbox's default, and usually what is meant
-  Start,
-  End,
-  Centre,
+  Stretch, ///< fill the cross axis -- flexbox's default, and usually what is meant
+  Start,  ///< against the top of a row's line, the left of a column's
+  End,  ///< against the bottom of a row's line, the right of a column's
+  Centre,  ///< centred across the line
 };
 
+/**
+ * Space kept clear around a FlexItem or a GridItem, in logical pixels: the
+ * item's box is laid out with it and the component placed inside it.
+ *
+ * The constructors follow CSS's shorthand order -- one value for all four
+ * sides, then vertical and horizontal, then top, right, bottom, left -- so a
+ * margin copied from a design tool means the same thing here.
+ */
 struct Margin {
-  float top = 0.0f, right = 0.0f, bottom = 0.0f, left = 0.0f;
+  float top = 0.0f, /**< above */ right = 0.0f, /**< to the right */ bottom = 0.0f, /**< below */ left = 0.0f; ///< to the left
 
-  Margin() = default;
-  explicit Margin(float all) : top(all), right(all), bottom(all), left(all) {}
+  Margin() = default; ///< no margin on any side
+  explicit Margin(float all) : top(all), right(all), bottom(all), left(all) {}  ///< the same on all four sides
+  /** `vertical` above and below, `horizontal` left and right. */
   Margin(float vertical, float horizontal)
       : top(vertical), right(horizontal), bottom(vertical), left(horizontal) {}
-  Margin(float t, float r, float b, float l) : top(t), right(r), bottom(b), left(l) {}
+  Margin(float t, float r, float b, float l) : top(t), right(r), bottom(b), left(l) {}  ///< CSS's order: top, right, bottom, left
 
-  float horizontal() const { return left + right; }
-  float vertical() const { return top + bottom; }
+  float horizontal() const { return left + right; }  ///< left + right
+  float vertical() const { return top + bottom; }  ///< top + bottom
 };
 
 /**
@@ -80,37 +90,63 @@ struct Margin {
  * is how a layout puts a gap somewhere without inventing an invisible child.
  */
 struct FlexItem {
+  /** What gets the bounds; not owned. Null makes the item a spacer. */
   Component* component = nullptr;
-  /** Along the main axis. `kAuto` means "use width/height", and width/height
-   *  themselves default to zero -- so an item with only a grow factor starts
-   *  at nothing and takes its share, which is what people expect from
-   *  `flex: 1`. */
+  /** Along the main axis, in logical pixels. 0 (or less) means "use
+   *  width/height", and width/height themselves default to zero -- so an item
+   *  with only a grow factor starts at nothing and takes its share, which is
+   *  what people expect from `flex: 1`. */
   float basis = 0.0f;
+  /** This item's share of the room left on its line, relative to the other
+   *  items' grow; 0 takes none. */
   float grow = 0.0f;
+  /** How readily it gives up room when the line overflows, weighted by its base
+   *  size as in CSS; 0 never goes below its base. */
   float shrink = 1.0f;
-  float width = 0.0f, height = 0.0f;
-  float minWidth = 0.0f, minHeight = 0.0f;
+  /** Logical pixels. Along the main axis the base size when `basis` is 0;
+   *  across it the item's size, where 0 stretches it to the line. */
+  float width = 0.0f, height = 0.0f;  ///< the same for the height, axes swapped
+  /** The least width it is given, in logical pixels, along or across. */
+  float minWidth = 0.0f, minHeight = 0.0f;  ///< and the least height
   /** Zero means unbounded. A maximum of zero would be a control with no size,
    *  which nobody means. */
-  float maxWidth = 0.0f, maxHeight = 0.0f;
+  float maxWidth = 0.0f, maxHeight = 0.0f;  ///< and the same for the height
+  /** Space kept clear around it, taken out of its line. */
   Margin margin;
   /** Stretch by default, like the container; anything else overrides it. */
   bool hasAlignSelf = false;
+  /** Its own cross alignment, used when `hasAlignSelf` is set. */
   AlignItems alignSelf = AlignItems::Stretch;
 
+  /** A spacer of no size until given a basis, a size or a grow factor. */
   FlexItem() = default;
+  /** `c`, not owned, with no size yet: give it a basis, a size or a grow
+   *  factor, or it is laid out at zero. */
   explicit FlexItem(Component* c) : component(c) {}
 
+  /** The base size along the main axis, logical pixels; 0 uses width or
+   *  height. Each with...() returns this item, for chaining. */
   FlexItem& withBasis(float b) { basis = b; return *this; }
+  /** Its share of the room left on the line. */
   FlexItem& withGrow(float g) { grow = g; return *this; }
+  /** How readily it gives up room; 0 never shrinks. */
   FlexItem& withShrink(float sh) { shrink = sh; return *this; }
+  /** The width: base size in a row, size across a column (0 stretches). */
   FlexItem& withWidth(float w) { width = w; return *this; }
+  /** The height: base size in a column, size across a row (0 stretches). */
   FlexItem& withHeight(float h) { height = h; return *this; }
+  /** The least width it is given. */
   FlexItem& withMinWidth(float w) { minWidth = w; return *this; }
+  /** The least height it is given. */
   FlexItem& withMinHeight(float h) { minHeight = h; return *this; }
+  /** The most width it is given; 0 is unbounded. */
   FlexItem& withMaxWidth(float w) { maxWidth = w; return *this; }
+  /** The most height it is given; 0 is unbounded. */
   FlexItem& withMaxHeight(float h) { maxHeight = h; return *this; }
+  /** Space kept clear around it. */
   FlexItem& withMargin(const Margin& m) { margin = m; return *this; }
+  /** Align this item across the line by `a` rather than by the box's
+   *  alignItems. */
   FlexItem& withAlignSelf(AlignItems a) {
     hasAlignSelf = true;
     alignSelf = a;
@@ -143,18 +179,26 @@ struct FlexItem {
  */
 class FlexBox {
 public:
-  enum class Direction { Row, Column, RowReverse, ColumnReverse };
+  /** The main axis and its direction. A reversed one is the forward layout
+   *  mirrored, free space and justification included. */
+  enum class Direction { Row, /**< left to right */ Column, /**< top to bottom */ RowReverse, /**< right to left */ ColumnReverse /**< bottom to top */ };
 
+  /** The main axis, and which way along it the items go. */
   Direction direction = Direction::Row;
+  /** How room left along a line is spent; each line on its own when wrapping. */
   Justify2 justifyContent = Justify2::Start;
+  /** How items sit across their line, unless an item's alignSelf says
+   *  otherwise. An item with no size across is stretched whatever this is. */
   AlignItems alignItems = AlignItems::Stretch;
   /** Items that do not fit start a new line rather than overflowing. */
   bool wrap = false;
   /** Between lines, when wrapping. */
   float lineGap = 0.0f;
 
+  /** What is laid out, in order. The components are not owned. */
   std::vector<FlexItem> items;
 
+  /** Append `item`; returns this box, for chaining. */
   FlexBox& add(const FlexItem& item) {
     items.push_back(item);
     return *this;
@@ -231,10 +275,12 @@ public:
     }
   }
 
+  /** Whether the main axis runs across: Row or RowReverse. */
   bool isHorizontal() const {
     return direction == Direction::Row || direction == Direction::RowReverse;
   }
 
+  /** Whether items run from the end: RowReverse or ColumnReverse. */
   bool isReversed() const {
     return direction == Direction::RowReverse || direction == Direction::ColumnReverse;
   }
@@ -271,13 +317,14 @@ private:
     const float mainStart = horizontal ? area.x : area.y;
 
     std::vector<float> sizes(line.size(), 0.0f);
-    float used = 0.0f, totalGrow = 0.0f, totalShrinkWeight = 0.0f;
+    float used = 0.0f;
     for (size_t k = 0; k < line.size(); ++k) {
       const FlexItem& item = items[line[k]];
-      sizes[k] = baseMain(item, horizontal);
+      // Held to its limits from the START -- CSS's hypothetical main size.
+      // Clamped only while distributing, an item with nothing to flex, or a
+      // row that fitted exactly, kept a size its own maximum forbade.
+      sizes[k] = clampMain(item, baseMain(item, horizontal), horizontal);
       used += sizes[k] + marginMain(item, horizontal);
-      totalGrow += item.grow;
-      totalShrinkWeight += item.shrink * sizes[k];
     }
 
     // ── Distribute, freezing whatever hits a limit ─────────────────────────
@@ -379,8 +426,12 @@ private:
       // so grow and shrink still see the order the caller wrote and a
       // row-reverse layout is the same layout mirrored rather than a different
       // one.
-      const size_t index = isReversed() ? line[line.size() - 1 - k] : line[k];
-      const size_t sizeIndex = isReversed() ? line.size() - 1 - k : k;
+      //
+      // Laid out forwards and then reflected, so it IS the mirror -- free
+      // space, justification and margins included. Reversing only the order
+      // kept packing from the start edge, which a reversed row does not.
+      const size_t index = line[k];
+      const size_t sizeIndex = k;
       const FlexItem& item = items[index];
       const float mainMargin = horizontal ? item.margin.left : item.margin.top;
       const float size = sizes[sizeIndex];
@@ -396,11 +447,13 @@ private:
       if (align == AlignItems::End) crossPos += crossAvailable - crossExtent;
       else if (align == AlignItems::Centre) crossPos += (crossAvailable - crossExtent) * 0.5f;
 
+      float mainPos = cursor + mainMargin;
+      if (isReversed()) mainPos = mainStart + mainStart + mainSize - mainPos - size;
       if (item.component) {
         if (horizontal)
-          item.component->setBounds({cursor + mainMargin, crossPos, size, crossExtent});
+          item.component->setBounds({mainPos, crossPos, size, crossExtent});
         else
-          item.component->setBounds({crossPos, cursor + mainMargin, crossExtent, size});
+          item.component->setBounds({crossPos, mainPos, crossExtent, size});
       }
       cursor += size + marginMain(item, horizontal) + between;
     }
@@ -426,61 +479,118 @@ private:
 };
 
 /**
- * A track in a Grid: a fixed size, a share of what is left, or content-sized.
+ * A track in a Grid: a fixed size, a share of what is left, or sized by its
+ * items.
  *
  * Fr is the one that matters. A plugin editor that has to fill whatever height
  * a host gives it is a header, a `1fr` body and a footer -- three lines instead
  * of a page of subtractions that break on the next change.
  */
 struct TrackSize {
-  enum class Kind { Pixels, Fraction, Auto };
+  /** Which of the three a track is. */
+  enum class Kind { Pixels, /**< `value` logical pixels */ Fraction, /**< `value` shares of what is left */ Auto /**< as big as its items say */ };
+  /** How `value` is read. */
   Kind kind = Kind::Auto;
+  /** Logical pixels for Pixels, a share for Fraction, unused for Auto. */
   float value = 0.0f;
 
+  /** A fixed track, in logical pixels. Kept even when it overflows the grid. */
   static TrackSize px(float pixels) { return {Kind::Pixels, pixels}; }
+  /** `fraction` shares of what the fixed tracks, auto tracks and gaps leave. */
   static TrackSize fr(float fraction = 1.0f) { return {Kind::Fraction, fraction}; }
+  /** As big as the largest width (a column) or height (a row) given to an
+   *  item that sits in this track alone, its margin on that side included;
+   *  0 when no such item has one. Beside fractions that is all it gets: it is
+   *  fixed space, and the fractions share the rest. With no fractions, the
+   *  auto tracks also share what is left evenly -- so unsized ones divide
+   *  the room evenly between them. */
   static TrackSize automatic() { return {Kind::Auto, 0.0f}; }
 };
 
 /** One thing in a Grid, placed by track index. Spans are 1-based counts, not
  *  end indices: `span 2` means two tracks, which is what CSS means by it. */
 struct GridItem {
+  /** What gets the bounds; not owned. An item without one is skipped. */
   Component* component = nullptr;
-  int column = 0, row = 0;
-  int columnSpan = 1, rowSpan = 1;
+  int column = 0, /**< 0-based track index */ row = 0;      ///< 0-based track index
+  int columnSpan = 1, /**< tracks covered */ rowSpan = 1; ///< tracks covered
+  /** Space kept clear inside the cell. */
   Margin margin;
+  /** What width and height hold until they are given one, spelt and valued
+   *  as the reference spells and values it. Any negative size is unset. */
+  static constexpr float notAssigned = -1.0f;
+  /** Logical pixels, read for one thing only: an `auto` column this item
+   *  covers alone (a columnSpan of 1) is as wide as the widest such width
+   *  plus that item's left and right margin. The component still fills its
+   *  cell less the margin, in an auto track or any other. */
+  float width = notAssigned;
+  /** The same for an `auto` row the item covers alone, with the top and
+   *  bottom margin. */
+  float height = notAssigned;
 
+  /** No component, so placed nowhere. */
   GridItem() = default;
+  /** `c`, not owned, in 0-based column `col` and row `r`, one track each. */
   GridItem(Component* c, int col, int r) : component(c), column(col), row(r) {}
 
+  /** Cover `columns` by `rows` tracks and the gaps between them; less than 1
+   *  is 1. Returns this item, for chaining. */
   GridItem& withSpan(int columns, int rows) {
     columnSpan = columns < 1 ? 1 : columns;
     rowSpan = rows < 1 ? 1 : rows;
     return *this;
   }
+  /** Space kept clear inside the cell; returns this item. */
   GridItem& withMargin(const Margin& m) {
     margin = m;
     return *this;
   }
+  /** The width an `auto` column reads; returns this item. */
+  GridItem& withWidth(float w) {
+    width = w;
+    return *this;
+  }
+  /** The height an `auto` row reads; returns this item. */
+  GridItem& withHeight(float h) {
+    height = h;
+    return *this;
+  }
 };
 
-/** Rows and columns, sized in pixels or in shares of what is left. */
+/** Rows and columns, sized in pixels, in shares of what is left, or by the
+ *  sizes their items were given. */
 class Grid {
 public:
+  /** The columns, left to right. A grid with no columns or no rows places
+   *  nothing. */
   std::vector<TrackSize> templateColumns;
+  /** The rows, top to bottom. */
   std::vector<TrackSize> templateRows;
+  /** Logical pixels between neighbouring columns; none at the edges. */
   float columnGap = 0.0f;
+  /** Logical pixels between neighbouring rows; none at the edges. */
   float rowGap = 0.0f;
+  /** What is placed. The components are not owned. */
   std::vector<GridItem> items;
 
+  /** Append `item`; returns this grid, for chaining. */
   Grid& add(const GridItem& item) {
     items.push_back(item);
     return *this;
   }
 
+  /**
+   * Place every item's component inside `area`, which is in the components'
+   * parent's coordinates -- localBounds() from inside resized().
+   *
+   * An item with no component, a negative index, or a column or row past the
+   * last track is skipped; a span that runs past the last track is cut there.
+   * Fixed tracks, and what the items of auto tracks ask for, are kept even
+   * when they overflow `area`, and the fractions then get nothing.
+   */
   void performLayout(const Rect& area) {
-    const std::vector<float> cols = resolve(templateColumns, area.w, columnGap);
-    const std::vector<float> rows = resolve(templateRows, area.h, rowGap);
+    const std::vector<float> cols = columnSizes(area.w);
+    const std::vector<float> rows = rowSizes(area.h);
     if (cols.empty() || rows.empty()) return;
 
     for (const GridItem& item : items) {
@@ -513,16 +623,48 @@ public:
   }
 
   /** The resolved size of each track, for a caller placing something by hand
-   *  beside a grid. */
+   *  beside a grid. The items are read for the auto tracks, as performLayout
+   *  reads them. */
   std::vector<float> columnSizes(float width) const {
-    return resolve(templateColumns, width, columnGap);
+    return resolve(templateColumns, width, columnGap, measure(true));
   }
+  /** The same for the rows, given the grid's height. */
   std::vector<float> rowSizes(float height) const {
-    return resolve(templateRows, height, rowGap);
+    return resolve(templateRows, height, rowGap, measure(false));
   }
 
 private:
-  static std::vector<float> resolve(const std::vector<TrackSize>& tracks, float total, float gap) {
+  // What each auto track's items ask for: the largest width (columns) or
+  // height (rows) given to an item that covers that track and no other, plus
+  // the item's margin on that axis, because the component is placed inside
+  // it. That is the reference's rule (its auto tracks are sized the same way,
+  // from items with a span of one), with one difference: there an unset size
+  // is -1 and still counted, so an unsized item with a margin asks for its
+  // margin less a pixel. Here an unset size asks for nothing.
+  //
+  // An item spanning several tracks asks nothing of any of them, again as in
+  // the reference: it fits whatever its tracks come to rather than this
+  // guessing how to split its size among them. An item performLayout skips
+  // -- no component, or outside the grid -- asks nothing either.
+  std::vector<float> measure(bool columns) const {
+    const std::vector<TrackSize>& tracks = columns ? templateColumns : templateRows;
+    std::vector<float> need(tracks.size(), 0.0f);
+    for (const GridItem& item : items) {
+      if (!item.component || item.column < 0 || item.row < 0) continue;
+      if (item.column >= (int) templateColumns.size() || item.row >= (int) templateRows.size()) continue;
+      if ((columns ? item.columnSpan : item.rowSpan) != 1) continue;
+      const size_t track = (size_t) (columns ? item.column : item.row);
+      if (tracks[track].kind != TrackSize::Kind::Auto) continue;
+      const float size = columns ? item.width : item.height;
+      if (!(size >= 0.0f)) continue; // unset: notAssigned, or any other negative
+      const float outer = size + (columns ? item.margin.horizontal() : item.margin.vertical());
+      if (outer > need[track]) need[track] = outer;
+    }
+    return need;
+  }
+
+  static std::vector<float> resolve(const std::vector<TrackSize>& tracks, float total, float gap,
+                                    const std::vector<float>& measured) {
     std::vector<float> out(tracks.size(), 0.0f);
     if (tracks.empty()) return out;
 
@@ -539,6 +681,10 @@ private:
           fractions += tracks[i].value;
           break;
         case TrackSize::Kind::Auto:
+          // What its items asked for is fixed space, as a pixel track is,
+          // and is settled BEFORE the fractions: `1fr` means "the rest".
+          out[i] = measured[i];
+          fixed += out[i];
           ++autos;
           break;
       }
@@ -547,26 +693,23 @@ private:
     float remaining = total - fixed;
     if (remaining < 0.0f) remaining = 0.0f;
 
-    // Auto tracks share equally with each other and are settled BEFORE the
-    // fractions, because `auto` in CSS is content-sized and this has no content
-    // to measure -- so an even share is the honest approximation, and taking it
-    // first keeps `1fr` meaning "the rest" rather than "the rest of the rest".
+    // With no fractions to take the rest, the auto tracks share it evenly on
+    // top of what their items asked for, which is CSS's stretching of auto
+    // tracks, and keeps a grid of unsized auto tracks dividing the room
+    // evenly as it always has. The reference leaves the rest empty here,
+    // which would give every grid of unsized auto tracks cells of no size.
     if (autos > 0 && fractions <= 0.0f) {
       const float each = remaining / (float) autos;
       for (size_t i = 0; i < tracks.size(); ++i)
-        if (tracks[i].kind == TrackSize::Kind::Auto) out[i] = each;
+        if (tracks[i].kind == TrackSize::Kind::Auto) out[i] += each;
       return out;
     }
-    if (autos > 0) {
-      const float each = remaining / (float) (autos + (fractions > 0.0f ? 1 : 0)) * 0.5f;
-      for (size_t i = 0; i < tracks.size(); ++i)
-        if (tracks[i].kind == TrackSize::Kind::Auto) {
-          out[i] = each;
-          remaining -= each;
-        }
-      if (remaining < 0.0f) remaining = 0.0f;
-    }
-
+    // Beside fractions an auto track gets exactly what its items asked for,
+    // as in the reference and in CSS, and the fractions share everything
+    // else. It used to get half of an even share whatever was in it (a
+    // quarter of the room beside one fr), a number nothing explained; a
+    // layout that leaned on that now gives the item in its auto track a
+    // width or a height.
     if (fractions > 0.0f)
       for (size_t i = 0; i < tracks.size(); ++i)
         if (tracks[i].kind == TrackSize::Kind::Fraction)

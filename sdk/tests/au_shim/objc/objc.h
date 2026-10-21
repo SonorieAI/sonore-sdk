@@ -2,10 +2,10 @@
 // A shim of <objc/objc.h>, so a compiler can read the Cocoa files.
 //
 // webview_cocoa.h, au_view.h and window_cocoa.h are roughly fifteen hundred
-// Apple-facing lines that no Windows or Linux compiler can read. macOS CI
-// builds them on every push; this shim answers the same question in seconds,
-// on any machine. Everything the AU shim's README says applies here word for
-// word: this proves internal consistency, never ABI correctness.
+// lines that no compiler has ever looked at: macOS CI is the only machine that
+// could, and it has not started a job since the account's spending limit was
+// reached. Everything the AU shim's README says applies here word for word --
+// this proves internal consistency, never ABI correctness.
 //
 // The Objective-C runtime is a plain C API, which is the only reason a shim of
 // it is even possible. Every declaration below is copied from Apple's published
@@ -24,7 +24,11 @@ typedef struct objc_object {
   Class isa;
 }* id;
 typedef struct objc_selector* SEL;
-typedef id (*IMP)(id, SEL, ...);
+// As Apple's objc.h has it for C and C++ since OBJC_OLD_DISPATCH_PROTOTYPES
+// defaulted to 0: no prototype, so a method implementation can only be
+// handed over by a cast. The old variadic one let a call through IMP compile
+// that the real header refuses.
+typedef void (*IMP)(void /* id, SEL, ... */);
 
 // On Apple this is `signed char`. Here it is whatever the host platform's own
 // BOOL is, because this check runs on Windows, where clap_wrapper.h reaches

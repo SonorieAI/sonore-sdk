@@ -45,9 +45,13 @@ public:
     return info;
   }
 
+  /** A bar running down (`vertical`) or across, with an empty range: nothing to
+   *  scroll, so it draws nothing until setRange. */
   explicit ScrollBar(bool vertical = true) : vertical_(vertical) {}
 
+  /** Whether it runs down rather than across. */
   bool isVertical() const { return vertical_; }
+  /** Run down (true) or across. */
   void setVertical(bool v) {
     vertical_ = v;
     repaint();
@@ -64,6 +68,8 @@ public:
     setPosition(position);
   }
 
+  /** Where the visible part starts, held to 0..maxPosition(). Calls onScroll
+   *  when it moved and `notify` is true. */
   void setPosition(float position, bool notify = true) {
     const float clamped = clampPosition(position);
     if (clamped == position_) return;
@@ -72,13 +78,17 @@ public:
     if (notify && onScroll) onScroll(position_);
   }
 
+  /** Where the visible part starts, in the range's units. */
   float position() const { return position_; }
+  /** The furthest position: total minus visible, or 0 when everything fits. */
   float maxPosition() const { return total_ > visible_ ? total_ - visible_ : 0.0f; }
 
   /** Nothing to scroll. A bar drawn in this state is a control that cannot be
    *  moved, which reads as broken rather than as "everything fits". */
   bool isRedundant() const { return total_ <= visible_ || visible_ <= 0.0f; }
 
+  /** The new position, after a drag, a click on the track (a page), the wheel,
+   *  or setPosition with `notify`. */
   std::function<void(float)> onScroll;
 
   void paint(Graphics& g) override {
@@ -139,8 +149,12 @@ public:
     return true;
   }
 
+  /** How far one wheel notch scrolls, in the range's units: logical pixels in a
+   *  viewport. */
   static constexpr float kWheelStep = 48.0f;
+  /** The shortest a thumb gets, in logical pixels, however long the content. */
   static constexpr float kMinThumb = 18.0f;
+  /** The bar's width across, in logical pixels: what a viewport gives it. */
   static constexpr float kThickness = 10.0f;
 
 private:
@@ -154,7 +168,7 @@ private:
     // Proportional, but never shorter than kMinThumb: a thumb four pixels tall
     // on a very long list is a target nobody can grab.
     const float proportional = length * (visible_ / total_);
-    return std::max(kMinThumb, std::min(length, proportional));
+    return (std::max)(kMinThumb, (std::min)(length, proportional));
   }
 
   Rect thumbBounds() const {
@@ -185,6 +199,7 @@ private:
 class Viewport : public Widget {
 public:
 
+  /** No content yet. Left out of the accessible tree; its bars are not. */
   Viewport() {
     // Left out of the accessible tree, children kept. A viewport is scrolling
     // machinery: it has no name, no value and nothing to say, and every level
@@ -206,24 +221,44 @@ public:
    *  that resized its content to fit would be doing the opposite of its job. */
   void setViewedComponent(Component* viewed) {
     if (viewed_ == viewed) return;
-    if (viewed_) removeChild(viewed_);
+    // Scrolling is a negative position on the viewed component, so both ends
+    // of a switch are put back at the origin: the page leaving, which is
+    // somebody else's again, and the page arriving, which may be coming back
+    // from a scroll it had before. Resetting only the view position left a
+    // returning page sitting 300 px up, and a setViewPosition(0, 0) did
+    // nothing about it because the position already said zero.
+    if (viewed_) {
+      const Rect b = viewed_->bounds();
+      viewed_->setBounds({0.0f, 0.0f, b.w, b.h});
+      removeChild(viewed_);
+    }
     viewed_ = viewed;
     if (viewed_) {
+      const Rect b = viewed_->bounds();
+      viewed_->setBounds({0.0f, 0.0f, b.w, b.h});
       addChild(viewed_);
       // Behind the bars, so a bar is never hidden under content. Children paint
       // in order and hit-test in reverse, so being first is both.
       moveChildToBack(viewed_);
     }
     viewX_ = viewY_ = 0.0f;
+    vertical_.setPosition(0.0f, false);
+    horizontal_.setPosition(0.0f, false);
     updateBars();
     repaint();
   }
 
+  /** The content, not owned, or null. */
   Component* viewedComponent() const { return viewed_; }
 
+  /** How far the content is scrolled across, logical pixels; 0 at its left. */
   float viewPositionX() const { return viewX_; }
+  /** How far the content is scrolled down, logical pixels; 0 at its top. */
   float viewPositionY() const { return viewY_; }
 
+  /** Scroll so the content's point (x, y) is at the top-left, held to what can
+   *  be scrolled. Moves the content -- its position becomes (-x, -y) -- and the
+   *  bars, without their onScroll. */
   void setViewPosition(float x, float y) {
     const float clampedX = clamp(x, maxScrollX());
     const float clampedY = clamp(y, maxScrollY());
@@ -261,7 +296,9 @@ public:
    *  list jumping back to the top on every mouse move. */
   void contentResized() { updateBars(); }
 
+  /** Whether the content is taller than the view, so the vertical bar shows. */
   bool isVerticalBarVisible() const { return !vertical_.isRedundant(); }
+  /** Whether the content is wider than the view, so the horizontal bar shows. */
   bool isHorizontalBarVisible() const { return !horizontal_.isRedundant(); }
 
   /** The part of the viewport the content actually gets, bars excluded. */
@@ -276,13 +313,13 @@ public:
 
   void resized() override { updateBars(); }
 
-  /** The wheel scrolls the CONTENT, wherever inside the viewport it happens.
-   *  A wheel that only worked over the bar would be a wheel nobody uses. */
   /** Yes while there is somewhere to go -- the same test mouseWheel makes, so
    *  a control asking "would anything above me scroll?" gets the answer the
    *  wheel would actually produce rather than a different one. */
   bool wouldScroll() const override { return maxScrollY() > 0.0f || maxScrollX() > 0.0f; }
 
+  /** The wheel scrolls the CONTENT, wherever inside the viewport it happens.
+   *  A wheel that only worked over the bar would be a wheel nobody uses. */
   bool mouseWheel(const MouseEvent&, float delta) override {
     if (delta == 0.0f) return false;
     // A viewport with nothing to scroll passes the wheel on, so a viewport

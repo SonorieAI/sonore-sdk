@@ -34,12 +34,12 @@ namespace sonore {
 /** A moment, split up. Fields are what a human would say: month 1..12, not
  *  0..11, because every off-by-one month bug starts with tm_mon. */
 struct DateTime {
-  int year = 1970;
-  int month = 1;   // 1..12
-  int day = 1;     // 1..31
-  int hour = 0;    // 0..23
-  int minute = 0;
-  int second = 0;
+  int year = 1970; ///< the full year, 2026
+  int month = 1;   ///< 1..12
+  int day = 1;     ///< 1..31
+  int hour = 0;    ///< 0..23
+  int minute = 0;  ///< 0..59
+  int second = 0;  ///< 0..59, or 60 for a leap second where the system reports one
   /** 0 = Sunday. */
   int weekday = 0;
 };
@@ -63,6 +63,9 @@ inline bool breakDown(int64_t unixSeconds, bool utc, std::tm* out) {
 
 } // namespace timedetail
 
+/** `unixSeconds` split up in the user's local time zone, or in UTC with
+ *  `utc`. A time the system cannot convert gives the default DateTime,
+ *  1970-01-01 00:00:00. Safe from any thread. */
 inline DateTime dateTimeFromUnix(int64_t unixSeconds, bool utc = false) {
   DateTime out;
   std::tm parts{};
@@ -119,12 +122,18 @@ inline std::string formatDateTime(const DateTime& when, bool withSeconds = false
  * Not a date -- this is how long a sample is, and it is the format every
  * player in the world uses. Rounded to the nearest second rather than
  * truncated: a 3.7-second sample reading "0:03" and then playing for four is
- * the kind of small wrongness that makes people distrust a readout.
+ * the kind of small wrongness that makes people distrust a readout. A length
+ * that is not one -- NaN, infinite -- is "--:--".
  */
 inline std::string formatDuration(double seconds) {
-  const bool negative = seconds < 0.0;
-  if (negative) seconds = -seconds;
-  const int64_t whole = (int64_t) (seconds + 0.5);
+  // A length nobody knows -- frames over a sample rate of 0, which is NaN or
+  // infinite -- reads as unknown. Converted to an integer it was undefined
+  // behaviour, and came out as "-30:-8", as did anything past the integer's
+  // range. Nothing past 10^15 seconds (thirty million years) is a length.
+  if (!(seconds > -1e15 && seconds < 1e15)) return "--:--";
+  const int64_t whole = (int64_t) ((seconds < 0.0 ? -seconds : seconds) + 0.5);
+  // A sign only on something to sign: -0.4 s rounded to "-0:00".
+  const bool negative = seconds < 0.0 && whole > 0;
   const int64_t hours = whole / 3600;
   const int64_t minutes = (whole / 60) % 60;
   const int64_t remainder = whole % 60;
@@ -147,7 +156,10 @@ inline std::string formatDuration(double seconds) {
 inline std::string formatShortDuration(double seconds) {
   char buffer[32];
   const double magnitude = seconds < 0.0 ? -seconds : seconds;
-  if (magnitude < 0.001) std::snprintf(buffer, sizeof(buffer), "%.0f µs", seconds * 1e6);
+  // The micro sign as its UTF-8 bytes, so it reads right whatever the compiler
+  // took this file's encoding to be: without /utf-8 it came out as two
+  // characters of the local code page.
+  if (magnitude < 0.001) std::snprintf(buffer, sizeof(buffer), "%.0f \xC2\xB5s", seconds * 1e6);
   else if (magnitude < 1.0) std::snprintf(buffer, sizeof(buffer), "%.1f ms", seconds * 1e3);
   else std::snprintf(buffer, sizeof(buffer), "%.2f s", seconds);
   return buffer;

@@ -12,7 +12,11 @@
 
 typedef struct objc_ivar* Ivar;
 typedef struct objc_method* Method;
-typedef struct objc_protocol* Protocol;
+// As Apple's runtime.h has it outside Objective-C: an object type, handed
+// around as Protocol*. This said `struct objc_protocol*`, which made
+// class_addProtocol take a pointer to a pointer -- unnoticed until
+// window_cocoa.h first called it (adopting NSTextInputClient).
+typedef struct objc_object Protocol;
 
 extern "C" {
 Class objc_getClass(const char* name);
@@ -27,6 +31,7 @@ BOOL class_addMethod(Class cls, SEL name, IMP imp, const char* types);
 BOOL class_addIvar(Class cls, const char* name, size_t size, uint8_t alignment,
                    const char* types);
 BOOL class_addProtocol(Class cls, Protocol* protocol);
+Protocol* objc_getProtocol(const char* name);
 const char* class_getName(Class cls);
 
 Ivar object_getInstanceVariable(id obj, const char* name, void** outValue);

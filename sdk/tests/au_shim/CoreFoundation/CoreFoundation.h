@@ -51,6 +51,11 @@ void CFRelease(CFTypeRef);
 CFTypeRef CFRetain(CFTypeRef);
 
 CFBundleRef CFBundleGetBundleWithIdentifier(CFStringRef);
+// The process's own bundle, which plugin_host_type.h asks for its identifier
+// and its short version string.
+CFBundleRef CFBundleGetMainBundle(void);
+CFStringRef CFBundleGetIdentifier(CFBundleRef);
+CFTypeRef CFBundleGetValueForInfoDictionaryKey(CFBundleRef, CFStringRef);
 CFURLRef CFBundleCopyResourcesDirectoryURL(CFBundleRef);
 CFURLRef CFBundleCopyBundleURL(CFBundleRef);
 Boolean CFURLGetFileSystemRepresentation(CFURLRef, Boolean, UInt8*, CFIndex);
@@ -109,3 +114,39 @@ extern const void* kCFTypeArrayCallBacks;
 CFArrayRef CFArrayCreate(CFAllocatorRef, const void**, CFIndex, const void*);
 CFURLRef CFURLCreateFromFileSystemRepresentation(CFAllocatorRef, const UInt8*, CFIndex, Boolean);
 CFURLRef CFURLCreateCopyDeletingLastPathComponent(CFAllocatorRef, CFURLRef);
+
+// ── Property lists as bytes, bundles, run loops (host_au.h) ─────────────────
+typedef double CFTimeInterval;
+typedef unsigned long CFOptionFlags;
+typedef struct __CFError* CFErrorRef;
+typedef struct __CFRunLoop* CFRunLoopRef;
+typedef CFStringRef CFRunLoopMode;
+
+typedef CFIndex CFPropertyListFormat;
+enum {
+  kCFPropertyListOpenStepFormat = 1,
+  kCFPropertyListXMLFormat_v1_0 = 100,
+  kCFPropertyListBinaryFormat_v1_0 = 200,
+};
+enum {
+  kCFPropertyListImmutable = 0,
+  kCFPropertyListMutableContainers = 1,
+  kCFPropertyListMutableContainersAndLeaves = 2,
+};
+CFDataRef CFPropertyListCreateData(CFAllocatorRef, CFPropertyListRef, CFPropertyListFormat,
+                                   CFOptionFlags, CFErrorRef*);
+CFPropertyListRef CFPropertyListCreateWithData(CFAllocatorRef, CFDataRef, CFOptionFlags,
+                                               CFPropertyListFormat*, CFErrorRef*);
+
+CFBundleRef CFBundleCreate(CFAllocatorRef, CFURLRef);
+CFTypeRef CFBundleGetValueForInfoDictionaryKey(CFBundleRef, CFStringRef);
+
+typedef SInt32 CFRunLoopRunResult;
+enum {
+  kCFRunLoopRunFinished = 1,
+  kCFRunLoopRunStopped = 2,
+  kCFRunLoopRunTimedOut = 3,
+  kCFRunLoopRunHandledSource = 4,
+};
+CFRunLoopRef CFRunLoopGetMain(void);
+CFRunLoopRunResult CFRunLoopRunInMode(CFRunLoopMode, CFTimeInterval, Boolean);

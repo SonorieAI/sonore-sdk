@@ -11,9 +11,13 @@
 // what CLAP says a plugin must answer, and the host asks what CLAP says a host
 // may ask. Where they disagree, one of them is wrong about the spec.
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -23,10 +27,31 @@
 
 #include <atomic>
 #include <new>
+#include <thread>
 
 #if defined(_WIN32)
+#include <malloc.h> // _msize
 #include <windows.h>
+#else
+#include <time.h> // clock_gettime, CLOCK_THREAD_CPUTIME_ID
 #endif
+
+// What this thread has spent on the CPU, in units that only a ratio of two
+// readings gives meaning to (cycles on Windows, nanoseconds elsewhere). A
+// wall clock counts the time another process held the core as well: on a
+// busy machine the longer of two measured loads was preempted more often
+// than the shorter, and their ratio crossed a bound the code met.
+static double threadCpuNow() {
+#if defined(_WIN32)
+  ULONG64 cycles = 0;
+  QueryThreadCycleTime(GetCurrentThread(), &cycles);
+  return (double) cycles;
+#else
+  timespec t{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+  return (double) t.tv_sec * 1e9 + (double) t.tv_nsec;
+#endif
+}
 
 // The header says process() allocates nothing. That is a claim about the
 // audio thread, and claims about the audio thread are worth exactly what they
@@ -58,17 +83,35 @@ static void checkNear(double got, double want, double tolerance, const char* wha
   std::printf("  %-4s %s (%.4f)\n", ok ? "ok" : "FAIL", what, got);
 }
 
+// The bytes this test's operator new has handed out and not had back: what
+// the HOST holds for the plugins it loaded. Windows only, where a module
+// allocates through an operator new of its own, so none of a plugin's own
+// bytes are in it; elsewhere a plugin's allocations can resolve to this one.
+static std::atomic<long long> g_liveBytes{0};
+static inline void countBytes(void* p, long long sign) {
+#if defined(_WIN32)
+  if (p) g_liveBytes.fetch_add(sign * (long long) _msize(p), std::memory_order_relaxed);
+#else
+  (void) p;
+  (void) sign;
+#endif
+}
+
 void* operator new(std::size_t n) {
   countIfArmed();
   void* p = std::malloc(n ? n : 1);
   if (!p) throw std::bad_alloc();
+  countBytes(p, 1);
   return p;
 }
 void* operator new[](std::size_t n) { return ::operator new(n); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p) noexcept {
+  countBytes(p, -1);
+  std::free(p);
+}
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { ::operator delete(p); }
 
 int main(int argc, char** argv) {
   // Unbuffered, because this test loads other people's code into its own
@@ -81,6 +124,33 @@ int main(int argc, char** argv) {
   }
   const std::string directory = argv[1];
   std::printf("── hosting: %s ──────────────────────────────────────\n", directory.c_str());
+
+  // ── A bundle's binary, for this host's architecture ───────────────────────
+  //
+  // The folder inside Contents was x86_64 whatever the host was built for, so
+  // a 32-bit or ARM64 host found nothing in a bundle that held its binary. A
+  // bundle holding only this build's folder must resolve to it.
+  {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const fs::path bundle = fs::temp_directory_path(error) / "sonore_host_arch" / "Arch.vst3";
+    fs::remove_all(bundle.parent_path(), error);
+    fs::create_directories(bundle / "Contents" / sonore::host::vst3ArchFolder(), error);
+#if defined(_WIN32)
+    const char* leaf = "Arch.vst3";
+#elif defined(__APPLE__)
+    const char* leaf = "Arch";
+#else
+    const char* leaf = "Arch.so";
+#endif
+    std::ofstream(bundle / "Contents" / sonore::host::vst3ArchFolder() / leaf) << "x";
+    const std::string binary = sonore::host::vst3BinaryPath(bundle.string());
+    char line[400];
+    std::snprintf(line, sizeof(line), "a bundle's binary is found in this host's own folder, %s (%s)",
+                  sonore::host::vst3ArchFolder(), binary.c_str());
+    check(fs::exists(fs::u8path(binary), error), line);
+    fs::remove_all(bundle.parent_path(), error);
+  }
 
   // ── Scan ──────────────────────────────────────────────────────────────────
   const std::vector<sonore::host::PluginDescription> found =
@@ -111,6 +181,193 @@ int main(int argc, char** argv) {
   }
   check(sawInstrument, "at least one is recognised as an instrument");
   check(sawEffect, "…and at least one as an effect");
+
+  // An LV2 bundle's author is RDF too. Read the way lilv reads it, a list of
+  // plugins shows the same vendor whatever the format.
+  {
+    int twins = 0, agree = 0;
+    for (const auto& l : found) {
+      if (l.format != "LV2") continue;
+      for (const auto& c : found) {
+        if (c.format != "CLAP" || c.name != l.name || c.vendor.empty()) continue;
+        ++twins;
+        if (c.vendor == l.vendor) ++agree;
+        else std::printf("       %s: LV2 vendor \"%s\", CLAP \"%s\"\n", l.name.c_str(),
+                         l.vendor.c_str(), c.vendor.c_str());
+        break;
+      }
+    }
+    std::printf("       %d of %d LV2 plugins name the vendor their CLAP does\n", agree, twins);
+    check(twins > 0 && agree == twins, "an LV2 plugin's vendor is its doap:maintainer, as CLAP reports it");
+    bool projectInFeatures = false;
+    for (const auto& d : found)
+      if (d.format == "LV2" && d.features.find("doap#Project") != std::string::npos)
+        projectInFeatures = true;
+    check(!projectInFeatures, "…and a doap:Project type is not taken for a category");
+  }
+  // What a value is called, LV2 edition: there is no call into the plugin for
+  // its text, so the host builds it from the bundle -- a named step's label,
+  // else the number and the unit's symbol. The saturator's table is fixed in
+  // its source (x, Hz, %, dB); the showcase's Shape names its steps, and the
+  // CLAP build of the same plugin says what each is called.
+  {
+    auto byName = [&](const char* format, const char* name) -> const sonore::host::PluginDescription* {
+      for (const auto& d : found)
+        if (d.format == format && d.name == name) return &d;
+      return nullptr;
+    };
+    auto paramIndex = [](const sonore::host::HostedPlugin& p, const char* name) {
+      for (int i = 0; i < p.numParameters(); ++i)
+        if (p.parameter(i).name == name) return i;
+      return -1;
+    };
+    if (const auto* d = byName("LV2", "Sonore Saturator")) {
+      auto sat = sonore::host::loadPlugin(*d);
+      if (sat && sat->isValid()) {
+        const int drive = paramIndex(*sat, "Drive"), tone = paramIndex(*sat, "Tone");
+        const int mix = paramIndex(*sat, "Mix"), out = paramIndex(*sat, "Output");
+        const std::string t[4] = {drive >= 0 ? sat->parameterText(drive, 2.5) : "?",
+                                  tone >= 0 ? sat->parameterText(tone, 6000.0) : "?",
+                                  mix >= 0 ? sat->parameterText(mix, 60.0) : "?",
+                                  out >= 0 ? sat->parameterText(out, -3.0) : "?"};
+        std::printf("       LV2 saturator: \"%s\", \"%s\", \"%s\", \"%s\"\n", t[0].c_str(), t[1].c_str(),
+                    t[2].c_str(), t[3].c_str());
+        check(t[0] == "2.5 x" && t[1] == "6000 Hz" && t[2] == "60 %" && t[3] == "-3 dB",
+              "an LV2 control's text carries its unit, LV2's own (Hz, %, dB) or the plugin's (x)");
+      } else {
+        check(false, "the LV2 saturator loads");
+      }
+    }
+    const auto* clapShow = byName("CLAP", "Sonore Showcase");
+    const auto* lv2Show = byName("LV2", "Sonore Showcase");
+    if (clapShow && lv2Show) {
+      auto c = sonore::host::loadPlugin(*clapShow);
+      auto l = sonore::host::loadPlugin(*lv2Show);
+      const int ci = c ? paramIndex(*c, "Shape") : -1, li = l ? paramIndex(*l, "Shape") : -1;
+      bool same = ci >= 0 && li >= 0 && l->parameter(li).stepped;
+      std::string seen;
+      for (int v = 0; same && v < 4; ++v) {
+        const std::string a = c->parameterText(ci, (double) v), b = l->parameterText(li, (double) v);
+        seen += (v ? ", " : "") + b;
+        same = same && a == b;
+      }
+      std::printf("       LV2 showcase Shape: %s\n", seen.c_str());
+      check(same, "…and a named step reads as its name, as the CLAP build calls it, on a stepped control");
+    }
+  }
+
+  // Somebody else's bundle may name the author on the plugin's lv2:project
+  // instead -- the SDK's own did until REAPER showed nobody looks there but
+  // lilv. Both are read.
+  {
+    const std::string bundle = sonoretest::tempPath("third-party.lv2");
+    std::filesystem::create_directories(bundle);
+    std::FILE* m = std::fopen((bundle + "/manifest.ttl").c_str(), "wb");
+    check(m != nullptr, "a hand-written bundle can be written");
+    if (m) {
+      std::fputs("@prefix doap: <http://usefulinc.com/ns/doap#> .\n"
+                 "@prefix foaf: <http://xmlns.com/foaf/0.1/> .\n"
+                 "@prefix lv2:  <http://lv2plug.in/ns/lv2core#> .\n"
+                 "<urn:example:nested>\n"
+                 "    a lv2:Plugin , lv2:DelayPlugin ;\n"
+                 "    doap:name \"Nested\" ;\n"
+                 "    lv2:binary <nested.dll> ;\n"
+                 "    lv2:project [\n"
+                 "        a doap:Project ;\n"
+                 "        doap:maintainer [ a foaf:Person ; foaf:name \"Project Author\" ] ;\n"
+                 "    ] .\n"
+                 "<urn:example:direct>\n"
+                 "    a lv2:Plugin , doap:Project ;\n"
+                 "    doap:name \"Direct\" ;\n"
+                 "    lv2:binary <direct.dll> ;\n"
+                 "    doap:maintainer [ a foaf:Person ; foaf:name \"Plugin Author\" ] .\n"
+                 "<urn:example:nobody>\n"
+                 "    a lv2:Plugin ;\n"
+                 "    doap:name \"Nobody\" ;\n"
+                 "    lv2:binary <nobody.dll> .\n",
+                 m);
+      std::fclose(m);
+    }
+    const auto described = sonore::host::describeFile(bundle);
+    std::string nested = "?", direct = "?", nobody = "?", directFeatures = "?";
+    for (const auto& d : described) {
+      if (d.id == "urn:example:nested") nested = d.vendor;
+      if (d.id == "urn:example:direct") { direct = d.vendor; directFeatures = d.features; }
+      if (d.id == "urn:example:nobody") nobody = d.vendor;
+    }
+    std::printf("       nested \"%s\", direct \"%s\", nobody \"%s\"\n", nested.c_str(),
+                direct.c_str(), nobody.c_str());
+    check(nested == "Project Author", "a maintainer on the plugin's lv2:project is the vendor");
+    check(direct == "Plugin Author", "…and so is one on the plugin itself");
+    check(nobody.empty(), "…and a bundle that names nobody gets no invented vendor");
+    check(directFeatures.empty(), "…and doap:Project is not listed as what the plugin is");
+  }
+
+  // An LV2 plugin with eight times the ports takes about eight times as long
+  // to read, not sixty-four. Each port's every property, and each preset's
+  // every port, was found by reading every triple of its document: a plugin
+  // of 256 parameters and 16 presets took 180 ms per instance to load, and a
+  // session of fifty of them nine seconds. A bundle of 48 ports and one of
+  // 384, each with 8 presets setting every port, and no binary, so the load
+  // ends once the Turtle is read: the larger took 30-48 times as long as the
+  // smaller before, and takes 6-8 times now. Timed against each other, best
+  // of three, so a loaded machine slows both.
+  {
+    auto writeWide = [](const char* leaf, int ports) {
+      const std::string dir = sonoretest::tempPath(leaf);
+      std::filesystem::create_directories(std::filesystem::u8path(dir));
+      std::string manifest = "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n"
+                             "@prefix pset: <http://lv2plug.in/ns/ext/presets#> .\n"
+                             "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+                             "<urn:example:wide> a lv2:Plugin ; lv2:binary <absent.dll> ;"
+                             " rdfs:seeAlso <plugin.ttl> .\n";
+      std::string plugin = "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n<urn:example:wide> lv2:port\n";
+      std::string presets = "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n"
+                            "@prefix pset: <http://lv2plug.in/ns/ext/presets#> .\n";
+      for (int i = 0; i < ports; ++i)
+        plugin += std::string(i ? " ,\n" : "") + "  [ a lv2:InputPort , lv2:ControlPort ; lv2:index " +
+                  std::to_string(i) + " ; lv2:symbol \"p" + std::to_string(i) + "\" ; lv2:name \"P " +
+                  std::to_string(i) + "\" ; lv2:default 0.5 ; lv2:minimum 0.0 ; lv2:maximum 1.0 ]";
+      plugin += " .\n";
+      for (int k = 0; k < 8; ++k) {
+        const std::string uri = "<urn:example:wide#preset" + std::to_string(k) + ">";
+        manifest += uri + " a pset:Preset ; lv2:appliesTo <urn:example:wide> ; rdfs:label \"P" +
+                    std::to_string(k) + "\" ; rdfs:seeAlso <presets.ttl> .\n";
+        presets += uri + " lv2:port\n";
+        for (int i = 0; i < ports; ++i)
+          presets += std::string(i ? " ,\n" : "") + "  [ lv2:symbol \"p" + std::to_string(i) + "\" ; pset:value 0.25 ]";
+        presets += " .\n";
+      }
+      const std::pair<const char*, const std::string*> files[] = {
+          {"manifest.ttl", &manifest}, {"plugin.ttl", &plugin}, {"presets.ttl", &presets}};
+      for (const auto& f : files) std::ofstream(std::filesystem::u8path(dir + "/" + f.first), std::ios::binary) << *f.second;
+      return dir;
+    };
+    // Timed on this thread's own CPU clock, the two sizes in turn, best of
+    // five each: by wall time, on a machine busy with other work (a parallel
+    // ctest, a CI runner), the larger load was preempted in every run often
+    // enough to cross the bound while the smaller one was not.
+    auto timeLoad = [](const std::string& bundle) {
+      sonore::host::PluginDescription d;
+      d.format = "LV2";
+      d.id = "urn:example:wide";
+      d.path = bundle;
+      const double t0 = threadCpuNow();
+      const auto loaded = sonore::host::loadPlugin(d); // no binary: null, after the Turtle
+      const double spent = threadCpuNow() - t0;
+      return loaded ? 1e300 : spent;
+    };
+    const std::string smallBundle = writeWide("wide48.lv2", 48);
+    const std::string largeBundle = writeWide("wide384.lv2", 384);
+    double small = 1e300, large = 1e300;
+    for (int k = 0; k < 5; ++k) {
+      small = (std::min)(small, timeLoad(smallBundle));
+      large = (std::min)(large, timeLoad(largeBundle));
+    }
+    std::printf("       LV2 load on the CPU, 384 ports against 48: %.1fx\n", large / small);
+    check(small < 1e300 && large < 16.0 * small,
+          "an LV2 bundle's load grows with its size, not with its size squared");
+  }
 
   // A scan must not need the plugin loaded to say what it is, so nothing above
   // this line has instantiated anything.
@@ -289,6 +546,32 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ── The stream a VST3 writes its state into ───────────────────────────────
+  //
+  // A plugin may write a placeholder, write its data, seek back and fill the
+  // placeholder in. The host's stream appended every write regardless of the
+  // cursor, so the size landed at the end and the placeholder stayed: a state
+  // the plugin itself could not read back.
+  {
+    std::vector<uint8_t> bytes;
+    sonore::host::MemoryStream stream(&bytes);
+    auto* s = reinterpret_cast<Steinberg_IBStream*>(&stream);
+    Steinberg_int32 n = 0;
+    Steinberg_int64 at = 0;
+    char placeholder[4] = {'?', '?', '?', '?'};
+    char body[4] = {'d', 'a', 't', 'a'};
+    char size[4] = {'0', '0', '0', '4'};
+    stream.lpVtbl->write(s, placeholder, 4, &n);
+    stream.lpVtbl->write(s, body, 4, &n);
+    stream.lpVtbl->seek(s, 0, Steinberg_IBStream_IStreamSeekMode_kIBSeekSet, &at);
+    stream.lpVtbl->write(s, size, 4, &n);
+    const std::string got(bytes.begin(), bytes.end());
+    char line[160];
+    std::snprintf(line, sizeof(line), "a VST3 state stream overwrites at its cursor (\"%s\", want "
+                  "\"0004data\")", got.c_str());
+    check(got == "0004data", line);
+  }
+
   // ── The promise process() makes ───────────────────────────────────────────
   if (!found.empty()) {
     // Prove the counter works before trusting it: a counter that silently
@@ -336,6 +619,247 @@ int main(int argc, char** argv) {
       check(n == 0, "process() allocates nothing, as the header promises");
     }
     }
+
+    // ...including the block that carries a preset's worth of parameter
+    // events back from the plugin. Those are collected on the audio thread
+    // into the host's edit list, which was never reserved: the first block
+    // after a preset load grew it from empty, allocation by allocation, in
+    // the one call that promises none.
+    for (const char* wantFormat : {"CLAP", "VST3"}) {
+      const sonore::host::PluginDescription* pick = nullptr;
+      for (const auto& d : found)
+        if (d.format == wantFormat && d.name.find("Saturator") != std::string::npos) pick = &d;
+      if (!pick) continue;
+      auto plugin = sonore::host::loadPlugin(*pick);
+      if (!plugin || !plugin->prepare(48000.0, 256, 2) || plugin->numPresets() < 2) continue;
+      std::vector<float> l(256, 0.0f), r(256, 0.0f);
+      float* ch[2] = {l.data(), r.data()};
+      { sonore::AudioBlock<float> io(ch, 2, 256); plugin->process(io, nullptr); }
+      std::vector<sonore::host::ParamEdit> edits;
+      plugin->drainParameterEdits(edits);
+      edits.clear();
+      plugin->loadPreset(plugin->numPresets() - 1);
+      g_allocs.store(0);
+      g_armed.store(true);
+      { sonore::AudioBlock<float> io(ch, 2, 256); plugin->process(io, nullptr); }
+      g_armed.store(false);
+      const long carried = g_allocs.load();
+      const size_t reported = plugin->drainParameterEdits(edits);
+      char line[200];
+      std::snprintf(line, sizeof(line), "%s: the block after a preset load allocates nothing "
+                    "while collecting the plugin's edits (%ld allocations, %zu edits)",
+                    wantFormat, carried, reported);
+      check(carried == 0, line);
+    }
+
+    // A parameter set from the UI thread while the audio thread processes --
+    // the way any host with a window uses this. The queue was a plain vector
+    // that process() cleared at the END of the block, so whatever arrived
+    // while the plugin was inside its process call was thrown away
+    // undelivered, and that is most of the time on a busy audio thread. It
+    // was also pushed and cleared from two threads with no synchronisation.
+    {
+      const sonore::host::PluginDescription* pick = nullptr;
+      for (const auto& d : found)
+        if (d.format == "CLAP" && d.name.find("Saturator") != std::string::npos) pick = &d;
+      auto plugin = pick ? sonore::host::loadPlugin(*pick) : nullptr;
+      if (plugin && plugin->prepare(48000.0, 256, 2) && plugin->numParameters() > 0) {
+        const sonore::host::HostedParam p = plugin->parameter(0);
+        std::atomic<bool> stop{false};
+        std::atomic<unsigned long> blocks{0};
+        std::thread audio([&] {
+          std::vector<float> l(256, 0.0f), r(256, 0.0f);
+          float* ch[2] = {l.data(), r.data()};
+          while (!stop.load()) {
+            sonore::AudioBlock<float> io(ch, 2, 256);
+            plugin->process(io, nullptr);
+            blocks.fetch_add(1);
+          }
+        });
+        int lost = 0;
+        const int trials = 100;
+        for (int t = 0; t < trials; ++t) {
+          const double v = p.minValue + (p.maxValue - p.minValue) * (double) ((t * 37) % 97 + 1) / 98.0;
+          while (!plugin->setParameterValue(0, v)) std::this_thread::yield();
+          const unsigned long from = blocks.load();
+          while (blocks.load() < from + 3) std::this_thread::yield();
+          if (std::fabs(plugin->parameterValue(0) - v) > 1e-4) ++lost;
+        }
+        stop.store(true);
+        audio.join();
+        char line[200];
+        std::snprintf(line, sizeof(line), "CLAP: a parameter set from another thread while audio runs "
+                      "always arrives (%d of %d lost)", lost, trials);
+        check(lost == 0, line);
+      }
+    }
+
+    // The musical clock a hosted VST3 is told. One second at 44.1 kHz and the
+    // fixed 120 BPM is two beats; the context said 48 kHz and left the beat
+    // position at zero while flagging it valid, so a tempo-synced plugin saw
+    // its song frozen on the first beat. Read back from the GUI probe's own
+    // state, where it records the position the host gave its last block.
+    for (const auto& d : found) {
+      if (d.format != "VST3" || d.name.find("GUI Probe") == std::string::npos) continue;
+      auto probe = sonore::host::loadPlugin(d);
+      if (!probe || !probe->prepare(44100.0, 441, 2)) break;
+      std::vector<float> l(441, 0.0f), r(441, 0.0f);
+      float* ch[2] = {l.data(), r.data()};
+      for (int block = 0; block <= 100; ++block) { // the last block starts at 1.000 s
+        sonore::AudioBlock<float> io(ch, 2, 441);
+        probe->process(io, nullptr);
+      }
+      std::vector<uint8_t> state;
+      probe->saveState(state);
+      const std::string text(state.begin(), state.end());
+      const size_t at = text.find("beat ");
+      const std::string said = at == std::string::npos ? "nothing" : text.substr(at, 10);
+      char line[200];
+      std::snprintf(line, sizeof(line), "a hosted VST3 is told the music moves: after one second "
+                    "at 44.1 kHz it hears \"%s\", want \"beat 2.000\"", said.c_str());
+      check(said == "beat 2.000", line);
+      break;
+    }
+  }
+
+  // ── A CLAP plugin that asks for the main thread gets it ───────────────────
+  //
+  // request_callback was ignored, so on_main_thread never ran: the SDK's own
+  // plugins ask for it to say their state changed, and that news never
+  // reached the host. And latency.changed() during activate() -- where CLAP
+  // allows it, and where the SDK's plugins announce their latency -- was
+  // taken for a restart request, so every prepare asked for another.
+  for (const auto& d : found) {
+    if (d.format != "CLAP" || d.name.find("GUI Probe") == std::string::npos) continue;
+    auto probe = sonore::host::loadPlugin(d);
+    if (!probe || !probe->prepare(48000.0, 256, 2)) break;
+    const bool restartAfterPrepare = probe->takeRestartRequest();
+    // The probe's switch stands in for "the user loaded a sample": moving it
+    // changes what the plugin would save.
+    for (int i = 0; i < probe->numParameters(); ++i)
+      if (std::string(probe->parameter(i).name).find("Latency") != std::string::npos ||
+          std::string(probe->parameter(i).name).find("Switch") != std::string::npos)
+        probe->setParameterValue(i, probe->parameter(i).maxValue);
+    std::vector<float> l(256, 0.0f), r(256, 0.0f);
+    float* ch[2] = {l.data(), r.data()};
+    for (int block = 0; block < 4; ++block) {
+      sonore::AudioBlock<float> io(ch, 2, 256);
+      probe->process(io, nullptr);
+    }
+    std::vector<sonore::host::ParamEdit> edits;
+    probe->drainParameterEdits(edits);
+    const bool dirty = probe->takeStateDirty();
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a CLAP plugin's state change reaches the host through on_main_thread (%s), and "
+                  "announcing its latency in activate asks for no restart (%s)",
+                  dirty ? "dirty" : "not told", restartAfterPrepare ? "restart asked" : "none");
+    check(dirty && !restartAfterPrepare, line);
+    break;
+  }
+
+  // ── An LV2 plugin's state survives the order a host restores in ─────────
+  //
+  // A session restores state and THEN prepares, and LV2 fixes the rate at
+  // instantiate, so prepare() makes a new instance: loadState() before it
+  // restored into nothing (and still returned true), and a later prepare
+  // wiped what the instance held. The ducker keeps its key source in its
+  // state, so a changed one has to come back through both.
+  for (const auto& d : found) {
+    if (d.format != "LV2" || d.name.find("Ducker") == std::string::npos) continue;
+    auto source = sonore::host::loadPlugin(d);
+    std::vector<uint8_t> blob;
+    if (!source || !source->prepare(48000.0, 256, 2) || !source->saveState(blob)) break;
+    const std::string from = "sidechain", to = "sidechaiN";
+    auto at = std::search(blob.begin(), blob.end(), from.begin(), from.end());
+    if (at == blob.end()) {
+      check(false, "the ducker's LV2 state names its key source");
+      break;
+    }
+    std::copy(to.begin(), to.end(), at);
+    auto holds = [&](auto& plugin) {
+      std::vector<uint8_t> now;
+      return plugin.saveState(now) && std::search(now.begin(), now.end(), to.begin(), to.end()) != now.end();
+    };
+    auto fresh = sonore::host::loadPlugin(d);
+    const bool restored = fresh && fresh->loadState(blob.data(), blob.size());
+    const bool held = restored && holds(*fresh);
+    const bool prepared = held && fresh->prepare(48000.0, 256, 2) && holds(*fresh);
+    const bool reprepared = prepared && fresh->prepare(48000.0, 512, 2) && holds(*fresh);
+    char line[220];
+    std::snprintf(line, sizeof(line),
+                  "an LV2 plugin's state, loaded before prepare, is still there after it (%s) and "
+                  "after a second prepare (%s)", prepared ? "yes" : "no", reprepared ? "yes" : "no");
+    check(held && prepared && reprepared, line);
+    break;
+  }
+
+  // ── An LV2 plugin's aux outputs stay off the main bus ─────────────────────
+  //
+  // This host routes the main channels only, and connected every audio port
+  // past them to the FIRST main channel: a splitter's aux bands were written
+  // over the main left channel, and a key input heard the main signal. A
+  // 12 kHz tone belongs entirely to the splitter's high band, so the main
+  // output -- the low band -- must stay near silent on BOTH sides.
+  for (const auto& d : found) {
+    if (d.format != "LV2" || d.name.find("Splitter") == std::string::npos) continue;
+    auto splitter = sonore::host::loadPlugin(d);
+    if (!splitter || !splitter->prepare(48000.0, 256, 2)) break;
+    std::vector<float> l(256), r(256);
+    float* ch[2] = {l.data(), r.data()};
+    double inEnergy = 0.0, leftEnergy = 0.0, rightEnergy = 0.0;
+    int phase = 0;
+    for (int block = 0; block < 60; ++block) {
+      for (int i = 0; i < 256; ++i, ++phase)
+        l[(size_t) i] = r[(size_t) i] = 0.5f * (float) std::sin(2.0 * 3.14159265358979 * 12000.0 * phase / 48000.0);
+      if (block >= 20)
+        for (int i = 0; i < 256; ++i) inEnergy += (double) l[(size_t) i] * l[(size_t) i];
+      sonore::AudioBlock<float> io(ch, 2, 256);
+      splitter->process(io, nullptr);
+      if (block >= 20)
+        for (int i = 0; i < 256; ++i) {
+          leftEnergy += (double) l[(size_t) i] * l[(size_t) i];
+          rightEnergy += (double) r[(size_t) i] * r[(size_t) i];
+        }
+    }
+    char line[220];
+    std::snprintf(line, sizeof(line), "an LV2 splitter's high band stays off the main bus (main "
+                  "left %.1f dB, right %.1f dB, relative to the input)",
+                  10.0 * std::log10(leftEnergy / inEnergy + 1e-30),
+                  10.0 * std::log10(rightEnergy / inEnergy + 1e-30));
+    check(leftEnergy < inEnergy * 0.01 && rightEnergy < inEnergy * 0.01, line);
+    break;
+  }
+
+  // ── An arpeggiator's notes come back, in every format ────────────────────
+  //
+  // The LV2 build has a MIDI output and a UI notification output, both atom
+  // ports, and this host connected every atom output to ONE buffer. The
+  // notification port, claimed after the MIDI was written, reset the
+  // sequence: the CLAP and VST3 arps handed on 43 notes in 2000 blocks and
+  // the LV2 one none at all.
+  for (const char* wantFormat : {"CLAP", "VST3", "LV2"}) {
+    const sonore::host::PluginDescription* d = nullptr;
+    for (const auto& candidate : found)
+      if (candidate.format == wantFormat && candidate.name == "Sonore Arp") d = &candidate;
+    if (!d) continue;
+    auto arp = sonore::host::loadPlugin(*d);
+    if (!arp || !arp->prepare(48000.0, 64, 2)) continue;
+    std::vector<float> l(64, 0.0f), r(64, 0.0f);
+    float* ch[2] = {l.data(), r.data()};
+    sonore::MidiBuffer held;
+    held.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    int notes = 0;
+    for (int block = 0; block < 2000; ++block) {
+      sonore::AudioBlock<float> io(ch, 2, 64);
+      arp->process(io, block == 0 ? &held : nullptr);
+      notes += arp->producedMidi().getNumEvents();
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "%s arpeggiator's notes come back through producedMidi() "
+                  "(%d in 2000 blocks)", wantFormat, notes);
+    check(notes > 0, line);
+    arp->release();
   }
 
   // ── Bypass, through one call in three formats ─────────────────────────────
@@ -550,7 +1074,7 @@ int main(int argc, char** argv) {
   // the output event list, and asks for a flush when it is idle so an edit
   // made with the transport stopped does not wait for playback. VST3 has the
   // host implement IComponentHandler and calls restartComponent with
-  // kParamValuesChanged: this host had no handler at all, so a hosted
+  // kParamValuesChanged; this host had no handler at all, so a hosted
   // plugin had nowhere to report anything. LV2 has no channel for it, because
   // a control port is a float the HOST owns and the plugin only reads.
   //
@@ -728,6 +1252,35 @@ int main(int argc, char** argv) {
       check(child != nullptr, "…and the window it made is a child of ours");
       check(sized, "…and it says what size it wants");
       check(width > 0 && height > 0, "…which is a size rather than nothing");
+
+      // The caller's window dragged larger: the editor is asked to follow,
+      // each format its own way -- CLAP's set_size(), VST3's onSize(),
+      // LV2's ui:resize -- and the window the OS measures is the new size.
+      {
+        const uint32_t wantW = width + 40, wantH = height + 30;
+        const bool took = plugin->setEditorSize(wantW, wantH);
+        for (int i = 0; i < 20; ++i) {
+          MSG pending;
+          while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&pending);
+            DispatchMessageW(&pending);
+          }
+          plugin->idleEditor();
+          Sleep(5);
+        }
+        uint32_t nowW = 0, nowH = 0;
+        plugin->editorSize(nowW, nowH);
+        RECT client{};
+        if (child) GetClientRect(child, &client);
+        char resized[200];
+        std::snprintf(resized, sizeof(resized), "%s: the caller resizes the editor to %ux%u (%s; it reports "
+                      "%ux%u, its window is %ldx%ld)", wantFormat, (unsigned) wantW, (unsigned) wantH,
+                      took ? "taken" : "refused", (unsigned) nowW, (unsigned) nowH, client.right - client.left,
+                      client.bottom - client.top);
+        check(took && nowW == wantW && nowH == wantH && (uint32_t) (client.right - client.left) == wantW &&
+                  (uint32_t) (client.bottom - client.top) == wantH,
+              resized);
+      }
 
       plugin->closeEditor();
       MSG msg;
@@ -941,7 +1494,7 @@ int main(int argc, char** argv) {
     // ── The second scan opens nothing ──
     //
     // The measurable claim, and the reason the cache exists. Not "it is
-    // faster", that is a stopwatch and a mood. Every file is UP TO DATE, so
+    // faster": that is a stopwatch and a mood. Every file is UP TO DATE, so
     // none of them is a candidate for loading.
     size_t upToDate = 0;
     for (const std::string& file : files)
@@ -953,6 +1506,24 @@ int main(int argc, char** argv) {
     const std::vector<sonore::host::PluginDescription> secondPass =
         sonore::host::scanDirectoryCached(directory, reloaded, kCachePath);
     check(secondPass.size() == firstPass.size(), "…and describes the same plugins");
+
+    // ── …and does not rewrite the cache ──
+    //
+    // Every write of the cache is a flush to the disk, some 10 ms, and a scan
+    // that found nothing changed paid one at its end to put back the bytes
+    // that were there: more than everything else the scan of an unchanged
+    // folder -- every start of a host -- costs. A file left alone keeps its
+    // modification time; one written again does not.
+    {
+      std::error_code error;
+      const auto writtenAt = std::filesystem::last_write_time(std::filesystem::u8path(kCachePath), error);
+      sonore::host::PluginCache third;
+      third.load(kCachePath);
+      const size_t thirdFound = sonore::host::scanDirectoryCached(directory, third, kCachePath).size();
+      const auto after = std::filesystem::last_write_time(std::filesystem::u8path(kCachePath), error);
+      check(!error && after == writtenAt && thirdFound == firstPass.size(),
+            "a scan that finds nothing changed leaves the cache file as it was");
+    }
 
     // ── A file that changed is scanned again ──
     //
@@ -967,6 +1538,35 @@ int main(int argc, char** argv) {
       // in the cache has no stamp to match.
       check(!stale.isUpToDate(directory + "/something-new.clap"),
             "a file the cache has not seen is not up to date");
+    }
+
+    // A BUNDLE -- every .lv2 -- is a folder, and on Windows a folder's own
+    // stamp is a size of 0 and a time that moves when a file is added or
+    // removed in it, not when one is rewritten. An update that wrote its
+    // manifest and binary over the old ones in place left the stamp as it
+    // was: the cache went on answering for the old bundle, its new plugins
+    // never listed. macOS and Linux stamped a bundle by its files already.
+    {
+      namespace fs = std::filesystem;
+      const fs::path bundle = fs::u8path(tempPath("sonore-cache-bundle.lv2"));
+      std::error_code error;
+      fs::create_directories(bundle, error);
+      auto write = [&](const char* leaf, const char* text) {
+        if (std::FILE* file = std::fopen((bundle / leaf).u8string().c_str(), "wb")) {
+          std::fputs(text, file);
+          std::fclose(file);
+        }
+      };
+      write("manifest.ttl", "# one plugin\n");
+      write("plugin.dll", "version 1\n");
+      sonore::host::PluginCache bundles;
+      bundles.remember(bundle.u8string(), {});
+      const bool knownAtFirst = bundles.isUpToDate(bundle.u8string());
+      write("manifest.ttl", "# one plugin, and now a second one beside it\n");
+      write("plugin.dll", "version 2, with the second plugin in it\n");
+      check(knownAtFirst && !bundles.isUpToDate(bundle.u8string()),
+            "an LV2 bundle whose files were rewritten in place is scanned again");
+      fs::remove_all(bundle, error);
     }
 
     // ── The dead man's switch ──
@@ -1014,6 +1614,124 @@ int main(int argc, char** argv) {
       const std::vector<sonore::host::PluginDescription> forgiven =
           sonore::host::scanDirectoryCached(directory, afterCrash, kCachePath);
       check(forgiven.size() == firstPass.size(), "…and is scanned again");
+    }
+
+    // A mark left by ANOTHER process that is still running is a scan in
+    // progress, not a crash. A second host process started mid-scan read the
+    // first one's mark as a death and blacklisted that plugin for good. The
+    // mark now carries the writer's process id; a live writer is left alone.
+    {
+      const std::string victim = files[0];
+#if defined(_WIN32)
+      const unsigned long alive = 4; // System: always running, and not ours
+#else
+      const unsigned long alive = 1; // init: the same
+#endif
+      const unsigned long dead = 0x7FFFFFF0ul; // no such process
+      auto writeMark = [&](unsigned long pid) {
+        if (std::FILE* file = std::fopen(kCachePath, "wb")) {
+          std::fprintf(file, "SONORE-PLUGIN-CACHE-1\nSCANNING\t%s\t%lu\n", victim.c_str(), pid);
+          std::fclose(file);
+        }
+      };
+      writeMark(alive);
+      sonore::host::PluginCache whileScanning;
+      check(whileScanning.load(kCachePath) && whileScanning.crashedOn().empty(),
+            "a scan mark from a process that is still running is not read as a crash");
+      writeMark(dead);
+      sonore::host::PluginCache afterDeath;
+      check(afterDeath.load(kCachePath) && afterDeath.crashedOn() == victim,
+            "while one from a process that is gone still is");
+
+      // Two processes scanning one cache, as two hosts started together do.
+      // Each writes the whole file from its own memory, before and after
+      // every plugin it opens -- so the second one's next write erased the
+      // first one's mark. A plugin that killed the first process while the
+      // second went on scanning left no trace, and killed it again on the
+      // next start. Another process's mark is carried over now, until it is
+      // acted on.
+      auto fileText = [&]() {
+        std::string text;
+        if (std::FILE* file = std::fopen(kCachePath, "rb")) {
+          char buffer[4096];
+          size_t got = 0;
+          while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) text.append(buffer, got);
+          std::fclose(file);
+        }
+        return text;
+      };
+      writeMark(alive);
+      sonore::host::PluginCache beside;
+      beside.load(kCachePath);
+      beside.endScanning(kCachePath); // this process, done with a file of its own
+      char mark[600];
+      std::snprintf(mark, sizeof(mark), "SCANNING\t%s\t%lu", victim.c_str(), alive);
+      check(fileText().find(mark) != std::string::npos,
+            "a scan in a second process keeps the first one's mark while that one is scanning");
+
+      sonore::host::PluginCache survivor;
+      if (std::FILE* file = std::fopen(kCachePath, "wb")) {
+        std::fprintf(file, "SONORE-PLUGIN-CACHE-1\n");
+        std::fclose(file);
+      }
+      survivor.load(kCachePath); // before the other process reached the plugin
+      writeMark(dead);           // which it then died inside
+      survivor.endScanning(kCachePath);
+      sonore::host::PluginCache nextStart;
+      check(nextStart.load(kCachePath) && nextStart.crashedOn() == victim,
+            "...and a plugin that killed one process while another scanned is found on the next start");
+      sonore::host::scanFilesCached({}, nextStart, kCachePath);
+      sonore::host::PluginCache acted;
+      check(acted.load(kCachePath) && acted.crashedOn().empty() && acted.isBlacklisted(victim),
+            "...blacklisted, and its mark gone once it has been acted on");
+    }
+
+    // A byte-order mark, which an editor may add when somebody edits the
+    // blacklist by hand -- as the format invites. It was read as part of the
+    // version line, and the whole cache, blacklist included, was thrown away.
+    {
+      if (std::FILE* file = std::fopen(kCachePath, "wb")) {
+        std::fprintf(file, "\xEF\xBB\xBFSONORE-PLUGIN-CACHE-1\nBLACKLIST\t%s\n", files[0].c_str());
+        std::fclose(file);
+      }
+      sonore::host::PluginCache edited;
+      check(edited.load(kCachePath) && edited.isBlacklisted(files[0]),
+            "a cache saved with a UTF-8 byte-order mark still loads, blacklist and all");
+    }
+
+    // Two stamps for one file -- a cache written twice over, or edited --
+    // with the file's real stamp first and a stale one after it. isUpToDate
+    // read the first and knownFor the last: the file was "up to date" and
+    // known to hold nothing, so a cached scan hid its plugins for good. The
+    // last line wins now, for every lookup, and the file is rescanned.
+    {
+      // The scan's whole cache again (the case above overwrote the file),
+      // so the file's real stamp comes first.
+      reloaded.save(kCachePath);
+      std::string text;
+      if (std::FILE* file = std::fopen(kCachePath, "rb")) {
+        char buffer[4096];
+        size_t got = 0;
+        while ((got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) text.append(buffer, got);
+        std::fclose(file);
+      }
+      std::string withPlugins;
+      for (const auto& d : found)
+        if (d.format == "CLAP") { withPlugins = d.path; break; }
+      if (!withPlugins.empty()) {
+        // A stamp no file has: 1 byte, modified at the epoch.
+        text += "STAMP\t" + withPlugins + "\t1\t1\n";
+        if (std::FILE* file = std::fopen(kCachePath, "wb")) {
+          std::fwrite(text.data(), 1, text.size(), file);
+          std::fclose(file);
+        }
+        sonore::host::PluginCache doubled;
+        const bool doubledLoads = doubled.load(kCachePath);
+        const bool current = doubled.isUpToDate(withPlugins);
+        const bool known = !doubled.knownFor(withPlugins).empty();
+        check(doubledLoads && current == known && !current,
+              "a file with two stamps is judged by the last, the same way by every lookup, and rescanned");
+      }
     }
 
     // A cache from a future version is thrown away rather than misread. A
@@ -1147,7 +1865,7 @@ int main(int argc, char** argv) {
 
         std::vector<uint8_t> v4;
         check(plugin->saveState(v4), "a current state blob saves");
-        check(v4.size() > 17 && v4[4] == 5, "…declaring version 5");
+        check(v4.size() > 17 && v4[4] == 6, "…declaring version 6");
 
         // v3: the version byte back, and the four preset bytes taken out.
         std::vector<uint8_t> v3 = v4;
@@ -1173,7 +1891,7 @@ int main(int argc, char** argv) {
 
   // The .vstpreset container itself, read back field by field. The round trip
   // above would pass even if the header were nonsense, because the same code
-  // wrote and read it: this checks the bytes are the format other hosts
+  // wrote and read it. This checks the bytes are the format other hosts
   // expect.
   {
     const char* kPath = tempPath("sonore-container.vstpreset");
@@ -1283,8 +2001,8 @@ int main(int argc, char** argv) {
   // ── The state an LV2 plugin keeps outside its ports ───────────────────────
   //
   // A control port is a float and nothing else. Everything a plugin knows
-  // beyond its knobs, which sample a sampler loaded, which impulse a reverb
-  // read: travels through the state: extension as typed key/value pairs, and
+  // beyond its knobs (which sample a sampler loaded, which impulse a reverb
+  // read) travels through the state: extension as typed key/value pairs, and
   // a host that saved only the ports would restore a session with the knobs
   // right and the sound wrong.
   //
@@ -1421,6 +2139,54 @@ int main(int argc, char** argv) {
     off.addEvent(sonore::MidiMessage::noteOff(0, 45), 0);
     capture(4, &off);
   }
+
+  // ── What the host holds for one plugin ────────────────────────────────────
+  //
+  // The bytes the host keeps for a plugin loaded, prepared at 48 kHz for 512
+  // frames and run once: its own structures, none of the plugin's (see
+  // g_liveBytes). Each bound sits between what is held now and what was
+  // held when a structure outgrew its use:
+  //   * a VST3 instrument's parameter list kept the room it was reserved for
+  //     the 2080 MIDI controller parameters the instrument hides (515 KB
+  //     held, 302 KB now);
+  //   * an LV2 plugin with an editor had the 192 KB of queues between it and
+  //     its interface from load, its editor opened or not (563 KB, 371 KB);
+  //   * a VST3 effect kept room for a block of notes it has no input for
+  //     (224 KB, 176 KB);
+  //   * and so did a CLAP effect (187 KB, 131 KB).
+#if defined(_WIN32)
+  {
+    struct Held {
+      const char* format;
+      const char* name;
+      long long boundKb;
+    };
+    const Held held[] = {{"VST3", "Sonore Synth", 400},
+                         {"LV2", "Sonore Synth", 470},
+                         {"VST3", "Sonore Saturator", 205},
+                         {"CLAP", "Sonore Saturator", 160}};
+    for (const Held& want : held) {
+      const sonore::host::PluginDescription* pick = nullptr;
+      for (const auto& d : found)
+        if (d.format == want.format && d.name == want.name) pick = &d;
+      if (!pick) continue;
+      std::vector<float> l(512, 0.0f), r(512, 0.0f);
+      float* ch[2] = {l.data(), r.data()};
+      const long long before = g_liveBytes.load();
+      auto plugin = sonore::host::loadPlugin(*pick);
+      const bool ready = plugin && plugin->prepare(48000.0, 512, 2);
+      if (ready) {
+        sonore::AudioBlock<float> io(ch, 2, 512);
+        plugin->process(io, nullptr);
+      }
+      const long long bytes = g_liveBytes.load() - before;
+      char line[200];
+      std::snprintf(line, sizeof(line), "%s %s: the host holds %lld KB for it, loaded and prepared "
+                    "(at most %lld KB)", want.format, want.name, bytes / 1024, want.boundKb);
+      check(ready && bytes > 0 && bytes <= want.boundKb * 1024, line);
+    }
+  }
+#endif
 
   std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
   if (g_failures == 0) std::printf("SONORE HOST PASSED\n");

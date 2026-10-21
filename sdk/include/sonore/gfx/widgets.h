@@ -31,7 +31,6 @@
 namespace sonore {
 namespace gfx {
 
-/** Shared plumbing: which LookAndFeel to draw with, and which font. */
 /**
  * What the mouse wheel does over a control.
  *
@@ -49,16 +48,20 @@ namespace gfx {
  * could scroll AND the control is not currently being dragged.
  */
 enum class WheelMode {
-  Never,         // this control never responds to the wheel
-  Always,        // it always does, even inside a scrolling view
-  DeferToScroll, // it does unless an ancestor would scroll and no drag is in progress
+  Never,         ///< this control never responds to the wheel
+  Always,        ///< it always does, even inside a scrolling view
+  DeferToScroll, ///< it does unless an ancestor would scroll and no drag is in progress
 };
 
+/** Shared plumbing: which LookAndFeel to draw with, and which font. */
 class Widget : public Component {
 public:
+  Widget* asWidget() override { return this; }
+
   /** The off case is conventionally a single boolean; this is that plus the
    *  case that usually has no name. */
   void setWheelMode(WheelMode mode) { wheelMode_ = mode; }
+  /** DeferToScroll unless setWheelMode said otherwise. */
   WheelMode wheelMode() const { return wheelMode_; }
 
   /** Whether this control should act on a wheel event right now. `dragging`
@@ -84,40 +87,67 @@ public:
     if (isEnabled() && onContextMenu) onContextMenu(e);
   }
 
+  /** ShowMenu, for every control: the same menu a right click asks for, as
+   *  if the click had landed in the control's centre -- a host placing its
+   *  menu at the event's position puts it over the control a reader is on.
+   *  Offered only when somebody supplied the menu (see baseInfo). */
+  bool performAccessibleAction(AccessibleAction action) override {
+    if (action != AccessibleAction::ShowMenu || !isEnabled() || !onContextMenu) return false;
+    MouseEvent e;
+    e.position = {localBounds().w * 0.5f, localBounds().h * 0.5f};
+    e.rootPosition = localToRoot(e.position);
+    e.downPosition = e.position;
+    e.rightButton = true;
+    contextMenu(e);
+    return true;
+  }
+
+  /** Draw this widget, and every widget inside it that sets none of its own,
+   *  with `laf`; null inherits again. Not owned: it must outlive the widgets
+   *  drawing with it. */
   void setLookAndFeel(LookAndFeel* laf) {
     laf_ = laf;
     repaint();
   }
 
+  /** This widget's look, else the nearest ancestor widget's, else
+   *  LookAndFeel::defaultLookAndFeel(). */
   LookAndFeel& lookAndFeel() const {
     if (laf_) return *laf_;
     // Inherited from the nearest ancestor that has one, so a panel can set
     // the look for everything inside it in a single call.
     for (Component* p = parent(); p; p = p->parent())
-      if (auto* w = dynamic_cast<Widget*>(p))
+      if (Widget* w = p->asWidget())
         if (w->laf_) return *w->laf_;
     return LookAndFeel::defaultLookAndFeel();
   }
 
+  /** Text in this widget, and in widgets inside it that set none, uses `f`;
+   *  an invalid Font -- the default -- inherits. */
   void setFont(const Font& f) {
     font_ = f;
     repaint();
   }
 
+  /** This widget's font if valid, else the nearest ancestor widget's. When none
+   *  has one the Font is invalid and no text is drawn. */
   const Font& font() const {
     if (font_.isValid()) return font_;
     for (Component* p = parent(); p; p = p->parent())
-      if (auto* w = dynamic_cast<Widget*>(p))
+      if (Widget* w = p->asWidget())
         if (w->font_.isValid()) return w->font_;
     return font_;
   }
 
+  /** A disabled widget draws dimmed, ignores clicks, keys and the wheel, and
+   *  lets the mouse through to whatever is behind it. Enabled by default. */
   void setEnabled(bool shouldBeEnabled) {
     if (enabled_ == shouldBeEnabled) return;
     enabled_ = shouldBeEnabled;
     setInterceptsMouse(shouldBeEnabled);
     repaint();
   }
+  /** True unless setEnabled(false). */
   bool isEnabled() const { return enabled_; }
 
 protected:
@@ -137,6 +167,7 @@ protected:
     info.focusable = wantsKeyboardFocus();
     info.focused = hasKeyboardFocus();
     info.enabled = isEnabled();
+    if (isEnabled() && onContextMenu) info.actions |= accessibleActionBit(AccessibleAction::ShowMenu);
     return info;
   }
 
@@ -146,6 +177,8 @@ protected:
     if (hasKeyboardFocus()) lookAndFeel().drawFocusRing(g, localBounds());
   }
 
+  /** The WidgetState a LookAndFeel call takes: hover and enabled from this
+   *  widget, pressed and toggled from the caller. */
   WidgetState stateFor(bool pressed, bool toggled = false) const {
     WidgetState s;
     s.hovered = hovered_;
@@ -164,6 +197,8 @@ protected:
     repaint();
   }
 
+  /** Whether the pointer is over this widget, kept by Widget's mouseEnter and
+   *  mouseExit: a subclass overriding those calls these versions too. */
   bool hovered_ = false;
 
 private:
@@ -183,12 +218,12 @@ private:
 class Slider : public Widget {
 public:
   enum class Style {
-    Rotary,
-    LinearHorizontal,
-    LinearVertical,
+    Rotary,  ///< a knob; dragged vertically unless setRotaryDrag says otherwise
+    LinearHorizontal,  ///< a horizontal track with a thumb: 0 at the left
+    LinearVertical,  ///< a vertical track with a thumb: 1 at the top
     /** A filled proportion rather than a thumb. */
     LinearBar,
-    LinearBarVertical,
+    LinearBarVertical,  ///< the same, filling upwards
   };
 
   /**
@@ -203,19 +238,29 @@ public:
    * as broken rather than as opinionated. Summing the two axes means any
    * direction with an upward or rightward component turns it up.
    */
-  enum class RotaryDrag { Vertical, Horizontal, Both };
+  enum class RotaryDrag { Vertical, /**< up turns it up */ Horizontal, /**< right turns it up */ Both /**< up and right both count, summed */ };
 
-  void setRotaryDrag(RotaryDrag d) { rotaryDrag_ = d; }
+  /** How a Rotary reads a drag; the linear styles ignore it. The cursor
+   *  follows -- left-right for Horizontal, up-down otherwise -- unless a
+   *  cursor was set on this slider, which is kept. */
+  void setRotaryDrag(RotaryDrag d) {
+    rotaryDrag_ = d;
+    followDragCursor();
+  }
+  /** Vertical unless setRotaryDrag said otherwise. */
   RotaryDrag rotaryDrag() const { return rotaryDrag_; }
 
   /** The three questions the drawing and the drag arithmetic both ask, spelled
    *  once. They carry the names these shapes are known by. */
   bool isRotary() const { return style_ == Style::Rotary; }
+  /** LinearBar or LinearBarVertical: a fill with no thumb. */
   bool isBar() const { return style_ == Style::LinearBar || style_ == Style::LinearBarVertical; }
+  /** LinearHorizontal or LinearBar: the value runs left to right. */
   bool isHorizontal() const {
     return style_ == Style::LinearHorizontal || style_ == Style::LinearBar;
   }
 
+  /** A slider of style `s` at 0, with a default of 0. Takes keyboard focus. */
   explicit Slider(Style s = Style::Rotary) : style_(s) {
     // Reachable by Tab, and therefore operable. Nothing but the text field and
     // the list took focus before this, so every knob in every generated editor
@@ -223,19 +268,25 @@ public:
     setWantsKeyboardFocus(true);
     // A rotary is dragged VERTICALLY however round it looks, so its cursor says
     // so -- which is the only hint a new user gets that a knob is not turned by
-    // dragging in a circle.
-    setCursor(s == Style::LinearHorizontal ? MouseCursor::DragHorizontal
-                                           : MouseCursor::DragVertical);
+    // dragging in a circle. Asked the way the drag itself asks: testing for
+    // LinearHorizontal alone gave the horizontal BAR the up-and-down cursor
+    // while it moved left and right.
+    ownCursor_ = dragCursor();
+    setCursor(ownCursor_);
   }
 
+  /** Change the shape; the value is kept. The cursor follows -- left-right
+   *  for LinearHorizontal, LinearBar and a rotary dragged Horizontal, up-down
+   *  for the rest -- unless a cursor was set on this slider, which is kept. */
   void setStyle(Style s) {
     style_ = s;
-    setCursor(s == Style::LinearHorizontal ? MouseCursor::DragHorizontal
-                                           : MouseCursor::DragVertical);
+    followDragCursor();
     repaint();
   }
+  /** The shape it is drawn as. */
   Style style() const { return style_; }
 
+  /** Normalised, 0..1. */
   float value() const { return value_; }
 
   /** `notify` false is for a host telling the widget what the parameter now
@@ -249,6 +300,7 @@ public:
     if (notify && onValueChange) onValueChange(value_);
   }
 
+  /** Where a double click puts it, normalised; 0 unless set. */
   void setDefaultValue(float normalised) { defaultValue_ = normalised; }
 
   /** How many pixels of drag cover the whole range. 200 is roughly a hand's
@@ -258,8 +310,18 @@ public:
     if (pixelsForFullRange > 1.0f) sensitivity_ = pixelsForFullRange;
   }
 
+  /** The new normalised value, each time it changes -- by a drag, a key, the
+   *  wheel, a double click, a reader, or setValue with `notify`. Not called
+   *  when a set leaves the value where it was. The handler may delete the
+   *  slider. */
   std::function<void(float)> onValueChange;
+  /** Opens a gesture: when a drag begins, and before each one-step edit (a key,
+   *  a wheel notch, a double click, a reader's set). Where an attachment begins
+   *  the host's edit. */
   std::function<void()> onDragStart;
+  /** Closes it: when the drag's button comes up, and after each one-step edit.
+   *  A slider removed from the tree or destroyed mid-drag gets no release, so
+   *  its owner closes that gesture (SliderAttachment does, when destroyed). */
   std::function<void()> onDragEnd;
 
   /**
@@ -293,7 +355,30 @@ public:
       std::snprintf(buffer, sizeof(buffer), "%.0f%%", (double) value_ * 100.0);
       info.value = buffer;
     }
+    if (isEnabled()) {
+      info.actions |= accessibleActionBit(AccessibleAction::Increment) |
+                      accessibleActionBit(AccessibleAction::Decrement);
+      info.valueSettable = true;
+    }
     return info;
+  }
+
+  /** Increment and Decrement are the arrow keys' step, through keyPressed --
+   *  one bracketed edit each, exactly as a keyboard user makes them. */
+  bool performAccessibleAction(AccessibleAction action) override {
+    if (action != AccessibleAction::Increment && action != AccessibleAction::Decrement)
+      return Widget::performAccessibleAction(action);
+    KeyPress key;
+    key.keyCode = action == AccessibleAction::Increment ? KeyPress::Up : KeyPress::Down;
+    return keyPressed(key);
+  }
+
+  /** A reader setting the position outright: one bracketed edit, as a
+   *  double click to the default is. */
+  bool setAccessibleValue(double value) override {
+    if (!isEnabled() || !(value == value)) return false; // NaN is no position
+    edit((float) value);
+    return true;
   }
 
   void paint(Graphics& g) override {
@@ -347,9 +432,7 @@ public:
     // Bracketed even when the value does not move -- at the end of the range an
     // unbracketed set would be the only path here that is not an edit, and a
     // host counting gestures would see them unbalanced.
-    if (onDragStart) onDragStart();
-    setValue(target);
-    if (onDragEnd) onDragEnd();
+    edit(target);
     return true;
   }
 
@@ -359,23 +442,25 @@ public:
     // a gesture bracket opened here and closed by the following release would
     // record an edit the user did not make.
     if (e.clickCount >= 2) {
-      if (onDragStart) onDragStart();
-      setValue(defaultValue_);
-      if (onDragEnd) onDragEnd();
+      edit(defaultValue_);
       return;
     }
     dragging_ = true;
     valueAtDown_ = value_;
+    // Repainted first: the handlers below may delete this slider (see edit).
+    repaint();
+    detail::DeletionWatch alive(this);
     if (onDragStart) onDragStart();
+    if (alive.deleted) return;
     // A linear slider JUMPS to where it was clicked, because the track shows
     // an absolute position and clicking a place you can see should go there.
     // A rotary does not: there is no position under the pointer to mean.
     if (style_ != Style::Rotary) {
-      setValue(valueFromPosition(e.position));
-      valueAtDown_ = value_;
+      const float jumped = valueFromPosition(e.position);
+      valueAtDown_ = jumped < 0.0f ? 0.0f : (jumped > 1.0f ? 1.0f : jumped);
       dragOrigin_ = e.position;
+      setValue(jumped);
     }
-    repaint();
   }
 
   void mouseDrag(const MouseEvent& e) override {
@@ -408,8 +493,10 @@ public:
   void mouseUp(const MouseEvent&) override {
     if (!dragging_) return;
     dragging_ = false;
-    if (onDragEnd) onDragEnd();
+    // Repainted BEFORE the handler, which may delete this slider: an editor
+    // rebuilt once a drag ends.
     repaint();
+    if (onDragEnd) onDragEnd();
   }
 
   /** A wheel notch is a small step, and brackets itself: it is a complete
@@ -422,13 +509,30 @@ public:
     // scroll out from under the hand adjusting the control.
     if (!wheelBelongsHere(dragging_)) return false;
     const float step = (e.shiftDown ? 0.01f : 0.05f) * (delta > 0.0f ? 1.0f : -1.0f);
-    if (onDragStart) onDragStart();
-    setValue(value_ + step);
-    if (onDragEnd) onDragEnd();
+    edit(value_ + step);
     return true;
   }
 
 private:
+  /**
+   * One complete edit: onDragStart, the value, onDragEnd -- what a key, a
+   * wheel notch, a double click and a reader setting the value each make.
+   *
+   * All three handlers are the owner's code, and onValueChange may delete
+   * this slider: an editor that lays itself out again around the value just
+   * set (a band count, a mode) rebuilds the control that set it. Each is
+   * read only from a slider that survived the one before -- a deleted one's
+   * handlers went with it.
+   */
+  void edit(float target) {
+    detail::DeletionWatch alive(this);
+    if (onDragStart) onDragStart();
+    if (alive.deleted) return;
+    setValue(target);
+    if (alive.deleted) return;
+    if (onDragEnd) onDragEnd();
+  }
+
   float valueFromPosition(Point p) const {
     const Rect b = localBounds();
     // A BAR has no thumb, so nothing is shortened and nothing is offset: the
@@ -447,8 +551,30 @@ private:
     return (p.x - knob * 0.5f) / span;
   }
 
+  // The cursor this slider's drag calls for: left-right where a drag reads
+  // left-right, which is what valueFromPosition and the rotary arithmetic
+  // ask, and up-down everywhere else, Both included.
+  MouseCursor dragCursor() const {
+    const bool leftRight = isRotary() ? rotaryDrag_ == RotaryDrag::Horizontal : isHorizontal();
+    return leftRight ? MouseCursor::DragHorizontal : MouseCursor::DragVertical;
+  }
+
+  // Moves the cursor to what the drag now calls for, but only while it is
+  // still the one this slider gave itself. Anything else was set on it, and
+  // a cursor a plugin chose is never replaced -- setStyle used to replace
+  // it. Told apart by value, since setCursor is Component's and not ours to
+  // watch: a plugin that sets the very cursor the slider already had cannot
+  // be told from one that set nothing, and it is followed like the default.
+  void followDragCursor() {
+    if (Component::cursor() != ownCursor_) return;
+    ownCursor_ = dragCursor();
+    setCursor(ownCursor_);
+  }
+
   Style style_;
   RotaryDrag rotaryDrag_ = RotaryDrag::Vertical;
+  // The last cursor followDragCursor or the constructor gave this slider.
+  MouseCursor ownCursor_ = MouseCursor::DragVertical;
   float value_ = 0.0f, defaultValue_ = 0.0f, valueAtDown_ = 0.0f;
   std::string valueText_;
   float sensitivity_ = 200.0f;
@@ -459,19 +585,33 @@ private:
 /** A push button, or a toggle when setToggleable(true). */
 class Button : public Widget {
 public:
+  /** A push button showing `label`. Takes keyboard focus. */
   explicit Button(std::string label = {}) : label_(std::move(label)) {
     setWantsKeyboardFocus(true);
   }
 
+  /** Repaints only when the text changes. A toggle's attachment sets the
+   *  label on every 33 ms sync; repainting each time kept an editor with a
+   *  switch from ever going idle. */
   void setLabel(std::string t) {
+    if (t == label_) return;
     label_ = std::move(t);
     repaint();
   }
+  /** The text drawn on it. */
   const std::string& label() const { return label_; }
 
+  /** Make it a toggle: each press flips isToggled, calling onToggle, before
+   *  onClick. */
   void setToggleable(bool shouldToggle) { toggleable_ = shouldToggle; }
+  /** Whether presses flip it. */
+  bool isToggleable() const { return toggleable_; }
 
+  /** The toggle's state. */
   bool isToggled() const { return toggled_; }
+  /** Set the state directly: repaints, and calls onToggle when it changed and
+   *  `notify` is true. `notify` false is for a host's echo, as for
+   *  Slider::setValue. */
   void setToggled(bool on, bool notify = true) {
     if (toggled_ == on) return;
     toggled_ = on;
@@ -479,7 +619,10 @@ public:
     if (notify && onToggle) onToggle(toggled_);
   }
 
+  /** A press: a click released INSIDE the button, Space, Return or a reader's
+   *  Press -- after onToggle, for a toggle. The handler may delete the button. */
   std::function<void()> onClick;
+  /** A toggle's new state, when a press or setToggled with `notify` flips it. */
   std::function<void(bool)> onToggle;
 
   /** What this toggle's current state is CALLED, for a reader. Set from the
@@ -499,9 +642,21 @@ public:
     // whose two positions are "Pre" and "Post" announced as "on" makes the
     // listener work out which of the two that is, and they cannot -- the
     // mapping is the plugin's, not a convention.
-    if (toggleable_)
+    if (toggleable_) {
       info.value = !stateText_.empty() ? stateText_ : (toggled_ ? "on" : "off");
+      info.toggle = toggled_ ? AccessibleToggle::On : AccessibleToggle::Off;
+    }
+    if (isEnabled()) info.actions |= accessibleActionBit(AccessibleAction::Press);
     return info;
+  }
+
+  /** Press is Return, through keyPressed: the same path as a click, so a
+   *  toggle toggles and onClick fires exactly once. */
+  bool performAccessibleAction(AccessibleAction action) override {
+    if (action != AccessibleAction::Press) return Widget::performAccessibleAction(action);
+    KeyPress key;
+    key.keyCode = KeyPress::Return;
+    return keyPressed(key);
   }
 
   void paint(Graphics& g) override {
@@ -515,8 +670,7 @@ public:
   bool keyPressed(const KeyPress& key) override {
     if (!isEnabled()) return false;
     if (!key.is(KeyPress::Return) && key.character != (uint32_t) ' ') return false;
-    if (toggleable_) setToggled(!toggled_);
-    if (onClick) onClick();
+    press();
     return true;
   }
 
@@ -545,11 +699,22 @@ public:
     // Only when the release happened INSIDE. Releasing outside is a cancel,
     // and a button that fired anyway would leave a user no way to back out.
     if (!wasPressed || !localBounds().contains(e.position)) return;
-    if (toggleable_) setToggled(!toggled_);
-    if (onClick) onClick();
+    press();
   }
 
 private:
+  /** A click or a key: toggle, then onClick. onToggle is the owner's code and
+   *  may delete this button -- a switch that swaps the panel it sits in for
+   *  another -- so onClick is read only from a button that survived it. */
+  void press() {
+    if (toggleable_) {
+      detail::DeletionWatch alive(this);
+      setToggled(!toggled_);
+      if (alive.deleted) return;
+    }
+    if (onClick) onClick();
+  }
+
   std::string label_;
   bool toggleable_ = false, toggled_ = false, pressed_ = false;
   std::string stateText_;
@@ -558,18 +723,22 @@ private:
 /** Text. Does not take the mouse, so a click passes to whatever is behind. */
 class Label : public Widget {
 public:
+  /** Shows `text`, placed across its width by `j`. */
   explicit Label(std::string text = {}, Justify j = Justify::Left)
       : text_(std::move(text)), justify_(j) {
     setInterceptsMouse(false);
   }
 
+  /** Repaints only when the text changes. */
   void setText(std::string t) {
     if (t == text_) return;
     text_ = std::move(t);
     repaint();
   }
+  /** What it shows, also its accessible name when none was set. */
   const std::string& text() const { return text_; }
 
+  /** Where the text sits across the label's width. */
   void setJustify(Justify j) {
     justify_ = j;
     repaint();
@@ -601,8 +770,11 @@ private:
  */
 class ComboBox : public Widget {
 public:
+  /** No items, so nothing selected (index -1). Takes keyboard focus. */
   ComboBox() { setWantsKeyboardFocus(true); }
 
+  /** Replace the choices. The selection is kept while still in range, else it
+   *  is the first item, or -1 with none. onChange is not called. */
   void setItems(std::vector<std::string> items) {
     items_ = std::move(items);
     // BOTH ends. A fresh box has selected_ == -1, and testing only the upper
@@ -614,8 +786,11 @@ public:
     repaint();
   }
 
+  /** 0-based, or -1 when there are no items. */
   int selectedIndex() const { return selected_; }
 
+  /** Select `index`, clamped into range; ignored with no items. Calls onChange
+   *  when the selection moved and `notify` is true. */
   void setSelectedIndex(int index, bool notify = true) {
     if (items_.empty()) return;
     const int clamped = index < 0 ? 0 : (index >= (int) items_.size() ? (int) items_.size() - 1
@@ -626,11 +801,14 @@ public:
     if (notify && onChange) onChange(selected_);
   }
 
+  /** The selected item, or empty with none. */
   std::string selectedText() const {
     if (selected_ < 0 || selected_ >= (int) items_.size()) return {};
     return items_[(size_t) selected_];
   }
 
+  /** The new 0-based index, after any change: a click or the wheel cycling, a
+   *  key, the menu, a reader, or setSelectedIndex with `notify`. */
   std::function<void(int)> onChange;
 
   void paint(Graphics& g) override {
@@ -694,8 +872,54 @@ public:
       info.minValue = 0.0;
       info.maxValue = (double) items_.size() - 1.0;
       info.currentValue = (double) selected_;
+      if (isEnabled()) {
+        info.actions |= accessibleActionBit(AccessibleAction::Press) |
+                        accessibleActionBit(AccessibleAction::Increment) |
+                        accessibleActionBit(AccessibleAction::Decrement);
+        info.valueSettable = true;
+      }
     }
     return info;
+  }
+
+  /** Press does what a click does -- the menu when somebody supplies one,
+   *  the next item when nobody does. Increment is the NEXT item, which is
+   *  Down here (the list reads downwards), not Up as on a slider. */
+  bool performAccessibleAction(AccessibleAction action) override {
+    if (!isEnabled() || items_.empty()) return Widget::performAccessibleAction(action);
+    switch (action) {
+      case AccessibleAction::Press:
+        if (onOpenMenu) onOpenMenu(*this);
+        else setSelectedIndex((selected_ + 1) % (int) items_.size());
+        return true;
+      case AccessibleAction::Increment:
+      case AccessibleAction::Decrement: {
+        KeyPress key;
+        key.keyCode = action == AccessibleAction::Increment ? KeyPress::Down : KeyPress::Up;
+        return keyPressed(key);
+      }
+      default:
+        return Widget::performAccessibleAction(action);
+    }
+  }
+
+  /** The item at that index, rounded: a reader's value is the range above. */
+  bool setAccessibleValue(double value) override {
+    if (!isEnabled() || items_.empty() || !(value == value)) return false;
+    setSelectedIndex((int) (value < 0.0 ? 0.0 : value + 0.5));
+    return true;
+  }
+
+  /** The item with that NAME, which is what a reader that sets a pop-up
+   *  button's value by its title sends. Unknown names change nothing. */
+  bool setAccessibleText(const std::string& text) override {
+    if (!isEnabled()) return false;
+    for (size_t i = 0; i < items_.size(); ++i)
+      if (items_[i] == text) {
+        setSelectedIndex((int) i);
+        return true;
+      }
+    return false;
   }
 
   void mouseUp(const MouseEvent& e) override {
@@ -710,10 +934,17 @@ public:
     setSelectedIndex((selected_ + 1) % (int) items_.size());
   }
 
+  /** The choices, in order. */
   const std::vector<std::string>& items() const { return items_; }
 
+  /** A notch steps to the next or previous item, wrapping -- unless the
+   *  wheel mode says it is not this box's: see WheelMode. */
   bool mouseWheel(const MouseEvent&, float delta) override {
     if (!isEnabled() || items_.empty() || delta == 0.0f) return false;
+    // The slider's rule, which this box never asked: inside a scrolling view
+    // a notch over it changed the selection instead of scrolling the list.
+    // There is no drag on a combo box, so nothing here overrides the view.
+    if (!wheelBelongsHere(false)) return false;
     const int n = (int) items_.size();
     setSelectedIndex(((selected_ + (delta > 0.0f ? 1 : -1)) % n + n) % n);
     return true;

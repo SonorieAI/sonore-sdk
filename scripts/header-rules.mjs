@@ -60,6 +60,30 @@ for (const file of everyHeader(includeDir)) {
                   `translation unit that touches this header.`);
 }
 
+// A system DLL loaded by its bare name is searched for in the HOST's folder
+// first -- the application directory -- and only then in System32. A plugin
+// that loads bcrypt.dll that way takes its keys' randomness from whatever
+// bcrypt.dll sits beside the DAW's executable. LoadLibraryExW with
+// LOAD_LIBRARY_SEARCH_SYSTEM32 is the only form allowed for a literal name; a
+// plugin's own path goes through host.h's openLib.
+let loads = 0;
+for (const file of everyHeader(includeDir)) {
+  const shown = relative(includeDir, file).replace(/\\/g, "/");
+  const lines = readFileSync(file, "utf8").split("\n");
+  lines.forEach((line, i) => {
+    const code = line.replace(/\/\/.*$/, "");
+    if (/LoadLibrary(?:A|W)?\s*\(\s*L?"/.test(code)) {
+      problems.push(`${shown}:${i + 1}: loads a DLL by bare name with LoadLibrary. The search starts ` +
+                    `in the host's folder; use LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32).`);
+    } else if (/LoadLibraryEx(?:A|W)?\s*\(\s*L?"/.test(code)) {
+      ++loads;
+      if (!/LOAD_LIBRARY_SEARCH_SYSTEM32/.test(code))
+        problems.push(`${shown}:${i + 1}: LoadLibraryEx of a literal name without ` +
+                      `LOAD_LIBRARY_SEARCH_SYSTEM32 searches the host's folder first.`);
+    }
+  });
+}
+
 console.log("── every header that reaches for windows.h ──\n");
 for (const name of checked.sort()) console.log(`  ok   ${name}`);
 
@@ -71,4 +95,4 @@ if (problems.length > 0) {
 }
 
 console.log(`\n${checked.length} headers include <windows.h>, and every one of them disarms it ` +
-            `first.`);
+            `first. ${loads} system DLLs are loaded by name, every one from System32.`);

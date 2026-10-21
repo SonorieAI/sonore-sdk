@@ -31,16 +31,24 @@ npm run verify:sanitize   # slow, opt-in: every wrapper, the suites and the pars
 npm run verify:features   # every capability the feature map claims still exists
 npm run verify:unclaimed  # every public type in the headers appears in the map
 npm run verify:parity     # every audited reference class carries a decision
-npm run verify:daw        # ask REAPER (if installed) what it makes of the plugins
+npm run verify:reaper     # every example, CLAP, VST3 and LV2, inside REAPER (if installed):
+                          # scan, renders against our own host, automation, a saved
+                          # session reopened, latency, editors
+npm run verify:clang      # Windows: clang's front end over every translation unit, with
+                          # only Visual Studio installed -- errors and header warnings fail
+npm run verify:llms       # llms.txt and llms-full.txt still match the headers
 ```
 
 The three map checks are how "as many features as the frameworks people know"
 stays a measured claim instead of a remembered one;
-`scripts/reference-index.mjs` documents the method.
+`scripts/reference-index.mjs` explains the method and
+names its own blind spots.
 
 The industry validators (`clap-validator`, `pluginval`) are fetched binaries,
-not committed. Drop them into `sdk/tools/` and the gate uses them; when they
-are absent it says so explicitly.
+not committed. On Windows, drop `clap-validator.exe` and `pluginval.exe` into
+`sdk/tools/` and the gate uses them; without them it skips those legs loudly
+rather than silently. On Linux and macOS the gate does not run them; CI fetches
+both for its Linux and Windows jobs.
 
 ## Writing plugins with a coding agent
 
@@ -84,15 +92,19 @@ Or, for any other MCP client:
 
 ## Status
 
-Windows and Linux are built and tested continuously (unit tests, our own host
-tests, clap-validator and pluginval strictness 10), and the VST3s have been
-exercised in a real DAW (REAPER, 2026-08-23). macOS is built and tested by CI
-too: the same unit and host tests, plus Apple's `auval` over the six example
-Audio Units with zero warnings (since 2026-09-01).
+Windows and Linux are built and tested continuously: unit tests and our own
+host tests, with clap-validator and pluginval (strictness 5, advisory) run on
+CI over the saturator and the synth. The VST3s have also been exercised in a
+real DAW (REAPER, 2026-08-23). macOS is built and tested by CI too: the same
+unit and host tests, plus Apple's `auval` over six of the eight example Audio
+Units with zero warnings (since 2026-09-01). What no CI runner can
+exercise is a real audio device, a MIDI device or an on-screen window, so the
+CoreAudio, CoreMIDI and Cocoa window paths are compiled but have not yet been
+run by a person.
 
 ## Getting help
 
-**[Discord](https://discord.gg/4bvsn8r8CG)** for questions about writing a
+**[Discord](https://discord.gg/4bvsn8r8CG)**: questions about writing a
 plugin, a wrapper that behaves oddly in some host, or a measurement that
 disagrees with yours. That last one is the most useful thing you can bring:
 every claim in this repository is meant to be reproducible, so a number that
@@ -103,7 +115,7 @@ found again. Security reports go through [`SECURITY.md`](SECURITY.md).
 
 ## Licence
 
-Apache License 2.0; see [`LICENSE`](LICENSE). Use it in closed-source and
+Apache License 2.0 (see [`LICENSE`](LICENSE)). Use it in closed-source and
 commercial products; the patent grant and its termination clause come with it.
 
 Two files are worth reading before you ship something built with this:
@@ -122,7 +134,7 @@ tracker.
 
 The Sonore SDK is built and maintained as the plugin framework behind
 [Sonorie](https://sonorie.com). "Sonore" and "Sonorie" are names, not part of
-the licence grant. Build what you like with it, just don't call your fork the
+the licence grant: build what you like with it, just don't call your fork the
 official one.
 
 Licensing or naming questions: **legal@sonorie.com**.

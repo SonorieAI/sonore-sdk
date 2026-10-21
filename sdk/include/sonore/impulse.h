@@ -30,10 +30,12 @@ namespace sonore {
 
 /** How to make two impulse responses equally loud. */
 enum class ImpulseNormalise {
-  None,
-  Peak,   // loudest sample becomes 1.0: predictable headroom, uneven loudness
-  Energy, // total energy normalised: even LOUDNESS, which is what a preset
-          // switch should preserve
+  None,   ///< the level the file has, untouched
+  Peak,   ///< loudest sample becomes 1.0: predictable headroom, uneven loudness
+  /** Unit energy per channel as measured at 48 kHz: even LOUDNESS, which is
+   *  what a preset switch should preserve, at whatever rate it plays. The
+   *  default. */
+  Energy,
 };
 
 /**
@@ -72,8 +74,13 @@ public:
     }
 
     sampleRate_ = source;
-    if (std::fabs(target - source) > 1e-6) resampleTo(target);
+    // Normalised as the file is, THEN converted -- and the conversion keeps
+    // the sound (see resampleTo). The other way round, the level depended on
+    // the rate the session ran at: unit energy measured at 96 kHz is 3 dB
+    // louder than at 48, and a peak of 1 twice as loud. The same reverb was
+    // 3 to 6 dB louder at every doubling.
     applyNormalisation(normalise);
+    if (std::fabs(target - source) > 1e-6) resampleTo(target);
     return !channels_.empty() && !channels_[0].empty();
   }
 
@@ -84,10 +91,18 @@ public:
    * is usually what a user wants from a raw recording and never what they want
    * from an IR someone already designed. Hence opt-in, with the amount removed
    * reported so a plugin can give it back as a control.
+   *
+   * The threshold is in dB below the response's own loudest sample. It was in
+   * dBFS, but by then the response is normalised -- Energy leaves a reverb
+   * peaking 24 to 33 dB under full scale -- so -60 dBFS cut a 3-second
+   * reverb 27 dB down its decay, at 1.3 s, dead. What is cut from the end is
+   * faded into over the last 10 ms (an eighth of what is left, at most), so
+   * the response does not end on a step either.
    */
   size_t trimSilence(float thresholdDb = -60.0f) {
     if (channels_.empty()) return 0;
-    const float threshold = std::pow(10.0f, thresholdDb * 0.05f);
+    const float peak = magnitude();
+    const float threshold = peak * std::pow(10.0f, thresholdDb * 0.05f);
     const size_t length = channels_[0].size();
 
     size_t first = length, last = 0;
@@ -97,17 +112,32 @@ public:
           if (i < first) first = i;
           if (i > last) last = i;
         }
-    if (first > last) return 0; // the whole thing is below threshold: leave it
+    if (peak <= 0.0f || first > last) return 0; // silent: leave it
 
+    const size_t kept = last + 1 - first;
+    size_t fade = 0;
+    if (last + 1 < length) {
+      fade = (size_t) (0.01 * sampleRate_);
+      if (fade > kept / 8) fade = kept / 8;
+    }
     for (std::vector<float>& channel : channels_) {
       std::vector<float> trimmed(channel.begin() + (long) first, channel.begin() + (long) last + 1);
+      // Raised cosine over the last `fade` samples, down to where the cut was.
+      for (size_t i = 0; i < fade; ++i)
+        trimmed[kept - 1 - i] *= 0.5f - 0.5f * std::cos(3.14159265358979f * (float) (i + 1) / (float) (fade + 1));
       channel.swap(trimmed);
     }
     return first;
   }
 
+  /** Channels loaded: 1 for a mono file, 2 for stereo; 0 before the first
+   *  successful load. */
   size_t numChannels() const { return channels_.size(); }
+  /** Frames per channel at sampleRate(); every channel has the same length.
+   *  0 before the first load. */
   size_t length() const { return channels_.empty() ? 0 : channels_[0].size(); }
+  /** The rate the response is held at, in Hz: the target rate of the last
+   *  load, or the file's own when no target was given. 48000 before any. */
   double sampleRate() const { return sampleRate_; }
 
   /** The response for one channel. A mono IR answers for every channel, which
@@ -126,6 +156,8 @@ public:
     return sum;
   }
 
+  /** The loudest absolute sample over every channel: what Peak makes 1.0
+   *  and what trimSilence() measures its threshold from. 0 when empty. */
   float magnitude() const {
     float peak = 0.0f;
     for (const std::vector<float>& channel : channels_)
@@ -137,13 +169,22 @@ public:
   }
 
 private:
+  static constexpr double kReferenceRate = 48000.0;
+
+  /** The same response at another rate. Resampling keeps the VALUES, and
+   *  a response at twice the rate has twice the samples: convolved, it was
+   *  twice as loud (+6 dB at every doubling, +12 at 192 kHz). Each sample
+   *  stands for 1/rate of a second, so the values are scaled by the ratio of
+   *  the rates and the response sounds the same at both. */
   void resampleTo(double target) {
     const double ratio = target / sampleRate_;
+    const float keep = (float) (sampleRate_ / target);
     for (std::vector<float>& channel : channels_) {
       const size_t outLength = Resampler::outputLength(channel.size(), ratio);
       if (outLength == 0) continue;
       std::vector<float> out(outLength);
       Resampler::resample(channel.data(), channel.size(), out.data(), out.size(), ratio);
+      for (float& v : out) v *= keep;
       channel.swap(out);
     }
     sampleRate_ = target;
@@ -161,8 +202,19 @@ private:
       // a user switching presets should not have to ride the mix control.
       // Normalising to unit energy means convolving with either leaves the
       // signal at the same level.
-      const double total = energy();
-      gain = total > 1e-12 ? (float) (1.0 / std::sqrt(total)) : 1.0f;
+      //
+      // Unit energy PER CHANNEL, on average, with one gain for all of them so
+      // the balance between the sides is kept. Each channel is heard on its
+      // own side, so normalising the total put a stereo response's sides at
+      // half the energy each -- 3 dB under the same response loaded as mono.
+      //
+      // As measured at 48 kHz. A response's energy grows with its rate (more
+      // samples, each standing for less time), so unit energy in a 96 kHz
+      // file is a quieter room than in a 48 kHz one; at the reference rate
+      // the two come out equally loud.
+      const double perChannel =
+          energy() / (double) channels_.size() * (sampleRate_ / kReferenceRate);
+      gain = perChannel > 1e-12 ? (float) (1.0 / std::sqrt(perChannel)) : 1.0f;
     }
     for (std::vector<float>& channel : channels_)
       for (float& v : channel) v *= gain;

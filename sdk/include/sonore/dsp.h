@@ -8,7 +8,7 @@
 // after prepare(): a block that isn't real-time safe in a DAW isn't real-time
 // safe in an AudioWorklet either.
 //
-// Everything is `sonore::`: filters, dynamics, modulation, voices. This is our
+// Everything is `sonore::` (filters, dynamics, modulation, voices). This is our
 // own implementation of standard, published DSP (RBJ's EQ cookbook, Simper's
 // TPT structures, polyBLEP, Schroeder/Moorer reverb topology): textbook maths,
 // written here from the maths rather than adapted from any framework's source.
@@ -21,10 +21,27 @@
 
 namespace sonore {
 
-// kPi / kTwoPi live in audio.h: see the note there.
+// kPi / kTwoPi live in audio.h (see the note there).
 
-inline float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
+/** x held to [lo, hi], and a NaN to lo.
+ *
+ *  A NaN fails both comparisons of the obvious clamp and came through it
+ *  untouched, into every setter that clamps its argument. A NaN frequency
+ *  became a NaN phase increment, and a phase that has taken a NaN never
+ *  wraps back: the oscillator, the LFOs, the FM and hard-sync oscillators
+ *  put out NaN for good, after the next good setting too, and the chorus,
+ *  the delay's modulation and the plate read their shortest delay from then
+ *  on. Every value in a clamp's range is one its caller accepts, so the
+ *  bottom of it is where a NaN setting lands. Any other x clamps as before,
+ *  to the bit. */
+inline float clampf(float x, float lo, float hi) { return x >= lo ? (x > hi ? hi : x) : lo; }
+/** Decibels to a linear amplitude gain: 0 dB is 1, -6.02 dB is 0.5. No
+ *  floor: minus infinity gives 0, and a large negative number a tiny gain
+ *  that is not silence -- dbToGainFloor() maps a floor to exactly 0. */
 inline float dbToGain(float db) { return std::pow(10.0f, db * 0.05f); }
+/** A linear amplitude gain to decibels. Anything at or below 1e-9 reads
+ *  -180 dB: zero, a NaN, and a NEGATIVE gain too, so pass a magnitude.
+ *  gainToDbFloor() is the one a meter wants. */
 inline float gainToDb(float g) { return 20.0f * std::log10(g > 1e-9f ? g : 1e-9f); }
 
 /** Decibels with an explicit FLOOR, and silence reported as that floor rather
@@ -41,21 +58,54 @@ inline float gainToDbFloor(float g, float floorDb = -100.0f) {
 inline float dbToGainFloor(float db, float floorDb = -100.0f) {
   return db <= floorDb ? 0.0f : dbToGain(db);
 }
+/** a + (b - a) t: `a` at t = 0, `b` at t = 1. `t` is not clamped, so a
+ *  value outside 0..1 extrapolates. */
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 /** Flush denormals. Subnormal floats cost hundreds of cycles on x86 and are the
- *  classic cause of a reverb tail that makes a DAW stutter as it fades out. */
-inline float flushDenormal(float x) { return (std::fabs(x) < 1e-18f) ? 0.0f : x; }
+ *  classic cause of a reverb tail that makes a DAW stutter as it fades out.
+ *
+ *  And NaN, written so the comparison that fails for NaN is the one that
+ *  keeps a value: one NaN or Inf sample used to latch into every feedback
+ *  state that passes through here -- an envelope follower stuck at NaN read
+ *  as -180 dB, so an expander sat at its full range, an upward compressor at
+ *  +20 dB and a compressor switched itself off, with FINITE output that no
+ *  NaN guard downstream would ever catch. Zero is where state recovers from.
+ *
+ *  And Inf, for the same reason. It used to pass, and a Biquad's state kept
+ *  it: a lowpass or bandpass re-read it as Inf - Inf, so one infinite sample
+ *  left every DeEsser in split mode, every MultibandDynamics, every
+ *  Linkwitz-Riley crossover and the spring reverb putting out NaN until
+ *  reset() -- and a wideband DeEsser finite, but no longer de-essing. */
+inline float flushDenormal(float x) {
+  const float a = std::fabs(x);
+  return (a >= 1e-18f && a <= 3.402823466e38f) ? x : 0.0f;
+}
 
 // ── Waveshaping ──────────────────────────────────────────────────────────────
 
+/** x / (1 + |x|): unity slope at zero, approaching +-1 without reaching it.
+ *  The cheapest smooth curve here, and a softer one than tanh: 1 in gives
+ *  0.5 where tanhClip() gives 0.76. Symmetric, so odd harmonics only. */
 inline float softClip(float x) { return x / (1.0f + std::fabs(x)); }
+/** std::tanh: unity slope at zero, saturating to +-1. The standard curve;
+ *  per sample in many voices, fastmath::tanhApprox in special.h is the
+ *  cheaper one. */
 inline float tanhClip(float x) { return std::tanh(x); }
+/** x held to [-1, 1]: a hard corner at full scale, whose harmonics reach
+ *  much higher, and alias more, than the smooth curves'. A NaN comes out
+ *  as -1, as clampf() sends it to the bottom of the range. */
 inline float hardClip(float x) { return clampf(x, -1.0f, 1.0f); }
 
-/** Cubic soft saturation with drive (1 = clean-ish, higher = grittier). */
+/** Cubic soft saturation with drive (1 = clean-ish, higher = grittier):
+ *  `1.5y - 0.5y^3` of y = x * drive held to [-1, 1], the textbook cubic
+ *  soft clipper scaled to unity peak. Slope 1.5 at zero, 0 at |y| = 1,
+ *  where it reaches +-1 and stays: monotonic, so more drive is never
+ *  quieter. The hold was at +-1.5, past the peak: from |y| = 1 to 1.5 the
+ *  curve fell back to 0.5625 and held there, so a harder drive came out
+ *  quieter. A NaN comes out as -1, as clampf() sends it to the bottom. */
 inline float cubic(float x, float drive) {
-  const float y = clampf(x * drive, -1.5f, 1.5f);
+  const float y = clampf(x * drive, -1.0f, 1.0f);
   return 1.5f * y - 0.5f * y * y * y;
 }
 
@@ -72,18 +122,84 @@ inline float asymmetric(float x, float bias) {
  *  Every control that reaches a coefficient should go through one of these. */
 class Smooth {
 public:
+  /** The time constant, `ms` milliseconds (floored at 0.01) at `sampleRate`
+   *  Hz (48 kHz if not above 1: a negative rate made the pole above 1, and
+   *  the value ran away from its target): a step is 63% of the way there
+   *  after `ms`, 99% after 4.6 times it. Before setup() there is no lag at
+   *  all: next() returns its target. */
   void setup(float sampleRate, float ms = 8.0f) {
-    a_ = std::exp(-1.0f / (0.001f * (ms > 0.01f ? ms : 0.01f) * sampleRate));
+    const float sr = sampleRate > 1.0f ? sampleRate : 48000.0f;
+    a_ = std::exp(-1.0f / (0.001f * (ms > 0.01f ? ms : 0.01f) * sr));
   }
+  /** Jump to `v` with no glide. The value starts at 0, so a control that is
+   *  not snapped in prepare() or reset() sweeps up from silence. */
   void snap(float v) { z_ = v; }
+  /** One sample's step toward `target`; returns the smoothed value. Call
+   *  once per sample, with the control's current value. */
   inline float next(float target) {
-    z_ = target + a_ * (z_ - target);
-    return flushDenormal(z_);
+    // The STORED value is flushed, not only the one returned: settling on
+    // zero, the raw state decayed through the subnormal range for thousands
+    // of samples, each one slow arithmetic on a thread without flush-to-zero.
+    z_ = flushDenormal(target + a_ * (z_ - target));
+    return z_;
   }
+  /** The value next() last returned, or snap() set, without stepping. */
   float value() const { return z_; }
 
 private:
   float a_ = 0.0f, z_ = 0.0f;
+};
+
+/**
+ * A control that GLIDES to a new value once audio is running, and lands at
+ * once before it is (or after snap()).
+ *
+ * Smooth needs its caller to remember to snap it at the start; this one
+ * knows. A plugin sets its knobs, then processes: those first values are a
+ * setting, not a movement, and land. After that every change is a movement,
+ * and a gain that moves in one sample is a click -- a compressor's makeup,
+ * input or threshold automated stepped the output up to 8.6 times its
+ * largest natural step. reset() on the owner should snap() it.
+ */
+struct Glide {
+  /** The glide's length against the rate it runs at; 10 ms by default. */
+  void setSampleRate(float sr, float ms = 10.0f) {
+    const float n = 0.001f * (ms > 0.1f ? ms : 0.1f) * (sr > 1.0f ? sr : 48000.0f);
+    k = 1.0f - std::exp(-1.0f / n);
+  }
+  /** A new target. Before the first next(), or after snap(), the value
+   *  lands on it at once; after that next() glides to it. */
+  void set(float v) {
+    target = v;
+    if (!running) now = v;
+  }
+  /** Land on the target now, and take the next set() as a setting again,
+   *  not a movement: what the owner's reset() calls. */
+  void snap() {
+    now = target;
+    running = false;
+  }
+  /** One sample's step toward the target; returns the value. Within a
+   *  millionth of the target (relative) it lands exactly, so a finished
+   *  glide costs one comparison. Call once per sample. */
+  inline float next() {
+    running = true;
+    if (now != target) {
+      now += (target - now) * k;
+      if (std::fabs(target - now) <= 1e-6f * (1.0f + std::fabs(target))) now = target;
+    }
+    return now;
+  }
+  ///@{
+  /** The value next() last returned, where it is going, and the fraction of
+   *  the remaining distance covered per sample (set by setSampleRate()).
+   *  Public so a Glide can be brace-initialised as `{now, target}`; read
+   *  them, but change them through set() and snap(). */
+  float now = 0.0f, target = 0.0f, k = 0.00208116f; // 10 ms at 48 kHz
+  ///@}
+  /** next() has run since construction or the last snap(), so set() glides
+   *  rather than lands. */
+  bool running = false;
 };
 
 /**
@@ -119,6 +235,9 @@ public:
    *  below the noise floor of anything this will ever fade. */
   static constexpr float kFloor = 1.0e-6f;
 
+  /** The ramp's length: `milliseconds` (floored at 0.01) at `sampleRate` Hz
+   *  (48 kHz if not positive), at least one sample. A ramp already running
+   *  keeps the length it started with. Before setup(), setTarget() jumps. */
   void setup(float sampleRate, float milliseconds) {
     const float ms = milliseconds > 0.01f ? milliseconds : 0.01f;
     steps_ = (int) (0.001f * ms * (sampleRate > 0.0f ? sampleRate : 48000.0f));
@@ -133,6 +252,12 @@ public:
     factor_ = 1.0f;
   }
 
+  /** Ramp from the current value to `target`, straight in dB, arriving in
+   *  exactly the setup() length. The same target again while a ramp to it
+   *  runs changes nothing. From silence (at or below kFloor) it jumps; to a
+   *  target at or below kFloor it ramps to the floor and lands on the target
+   *  on the last sample. For gains: the ramp works on magnitudes and keeps
+   *  the current value's sign until it lands. One pow() per call. */
   void setTarget(float target) {
     if (target == target_ && remaining_ > 0) return;
     target_ = target;
@@ -152,6 +277,8 @@ public:
     factor_ = (float) std::pow((double) to / (double) from, 1.0 / (double) steps_);
   }
 
+  /** One sample of the ramp; returns the new value. Once it has landed it
+   *  returns the target, exactly, until the next setTarget(). */
   inline float next() {
     if (remaining_ <= 0) return current_;
     current_ *= factor_;
@@ -159,8 +286,12 @@ public:
     return current_;
   }
 
+  /** The current value, without stepping. */
   float value() const { return current_; }
+  /** Where the ramp is going, or has arrived. */
   float target() const { return target_; }
+  /** True while steps remain; false once landed, after snap(), or after a
+   *  setTarget() that jumped. */
   bool isRamping() const { return remaining_ > 0; }
 
 private:
@@ -193,18 +324,28 @@ private:
  */
 class OnePole {
 public:
+  /** Sample rate in Hz (48 kHz if not above 1). Call setCutoff() after it:
+   *  the coefficient is worked out there, not here. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** The corner in Hz, held to 1 Hz .. 0.49 of the sample rate: -3 dB there,
+   *  exactly. One tan() per call; the state is kept, so it may move while
+   *  audio runs. */
   inline void setCutoff(float hz) {
     const float g = std::tan(kPi * clampf(hz, 1.0f, sr_ * 0.49f) / sr_);
     G_ = g / (1.0f + g);
   }
+  /** One sample through the lowpass; returns it. lp() and hp() share one
+   *  state, so call one of them per sample, not both. */
   inline float lp(float x) {
     const float v = (x - z_) * G_;
     const float y = v + z_;
     z_ = flushDenormal(y + v);
     return y;
   }
+  /** One sample through the matching highpass, x - lp(x). It advances the
+   *  same state as lp(): one or the other per sample. */
   inline float hp(float x) { return x - lp(x); }
+  /** Clear the state, as after silence. */
   void reset() { z_ = 0.0f; }
 
   /** The lowpass's gain in dB at `hz`, from its own transfer function. */
@@ -226,6 +367,9 @@ public:
     // The zero at Nyquist contributes half a sample; the pole the rest.
     return (float) (0.5 + std::atan2(p * std::sin(w), 1.0 - p * std::cos(w)) / w);
   }
+  /** G = g / (1 + g), the gain into the state per sample, between 0 and 1:
+   *  the number in the transfer function above, for a caller that models a
+   *  loop around this filter. */
   float coefficient() const { return G_; }
 
 private:
@@ -235,21 +379,47 @@ private:
 /** Transposed-Direct-Form-II biquad with RBJ cookbook coefficients. */
 class Biquad {
 public:
-  void setSampleRate(float sr) { sr_ = sr; }
+  /** Sample rate in Hz (48 kHz until set, and if not above 1: a design
+   *  divides by it, and a rate of 0 made every coefficient NaN). Set it
+   *  before a design call, which reads it; changing it does not redesign
+   *  the section. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Clear the two state values, as after silence; the coefficients stay. */
   void reset() { z1_ = z2_ = 0.0f; }
+  /** One sample through the section; returns it. The state is passed
+   *  through flushDenormal(), so a NaN or Inf sample does not stay in it.
+   *  Until a design call the section passes its input unchanged. */
   inline float process(float x) {
     const float y = b0_ * x + z1_;
     z1_ = flushDenormal(b1_ * x - a1_ * y + z2_);
     z2_ = flushDenormal(b2_ * x - a2_ * y);
     return y;
   }
+  /** 12 dB/oct lowpass at `freq` Hz, held to 10 Hz .. 0.49 of the sample
+   *  rate, with resonance `q`, floored at 0.05 (0.7071 is Butterworth, the
+   *  flattest with no peak). Every design call recomputes the coefficients
+   *  and keeps the state; for a corner that moves every few samples, SVF or
+   *  SvfSection is the structure that stays clean. */
   void lowpass(float freq, float q) { rbj(freq, q, 0); }
+  /** 12 dB/oct highpass; `freq` and `q` as lowpass(). */
   void highpass(float freq, float q) { rbj(freq, q, 1); }
+  /** Bandpass with 0 dB at `freq` (the cookbook's constant-peak form); a
+   *  higher `q` is a narrower band. Ranges as lowpass(). */
   void bandpass(float freq, float q) { rbj(freq, q, 2); }
+  /** Notch: no output at `freq`, a higher `q` a narrower notch. Ranges as
+   *  lowpass(). */
   void notch(float freq, float q) { rbj(freq, q, 3); }
+  /** Second-order allpass: unity gain at every frequency, the phase turning
+   *  through 180 degrees at `freq`, more abruptly for a higher `q`. */
   void allpass(float freq, float q) { rbj(freq, q, 4); }
+  /** Peaking EQ: `gainDb` of boost (or cut, negative) centred on `freq`,
+   *  with bandwidth set by `q`; 0 dB is flat. Ranges as lowpass(). */
   void peak(float freq, float q, float gainDb) { rbjPeak(freq, q, gainDb); }
+  /** Low shelf: `gainDb` below `freq`, 0 dB above, half the gain in dB at
+   *  `freq` itself. `q` is the cookbook's shelf Q: 0.7071 is the steepest
+   *  slope with no overshoot; higher overshoots on both sides of it. */
   void lowShelf(float freq, float q, float gainDb) { rbjShelf(freq, q, gainDb, false); }
+  /** High shelf: `gainDb` above `freq`, 0 dB below; `q` as lowShelf(). */
   void highShelf(float freq, float q, float gainDb) { rbjShelf(freq, q, gainDb, true); }
 
   /** Coefficients from somewhere else, already normalised by a0.
@@ -261,6 +431,17 @@ public:
    *  reinvented as named methods. */
   void setCoefficients(float b0, float b1, float b2, float a1, float a2) {
     b0_ = b0; b1_ = b1; b2_ = b2; a1_ = a1; a2_ = a2;
+  }
+
+  /** Another section's coefficients, leaving this one's state alone: two
+   *  channels through the same filter need one design, not two. */
+  void copyCoefficientsFrom(const Biquad& other) {
+    b0_ = other.b0_; b1_ = other.b1_; b2_ = other.b2_; a1_ = other.a1_; a2_ = other.a2_;
+  }
+
+  /** The five numbers, normalised so a0 is 1 -- what setCoefficients takes. */
+  void getCoefficients(float& b0, float& b1, float& b2, float& a1, float& a2) const {
+    b0 = b0_; b1 = b1_; b2 = b2_; a1 = a1_; a2 = a2_;
   }
 
   /** The section's gain at a frequency, in dB, from its own coefficients.
@@ -323,11 +504,224 @@ private:
   float b0_ = 1, b1_ = 0, b2_ = 0, a1_ = 0, a2_ = 0, z1_ = 0, z2_ = 0;
 };
 
+/**
+ * One second-order section in DOUBLE precision -- coefficients, state and
+ * response all.
+ *
+ * A float biquad is fine for a corner a few hundred hertz up and falls apart
+ * as the corner nears DC. At 2 Hz in a 48 kHz session the poles sit 2.6e-4
+ * inside the unit circle, which float coefficients barely resolve, and the
+ * TDF-II state loses what is left: an order-6 Butterworth lowpass there
+ * measured -19 dB at its own corner instead of -3, and a Chebyshev order 8 at
+ * 30 Hz measured -8 dB at 192 kHz where -1 was designed. A rumble filter, a
+ * DC blocker and every crossover at a high session rate live in that corner.
+ * Doubles cost a few cycles per section and buy all of it back.
+ */
+class IirSection {
+public:
+  /** Sample rate in Hz (48 kHz until set, and if not above 1, as Biquad
+   *  takes it). Set it before a design call, which reads it; changing it
+   *  does not redesign the section. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Clear the state, as after silence; the coefficients stay. */
+  void reset() { z1_ = z2_ = 0.0; }
+  /** Coefficients from elsewhere, normalised so a0 is 1, as
+   *  Biquad::setCoefficients() takes them but in double: what the EQ and
+   *  filter designs hand each section. The state is kept. */
+  void setCoefficients(double b0, double b1, double b2, double a1, double a2) {
+    b0_ = b0;
+    b1_ = b1;
+    b2_ = b2;
+    a1_ = a1;
+    a2_ = a2;
+  }
+  /** The cookbook lowpass, highpass and allpass, designed in double: the
+   *  crossovers need them, and Biquad's float cosine of a 40 Hz corner at
+   *  192 kHz has too few digits left to put the corner where it was asked.
+   *  The corner is held to 10 Hz .. 0.49 fs, as Biquad holds it. */
+  void lowpass(double hz, double q) { design(hz, q, 0); }
+  /** The cookbook highpass in double; `hz` and `q` as lowpass(). */
+  void highpass(double hz, double q) { design(hz, q, 1); }
+  /** The cookbook second-order allpass in double: flat, 180 degrees of phase
+   *  at `hz`; `hz` and `q` as lowpass(). */
+  void allpass(double hz, double q) { design(hz, q, 2); }
+  /** The cookbook shelves, as Biquad has them, in double: a 50 Hz shelf at
+   *  384 kHz in float sat 1.1 dB off at its own corner. */
+  void lowShelf(double hz, double q, double gainDb) { shelf(hz, q, gainDb, false); }
+  /** The high shelf, in double: `gainDb` above `hz`, as Biquad::highShelf(). */
+  void highShelf(double hz, double q, double gainDb) { shelf(hz, q, gainDb, true); }
+  /** One sample through the section, computed in double; returns it. Tiny,
+   *  NaN and Inf state is zeroed, as flushDenormal() does for float. Until
+   *  a design call the section passes its input unchanged. */
+  inline float process(float in) {
+    const double x = (double) in;
+    const double y = b0_ * x + z1_;
+    z1_ = b1_ * x - a1_ * y + z2_;
+    z2_ = b2_ * x - a2_ * y;
+    // Tiny state to zero, NaN and Inf included (the comparisons that fail
+    // for NaN are the ones that keep a value), as flushDenormal does for
+    // float: an Inf kept here came back as Inf - Inf.
+    const double m1 = std::fabs(z1_), m2 = std::fabs(z2_);
+    z1_ = (m1 >= 1e-30 && m1 <= 1e300) ? z1_ : 0.0;
+    z2_ = (m2 >= 1e-30 && m2 <= 1e300) ? z2_ : 0.0;
+    return (float) y;
+  }
+  /** The section's gain at a frequency, in dB, from its own coefficients. */
+  float magnitudeDb(float freq) const {
+    const double w = kTwoPi * (double) freq / (double) sr_;
+    const double cw = std::cos(w), sw = std::sin(w);
+    const double c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
+    const double nr = b0_ + b1_ * cw + b2_ * c2;
+    const double ni = -(b1_ * sw + b2_ * s2);
+    const double dr = 1.0 + a1_ * cw + a2_ * c2;
+    const double di = -(a1_ * sw + a2_ * s2);
+    const double num = std::sqrt(nr * nr + ni * ni);
+    const double den = std::sqrt(dr * dr + di * di);
+    if (den < 1e-300) return -300.0f;
+    const double mag = num / den;
+    return (float) (20.0 * std::log10(mag > 1e-15 ? mag : 1e-15));
+  }
+
+private:
+  void design(double hz, double q, int type) {
+    const double fs = (double) sr_;
+    const double f = hz < 10.0 ? 10.0 : (hz > 0.49 * fs ? 0.49 * fs : hz);
+    const double w0 = kTwoPi * f / fs;
+    const double cw = std::cos(w0), sw = std::sin(w0), sh = std::sin(0.5 * w0);
+    const double alpha = sw / (2.0 * (q < 0.05 ? 0.05 : q));
+    const double a0 = 1.0 + alpha;
+    double b0, b1, b2;
+    if (type == 0) {
+      b0 = sh * sh; // (1 - cos) / 2, with its digits
+      b1 = 2.0 * sh * sh;
+      b2 = sh * sh;
+    } else if (type == 1) {
+      b0 = 0.5 * (1.0 + cw);
+      b1 = -(1.0 + cw);
+      b2 = 0.5 * (1.0 + cw);
+    } else {
+      b0 = 1.0 - alpha;
+      b1 = -2.0 * cw;
+      b2 = 1.0 + alpha;
+    }
+    setCoefficients(b0 / a0, b1 / a0, b2 / a0, -2.0 * cw / a0, (1.0 - alpha) / a0);
+  }
+  void shelf(double hz, double q, double gainDb, bool high) {
+    const double fs = (double) sr_;
+    const double f = hz < 10.0 ? 10.0 : (hz > 0.49 * fs ? 0.49 * fs : hz);
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double w0 = kTwoPi * f / fs;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * (q < 0.05 ? 0.05 : q));
+    const double tsa = 2.0 * std::sqrt(A) * alpha, Ap1 = A + 1.0, Am1 = A - 1.0;
+    double a0, a1, a2, b0, b1, b2;
+    if (!high) {
+      a0 = Ap1 + Am1 * cw + tsa;
+      a1 = -2.0 * (Am1 + Ap1 * cw);
+      a2 = Ap1 + Am1 * cw - tsa;
+      b0 = A * (Ap1 - Am1 * cw + tsa);
+      b1 = 2.0 * A * (Am1 - Ap1 * cw);
+      b2 = A * (Ap1 - Am1 * cw - tsa);
+    } else {
+      a0 = Ap1 - Am1 * cw + tsa;
+      a1 = 2.0 * (Am1 - Ap1 * cw);
+      a2 = Ap1 - Am1 * cw - tsa;
+      b0 = A * (Ap1 + Am1 * cw + tsa);
+      b1 = -2.0 * A * (Am1 + Ap1 * cw);
+      b2 = A * (Ap1 + Am1 * cw - tsa);
+    }
+    setCoefficients(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
+  }
+
+  double b0_ = 1.0, b1_ = 0.0, b2_ = 0.0, a1_ = 0.0, a2_ = 0.0;
+  double z1_ = 0.0, z2_ = 0.0;
+  float sr_ = 48000.0f;
+};
+
+/**
+ * IirSection's lowpass, highpass and allpass as a state-variable filter --
+ * the same three responses, in a structure that survives its corner MOVING.
+ *
+ * Both are the bilinear transform of the same analogue prototype, prewarped
+ * at the corner, so for a fixed corner they are one filter and differ only in
+ * rounding. They part company when the corner is automated. A direct-form
+ * section's state is made of the previous coefficients' outputs, and with
+ * new coefficients it no longer describes any signal: a Linkwitz-Riley
+ * crossover swept from 500 Hz to Nyquist and back every sample diverged to
+ * infinity, and one stepped every few samples spiked 20 dB above its input.
+ * A TPT state-variable filter (Zavalishin; Simper's linear trapezoidal SVF)
+ * keeps two integrator charges, which are valid under any coefficients.
+ *
+ * In double, as IirSection, for the same reason: a 40 Hz corner at 192 kHz.
+ * The corner is held to 10 Hz .. 0.49 fs, as IirSection holds it.
+ */
+class SvfSection {
+public:
+  /** Sample rate in Hz (48 kHz if not above 1). Set it before a design call,
+   *  which reads it; changing it does not redesign the section. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Clear the two integrator states, as after silence; the response stays. */
+  void reset() { ic1_ = ic2_ = 0.0; }
+  /** 12 dB/oct lowpass at `hz`, resonance `q` (floored at 0.05; 0.7071 is
+   *  Butterworth). One tan() per call, and safe to call every sample: the
+   *  state stays valid under the new coefficients. Until a design call the
+   *  section puts out silence. */
+  void lowpass(double hz, double q) { design(hz, q, 1.0, 0.0, 0.0); }
+  /** 12 dB/oct highpass; `hz` and `q` as lowpass(). */
+  void highpass(double hz, double q) { design(hz, q, -1.0, -1.0, 1.0); }
+  /** Second-order allpass: flat, 180 degrees of phase at `hz`; `hz` and `q`
+   *  as lowpass(). */
+  void allpass(double hz, double q) { design(hz, q, 0.0, -2.0, 1.0); }
+  /** One sample through the response last designed, in double; returns it. */
+  inline float process(float in) {
+    const double x = (double) in;
+    const double v3 = x - ic2_;
+    const double v1 = a1_ * ic1_ + a2_ * v3; // band
+    const double v2 = ic2_ + a2_ * ic1_ + a3_ * v3; // low
+    ic1_ = 2.0 * v1 - ic1_;
+    ic2_ = 2.0 * v2 - ic2_;
+    // Tiny state to zero, NaN and Inf included, as IirSection does.
+    const double m1 = std::fabs(ic1_), m2 = std::fabs(ic2_);
+    ic1_ = (m1 >= 1e-30 && m1 <= 1e300) ? ic1_ : 0.0;
+    ic2_ = (m2 >= 1e-30 && m2 <= 1e300) ? ic2_ : 0.0;
+    return (float) (mixLow_ * v2 + mixBand_ * v1 + mixIn_ * x);
+  }
+
+private:
+  /** The output is a mix of the low and band states and the input: low is
+   *  v2, high is x - k v1 - v2, allpass x - 2k v1. The band weights given are
+   *  in units of k. */
+  void design(double hz, double q, double low, double bandPerK, double input) {
+    const double fs = (double) sr_;
+    const double f = hz < 10.0 ? 10.0 : (hz > 0.49 * fs ? 0.49 * fs : hz);
+    const double g = std::tan(kPi * f / fs);
+    const double k = 1.0 / (q < 0.05 ? 0.05 : q);
+    a1_ = 1.0 / (1.0 + g * (g + k));
+    a2_ = g * a1_;
+    a3_ = g * a2_;
+    mixLow_ = low;
+    mixBand_ = bandPerK * k;
+    mixIn_ = input;
+  }
+
+  double a1_ = 1.0, a2_ = 0.0, a3_ = 0.0;
+  double mixLow_ = 1.0, mixBand_ = 0.0, mixIn_ = 0.0;
+  double ic1_ = 0.0, ic2_ = 0.0;
+  float sr_ = 48000.0f;
+};
+
 /** State-variable filter (TPT topology): stable under heavy modulation and
  *  gives LP/HP/BP/notch simultaneously. The default filter for anything swept. */
 class SVF {
 public:
-  void setSampleRate(float sr) { sr_ = sr; }
+  /** Sample rate in Hz (48 kHz until set, and if not above 1, as Biquad
+   *  takes it). Call set() after it, which reads it. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Corner (or centre) in Hz, held to 10 Hz .. 0.49 of the sample rate,
+   *  and resonance `q`, floored at 0.05 (0.7071 is Butterworth). One tan()
+   *  per call, and safe to call every sample: that is what the structure is
+   *  for. Call it before the first process(): until then the lowpass and
+   *  bandpass are silent and the highpass and notch pass the input. */
   inline void set(float freq, float q) {
     g_ = std::tan(kPi * clampf(freq, 10.0f, sr_ * 0.49f) / sr_);
     k_ = 1.0f / (q < 0.05f ? 0.05f : q);
@@ -335,6 +729,8 @@ public:
     a2_ = g_ * a1_;
     a3_ = g_ * a2_;
   }
+  /** One sample in. Returns nothing: the four responses land in lp, hp, bp
+   *  and notch, so read whichever the caller wants after the call. */
   inline void process(float x) {
     const float v3 = x - ic2_;
     const float v1 = a1_ * ic1_ + a2_ * v3;
@@ -343,7 +739,14 @@ public:
     ic2_ = flushDenormal(2 * v2 - ic2_);
     lp = v2; bp = v1; hp = x - k_ * v1 - v2; notch = x - k_ * v1;
   }
+  ///@{
+  /** The last process() call's outputs: 12 dB/oct lowpass and highpass, the
+   *  bandpass, and the notch (lowpass plus highpass). The bandpass's gain at
+   *  the centre is `q`, not 1; times 1/q it peaks at 0 dB. */
   float lp = 0, hp = 0, bp = 0, notch = 0;
+  ///@}
+  /** Clear the integrators, as after silence. The outputs keep their last
+   *  values until the next process(). */
   void reset() { ic1_ = ic2_ = 0; }
 
 private:
@@ -375,7 +778,11 @@ private:
  */
 class LadderFilter {
 public:
+  /** Sample rate in Hz (48 kHz if not above 1). Call set() after it, which
+   *  reads it; until set() has run the filter puts out silence. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Clear the four stage states and the loop's last output, as after
+   *  silence; the settings stay. */
   void reset() {
     for (int i = 0; i < 4; ++i) s_[i] = 0.0f;
     last_ = 0.0f;
@@ -403,6 +810,10 @@ public:
    *  filter), 1 = tanh at each stage on a full-scale signal. The linear
    *  ZDF solve stays the predictor for the loop, exact for a quiet signal. */
   void setDrive(float d) { drive_ = clampf(d, 0.0f, 4.0f); }
+  /** One sample through the ladder; returns the 24 dB/oct lowpass. As in
+   *  the hardware, resonance thins the passband: the linear ladder's DC gain
+   *  is 1 / (1 + k), about -14 dB at full resonance. No allocation; one
+   *  tanhApprox per sample with saturation on, four more with drive. */
   inline float process(float x) {
     // The feedback gain this sample: k compressed by how loud the loop was.
     float k = k_;
@@ -434,10 +845,13 @@ private:
 class DcBlocker {
 public:
   /** Where the highpass sits. Low enough to leave the bottom octave alone,
-   *  which is also why it takes so long to settle: see tailSamples(). */
+   *  which is also why it takes so long to settle; see tailSamples(). */
   static constexpr float kCornerHz = 10.0f;
 
-  void setSampleRate(float sr) { r_ = 1.0f - (kTwoPi * kCornerHz / sr); }
+  /** Sample rate in Hz (48 kHz if not above 1: at 0 the pole was minus
+   *  infinity): puts the corner at kCornerHz. Until it is called the pole is
+   *  0.999, about 7.6 Hz at 48 kHz. */
+  void setSampleRate(float sr) { r_ = 1.0f - (kTwoPi * kCornerHz / (sr > 1.0f ? sr : 48000.0f)); }
 
   /** How many samples a full-scale transient takes to decay below `floorDb`.
    *
@@ -456,12 +870,14 @@ public:
     return (int) std::ceil(std::log(std::pow(10.0f, floorDb * 0.05f)) / std::log(r));
   }
 
+  /** One sample through the highpass; returns it. */
   inline float process(float x) {
     const float y = x - x1_ + r_ * y1_;
     x1_ = x;
     y1_ = flushDenormal(y);
     return y;
   }
+  /** Clear the state, as after silence. */
   void reset() { x1_ = y1_ = 0.0f; }
 
 private:
@@ -471,14 +887,26 @@ private:
 // ── Oscillators ──────────────────────────────────────────────────────────────
 
 /** polyBLEP band-limited oscillator. The naive shapes alias badly at high notes
- *, the aliasing gate measures exactly that, so saw/square subtract a
+ *  (the aliasing gate measures exactly that), so saw/square subtract a
  *  polynomial approximation of a band-limited step at each discontinuity. */
 class Oscillator {
 public:
-  void setSampleRate(float sr) { sr_ = sr; }
+  /** Sample rate in Hz (48 kHz until set, and if not above 1: at 0 the
+   *  phase increment was 0 / 0 and every shape NaN for good). Call setFreq()
+   *  after it: the phase increment is worked out there. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Frequency in Hz, held to 0 .. half the sample rate; 0 (the default)
+   *  holds the phase still. Takes effect on the next sample with no phase
+   *  jump, so it may be called every sample for vibrato or FM. */
   inline void setFreq(float hz) { inc_ = clampf(hz, 0.0f, sr_ * 0.5f) / sr_; }
+  /** Restart at `phase`, in turns, 0 up to (not including) 1: 0 is the
+   *  start of a cycle, the sine rising through zero and the saw at its
+   *  jump. Also clears the triangle's integrator, for a retriggered voice. */
   void reset(float phase = 0.0f) { phase_ = phase; tri_ = 0.0f; }
 
+  /** One sample of a sine, -1..1, then the phase advances. EVERY shape call
+   *  advances the phase, so call one per sample: two calls run the
+   *  oscillator at twice its frequency (triangle() is already one). */
   inline float sine() {
     // The phase is already in turns, so this is the library call AND the
     // multiply by 2*pi that would have preceded it. A polyphonic synth runs
@@ -487,12 +915,17 @@ public:
     adv();
     return y;
   }
+  /** One sample of a rising sawtooth, -1 to 1, band-limited by polyBLEP;
+   *  advances the phase. */
   inline float saw() {
     float y = 2.0f * phase_ - 1.0f;
     y -= blep(phase_);
     adv();
     return y;
   }
+  /** One sample of a pulse: +1 for the first `pulseWidth` of each cycle and
+   *  -1 for the rest, `pulseWidth` held to 0.02 .. 0.98 (0.5 is a square),
+   *  band-limited by polyBLEP at both edges; advances the phase. */
   inline float square(float pulseWidth = 0.5f) {
     const float pw = clampf(pulseWidth, 0.02f, 0.98f);
     float y = phase_ < pw ? 1.0f : -1.0f;
@@ -524,6 +957,7 @@ public:
     tri_ = flushDenormal(tri_ * (1.0f - leak) + 4.0f * inc_ * sq);
     return tri_;
   }
+  /** The phase the next shape call will use, in turns, 0..1. */
   float phase() const { return phase_; }
 
 private:
@@ -552,18 +986,30 @@ private:
 /** Peak envelope follower with independent attack/release. */
 class EnvFollower {
 public:
-  void setSampleRate(float sr) { sr_ = sr; }
+  /** Sample rate in Hz (48 kHz until set, and if not above 1: a negative
+   *  rate made both coefficients above 1, and the envelope grew without
+   *  bound). Call setTimes() after it: the coefficients are worked out
+   *  there, from this rate. */
+  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  /** Attack and release time constants in ms, each floored at 0.01. Until
+   *  this is called both are instant and process() returns |x|. Two exp()
+   *  per call. */
   void setTimes(float attackMs, float releaseMs) {
     aA_ = std::exp(-1.0f / (0.001f * (attackMs > 0.01f ? attackMs : 0.01f) * sr_));
     aR_ = std::exp(-1.0f / (0.001f * (releaseMs > 0.01f ? releaseMs : 0.01f) * sr_));
   }
+  /** One sample: returns the envelope of |x|, a linear amplitude, rising at
+   *  the attack rate while |x| is above the envelope and falling at the
+   *  release rate otherwise. */
   inline float process(float x) {
     const float r = std::fabs(x);
     const float a = r > env_ ? aA_ : aR_;
     env_ = flushDenormal(r + a * (env_ - r));
     return env_;
   }
+  /** The envelope after the last process(), without stepping. */
   float value() const { return env_; }
+  /** Back to 0, as after silence; the times stay. */
   void reset() { env_ = 0.0f; }
 
 private:
@@ -573,25 +1019,65 @@ private:
 /** ADSR in seconds, exponential-ish segments. Drives one voice's amplitude. */
 class ADSR {
 public:
+  /** The envelope's settings, as the reference's ADSR::Parameters has them:
+   *  attack, decay and release in seconds, sustain a level 0..1. The attack
+   *  is a straight ramp to 1 from wherever the level is; decay and release
+   *  are exponential, and their time is the time to fall 60 dB, so the
+   *  number on the control is the number a meter reads. */
   struct Parameters {
+    ///@{
+    /** 10 ms attack, 100 ms decay, sustain 0.8, 200 ms release by default.
+     *  A time at or under 0.1 ms takes a sample or two. Sustain is not
+     *  clamped: a level above 1 makes the decay rise to it. */
     float attack = 0.01f, decay = 0.1f, sustain = 0.8f, release = 0.2f;
+    ///@}
   };
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
-  void setParameters(const Parameters& p) { p_ = p; }
+  /** Idle at level 0, at 48 kHz with the default Parameters. */
+  ADSR() { updateCoefficients(); }
+  /** Sample rate in Hz (48 kHz if not above 1). The segments are worked out
+   *  again, so this may come before or after setParameters(). */
+  void setSampleRate(float sr) {
+    sr_ = sr > 1.0f ? sr : 48000.0f;
+    updateCoefficients();
+  }
+  /** New settings, from the next sample, mid-note too: a segment already
+   *  running carries on at its new rate, toward the new sustain. Two exp()
+   *  per call, so once per block rather than per sample. */
+  void setParameters(const Parameters& p) {
+    p_ = p;
+    // A sustain that is not finite is none. The level decays toward it and
+    // became NaN; a NaN level never reaches a target or falls under the
+    // release floor, so the voice sounded NaN and stayed active through
+    // noteOff and the next noteOn alike, until reset(). The times need no
+    // such line: a NaN fails their "long enough" tests and takes the floor.
+    if (!std::isfinite(p_.sustain)) p_.sustain = 0.0f;
+    updateCoefficients();
+  }
+  /** Start the attack, from the current level: a retriggered note ramps up
+   *  from where the voice is instead of clicking to zero first. */
   void noteOn() { stage_ = Attack; }
+  /** Start the release from the current level, whatever the stage; nothing
+   *  when idle. */
   void noteOff() { if (stage_ != Idle) stage_ = Release; }
+  /** False when idle: before the first noteOn(), after reset(), and once a
+   *  release falls under -80 dB, about 1.33 times the release time from
+   *  full level. A voice is free to reuse when this is false. */
   bool isActive() const { return stage_ != Idle; }
+  /** Idle at level 0 at once, with no release: for a voice being reused or
+   *  a transport reset, where a tail is not wanted. */
   void reset() { stage_ = Idle; level_ = 0.0f; }
 
+  /** Advance one sample and return the level (0 when idle, 1 at the top of
+   *  the attack): the gain for that sample of the voice. */
   inline float getNextSample() {
     switch (stage_) {
       case Attack: {
-        level_ += 1.0f / (p_.attack > 1e-4f ? p_.attack * sr_ : 1.0f);
+        level_ += attackStep_;
         if (level_ >= 1.0f) { level_ = 1.0f; stage_ = Decay; }
         break;
       }
       case Decay: {
-        level_ = p_.sustain + decayK() * (level_ - p_.sustain);
+        level_ = p_.sustain + decayK_ * (level_ - p_.sustain);
         if (std::fabs(level_ - p_.sustain) < 1e-4f) { level_ = p_.sustain; stage_ = Sustain; }
         break;
       }
@@ -599,7 +1085,7 @@ public:
         level_ = p_.sustain;
         break;
       case Release: {
-        level_ *= releaseK();
+        level_ *= releaseK_;
         // -80 dB is inaudible and frees the voice promptly; waiting for a
         // literal zero would keep a stolen voice busy for no audible reason.
         if (level_ < 1e-4f) { level_ = 0.0f; stage_ = Idle; }
@@ -621,39 +1107,84 @@ private:
    *  control mean nothing measurable, and `release` is exactly what the
    *  acceptance probe measures on a shipped synth. */
   static constexpr float kDecay60 = 6.907755f;
-  float decayK() const {
-    return std::exp(-kDecay60 / (p_.decay > 1e-4f ? p_.decay * sr_ : 1.0f));
-  }
-  float releaseK() const {
-    return std::exp(-kDecay60 / (p_.release > 1e-4f ? p_.release * sr_ : 1.0f));
+  /** Worked out when the settings or the rate change, not per sample: the
+   *  envelope runs on every sample of every voice, and decay and release
+   *  were an exp() each time. */
+  void updateCoefficients() {
+    attackStep_ = 1.0f / (p_.attack > 1e-4f ? p_.attack * sr_ : 1.0f);
+    decayK_ = std::exp(-kDecay60 / (p_.decay > 1e-4f ? p_.decay * sr_ : 1.0f));
+    releaseK_ = std::exp(-kDecay60 / (p_.release > 1e-4f ? p_.release * sr_ : 1.0f));
   }
 
   Stage stage_ = Idle;
   float sr_ = 48000.0f, level_ = 0.0f;
   Parameters p_{};
+  float attackStep_ = 0.0f, decayK_ = 0.0f, releaseK_ = 0.0f;
 };
 
 /** Feed-forward compressor with a peak detector, soft knee and makeup.
- *  `gainReduction()` reports the last computed GR in dB: the acceptance gates
+ *  `gainReduction()` reports the last computed GR in dB; the acceptance gates
  *  measure exactly this number. */
 class Compressor {
 public:
+  /** -18 dB threshold, 4:1, a 6 dB knee, no makeup, and the detector's
+   *  10 ms attack and 100 ms release, at 48 kHz. The times used to wait for
+   *  setSampleRate() or setAttack()/setRelease(): until then the detector
+   *  followed the peak sample by sample, and a 100 Hz tone over the
+   *  threshold came out with its gain modulated at 200 Hz. */
+  Compressor() {
+    refreshQuiet();
+    setSampleRate(48000.0f);
+  }
+  /** Sample rate in Hz (48 kHz if not above 1, as EnvFollower takes it);
+   *  works the detector's attack and release out again for it (10 ms and
+   *  100 ms unless set). */
   void setSampleRate(float sr) {
-    sr_ = sr;
-    env_.setSampleRate(sr);
+    sr_ = sr > 1.0f ? sr : 48000.0f;
+    env_.setSampleRate(sr_);
     env_.setTimes(attackMs_, releaseMs_);
   }
-  void setThreshold(float db) { thresholdDb_ = db; }
-  void setRatio(float ratio) { ratio_ = ratio < 1.0f ? 1.0f : ratio; }
-  void setKnee(float db) { kneeDb_ = db < 0.0f ? 0.0f : db; }
+  /** Threshold in dBFS: where the knee is centred. */
+  void setThreshold(float db) {
+    thresholdDb_ = db;
+    refreshQuiet();
+  }
+  /** Ratio, n:1 above the threshold; under 1 is taken as 1, no compression,
+   *  and so is a NaN, which the old `ratio < 1` test let through: every gain
+   *  above the knee came out NaN, and so did the output. There is no
+   *  infinite setting: a very large ratio is a limiter's curve. */
+  void setRatio(float ratio) { ratio_ = ratio >= 1.0f ? ratio : 1.0f; }
+  /** Knee width in dB, centred on the threshold (half below, half above);
+   *  0 is a hard knee, a negative width is taken as 0. */
+  void setKnee(float db) {
+    kneeDb_ = db < 0.0f ? 0.0f : db;
+    refreshQuiet();
+  }
+  /** The detector's attack time constant in ms (floored at 0.01). Two exp()
+   *  per call. */
   void setAttack(float ms) { attackMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
+  /** The detector's release time constant in ms (floored at 0.01). Two
+   *  exp() per call. */
   void setRelease(float ms) { releaseMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
-  void setMakeup(float db) { makeupDb_ = db; }
+  /** Gain after the compression, in dB, applied to every sample. */
+  void setMakeup(float db) {
+    makeupDb_ = db;
+    refreshQuiet();
+  }
+  /** Clear the detector and the reported gain reduction; the settings stay. */
   void reset() { env_.reset(); grDb_ = 0.0f; }
 
   /** Compute the gain for this sample from a (possibly external) detector input. */
   inline float computeGain(float detector) {
-    const float levelDb = gainToDb(env_.process(detector));
+    const float level = env_.process(detector);
+    // Below where the knee starts the reduction is exactly zero and the gain
+    // is the makeup, a constant: a log and a pow every sample, for nothing,
+    // in the range a compressor spends most of its time in.
+    if (level < quietBelow_) {
+      grDb_ = 0.0f;
+      return quietGain_;
+    }
+    const float levelDb = gainToDb(level);
     const float over = levelDb - thresholdDb_;
     float grDb = 0.0f;
     if (kneeDb_ > 0.0f && over > -kneeDb_ * 0.5f && over < kneeDb_ * 0.5f) {
@@ -666,6 +1197,9 @@ public:
     grDb_ = grDb;
     return dbToGain(grDb + makeupDb_);
   }
+  /** One sample, compressed by its own level: x times computeGain(x). For a
+   *  sidechain, or one gain for linked channels, call computeGain() with the
+   *  detector signal and multiply each channel by it. */
   inline float process(float x) { return x * computeGain(x); }
   /** Last gain reduction, in dB (negative = attenuating). */
   float gainReduction() const { return grDb_; }
@@ -674,6 +1208,14 @@ private:
   float sr_ = 48000.0f;
   float thresholdDb_ = -18.0f, ratio_ = 4.0f, kneeDb_ = 6.0f;
   float attackMs_ = 10.0f, releaseMs_ = 100.0f, makeupDb_ = 0.0f, grDb_ = 0.0f;
+  /** The level under which the knee has not begun, a hair inside it so the
+   *  shortcut never claims a sample the curve would have touched, and the
+   *  gain there. */
+  float quietBelow_ = 0.0f, quietGain_ = 1.0f;
+  void refreshQuiet() {
+    quietBelow_ = dbToGain(thresholdDb_ - kneeDb_ * 0.5f) * 0.9999f;
+    quietGain_ = dbToGain(0.0f + makeupDb_);
+  }
   EnvFollower env_;
 };
 
@@ -692,12 +1234,51 @@ private:
  *                the delay moves a lowpass along with it.
  *
  * The difference, measured through a 3 ms sweep at 48 kHz: nothing below
- * 2 kHz, 0.66 dB at 8 kHz, 1.58 dB at 16 kHz. Through a STATIC delay the two
- * are identical.
+ * 2 kHz, 0.66 dB at 8 kHz, 1.58 dB at 16 kHz. A STATIC fractional delay
+ * lowpasses too, by a fixed amount: at 10.5 samples, 8 kHz is -1.25 dB
+ * through read() and -0.23 dB through readCubic(). At a whole-sample delay
+ * both are exact.
+ *
+ * And a third, which is a different trade rather than a better one:
+ *
+ *   readThiran() first-order allpass (Thiran). Its magnitude is flat BY
+ *                CONSTRUCTION at every frequency and every fraction (within
+ *                5e-8 in float, measured) -- the one read here
+ *                that does not lowpass a half-sample delay -- and its delay is
+ *                exact at DC. The price is phase: the delay drifts with
+ *                frequency (dispersion), and because it is recursive it has a
+ *                state, so each read head needs its own ThiranState and must
+ *                be read once per sample. The read for a fractional delay
+ *                inside a FEEDBACK loop -- a waveguide string, a tuned comb --
+ *                where a lowpass on every pass would decay the high partials
+ *                and detune the loop.
  */
 template <int MaxSamples>
 class DelayLine {
 public:
+  /**
+   * One Thiran read head's memory: the allpass's previous output, and the
+   * delay it was last read at.
+   *
+   * Separate from the line because one line can feed several heads (the
+   * crossfade in delay.h opens a second one) and each recursion needs its
+   * own past. The line keeps one for readThiran(float) and resets it with
+   * itself; a head declared outside the line is reset by its owner.
+   */
+  struct ThiranState {
+    float y1 = 0.0f;          ///< the allpass's previous output
+    float lastDelay = -1.0f;  ///< negative: nothing read since reset, so seed
+    float coefficient = 0.0f; ///< the allpass's a, cached while the delay holds still
+    int integerPart = 1;      ///< N, the whole samples read straight from the buffer
+    /** Forget the past: the next read seeds itself, as a head just opened
+     *  does. A head kept outside the line is reset by its owner, with the
+     *  line. */
+    void reset() {
+      y1 = 0.0f;
+      lastDelay = -1.0f;
+    }
+  };
+
   /** The spline used by readCubic(). Declared here rather than pulled from
    *  shaping.h because dsp.h defines DelayLine BEFORE that header is
    *  chained in: the alternative is a circular include. */
@@ -708,47 +1289,132 @@ public:
     return CatmullRomKernel::at4(y0, y1, y2, y3, frac);
   }
 
+  /** Silence the whole buffer and reset the line's own Thiran head:
+   *  MaxSamples writes, so from prepare() or a transport reset rather than
+   *  every block for a long line. No allocation. */
   void reset() {
     for (int i = 0; i < MaxSamples; ++i) buf_[i] = 0.0f;
     w_ = 0;
+    thiran_.reset();
   }
+  /** Write the next sample, over the oldest one. Once per sample; every
+   *  read counts its delay back from the last sample written. */
   inline void write(float x) {
     buf_[w_] = x;
     if (++w_ >= MaxSamples) w_ = 0;
   }
+
+  /**
+   * Read through a first-order Thiran allpass. Call ONCE PER SAMPLE per head,
+   * on the same side of write() every time, like every other read here.
+   *
+   * The delay is split into an integer part N read straight from the buffer
+   * and a fraction d that the allpass  H(z) = (a + z^-1) / (1 + a z^-1),
+   * a = (1 - d) / (1 + d)  supplies; its group delay at DC is exactly d.
+   *
+   * The split keeps d in [0.618, 1.618), not [0, 1). The pole sits at -a, and
+   * a fraction near zero puts it near -1: a filter that rings for hundreds of
+   * samples after every change, with the rounding error ringing along. At
+   * the golden-ratio bounds a is +-0.236 at worst -- symmetric, so neither
+   * end is the bad one -- and any disturbance is gone 12.5 dB per sample.
+   * The one place it cannot hold is the bottom of the range: a delay
+   * between 1 and 1.618 samples has no buffer sample to borrow from, and
+   * rings longer there.
+   *
+   * Two things a recursive read has to get right that a stateless one gets
+   * free:
+   *   - a delay that SLIDES needs nothing: the two taps are read at absolute
+   *     delays N and N+1, so the previous output is still a valid sample of
+   *     the same signal when N steps;
+   *   - a delay that JUMPS (a preset, a tap-tempo, a head that has just been
+   *     opened) would feed the recursion an output from somewhere else in
+   *     the buffer. A move of a sample or more reseeds the state with what
+   *     the previous output would have been at the NEW delay, so the first
+   *     sample out is not a transient.
+   * The corollary: a head that moves a whole sample EVERY sample -- an
+   * octave-up pitch shift -- is reseeded every sample and is no longer an
+   * allpass. That is readCubic()'s job.
+   */
+  inline float readThiran(float delaySamples, ThiranState& state) const {
+    // A NaN delay is the shortest, as in readCubic; this read holds state,
+    // so a NaN here would also stay in it.
+    const float d = delaySamples == delaySamples
+                        ? clampf(delaySamples, 1.0f, (float) (MaxSamples - 3))
+                        : 1.0f;
+    if (d != state.lastDelay) {
+      int n = (int) d; // d >= 1, so truncation is floor
+      float frac = d - (float) n;
+      // n > 1 keeps the integer tap inside the written region. An exact
+      // integer is the exception: frac becomes 1, the coefficient 0, and the
+      // read is the plain sample at N+1 whatever N is.
+      if (frac < kThiranLow && (n > 1 || frac == 0.0f)) {
+        --n;
+        frac += 1.0f;
+      }
+      state.coefficient = (1.0f - frac) / (1.0f + frac);
+      state.integerPart = n;
+      const bool jumped = state.lastDelay < 0.0f || std::fabs(d - state.lastDelay) >= 1.0f;
+      state.lastDelay = d;
+      if (jumped) state.y1 = read(d + 1.0f);
+    }
+    int i1 = w_ - state.integerPart - 1; // delay N+1
+    if (i1 < 0) i1 += MaxSamples;
+    // Delay N. At N == 0 the coefficient is exactly 0 and the slot is never
+    // weighed -- but buf_[w_] is the OLDEST sample, so read a written one.
+    int i0 = state.integerPart > 0 ? i1 + 1 : i1;
+    if (i0 >= MaxSamples) i0 -= MaxSamples;
+    const float y = state.coefficient * (buf_[i0] - state.y1) + buf_[i1];
+    state.y1 = y;
+    return y;
+  }
+  /** The same, through the line's own head: reset() clears it. */
+  inline float readThiran(float delaySamples) { return readThiran(delaySamples, thiran_); }
+
   /** Read with THIRD-ORDER interpolation. This is what a modulated delay
    *  should use: linear interpolation's response changes with the fraction,
    *  so sweeping the delay sweeps a lowpass along with it. */
   inline float readCubic(float delaySamples) const {
-    const float d = clampf(delaySamples, 2.0f, (float) (MaxSamples - 3));
-    float rp = (float) w_ - d;
-    while (rp < 0) rp += MaxSamples;
-    // The wrap can land EXACTLY on MaxSamples: a tiny negative rp -- which a
-    // modulated delay produces in ordinary operation, w_ minus a fractional
-    // delay a hair larger -- plus MaxSamples rounds UP to it, because the
-    // float just below MaxSamples is further away than MaxSamples itself.
-    // (int) rp is then one past the array. UBSan's find; ASan could not see
-    // it, because overflowing into the struct's next member is intra-object.
-    if (rp >= (float) MaxSamples) rp -= (float) MaxSamples;
-    const int i1 = (int) rp;
-    const float frac = rp - (float) i1;
-    const int i0 = (i1 - 1 + MaxSamples) % MaxSamples;
-    const int i2 = (i1 + 1) % MaxSamples;
-    const int i3 = (i1 + 2) % MaxSamples;
+    // A NaN read position became an index far outside the buffer: a NaN
+    // delay -- an LFO fed a NaN depth, a parameter divided by zero -- reads
+    // as the shortest delay instead. clampf() now sends NaN there itself;
+    // the test stays where an index is at stake.
+    const float d = delaySamples == delaySamples
+                        ? clampf(delaySamples, 2.0f, (float) (MaxSamples - 3))
+                        : 2.0f;
+    // The read point in whole samples and a fraction, kept apart (see
+    // split()). It was w_ - d in one float, wrapped by adding MaxSamples:
+    // that also rounded EXACTLY onto MaxSamples, one past the array, when a
+    // modulated delay put w_ a hair under d -- UBSan's find.
+    float frac;
+    const int i1 = split(d, frac);
+    // Neighbours wrapped by a compare, not a modulo: three signed `%` per
+    // read was most of the arithmetic outside the spline itself, and every
+    // modulated delay -- chorus, flanger, vibrato, the pitch shifter's two
+    // heads -- pays it per sample.
+    const int i0 = i1 > 0 ? i1 - 1 : MaxSamples - 1;
+    int i2 = i1 + 1;
+    if (i2 >= MaxSamples) i2 -= MaxSamples;
+    int i3 = i1 + 2;
+    if (i3 >= MaxSamples) i3 -= MaxSamples;
     return catmullRomTap(buf_[i0], buf_[i1], buf_[i2], buf_[i3], frac);
   }
 
+  /** Linear read, `delaySamples` back: 1 is the sample last written, so a
+   *  read BEFORE write() (as tap() does) delays by exactly that many
+   *  samples, and a read after it by one fewer. Held to 1 .. MaxSamples - 2;
+   *  a NaN reads at 1. For a delay that does not move (see the class). */
   inline float read(float delaySamples) const {
-    const float d = clampf(delaySamples, 1.0f, (float) (MaxSamples - 2));
-    float rp = (float) w_ - d;
-    while (rp < 0) rp += MaxSamples;
-    if (rp >= (float) MaxSamples) rp -= (float) MaxSamples; // see readCubic
-    const int i0 = (int) rp;
-    const float frac = rp - i0;
+    const float d = delaySamples == delaySamples // NaN: see readCubic
+                        ? clampf(delaySamples, 1.0f, (float) (MaxSamples - 2))
+                        : 1.0f;
+    float frac;
+    const int i0 = split(d, frac);
     int i1 = i0 + 1;
     if (i1 >= MaxSamples) i1 -= MaxSamples;
     return buf_[i0] + frac * (buf_[i1] - buf_[i0]);
   }
+  /** read(delaySamples), then write(x): one sample through a delay of
+   *  `delaySamples`, linearly interpolated. Returns the delayed sample. */
   inline float tap(float delaySamples, float x) {
     const float y = read(delaySamples);
     write(x);
@@ -756,16 +1422,50 @@ public:
   }
 
 private:
+  // The golden-ratio split point: (1 - d)/(1 + d) is +0.236 at 0.618 and
+  // -0.236 at 1.618.
+  static constexpr float kThiranLow = 0.618034f;
+
+  /** Where a read at delay `d` (at least 1) lands: the index of the sample
+   *  at or before the read point, and how far past it the point sits.
+   *
+   *  The whole samples are integers and the fraction is d's own, so the
+   *  fraction is as fine in a long line as in a short one. Worked as one
+   *  float, w_ - d, it had the precision of a number the size of the line
+   *  -- a sixty-fourth of a sample past 131072, an eighth past 2^20 -- and
+   *  rounded by an amount that moved as the write point went round: a
+   *  static 100.3-sample read of a 5 kHz tone through the cubic tap was
+   *  0.037 off in a 2^21-sample line, against 0.005 in a short one. */
+  inline int split(float d, float& frac) const {
+    const int whole = (int) d; // d >= 1, so truncation is floor
+    const float part = d - (float) whole; // exact
+    int i = w_ - whole;
+    frac = 0.0f;
+    if (part > 0.0f) {
+      --i;
+      frac = 1.0f - part;
+    }
+    if (i < 0) i += MaxSamples;
+    return i;
+  }
+
   float buf_[MaxSamples] = {0.0f};
   int w_ = 0;
+  ThiranState thiran_;
 };
 
 /** Schroeder allpass: the diffusion element of a reverb. */
 template <int MaxSamples>
 class Allpass {
 public:
+  /** Silence the delay line (MaxSamples writes). */
   void reset() { line_.reset(); }
+  /** Delay in samples, which the line holds to 1 .. MaxSamples - 2, and
+   *  gain `g`, held to -0.95 .. 0.95: the nearer to +-1, the longer its
+   *  echoes ring. 100 samples and 0.5 until set. */
   void set(float delaySamples, float g) { d_ = delaySamples; g_ = clampf(g, -0.95f, 0.95f); }
+  /** One sample through the allpass; returns it. Flat in magnitude once
+   *  settled, smeared in time. */
   inline float process(float x) {
     const float delayed = line_.read(d_);
     const float v = x + g_ * delayed;
@@ -782,13 +1482,21 @@ private:
 template <int MaxSamples>
 class Comb {
 public:
+  /** Silence the delay line (MaxSamples writes) and the damping filter. */
   void reset() { line_.reset(); damp_.reset(); }
+  /** The loop's length in samples (the line holds it to 1 .. MaxSamples - 2),
+   *  `feedback` held to 0 .. 0.98 (higher rings longer), and the corner of
+   *  the lowpass in the loop, `dampingHz` at sample rate `sr`: the lower it
+   *  is, the faster the highs die. One tan() per call. */
   void set(float delaySamples, float feedback, float dampingHz, float sr) {
     d_ = delaySamples;
     fb_ = clampf(feedback, 0.0f, 0.98f);
     damp_.setSampleRate(sr);
     damp_.setCutoff(dampingHz);
   }
+  /** One sample: returns the line's output, and writes the input plus the
+   *  damped output times the feedback back into it. Until set(): 1000
+   *  samples at 0.7 feedback. */
   inline float process(float x) {
     const float y = line_.read(d_);
     line_.write(flushDenormal(x + fb_ * damp_.lp(y)));
@@ -807,15 +1515,55 @@ private:
  *  which is what stops "more effect" from also meaning "louder". */
 class DryWetMixer {
 public:
+  /** All dry: a mix of 0. */
+  DryWetMixer() = default;
+  /** Landed on `mix` (see setMix()), not gliding to it: what an effect
+   *  whose default mix is not 0 holds its mixer as. */
+  explicit DryWetMixer(float mix) { setMix(mix); }
+  /** The glide's length against the rate it runs at. Left alone it is 960
+   *  calls: 20 ms at 48 kHz, 5 at 192 -- smoothing either way. */
+  void setSampleRate(float sr, float ms = 20.0f) {
+    const float n = 0.001f * (ms > 0.1f ? ms : 0.1f) * (sr > 1.0f ? sr : 48000.0f);
+    k_ = 1.0f - std::exp(-1.0f / n);
+  }
+  /** A new mix GLIDES in once audio is running. It used to land in one
+   *  sample, and a mix knob automated on a delay stepped the output 52
+   *  times its largest natural step -- on every reverb, the chorus and the
+   *  phaser alike. Set before the first process(), or after snap(), it
+   *  lands at once: a starting mix is a setting, not a movement. */
   void setMix(float mix) {
     const float m = clampf(mix, 0.0f, 1.0f);
-    wet_ = std::sin(m * kPi * 0.5f);
-    dry_ = std::cos(m * kPi * 0.5f);
+    wetTarget_ = std::sin(m * kPi * 0.5f);
+    dryTarget_ = std::cos(m * kPi * 0.5f);
+    if (!running_) snap();
   }
-  inline float process(float dry, float wet) const { return dry_ * dry + wet_ * wet; }
+  /** Land on the mix now: what a reset() means. */
+  void snap() {
+    dry_ = dryTarget_;
+    wet_ = wetTarget_;
+    running_ = false;
+  }
+  /** One sample of the mix, `dry` times cos(mix pi/2) plus `wet` times
+   *  sin(mix pi/2), taking a changing mix one glide step on. The glide
+   *  steps per CALL: one mixer shared by two channels glides twice as fast
+   *  as setSampleRate() says. */
+  inline float process(float dry, float wet) {
+    running_ = true;
+    if (dry_ != dryTarget_ || wet_ != wetTarget_) {
+      dry_ += (dryTarget_ - dry_) * k_;
+      wet_ += (wetTarget_ - wet_) * k_;
+      if (std::fabs(dryTarget_ - dry_) < 1e-6f && std::fabs(wetTarget_ - wet_) < 1e-6f) {
+        dry_ = dryTarget_;
+        wet_ = wetTarget_;
+      }
+    }
+    return dry_ * dry + wet_ * wet;
+  }
 
 private:
-  float dry_ = 1.0f, wet_ = 0.0f;
+  float dry_ = 1.0f, wet_ = 0.0f, dryTarget_ = 1.0f, wetTarget_ = 0.0f;
+  float k_ = 0.00104112f; // 1 - exp(-1/960)
+  bool running_ = false;
 };
 
 /**
@@ -825,13 +1573,13 @@ private:
  * through an oversampler, a partitioned convolver or a look-ahead detector is
  * not: it comes out N samples late, and summing it against an undelayed dry
  * signal is adding a signal to a delayed copy of itself. That is a comb
- * filter, a row of notches every 1/N of the sample rate, and it is at its
+ * filter (a row of notches every 1/N of the sample rate), and it is at its
  * worst at 50% mix, exactly where most users leave the control.
  *
  * There is a second failure that is easier to miss. A plugin whose wet path is
  * late usually DECLARES that latency, and the host then shifts the plugin's
  * whole output earlier to compensate. The dry signal was never late, so the
- * host has just pushed it early: against every other track in the session.
+ * host has just pushed it early, against every other track in the session.
  *
  * Both of these were live in the convolution reverb example. It declared 512
  * samples of latency and the host test measured its output correlating with
@@ -845,7 +1593,20 @@ private:
 template <int MaxChannels = 2, int MaxLatency = 4096>
 class CompensatedDryWetMixer {
 public:
-  void setMix(float mix) { mixer_.setMix(mix); }
+  /** The mix glide's length against the rate, as DryWetMixer::setSampleRate()
+   *  takes them: 20 ms unless `ms` says otherwise, 960 samples until this is
+   *  called. Call it from prepare(). */
+  void setSampleRate(float sr, float ms = 20.0f) {
+    for (DryWetMixer& m : mixer_) m.setSampleRate(sr, ms);
+  }
+  /** The mix, 0 (dry) .. 1 (wet), held to that range: equal-power, and
+   *  gliding once audio runs, as DryWetMixer::setMix(). Each channel glides
+   *  on its own, so a stereo pair takes the glide setSampleRate() set, not
+   *  half of it: one glide shared by both channels was stepped twice a
+   *  frame. */
+  void setMix(float mix) {
+    for (DryWetMixer& m : mixer_) m.setMix(mix);
+  }
 
   /** How late the wet path is, in samples. Call from prepare(): it clears the
    *  delay buffer, which is not something to do while audio is running. */
@@ -853,35 +1614,43 @@ public:
     latency_ = samples < 0 ? 0 : (samples > MaxLatency ? MaxLatency : samples);
     reset();
   }
+  /** The dry delay in samples, as setWetLatency() held it: 0 .. MaxLatency. */
   int wetLatency() const { return latency_; }
 
+  /** Silence the dry delays and land the mix on its target: MaxChannels
+   *  times MaxLatency writes, so from prepare() or a transport reset, not
+   *  per block. */
   void reset() {
     for (int c = 0; c < MaxChannels; ++c) {
       for (int i = 0; i < MaxLatency; ++i) dry_[c][i] = 0.0f;
       write_[c] = 0;
     }
+    for (DryWetMixer& m : mixer_) m.snap();
   }
 
   /** One sample of ONE channel.
    *
-   *  The channel is explicit and each carries its own write cursor, so this is
-   *  correct however the caller nests its loops. A single shared cursor would
-   *  work only for `for each sample { for each channel }` and would interleave
-   *  the channels' histories the other way round: a bug that sounds like a
-   *  subtle stereo smear and is invisible in mono. */
+   *  The channel is explicit and each carries its own write cursor and its
+   *  own mix glide, so this is correct however the caller nests its loops. A
+   *  single shared cursor would work only for `for each sample { for each
+   *  channel }` and would interleave the channels' histories the other way
+   *  round, a bug that sounds like a subtle stereo smear and is invisible in
+   *  mono. A channel outside 0 .. MaxChannels - 1 is mixed undelayed, through
+   *  one more glide that every such channel shares. */
   inline float process(int channel, float dry, float wet) {
-    if (latency_ == 0 || channel < 0 || channel >= MaxChannels)
-      return mixer_.process(dry, wet);
+    if (channel < 0 || channel >= MaxChannels) return mixer_[MaxChannels].process(dry, wet);
+    if (latency_ == 0) return mixer_[channel].process(dry, wet);
     float* line = dry_[channel];
     int& w = write_[channel];
     const float delayed = line[w];
     line[w] = dry;
     if (++w >= latency_) w = 0;
-    return mixer_.process(delayed, wet);
+    return mixer_[channel].process(delayed, wet);
   }
 
 private:
-  DryWetMixer mixer_;
+  /** One glide per channel, and the last for channels out of range. */
+  DryWetMixer mixer_[MaxChannels + 1];
   float dry_[MaxChannels][MaxLatency] = {};
   int write_[MaxChannels] = {};
   int latency_ = 0;
@@ -918,12 +1687,16 @@ private:
 template <typename VoiceType, int MaxVoices = 8>
 class VoiceManager {
 public:
+  /** How many voices there are, MaxVoices: the range voice() is indexed by. */
   static constexpr int kNumVoices = MaxVoices;
   /** "Whichever voice is playing this key, on any channel." The default for
    *  every lookup, so a plain MIDI keyboard behaves exactly as it always did. */
   static constexpr int kAnyChannel = -1;
 
+  /** Voice `i`, 0 .. kNumVoices - 1, unchecked: to set every voice's
+   *  parameters, or to reach the one voiceForNote() found. */
   VoiceType& voice(int i) { return voices_[i]; }
+  /** As above, read-only. */
   const VoiceType& voice(int i) const { return voices_[i]; }
 
   /** Start a note.
@@ -934,6 +1707,18 @@ public:
    *  channel this class could not tell them apart: lifting one finger released
    *  both, and a bend on one bent whichever voice was found first. */
   void noteOn(int note, float velocity, int channel = 0) {
+    // A key struck again while a pedal holds its last note -- the key is up,
+    // the note sounds on the pedal's account -- releases that note first, as
+    // the reference does and as a re-struck string is damped and struck
+    // again. Each strike took a voice of its own and the pedal kept the old
+    // ones, so a note repeated under the pedal stacked copies of itself: on
+    // a sustaining envelope, four strikes were four voices at full level
+    // until the pedal came up. The same key on another channel is another
+    // finger (MPE) and is left alone.
+    for (int i = 0; i < MaxVoices; ++i)
+      if (notes_[i] == note && channels_[i] == channel && voices_[i].isActive() && !held_[i] &&
+          !released_[i])
+        releaseSlot(i);
     int slot = -1;
     for (int i = 0; i < MaxVoices; ++i) {
       if (!voices_[i].isActive()) { slot = i; break; }
@@ -957,13 +1742,23 @@ public:
    *  what identifies a finger under MPE. Passing kAnyChannel gives the old
    *  behaviour -- the first voice on that key -- which is right for a keyboard
    *  that puts everything on one channel and wrong for a controller that does
-   *  not. */
+   *  not.
+   *
+   *  The NEWEST such voice. A key struck again while its last note is still
+   *  in its release tail sounds on two voices, and the first one found was
+   *  usually the old tail: the new note's bend and pressure -- and the
+   *  sampler's reset of its tuning at the note-on -- went to the voice that
+   *  was dying, so the note being played kept whatever bend its voice last
+   *  had and ignored the wheel. Whatever arrives for a key and channel is
+   *  about the note most recently started there. */
   int voiceForNote(int note, int channel = kAnyChannel) const {
+    int found = -1;
     for (int i = 0; i < MaxVoices; ++i)
       if (notes_[i] == note && voices_[i].isActive() &&
-          (channel == kAnyChannel || channels_[i] == channel))
-        return i;
-    return -1;
+          (channel == kAnyChannel || channels_[i] == channel) &&
+          (found < 0 || age_[i] > age_[found]))
+        found = i;
+    return found;
   }
 
   /** Lift a key. With a channel, only the finger that played it; without one,
@@ -1022,6 +1817,7 @@ public:
     }
   }
 
+  /** Whether the damper pedal is down, as sustainPedal() last set it. */
   bool isSustainDown() const { return sustainDown_; }
 
   /** Release everything, pedals included. This is what CC 123 and a panic
@@ -1140,6 +1936,9 @@ inline bool applyPedals(VoiceManagerType& voices, const MidiMessage& m) {
 // primitives above, and are included here so `#include <sonore/dsp.h>` stays
 // the single entry point a generated plugin needs.
 // Rate conversion first: effects.h uses the oversampler.
+// The toolkit headers below lean on everything above and are only ever
+// included from here; each says so if it is included on its own.
+#define SONORE_DSP_H_INCLUDED 1
 #include "resample.h"
 #include "effects.h"
 #include "transport.h"

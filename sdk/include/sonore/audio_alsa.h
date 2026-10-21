@@ -36,18 +36,28 @@ public:
   uint32_t channels() const { return channels_; }
   const std::string& error() const { return error_; }
 
-  /** Negotiate the device; no audio flows until run(). */
   /** ALSA's PCM names, as a user would type them. Enumerating the full card
    *  list needs the config API; these are the aliases that actually exist on
    *  every install and cover what a standalone needs. */
   static std::vector<std::string> listDevices() {
-    return {"default", "sysdefault", "hw:0,0", "hw:1,0", "pulse", "pipewire"};
+    // plughw, not hw: a raw hw: device takes only the formats its codec
+    // speaks, and nearly no codec speaks float, so the two card entries were
+    // refused on almost every machine. The plug layer converts format, rate
+    // and channel count, and is still that card with no mixer in between.
+    return {"default", "sysdefault", "plughw:0,0", "plughw:1,0", "pulse", "pipewire"};
   }
 
   void setDeviceIndex(int index) { deviceIndex_ = index; }
   const std::string& deviceName() const { return deviceName_; }
 
+  /** Negotiate the device; no audio flows until run(). */
   bool open(RenderFn render) {
+    // Whatever was open goes first, as the WASAPI and ASIO outputs' open()
+    // do: a second open() replaced render_ under a running stream and leaked
+    // the first PCM, which keeps a hw device busy for the second. And the
+    // last failure is not this one's.
+    stop();
+    error_.clear();
     render_ = std::move(render);
 
     // Versioned soname only: the unversioned .so lives in dev packages.
@@ -97,9 +107,14 @@ public:
     return true;
   }
 
+  /** True once since the device failed in a way recovery could not mend. */
+  bool takeDeviceLost() { return lost_.exchange(false, std::memory_order_acq_rel); }
+
   bool run() {
     if (!pcm_) return false;
+    lost_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
+    block_.assign((size_t) kBlock * channels_, 0.0f);
     thread_ = std::thread([this] { renderLoop(); });
     return true;
   }
@@ -117,18 +132,21 @@ public:
   }
 
 private:
+  /** Frames per write. The buffer for them is sized in run(), before the
+   *  thread exists, so the loop itself never allocates. */
+  static constexpr uint32_t kBlock = 256;
+
   void renderLoop() {
-    constexpr uint32_t kBlock = 256;
-    std::vector<float> buffer(kBlock * channels_);
+    float* const buffer = block_.data();
     while (running_.load(std::memory_order_acquire)) {
-      render_(buffer.data(), kBlock, channels_);
+      render_(buffer, kBlock, channels_);
       // A short write is legal (the device took what fitted); the rest is
       // written in a second call rather than dropped, which was a click per
       // period on a device whose period is not a multiple of the block.
       uint32_t done = 0;
       while (done < kBlock && running_.load(std::memory_order_acquire)) {
         const long wrote =
-            writei_(pcm_, buffer.data() + (size_t) done * channels_, kBlock - done);
+            writei_(pcm_, buffer + (size_t) done * channels_, kBlock - done);
         if (wrote >= 0) {
           done += (uint32_t) wrote;
           continue;
@@ -136,11 +154,11 @@ private:
         // An underrun or a suspend is recovered (snd_pcm_prepare behind the
         // call) and the block retried. A device that cannot be recovered --
         // unplugged, server gone -- used to make this loop spin at full CPU,
-        // rendering blocks for a device that would never take another frame;
-        // it now waits, and keeps waiting quietly until stop().
+        // and then to wait quietly until stop(), "open" and silent. It is
+        // reported now, and the loop ends: the standalone reopens a device.
         if (recover_(pcm_, (int) wrote, 1) < 0) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
-          break;
+          lost_.store(true, std::memory_order_release);
+          return;
         }
       }
     }
@@ -153,6 +171,7 @@ private:
   using CloseFn = int (*)(void*);
 
   RenderFn render_;
+  std::vector<float> block_;
   int deviceIndex_ = 0;
   std::string deviceName_;
   void* lib_ = nullptr;
@@ -164,6 +183,7 @@ private:
   CloseFn close_ = nullptr;
   std::thread thread_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> lost_{false};
   double sampleRate_ = 48000.0;
   uint32_t channels_ = 2;
   std::string error_;

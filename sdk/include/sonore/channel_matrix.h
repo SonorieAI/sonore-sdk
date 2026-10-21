@@ -9,8 +9,8 @@
 // The usual shape for this is a generic matrix that leaves the coefficients
 // to the caller. We can do better, because ProcessContext already carries what each
 // channel MEANS: given the roles on both sides, the matrix derives itself, and
-// the one thing nobody remembers, that LFE must not be folded into full-range
-// channels: is handled rather than left as a footnote.
+// the one thing nobody remembers (that LFE must not be folded into full-range
+// channels) is handled rather than left as a footnote.
 
 #pragma once
 
@@ -30,29 +30,42 @@ namespace sonore {
  */
 class ChannelMatrix {
 public:
+  /** The most inputs and outputs a matrix has: 8, the SDK's channel limit
+   *  (kMaxAudioChannels). Larger counts are clamped to it. */
   static constexpr size_t kMaxChannels = 8;
 
+  /** Every gain to 0 and the size to 0 by 0, so process() does nothing until
+   *  setSize() or a builder gives it one. */
   void clear() {
     for (size_t o = 0; o < kMaxChannels; ++o)
       for (size_t i = 0; i < kMaxChannels; ++i) gain_[o][i] = 0.0f;
     inputs_ = outputs_ = 0;
   }
 
+  /** How many input channels process() reads and how many outputs it
+   *  writes, each clamped to kMaxChannels. The gains are left as they are. */
   void setSize(size_t numInputs, size_t numOutputs) {
     inputs_ = numInputs < kMaxChannels ? numInputs : kMaxChannels;
     outputs_ = numOutputs < kMaxChannels ? numOutputs : kMaxChannels;
   }
 
+  /** The linear gain from input channel `input` into output channel
+   *  `output`, both 0-based; 1 is unity. An index at or past kMaxChannels is
+   *  ignored. Gains outside the current size are kept but not used. */
   void setGain(size_t output, size_t input, float gain) {
     if (output < kMaxChannels && input < kMaxChannels) gain_[output][input] = gain;
   }
 
+  /** The linear gain set from `input` into `output`; 0 for an index at or
+   *  past kMaxChannels. */
   float getGain(size_t output, size_t input) const {
     if (output >= kMaxChannels || input >= kMaxChannels) return 0.0f;
     return gain_[output][input];
   }
 
+  /** Input channels process() reads, 0 .. kMaxChannels; 0 after clear(). */
   size_t numInputs() const { return inputs_; }
+  /** Output channels process() writes, 0 .. kMaxChannels; 0 after clear(). */
   size_t numOutputs() const { return outputs_; }
 
   /**
@@ -130,16 +143,11 @@ public:
       }
     }
 
-    // A mono INPUT feeding a wider output has the opposite problem: nothing
-    // to fold, everything to spread.
-    if (inputs_ == 1 && outputs_ > 1 && inputRoles[0] == kChannelFC) {
-      const long left = findOutput(kChannelFL);
-      const long right = findOutput(kChannelFR);
-      if (left >= 0 && right >= 0) {
-        gain_[(size_t) left][0] = minus3dB;
-        gain_[(size_t) right][0] = minus3dB;
-      }
-    }
+    // A mono input needs no rule of its own. Its role is the centre: into an
+    // output with a centre it goes there at unity, and into one without (plain
+    // stereo) the fold above spreads it across left and right at -3 dB. A
+    // separate spread used to run as well, so mono into 5.1 landed in the
+    // centre AND at -3 dB in front left and right -- +3 dB, smeared.
   }
 
   /** Mid/side encode: M = (L+R)/sqrt2, S = (L-R)/sqrt2. The root-two keeps the
@@ -159,7 +167,7 @@ public:
 
   /** Apply in place. `scratch` must hold at least numInputs samples and exists
    *  because an in-place matrix multiply would otherwise read outputs it had
-   *  already overwritten: the bug that turns a downmix into feedback. */
+   *  already overwritten, the bug that turns a downmix into feedback. */
   void process(AudioBlock<float>& block, float* scratch) const {
     if (!scratch || outputs_ == 0) return;
     const size_t channels = block.getNumChannels();

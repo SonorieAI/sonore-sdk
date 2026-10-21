@@ -38,7 +38,17 @@ enum {
   kAudioHardwarePropertyDefaultInputDevice = 0x64496E20,
   kAudioDevicePropertyStreamConfiguration = 0x736C6179,
   kAudioDevicePropertyNominalSampleRate = 0x6E737274,
+  kAudioDevicePropertyBufferFrameSize = 0x6673697A,
+  kAudioDevicePropertyDeviceIsAlive = 0x6C69766E,
+  kAudioDevicePropertyIOThreadOSWorkgroup = 0x6F737767, // oswg, macOS 11
 };
+
+typedef OSStatus (*AudioObjectPropertyListenerProc)(AudioObjectID, UInt32,
+                                                    const AudioObjectPropertyAddress*, void*);
+OSStatus AudioObjectAddPropertyListener(AudioObjectID, const AudioObjectPropertyAddress*,
+                                        AudioObjectPropertyListenerProc, void*);
+OSStatus AudioObjectRemovePropertyListener(AudioObjectID, const AudioObjectPropertyAddress*,
+                                           AudioObjectPropertyListenerProc, void*);
 
 OSStatus AudioObjectGetPropertyData(AudioObjectID, const AudioObjectPropertyAddress*, UInt32,
                                     const void*, UInt32*, void*);
@@ -46,3 +56,7 @@ OSStatus AudioObjectGetPropertyDataSize(AudioObjectID, const AudioObjectProperty
                                         const void*, UInt32*);
 OSStatus AudioObjectSetPropertyData(AudioObjectID, const AudioObjectPropertyAddress*, UInt32,
                                     const void*, UInt32, const void*);
+
+// The default output's volume and mute (system_volume.h).
+Boolean AudioObjectHasProperty(AudioObjectID, const AudioObjectPropertyAddress*);
+OSStatus AudioObjectIsPropertySettable(AudioObjectID, const AudioObjectPropertyAddress*, Boolean*);

@@ -24,6 +24,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "reflections.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -36,28 +39,51 @@ namespace sonore {
 template <int MaxDelay = 16384, int MaxTaps = 256>
 class EarlyReflections {
 public:
+  /** The room and the two positions in it, set with setRoom(). Sizes and
+   *  coordinates are in metres, x along the length, y across the width, z up,
+   *  the origin in a corner; the two ears sit earSpacing apart along y.
+   *  Absorption 0..0.99 is the energy each bounce loses, damping 0..1 the
+   *  output lowpass from 20 kHz down to 2 kHz, order 0..4 the most bounces
+   *  kept. Nothing checks that the source and listener are inside the room.
+   *  setRoom() works every image out again and moves the taps at once,
+   *  unsmoothed. */
   struct Room {
-    float length = 8.0f, width = 6.0f, height = 3.0f;  // metres: x, y, z
-    float sourceX = 2.0f, sourceY = 3.0f, sourceZ = 1.5f;
-    float listenerX = 6.0f, listenerY = 3.0f, listenerZ = 1.5f;
-    float earSpacing = 0.17f;       // the two listening points, along y
-    float absorption = 0.3f;        // 0..1: energy lost per bounce
-    float damping = 0.3f;           // 0..1: high-frequency loss on the output
-    int order = 2;                  // reflections up to this many bounces
-    bool includeDirect = false;     // the direct path is usually the dry signal
+    /** The room's length along x in metres; width and height follow. */
+    float length = 8.0f, width = 6.0f, /**< metres along y */ height = 3.0f;  ///< metres along z, up
+    /** Where the sound starts, in metres from the corner: x, then y and z. */
+    float sourceX = 2.0f, sourceY = 3.0f, /**< the source's y, metres */ sourceZ = 1.5f; ///< the source's z, metres
+    /** The centre of the listener's head, in metres from the corner: x, then y and z. */
+    float listenerX = 6.0f, listenerY = 3.0f, /**< the listener's y, metres */ listenerZ = 1.5f; ///< the listener's z, metres
+    float earSpacing = 0.17f;       ///< metres between the two listening points, along y
+    float absorption = 0.3f;        ///< 0..0.99: energy lost per bounce
+    float damping = 0.3f;           ///< 0..1: output lowpass from 20 kHz (0) down to 2 kHz (1)
+    int order = 2;                  ///< 0..4: reflections up to this many bounces
+    /** Also a tap for the straight path, at its time of flight. Off by
+     *  default because the direct path is usually the dry signal. */
+    bool includeDirect = false;
   };
 
+  /** Take spec.sampleRate, work the taps out again for the current Room at
+   *  that rate and clear the line. Nothing is allocated: the line and the
+   *  taps are the fixed arrays the template sized. */
   void prepare(const ProcessSpec& spec) {
     sr_ = (float) spec.sampleRate;
     for (int c = 0; c < 2; ++c) damp_[c].setSampleRate(sr_);
     setRoom(room_);
     reset();
   }
+  /** Silence: the delay line and the output lowpass cleared, the room and
+   *  its taps kept. */
   void reset() {
     line_.reset();
     for (int c = 0; c < 2; ++c) damp_[c].reset();
   }
 
+  /** Keep `r` and work out both ears' taps from it at the rate prepare()
+   *  set, each delayed by its path over 343 m/s and scaled by the direct
+   *  distance over its own and by the walls once per bounce. Out-of-range
+   *  fields are clamped as Room says. Allocation-free, but it visits up to
+   *  9 x 9 x 9 images per ear, and the taps move at once, unsmoothed. */
   void setRoom(const Room& r) {
     room_ = r;
     const float reflect = std::sqrt(1.0f - clampf(r.absorption, 0.0f, 0.99f));
@@ -70,6 +96,7 @@ public:
                                (r.sourceZ - r.listenerZ) * (r.sourceZ - r.listenerZ));
     for (int ch = 0; ch < 2; ++ch) {
       count_[ch] = 0;
+      dropped_[ch] = 0;
       for (int i = -order; i <= order; ++i)
         for (int j = -order; j <= order; ++j)
           for (int k = -order; k <= order; ++k) {
@@ -81,7 +108,16 @@ public:
             const float dx = x - r.listenerX, dy = y - ear[ch], dz = z - r.listenerZ;
             const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
             const float delay = d / c * sr_;
-            if (delay < 1.0f || delay > (float) (MaxDelay - 2)) continue;
+            if (delay < 1.0f) continue;
+            // Longer than the line: dropped, and COUNTED. MaxDelay is in
+            // samples, so the same room at a higher rate reaches further
+            // into it -- 16384 holds 85 ms at 192 kHz, and a large room or a
+            // high order lost its far images there and nowhere else, so the
+            // plugin sounded different at 192 kHz with nothing to say why.
+            if (delay > (float) (MaxDelay - 2)) {
+              ++dropped_[ch];
+              continue;
+            }
             delay_[ch][count_[ch]] = delay;
             gain_[ch][count_[ch]] = (d0 / (d > 0.1f ? d : 0.1f)) * std::pow(reflect, (float) bounces);
             ++count_[ch];
@@ -91,7 +127,14 @@ public:
     for (int ch = 0; ch < 2; ++ch) damp_[ch].setCutoff(20000.0f * std::pow(2000.0f / 20000.0f, d));
   }
 
+  /** Taps the ear has after the last setRoom(): channel 0 is left, 1 right
+   *  (only the lowest bit is read). At most MaxTaps; images past that are
+   *  left out, and droppedTaps() does not count them. */
   int tapCount(int channel = 0) const { return count_[channel & 1]; }
+  /** Images the room has that the line is too short for at this rate. Zero is
+   *  the answer to want; anything else says to raise MaxDelay (in samples)
+   *  for the rates the plugin supports, or the room sounds smaller there. */
+  int droppedTaps(int channel = 0) const { return dropped_[channel & 1]; }
   /** The earliest tap's delay in samples, for the record. */
   float firstTapSamples(int channel = 0) const {
     const int ch = channel & 1;
@@ -122,6 +165,7 @@ private:
   OnePole damp_[2];
   float delay_[2][MaxTaps]{}, gain_[2][MaxTaps]{};
   int count_[2] = {0, 0};
+  int dropped_[2] = {0, 0};
   Room room_{};
   float sr_ = 48000.0f;
 };

@@ -19,6 +19,9 @@
 //
 // Included by dsp.h. Depends on Fft<> from fft.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "stft.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include <cstddef>
 #include "audio.h"
@@ -36,13 +39,23 @@ class Stft {
   static_assert(Overlap >= 2 && Size % Overlap == 0, "Overlap must divide Size and be >= 2");
 
 public:
+  /** The frame length in samples: the FFT size. */
   static constexpr size_t size() { return Size; }
+  /** Samples between frames, Size / Overlap: how often process() calls its
+   *  functor. */
   static constexpr size_t hop() { return Size / Overlap; }
+  /** Bins the functor is handed, DC to Nyquist: Size / 2 + 1. */
   static constexpr size_t numBins() { return Size / 2 + 1; }
+  /** Input to output, in samples: Size, whatever the overlap. The figure a
+   *  plugin built on this reports to the host. */
   static constexpr int latencySamples() { return (int) Size; }
 
+  /** Ready to use: the window built and the state cleared. */
   Stft() { prepare(); }
 
+  /** Build the window and the overlap-add normalisation, then reset(). The
+   *  constructor has already done it. Every buffer is a member: nothing here
+   *  allocates. */
   void prepare() {
     // The PERIODIC Hann -- cos over N, not N-1 -- because it is the one whose
     // overlapped copies sum to a constant. The symmetric form in fillWindow
@@ -64,6 +77,8 @@ public:
     reset();
   }
 
+  /** Forget every past sample: the next Size outputs are silence, as at
+   *  construction. No allocation. */
   void reset() {
     for (size_t i = 0; i < Size; ++i) input_[i] = 0.0f;
     for (size_t i = 0; i < Size; ++i) ola_[i] = 0.0f;

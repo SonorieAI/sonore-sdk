@@ -2,15 +2,16 @@
 // Sonore SDK: FIR filters, designed and run.
 //
 // The biquads in dsp.h cover everything that wants to be cheap and minimum
-// phase. An FIR is what you reach for when the requirement is LINEAR PHASE:
-// a mastering EQ, a crossover whose bands must sum flat, a filter that must
-// not smear transients, and the price is latency of exactly half the kernel.
+// phase. An FIR is what you reach for when the requirement is LINEAR PHASE
+// (a mastering EQ, a crossover whose bands must sum flat, a filter that must
+// not smear transients), and the price is latency of exactly half the kernel.
 //
 // Design and processing are separate on purpose: design() allocates and
 // belongs in prepare(), process() allocates nothing and is real-time safe.
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -25,11 +26,11 @@ namespace sonore {
 /** Window shapes for kernel design. The trade is always the same: a narrower
  *  transition band costs worse stopband rejection, and vice versa. */
 enum class FirWindow {
-  Rectangular, // sharpest transition, -21 dB stopband: almost never right
-  Hann,        // -44 dB
-  Hamming,     // -53 dB
-  Blackman,    // -74 dB, the safe default
-  BlackmanHarris, // -92 dB, for when nothing may leak through
+  Rectangular, ///< sharpest transition, -21 dB stopband: almost never right
+  Hann,        ///< -44 dB
+  Hamming,     ///< -53 dB
+  Blackman,    ///< -74 dB, the safe default
+  BlackmanHarris, ///< -92 dB, for when nothing may leak through
   /** The only one with a DIAL.
    *
    *  Every window above is a fixed trade: a stopband figure and a transition
@@ -46,6 +47,11 @@ enum class FirWindow {
  *  8.6 is roughly -90 dB, which is where a float kernel stops being the limit
  *  and the format is. */
 struct FirWindowParams {
+  /** Kaiser's beta: 0 is the rectangular window, and each step up widens
+   *  the transition and deepens the stopband. designLowpass(),
+   *  designHighpass() and designBandpass() take one after the window (none
+   *  did, and the struct was a setting nothing read); designLowpassToSpec()
+   *  works out its own. */
   double kaiserBeta = 8.6;
 };
 
@@ -142,7 +148,9 @@ public:
 
     const double pi = 3.14159265358979323846;
     const double deltaOmega = 2.0 * pi * (double) transitionHz / (double) sampleRate;
-    const double exact = (a - 8.0) / (2.285 * deltaOmega);
+    // Negative for a stopband under 6 dB, which any kernel meets -- and a
+    // negative double cast to size_t is undefined, not small.
+    const double exact = (std::max)(0.0, (a - 8.0) / (2.285 * deltaOmega));
     size_t taps = (size_t) std::ceil(exact) + 1;
     taps |= 1; // odd, so there is a centre tap and the phase stays linear
     if (taps < 3) taps = 3;
@@ -155,13 +163,15 @@ public:
   }
 
   /** Lowpass at `cutoffHz`. More taps = steeper, at one sample of latency per
-   *  two taps. */
+   *  two taps. An even count is rounded up to odd: an even kernel delays by
+   *  a half-sample, which no latency report can state. `params` is read only
+   *  with FirWindow::Kaiser: its beta, 8.6 unless set. */
   void designLowpass(float cutoffHz, float sampleRate, size_t taps,
-                     FirWindow window = FirWindow::Blackman) {
+                     FirWindow window = FirWindow::Blackman, FirWindowParams params = {}) {
     const double normalised = clampCutoff(cutoffHz, sampleRate);
-    build(taps, window, [normalised](size_t i, size_t n) {
+    build(taps | 1, window, [normalised](size_t i, size_t n) {
       return firdetail::sincAt(i, n, normalised);
-    });
+    }, params.kaiserBeta);
   }
 
   /** Highpass, by spectral inversion of the matching lowpass: negate every
@@ -173,23 +183,24 @@ public:
    *  DC gain of 1 minus whatever the window made the sum, which for a
    *  201-tap Blackman is -40 dB of DC coming through a filter whose one job
    *  is to stop it. Normalised, the coefficients sum to zero to float
-   *  precision and the null is real. */
+   *  precision and the null is real. `params` as designLowpass(). */
   void designHighpass(float cutoffHz, float sampleRate, size_t taps,
-                      FirWindow window = FirWindow::Blackman) {
-    designLowpass(cutoffHz, sampleRate, taps | 1, window);
+                      FirWindow window = FirWindow::Blackman, FirWindowParams params = {}) {
+    designLowpass(cutoffHz, sampleRate, taps | 1, window, params);
     for (float& c : coefficients_) c = -c;
     coefficients_[(coefficients_.size() - 1) / 2] += 1.0f;
   }
 
   /** Bandpass: the difference of two lowpass kernels, each normalised to
-   *  unity DC first so their difference is zero there exactly. */
+   *  unity DC first so their difference is zero there exactly. `params` as
+   *  designLowpass(). */
   void designBandpass(float lowHz, float highHz, float sampleRate, size_t taps,
-                      FirWindow window = FirWindow::Blackman) {
+                      FirWindow window = FirWindow::Blackman, FirWindowParams params = {}) {
     const float a = lowHz < highHz ? lowHz : highHz;
     const float b = lowHz < highHz ? highHz : lowHz;
-    designLowpass(b, sampleRate, taps | 1, window);
+    designLowpass(b, sampleRate, taps | 1, window, params);
     std::vector<float> upper = coefficients_; // design time: allocation is allowed here
-    designLowpass(a, sampleRate, taps | 1, window);
+    designLowpass(a, sampleRate, taps | 1, window, params);
     for (size_t i = 0; i < coefficients_.size() && i < upper.size(); ++i)
       coefficients_[i] = upper[i] - coefficients_[i];
   }
@@ -201,11 +212,14 @@ public:
     position_ = 0;
   }
 
+  /** Clear the history; the kernel is kept. No allocation. */
   void reset() {
     std::fill(history_.begin(), history_.end(), 0.0f);
     position_ = 0;
   }
 
+  /** The kernel's length in taps: odd for every kernel designed here, 0
+   *  before the first design. */
   size_t numTaps() const { return coefficients_.size(); }
 
   /** Latency in samples: half the kernel, which is what linear phase costs.
@@ -214,6 +228,9 @@ public:
     return coefficients_.empty() ? 0 : (int) ((coefficients_.size() - 1) / 2);
   }
 
+  /** [audio-thread] One sample through the kernel: a dot product over
+   *  numTaps() taps, no allocation. With no kernel yet the input comes back
+   *  unchanged. */
   inline float process(float x) {
     if (coefficients_.empty()) return x;
     const size_t n = coefficients_.size();
@@ -230,6 +247,9 @@ public:
     return acc;
   }
 
+  /** The kernel, tap 0 first: the coefficient the newest sample is
+   *  multiplied by. The reference is valid until the next design or
+   *  setCoefficients() call. */
   const std::vector<float>& coefficients() const { return coefficients_; }
 
 private:
@@ -242,8 +262,10 @@ private:
   }
 
   /** Past this a kernel costs more than any audible gain, and a caller that
-   *  asked for more has asked for something that will not fit. */
-  static constexpr size_t kMaxTaps = 4096;
+   *  asked for more has asked for something that will not fit. ODD, like
+   *  every kernel designed here: clamping to an even limit took the centre
+   *  tap away from a highpass after it had been made odd to have one. */
+  static constexpr size_t kMaxTaps = 4095;
 
   template <typename Ideal>
   void build(size_t taps, FirWindow window, Ideal&& ideal, double kaiserBeta = 8.6) {
@@ -256,10 +278,13 @@ private:
       coefficients_[i] = (float) v;
       sum += v;
     }
-    // Normalise a lowpass to unity DC gain. Highpass and bandpass kernels sum
-    // to ~0 by construction, so normalising them would divide by nothing:
-    // the guard is what stops a "steeper filter" turning into silence.
-    if (std::fabs(sum) > 1e-3)
+    // Normalise to unity DC gain. Every kernel built here is a LOWPASS sinc:
+    // the highpass and the bandpass are made from normalised lowpasses after
+    // this returns, so nothing that sums to zero by design ever arrives. The
+    // guard was 1e-3, which skipped exactly the kernels that need it most --
+    // a short lowpass at a very low cutoff sums to almost nothing, and a
+    // 3-tap one at 5 Hz passed DC at 0.0002, -74 dB: a lowpass that was mute.
+    if (std::fabs(sum) > 1e-12)
       for (float& c : coefficients_) c = (float) ((double) c / sum);
 
     // The delay line is stored REVERSED relative to the kernel, so the dot

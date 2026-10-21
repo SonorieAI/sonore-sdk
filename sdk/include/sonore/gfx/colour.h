@@ -22,6 +22,7 @@
 // is a picture that looks washed out in a way nobody can locate.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace sonore {
@@ -29,9 +30,11 @@ namespace gfx {
 
 /** Straight (non-premultiplied) 8-bit RGBA: what a caller writes. */
 struct Colour {
-  uint8_t r = 0, g = 0, b = 0, a = 255;
+  uint8_t r = 0, /**< red, 0..255 */ g = 0, /**< green */ b = 0, /**< blue */ a = 255; ///< 0 transparent, 255 opaque
 
+  /** Opaque black. */
   Colour() = default;
+  /** Straight channels, 0..255 each; opaque unless `ca` says otherwise. */
   Colour(uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca = 255) : r(cr), g(cg), b(cb), a(ca) {}
 
   /** 0xAARRGGBB, the order these are written in every design tool. */
@@ -43,19 +46,26 @@ struct Colour {
   /** 0xRRGGBB, opaque. The spelling a stylesheet uses. */
   static Colour fromRGB(uint32_t rgb) { return fromARGB(0xFF000000u | rgb); }
 
+  /** 0xAARRGGBB: the inverse of fromARGB. */
   uint32_t toARGB() const {
     return ((uint32_t) a << 24) | ((uint32_t) r << 16) | ((uint32_t) g << 8) | (uint32_t) b;
   }
 
+  /** Alpha 0: nothing shows. */
   bool isTransparent() const { return a == 0; }
+  /** Alpha 255: nothing shows through. */
   bool isOpaque() const { return a == 255; }
 
+  /** The same colour with its alpha replaced by `newAlpha`. */
   Colour withAlpha(uint8_t newAlpha) const { return {r, g, b, newAlpha}; }
 
   /** Scale the existing alpha rather than replace it, for fading something
    *  that is already partly transparent. */
   Colour withMultipliedAlpha(float factor) const {
-    const float f = factor < 0.0f ? 0.0f : (factor > 1.0f ? 1.0f : factor);
+    // Written so a NaN -- a fade computed from 0/0 -- counts as zero: it
+    // failed both tests of the old spelling and reached the conversion to
+    // uint8_t, which for a NaN is undefined. The same in the two below.
+    const float f = factor > 0.0f ? (factor < 1.0f ? factor : 1.0f) : 0.0f;
     return {r, g, b, (uint8_t) ((float) a * f + 0.5f)};
   }
 
@@ -68,7 +78,7 @@ struct Colour {
    * the grey halo seen around badly composited artwork.
    */
   Colour interpolatedTo(Colour other, float amount) const {
-    const float t = amount < 0.0f ? 0.0f : (amount > 1.0f ? 1.0f : amount);
+    const float t = amount > 0.0f ? (amount < 1.0f ? amount : 1.0f) : 0.0f;
     auto mix = [t](uint8_t x, uint8_t y) {
       return (uint8_t) ((float) x + ((float) y - (float) x) * t + 0.5f);
     };
@@ -79,6 +89,7 @@ struct Colour {
    *  LookAndFeel wants for a hover or pressed state without a second colour
    *  in the palette. */
   Colour brightened(float amount) const {
+    if (std::isnan(amount)) amount = 0.0f;
     auto shift = [amount](uint8_t v) {
       const float f = (float) v + 255.0f * amount;
       return (uint8_t) (f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f));
@@ -107,19 +118,25 @@ struct Colour {
     return brightness() > 0.5f ? Colour(0, 0, 0) : Colour(255, 255, 255);
   }
 
+  /** All four channels equal. */
   bool operator==(const Colour& o) const {
     return r == o.r && g == o.g && b == o.b && a == o.a;
   }
+  /** Any channel differs. */
   bool operator!=(const Colour& o) const { return !(*this == o); }
 };
 
 /** Premultiplied 8-bit RGBA: what the rasteriser blends. */
 struct PremulColour {
-  uint8_t r = 0, g = 0, b = 0, a = 0;
+  uint8_t r = 0, /**< red times alpha */ g = 0, /**< green times alpha */ b = 0, /**< blue times alpha */ a = 0; ///< alpha
 
+  /** Fully transparent: every channel 0. */
   PremulColour() = default;
+  /** Channels as given, already premultiplied: no colour channel should
+   *  exceed `pa`. */
   PremulColour(uint8_t pr, uint8_t pg, uint8_t pb, uint8_t pa) : r(pr), g(pg), b(pb), a(pa) {}
 
+  /** `c` with its colour channels multiplied by its alpha, rounded to nearest. */
   static PremulColour from(Colour c) {
     // +127 before the divide is round-to-nearest rather than truncation.
     // Truncating loses up to one level per channel per composite, and a
@@ -171,12 +188,19 @@ inline PremulColour over(PremulColour src, PremulColour dst, uint8_t coverage = 
 /** A few colours the default LookAndFeel is built from, so a plugin that
  *  names none of its own still looks deliberate rather than grey. */
 namespace palette {
+/** 0x0D1014: the window's ground. */
 inline Colour background() { return Colour::fromRGB(0x0D1014); }
+/** 0x131922: a control's body. */
 inline Colour panel() { return Colour::fromRGB(0x131922); }
+/** 0x26313F: edges and tracks. */
 inline Colour outline() { return Colour::fromRGB(0x26313F); }
+/** 0xDCE5EE: text. */
 inline Colour text() { return Colour::fromRGB(0xDCE5EE); }
+/** 0x7D8B9C: secondary and disabled text. */
 inline Colour dimText() { return Colour::fromRGB(0x7D8B9C); }
+/** 0x4EA3FF: a control's value, focus, selection. */
 inline Colour accent() { return Colour::fromRGB(0x4EA3FF); }
+/** 0xE5A13A: something destructive, such as a close button being pressed. */
 inline Colour warning() { return Colour::fromRGB(0xE5A13A); }
 } // namespace palette
 

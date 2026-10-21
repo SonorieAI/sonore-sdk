@@ -61,16 +61,23 @@ namespace sonore {
  * voltage sources, MaxReactive capacitors + inductors and MaxPorts nonlinear
  * ports (a diode is one port, a transistor two).
  *
+ * A part's node numbers are ground or ones addNode() returned; every add
+ * refuses (-1) any other, so nothing is ever stamped outside the matrix.
+ *
  * SIZE: a few KB of doubles. Fine as a member.
  */
 template<int MaxNodes = 12, int MaxSources = 2, int MaxReactive = 8, int MaxPorts = 4,
          int MaxOpamps = 2>
 class NodalCircuit {
 public:
+  /** The size of the nodal system: an unknown per node, per voltage
+   *  source's current and per op-amp's output current. */
   static constexpr int kDim = MaxNodes + MaxSources + MaxOpamps;
-  static constexpr double kVt = 0.02585; // thermal voltage at 300 K
-  static constexpr double kGmin = 1e-9;  // SPICE's floating-node insurance
+  static constexpr double kVt = 0.02585; ///< thermal voltage at 300 K, in volts
+  static constexpr double kGmin = 1e-9;  ///< siemens, node to ground: SPICE's floating-node insurance
 
+  /** An empty netlist at 48 kHz. Add the parts, then setSampleRate() and
+   *  reset() before the first step(). */
   NodalCircuit() { clear(); }
 
   /** Forget the netlist. */
@@ -78,20 +85,29 @@ public:
     nodes_ = sources_ = resistors_ = reactive_ = ports_ = devices_ = opamps_ = 0;
     valid_ = false;
   }
-  /** A new node; node 0 is ground. Returns its index. */
-  int addNode() { return nodes_ < MaxNodes ? ++nodes_ : 0; }
+  /** A new node; node 0 is ground. Returns its index, 1 to MaxNodes -- or
+   *  -1 once MaxNodes are in use, which every part refuses. It was 0, and a
+   *  part meant for the extra node was wired to ground without a word. */
+  int addNode() { return nodes_ < MaxNodes ? ++nodes_ : -1; }
 
+  /** A resistor between nodes `a` and `b`, in ohms; 1 mΩ or less is held
+   *  at 1 mΩ. Returns the id setResistor() takes, or -1 once 24 resistors
+   *  are in or for a node that is not one (see the class comment). */
   int addResistor(int a, int b, double ohms) {
-    if (resistors_ >= kMaxResistors) return -1;
+    if (resistors_ >= kMaxResistors || !isNode(a) || !isNode(b)) return -1;
     res_[resistors_] = {a, b, ohms > 1e-3 ? 1.0 / ohms : 1e3};
     valid_ = false;
     return resistors_++;
   }
+  /** A capacitor between nodes `a` and `b`, in farads. Capacitors and
+   *  inductors share MaxReactive: returns its index among them, or -1 when
+   *  they are full. */
   int addCapacitor(int a, int b, double farads) { return addReactive(a, b, farads, false); }
+  /** An inductor between nodes `a` and `b`, in henries; as addCapacitor(). */
   int addInductor(int a, int b, double henry) { return addReactive(a, b, henry, true); }
   /** A voltage source from `a` (+) to `b` (-). */
   int addVoltageSource(int a, int b, double volts) {
-    if (sources_ >= MaxSources) return -1;
+    if (sources_ >= MaxSources || !isNode(a) || !isNode(b)) return -1;
     src_[sources_] = {a, b, volts};
     valid_ = false;
     return sources_++;
@@ -100,7 +116,7 @@ public:
    *  driven by whatever current that takes. Infinite gain, no rails -- see
    *  the header note. Needs a feedback path. */
   int addOpamp(int plus, int minus, int out) {
-    if (opamps_ >= MaxOpamps) return -1;
+    if (opamps_ >= MaxOpamps || !isNode(plus) || !isNode(minus) || !isNode(out)) return -1;
     oa_[opamps_] = {plus, minus, out};
     valid_ = false;
     return opamps_++;
@@ -111,7 +127,7 @@ public:
    *  gate junction reverse-biased. `pchannel` flips every sign. */
   int addJfet(int d, int g, int s, double beta, double vp, double lambda = 0.01,
               bool pchannel = false) {
-    if (ports_ + 2 > MaxPorts || devices_ >= kMaxDevices) return -1;
+    if (ports_ + 2 > MaxPorts || devices_ >= kMaxDevices || !isNode(d) || !isNode(g) || !isNode(s)) return -1;
     Device& dev = dev_[devices_];
     dev.kind = Device::Jfet;
     dev.port[0] = ports_;
@@ -128,7 +144,7 @@ public:
 
   /** A Shockley diode, anode `a`, cathode `b`. */
   int addDiode(int a, int b, double is = 2.52e-9, double n = 1.752) {
-    if (ports_ + 1 > MaxPorts || devices_ >= kMaxDevices) return -1;
+    if (ports_ + 1 > MaxPorts || devices_ >= kMaxDevices || !isNode(a) || !isNode(b)) return -1;
     Device& d = dev_[devices_];
     d.kind = Device::Diode;
     d.port[0] = ports_;
@@ -141,7 +157,7 @@ public:
   /** An Ebers-Moll BJT. `betaR` is the reverse beta (a few, for any real
    *  transistor); `pnp` flips every junction. */
   int addBjt(int c, int b, int e, double is, double betaF, double betaR = 4.0, bool pnp = false) {
-    if (ports_ + 2 > MaxPorts || devices_ >= kMaxDevices) return -1;
+    if (ports_ + 2 > MaxPorts || devices_ >= kMaxDevices || !isNode(c) || !isNode(b) || !isNode(e)) return -1;
     Device& d = dev_[devices_];
     d.kind = Device::Bjt;
     d.port[0] = ports_;
@@ -165,9 +181,16 @@ public:
   }
   /** Drive a source. Cheap: no re-factorisation. */
   void setSource(int id, double volts) {
-    if (id >= 0 && id < sources_) src_[id].v = volts;
+    // Finite or nothing: an Inf source drove every Newton state to NaN, and
+    // NaN never converges back to anything -- FuzzFace and TubeScreamer
+    // went silent for good on one infinite input sample, converged() still
+    // saying yes.
+    if (id >= 0 && id < sources_) src_[id].v = std::isfinite(volts) ? volts : 0.0;
   }
 
+  /** The sample rate step() runs at, in Hz (1 or less means 48000). Marks
+   *  the linear part for re-factorisation; call reset() after it to settle
+   *  the circuit at the new rate. */
   void setSampleRate(double sr) {
     sr_ = sr > 1.0 ? sr : 48000.0;
     valid_ = false;
@@ -185,20 +208,31 @@ public:
     for (int r = 0; r < reactive_; ++r) rx_[r].ieq = 0.0;
     loadSources(b_);
     solve(ainv, b_, 200);
-    // The companion history that makes the reactive element carry the DC
-    // solution's voltage with no current.
+    // The companion history that carries the DC solution on: a capacitor
+    // holds its voltage with no current, and an inductor its CURRENT -- the
+    // DC stamp's near-short of 1e3 S times the little voltage it drops. The
+    // first version gave the inductor no current, so a choke carrying bias
+    // started at 0 A and climbed back with L/R: a thump at the top of every
+    // render, from a reset whose whole job is to start settled.
     for (int r = 0; r < reactive_; ++r) {
       const double vr = nodeV(rx_[r].a) - nodeV(rx_[r].b);
       rx_[r].v = vr;
-      rx_[r].ieq = rx_[r].inductor ? rx_[r].g * vr : -rx_[r].g * vr;
-      rx_[r].i = 0.0;
-      if (rx_[r].inductor) rx_[r].i = 0.0;
+      if (rx_[r].inductor) {
+        const double idc = 1e3 * vr;
+        rx_[r].i = idc;
+        rx_[r].ieq = idc + rx_[r].g * vr;
+      } else {
+        rx_[r].i = 0.0;
+        rx_[r].ieq = -rx_[r].g * vr;
+      }
     }
     // From here on, the dynamic matrix.
     if (!valid_) factorise();
   }
 
-  /** Advance one sample with the sources at their current values. */
+  /** Advance one sample with the sources at their current values. A
+   *  resistor, rate or netlist change since the last step is re-factorised
+   *  here first, a full matrix inversion. No allocation. */
   inline void step() {
     if (!valid_) factorise();
     // History currents and sources.
@@ -209,7 +243,21 @@ public:
       if (rx_[r].b > 0) b_[rx_[r].b - 1] += rx_[r].ieq;
     }
     loadSources(b_);
+    // A step whose answer is not finite is not taken: the last good state
+    // stays, and converged() says no. Nothing finite should get here, but a
+    // NaN in this state is for ever, so the price of one copy is worth it.
+    double pvKept[MaxPorts > 0 ? MaxPorts : 1], vKept[kDim];
+    for (int p = 0; p < ports_; ++p) pvKept[p] = pv_[p];
+    for (int i = 0; i < kDim; ++i) vKept[i] = v_[i];
     solve(ainv_, b_, 24);
+    bool finite = true;
+    for (int i = 0; i < kDim && finite; ++i) finite = std::isfinite(v_[i]);
+    if (!finite) {
+      for (int p = 0; p < ports_; ++p) pv_[p] = pvKept[p];
+      for (int i = 0; i < kDim; ++i) v_[i] = vKept[i];
+      converged_ = false;
+      return;
+    }
     // Update the companions.
     for (int r = 0; r < reactive_; ++r) {
       const double vr = nodeV(rx_[r].a) - nodeV(rx_[r].b);
@@ -220,21 +268,40 @@ public:
     }
   }
 
-  /** Node voltage (0 for ground). */
-  inline double voltage(int node) const { return nodeV(node); }
+  /** Node voltage: 0 for ground, and for a number that is not a node --
+   *  past the nodes made, the unknowns are source and op-amp currents. */
+  inline double voltage(int node) const { return isNode(node) ? nodeV(node) : 0.0; }
   /** Current through voltage source `id`, into its + terminal. */
   double sourceCurrent(int id) const { return id >= 0 && id < sources_ ? v_[nodes_ + id] : 0.0; }
+  /** Newton iterations the last step() or reset() took: typically two or
+   *  three for a warm-started step at audio rates, at most 24 for a step
+   *  and 200 for reset(). */
   int newtonIterations() const { return iterations_; }
+  /** Whether the last step() or reset() settled to 1e-9 V within its
+   *  iteration limit. False too after a step whose answer was not finite
+   *  and was thrown away, the previous state kept. */
   bool converged() const { return converged_; }
 
 private:
   static constexpr int kMaxResistors = 24;
   static constexpr int kMaxDevices = MaxPorts;
 
+  /** A resistor between nodes a and b, held as its conductance in siemens. */
   struct Resistor { int a, b; double g; };
+  /** A capacitor (farads) or inductor (henries) as its trapezoidal companion:
+   *  the conductance for the sample rate, the history current, and the last
+   *  voltage across it and current through it. */
   struct Reactive { int a, b; double value, g, ieq, v, i; bool inductor; };
+  /** A voltage source, a (+) to b (-), at v volts. */
   struct Source { int a, b; double v; };
+  /** A nonlinear port: the voltage from a to b that Newton solves for. A
+   *  diode is one (anode to cathode), a BJT two (base-emitter and
+   *  base-collector), a JFET two (gate-source and drain-source). */
   struct Port { int a, b; };
+  /** A nonlinear device, its ports and its model's parameters: saturation
+   *  current and emission coefficient for a junction, the forward and
+   *  reverse betas for a BJT, the square law's beta, pinch-off and lambda
+   *  for a JFET. */
   struct Device {
     enum Kind { Diode, Bjt, Jfet } kind = Diode;
     int port[2] = {0, 0};
@@ -242,10 +309,17 @@ private:
     double beta = 1e-3, vp = -2.0, lambda = 0.01;
     bool pnp = false;
   };
+  /** An ideal op-amp: the two input nodes the solver holds equal, and the
+   *  output node it drives. */
   struct Opamp { int plus, minus, out; };
 
+  /** Ground, or a node addNode() made. A node number is a row of the
+   *  matrix: one past the nodes made was stamped into a source's row, and
+   *  one past kDim outside the matrix altogether, onto the stack. */
+  bool isNode(int n) const { return n >= 0 && n <= nodes_; }
+
   int addReactive(int a, int b, double value, bool inductor) {
-    if (reactive_ >= MaxReactive) return -1;
+    if (reactive_ >= MaxReactive || !isNode(a) || !isNode(b)) return -1;
     rx_[reactive_] = {a, b, value, 0.0, 0.0, 0.0, 0.0, inductor};
     valid_ = false;
     return reactive_++;
@@ -257,6 +331,47 @@ private:
     const double t = 1.0 / sr_;
     for (int r = 0; r < reactive_; ++r)
       rx_[r].g = rx_[r].inductor ? t / (2.0 * rx_[r].value) : 2.0 * rx_[r].value / t;
+    // Each port's limiting, from the junction it belongs to: its thermal
+    // voltage, SPICE's critical voltage vt ln(vt / (sqrt2 Is)), and which way
+    // is forward. A JFET's ports are quadratic, not exponential.
+    for (int p = 0; p < MaxPorts; ++p) {
+      limit_[p].junction = false;
+      limit_[p].sign = 1.0;
+      limit_[p].vt = kVt;
+      limit_[p].vcrit = 0.0;
+    }
+    for (int d = 0; d < devices_; ++d) {
+      const Device& dev = dev_[d];
+      if (dev.kind == Device::Jfet) continue;
+      const double vt = dev.n * kVt;
+      const double vcrit = vt * std::log(vt / (1.4142135623730951 * (dev.is > 1e-30 ? dev.is : 1e-30)));
+      const int count = dev.kind == Device::Bjt ? 2 : 1;
+      for (int k = 0; k < count; ++k) {
+        Limit& l = limit_[dev.port[k]];
+        l.junction = true;
+        l.sign = dev.pnp ? -1.0 : 1.0;
+        l.vt = vt;
+        l.vcrit = vcrit;
+      }
+    }
+  }
+
+  /** SPICE's junction limiting (pnjlim). A step INTO forward conduction past
+   *  vcrit is taken logarithmically -- the current there grows e-fold every
+   *  vt, and a full step overflows its way out of the basin. A step OUT of
+   *  conduction, or one that stays below vcrit, is taken whole: nothing
+   *  explodes that way, and capping it is what made a diode that had to
+   *  swing 20 V in one sample take 80 iterations to get there. */
+  static double pnjlim(double vnew, double vold, double vt, double vcrit) {
+    if (vnew > vcrit && std::fabs(vnew - vold) > 2.0 * vt) {
+      if (vold > 0.0) {
+        const double arg = 1.0 + (vnew - vold) / vt;
+        vnew = arg > 0.0 ? vold + vt * std::log(arg) : vcrit;
+      } else {
+        vnew = vt * std::log(vnew / vt);
+      }
+    }
+    return vnew;
   }
 
   void stampLinear(double a[kDim][kDim], bool dc) {
@@ -327,33 +442,46 @@ private:
     double a[kDim][kDim];
     stampLinear(a, false);
     invert(a, ainv_);
+    // What the solve needs from A^-1 that does not change until the next
+    // factorise: the port columns A^-1 N^T and the reduced matrix
+    // K = N A^-1 N^T. Rebuilt every sample, they were a kDim x ports pass and
+    // a ports^2 x kDim one per step, for numbers that had not moved.
+    portColumns(ainv_, colCache_, kCache_);
     valid_ = true;
+  }
+
+  /** A^-1 N_q^T for every port q, and K = N A^-1 N^T from them. */
+  void portColumns(const double ainv[kDim][kDim], double col[MaxPorts][kDim],
+                   double k[MaxPorts][MaxPorts]) const {
+    for (int q = 0; q < ports_; ++q)
+      for (int i = 0; i < kDim; ++i) {
+        double s = 0.0;
+        if (port_[q].a > 0) s += ainv[i][port_[q].a - 1];
+        if (port_[q].b > 0) s -= ainv[i][port_[q].b - 1];
+        col[q][i] = s;
+      }
+    for (int p = 0; p < ports_; ++p)
+      for (int q = 0; q < ports_; ++q) k[p][q] = rowV(col[q], port_[p]);
   }
 
   /** Newton on the reduced port system, then the full node solution. */
   void solve(const double ainv[kDim][kDim], const double b[kDim], int maxIter) {
-    // p0 = N A^-1 b, K = N A^-1 N^T.
-    double p0[MaxPorts], k[MaxPorts][MaxPorts];
+    // p0 = N A^-1 b, K = N A^-1 N^T. The columns and K come from factorise()
+    // for the dynamic matrix, which is every step(); reset()'s one-off DC
+    // solve passes a matrix of its own and builds them here.
+    double localCol[MaxPorts][kDim], localK[MaxPorts][MaxPorts];
+    const bool cached = ainv == ainv_;
+    if (!cached) portColumns(ainv, localCol, localK);
+    const double (*col)[kDim] = cached ? colCache_ : localCol;
+    const double (*k)[MaxPorts] = cached ? kCache_ : localK;
+    double p0[MaxPorts];
     double ab[kDim];
     for (int i = 0; i < kDim; ++i) {
       double s = 0.0;
       for (int j = 0; j < kDim; ++j) s += ainv[i][j] * b[j];
       ab[i] = s;
     }
-    for (int p = 0; p < ports_; ++p) {
-      p0[p] = rowV(ab, port_[p]);
-      for (int q = 0; q < ports_; ++q) {
-        // (N A^-1 N^T)_pq = N_p . (A^-1 . N_q^T)
-        double col[kDim];
-        for (int i = 0; i < kDim; ++i) {
-          double s = 0.0;
-          if (port_[q].a > 0) s += ainv[i][port_[q].a - 1];
-          if (port_[q].b > 0) s -= ainv[i][port_[q].b - 1];
-          col[i] = s;
-        }
-        k[p][q] = rowV(col, port_[p]);
-      }
-    }
+    for (int p = 0; p < ports_; ++p) p0[p] = rowV(ab, port_[p]);
     // Newton: f(p) = p - p0 + K i(p) = 0, J = I + K di/dp.
     double cur[MaxPorts], jac[MaxPorts][MaxPorts];
     converged_ = false;
@@ -376,29 +504,35 @@ private:
       double delta[MaxPorts];
       solveSmall(j, f, delta);
       for (int p = 0; p < ports_; ++p) {
-        // Junction limiting: a Newton step through an exponential is capped
-        // so it cannot overflow its way out of the basin.
-        double d = -delta[p];
-        const double lim = 0.25;
-        if (d > lim) d = lim;
-        if (d < -lim) d = -lim;
-        pv_[p] += d;
-        worst = std::fabs(d) > worst ? std::fabs(d) : worst;
+        // Junction limiting, SPICE's: see pnjlim. It was a flat 0.25 V cap on
+        // every step in every direction, so with 24 iterations a port could
+        // move 6 V a sample and no more: a diode clipper fed 24 V at 5 kHz
+        // (15.7 V a sample) left 2798 of 4800 samples unconverged and was
+        // 20 V wrong. A JFET's quadratic ports are capped generously instead.
+        const double vold = pv_[p];
+        double vnew = vold - delta[p];
+        const Limit& l = limit_[p];
+        if (l.junction) {
+          vnew = l.sign * pnjlim(l.sign * vnew, l.sign * vold, l.vt, l.vcrit);
+        } else {
+          const double cap = 4.0;
+          if (vnew > vold + cap) vnew = vold + cap;
+          if (vnew < vold - cap) vnew = vold - cap;
+        }
+        pv_[p] = vnew;
+        const double d = std::fabs(vnew - vold);
+        worst = d > worst ? d : worst;
       }
       if (worst < 1e-9) { converged_ = true; break; }
     }
     deviceCurrents(pv_, cur, jac);
     for (int p = 0; p < ports_; ++p) pi_[p] = cur[p];
-    // v = A^-1 (b - N^T i)
-    double rhs[kDim];
-    for (int i = 0; i < kDim; ++i) rhs[i] = b[i];
-    for (int p = 0; p < ports_; ++p) {
-      if (port_[p].a > 0) rhs[port_[p].a - 1] -= cur[p];
-      if (port_[p].b > 0) rhs[port_[p].b - 1] += cur[p];
-    }
+    // v = A^-1 (b - N^T i) = A^-1 b - sum_p (A^-1 N_p^T) i_p: ab is already in
+    // hand and the port columns are cached, so a second kDim^2 product
+    // becomes kDim x ports.
     for (int i = 0; i < kDim; ++i) {
-      double s = 0.0;
-      for (int j = 0; j < kDim; ++j) s += ainv[i][j] * rhs[j];
+      double s = ab[i];
+      for (int p = 0; p < ports_; ++p) s -= col[p][i] * cur[p];
       v_[i] = s;
     }
   }
@@ -529,10 +663,22 @@ private:
   Source src_[MaxSources];
   Port port_[MaxPorts];
   Device dev_[kMaxDevices];
-  double ainv_[kDim][kDim];
-  double b_[kDim], v_[kDim];
-  double pv_[MaxPorts], pi_[MaxPorts];
+  // Initialised, because step() before any reset() reads them: the Newton
+  // guess pv_ above all, which as a NaN never converges to anything else.
+  double ainv_[kDim][kDim] = {};
+  double colCache_[MaxPorts][kDim] = {};
+  double kCache_[MaxPorts][MaxPorts] = {};
+  double b_[kDim] = {}, v_[kDim] = {};
+  double pv_[MaxPorts] = {}, pi_[MaxPorts] = {};
   double sr_ = 48000.0;
+  /** How a port's Newton step is limited, worked out in prepare(): whether
+   *  it is a junction at all, which way is forward (PNP flips it), its
+   *  thermal voltage and SPICE's critical voltage for pnjlim(). */
+  struct Limit {
+    bool junction;
+    double sign, vt, vcrit;
+  };
+  Limit limit_[MaxPorts > 0 ? MaxPorts : 1]{};
   bool valid_ = false, converged_ = false;
   int iterations_ = 0;
 };

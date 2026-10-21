@@ -61,6 +61,18 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A window peer's backing store: the device-pixel bitmap, the scale, and the
+ * paint of the component tree into it. See the file comment for why scale
+ * lives here and nowhere else.
+ *
+ * The peer feeds it platform facts (setDeviceSize from a resize event,
+ * setScale from the host, pointer positions through toLogical) and calls
+ * render() when it is asked to paint; what comes back is the list of device
+ * rectangles to blit, empty when nothing changed. The content component is not
+ * owned and must outlive the Backing, or be replaced with setContent first.
+ * UI thread only, like everything that touches the tree.
+ */
 class Backing {
 public:
   /** The component filling the window. Not owned -- the peer's caller owns it,
@@ -71,6 +83,7 @@ public:
     applyLayout();
   }
 
+  /** The component filling the window, or null. */
   Component* content() const { return content_; }
 
   /** What to clear to before the tree paints. Below the tree, so it cannot come
@@ -93,7 +106,22 @@ public:
     if (width == deviceWidth_ && height == deviceHeight_) return;
     deviceWidth_ = width > 0 ? width : 0;
     deviceHeight_ = height > 0 ? height : 0;
-    bitmap_.resize(deviceWidth_, deviceHeight_);
+    // Resized, which keeps the buffer it has when the new size fits in it --
+    // a drag that grows the window by a few pixels a step reallocates only
+    // now and then, because the buffer grows by half again when it is
+    // outgrown. But shrunk to under half of what it holds, the bitmap is
+    // made anew at this size: a window moved from a 200% monitor to a 100%
+    // one went on holding the 200% frame, 9 MB for the showcase where 1.5
+    // would do, for as long as it stayed open. One allocation for that move,
+    // and none for a drag.
+    const size_t pixels = (size_t) deviceWidth_ * (size_t) deviceHeight_;
+    if (pixels * 2u < heldPixels_) {
+      bitmap_ = Bitmap(deviceWidth_, deviceHeight_);
+      heldPixels_ = pixels;
+    } else {
+      bitmap_.resize(deviceWidth_, deviceHeight_);
+      if (pixels > heldPixels_) heldPixels_ = pixels;
+    }
     // A resized bitmap has no previous frame to keep, so the next paint is a
     // full one. Not an optimisation to skip: the new pixels contain nothing.
     fullRepaintNeeded_ = true;
@@ -118,11 +146,16 @@ public:
     applyLayout();
   }
 
+  /** Device pixels per logical pixel, 0.05..8; 1 until setScale. */
   float scale() const { return scale_; }
+  /** The client area's width, device pixels. */
   int deviceWidth() const { return deviceWidth_; }
+  /** The client area's height, device pixels. */
   int deviceHeight() const { return deviceHeight_; }
 
+  /** The width the content is laid out to: device width over the scale. */
   float logicalWidth() const { return (float) deviceWidth_ / scale_; }
+  /** The height the content is laid out to: device height over the scale. */
   float logicalHeight() const { return (float) deviceHeight_ / scale_; }
 
   /** The size to ASK the platform for, given a size in logical units. Rounded
@@ -132,8 +165,33 @@ public:
     return (int) (logical * scale + 0.5f);
   }
 
+  /** The device-pixel frame render() paints into and the peer blits from. */
   Bitmap& bitmap() { return bitmap_; }
+  /** The same, read-only. */
   const Bitmap& bitmap() const { return bitmap_; }
+
+  /**
+   * Give the pixels back: the memory, not only the size. For a peer whose
+   * window has closed.
+   *
+   * A peer is a member of NativeEditor, and a wrapper keeps that for the
+   * life of the plugin instance, so the bitmap of a closed editor stayed
+   * allocated for as long as the plugin was in the session -- 6 MB for a
+   * 780x500 editor opened once at 200%, in every instance whose editor had
+   * ever been looked at. Resizing to zero would not return it, because a
+   * vector keeps its capacity; the bitmap is replaced instead. The device
+   * size goes back to zero with it, so the next open's setDeviceSize
+   * allocates again even when the size is the same, and that open paints
+   * in full, as a first one does.
+   */
+  void release() {
+    bitmap_ = Bitmap();
+    std::vector<PixelRect>().swap(changed_);
+    deviceWidth_ = 0;
+    deviceHeight_ = 0;
+    heldPixels_ = 0;
+    fullRepaintNeeded_ = true;
+  }
 
   // ── Input ────────────────────────────────────────────────────────────────
 
@@ -157,7 +215,10 @@ public:
 
   // ── Painting ─────────────────────────────────────────────────────────────
 
+  /** Make the next render() paint everything, not only the damage. */
   void invalidateAll() { fullRepaintNeeded_ = true; }
+  /** Whether the next render() paints everything: after a resize, a new scale,
+   *  content or ground, or invalidateAll. */
   bool needsFullRepaint() const { return fullRepaintNeeded_; }
 
   /**
@@ -194,9 +255,19 @@ public:
 
     {
       Graphics g(bitmap_);
-      // Cleared FIRST, all of them, before anything paints. Clearing and
-      // painting one rectangle at a time would erase a neighbour that had
-      // already been painted where two damaged rectangles overlap.
+      // One damaged rectangle at a time, cleared and then painted with the
+      // clip HELD to it. The clip is what keeps a partial render partial:
+      // paintTree skips the components the damage misses, but a component it
+      // does visit paints all of itself -- and the root is always visited,
+      // and a root paints its background over its whole bounds. With the
+      // clip at the damage, that fill stays inside it; without, it covered
+      // every control the damage had skipped, in the bitmap, where nothing
+      // showed it until the platform copied the whole window. Then the
+      // editor was one moved knob on an empty background.
+      //
+      // Overlapping rectangles are safe this way: each pass repaints
+      // EVERYTHING that intersects its rectangle, in order, within it, so a
+      // pass that clears an overlap also paints the overlap back.
       for (const Rect& r : damage.rects()) {
         const PixelRect device = deviceRectFor(r);
         if (device.isEmpty()) continue;
@@ -204,9 +275,17 @@ public:
         g.clipTo(device);
         if (g.isClippedOut()) continue;
         g.fillAll(ground_);
+        g.addTransform(Transform::scaling(scale_, scale_));
+        // The damage handed down is what was CLEARED -- the device rectangle,
+        // rounded outward, back in logical units -- not `r` itself. At a
+        // fractional scale the outward rounding takes in the edge pixel of a
+        // neighbour that `r` does not touch; asked about `r`, paintTree would
+        // skip that neighbour and leave its antialiased edge as bare ground.
+        RectangleList one;
+        one.add(Rect((float) device.x / scale_, (float) device.y / scale_,
+                     (float) device.w / scale_, (float) device.h / scale_));
+        content_->paintTree(g, one);
       }
-      g.addTransform(Transform::scaling(scale_, scale_));
-      content_->paintTree(g, damage);
     }
     content_->clearDamage();
 
@@ -247,6 +326,9 @@ private:
   float scale_ = 1.0f;
   int deviceWidth_ = 0;
   int deviceHeight_ = 0;
+  /** The most pixels the bitmap has been sized for since it was last made
+   *  anew: what its buffer holds at least. See setDeviceSize. */
+  size_t heldPixels_ = 0;
   bool fullRepaintNeeded_ = true;
 };
 

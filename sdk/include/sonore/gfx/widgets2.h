@@ -37,21 +37,37 @@ namespace gfx {
  */
 class RangeSlider : public Widget {
 public:
+  /** A thumb's width in logical pixels. The track is inset by half of it at
+   *  each end, and a press within this distance of a thumb grabs it. */
   static constexpr float kThumb = 12.0f;
   /** The closest the two ends may come. Zero would let them land on the same
    *  value, where neither can be grabbed again because they are on top of each
    *  other. */
   static constexpr float kMinimumGap = 0.001f;
 
+  /** The whole track: low 0, high 1. */
   RangeSlider() { setCursor(MouseCursor::DragHorizontal); }
 
+  /** The new normalised ends, each time either moves -- by a drag, or by
+   *  setRange with `notify`. */
   std::function<void(float low, float high)> onRangeChange;
+  /** A press began a drag, before its first change: where an owner opens the
+   *  host's gesture. */
   std::function<void()> onDragStart;
+  /** The drag's button came up. */
   std::function<void()> onDragEnd;
 
+  /** The lower end, normalised 0..1. */
   float lowValue() const { return low_; }
+  /** The upper end, normalised 0..1; at least kMinimumGap above lowValue(). */
   float highValue() const { return high_; }
 
+  /**
+   * Set both ends, normalised. Each is clamped to 0..1, the two are swapped if
+   * given the wrong way round, and they are pushed kMinimumGap apart. Calls
+   * onRangeChange when something changed and `notify` is true. Opens no
+   * gesture: a caller making this an edit brackets it itself.
+   */
   void setRange(float low, float high, bool notify = true) {
     float a = clamp01(low), b = clamp01(high);
     // Swapped rather than refused. A caller setting them the wrong way round
@@ -62,7 +78,17 @@ public:
       a = b;
       b = t;
     }
-    if (b - a < kMinimumGap) b = a + kMinimumGap > 1.0f ? 1.0f : a + kMinimumGap;
+    // Too close: the high end moves up to make the gap, and at the top of
+    // the track, where it cannot, the low end moves down instead. Moving only
+    // the high end left 1..1 a range of nothing.
+    if (b - a < kMinimumGap) {
+      if (a + kMinimumGap <= 1.0f) {
+        b = a + kMinimumGap;
+      } else {
+        b = 1.0f;
+        a = 1.0f - kMinimumGap;
+      }
+    }
     if (a == low_ && b == high_) return;
     low_ = a;
     high_ = b;
@@ -91,8 +117,9 @@ public:
     grabOffset_ = at;
     grabLow_ = low_;
     grabHigh_ = high_;
+    detail::DeletionWatch alive(this);
     if (onDragStart) onDragStart();
-    applyDrag(at);
+    if (!alive.deleted) applyDrag(at);
   }
 
   void mouseDrag(const MouseEvent& e) override {
@@ -103,8 +130,10 @@ public:
   void mouseUp(const MouseEvent&) override {
     if (dragging_ == Drag::None) return;
     dragging_ = Drag::None;
-    if (onDragEnd) onDragEnd();
+    // Repainted BEFORE the handler, which is the owner's and may delete this
+    // slider: an editor rebuilt once a drag ends.
     repaint();
+    if (onDragEnd) onDragEnd();
   }
 
 private:
@@ -130,10 +159,10 @@ private:
       case Drag::Low:
         // Pushed against the other end rather than through it. A range whose
         // ends can cross is the bug this control exists to prevent.
-        setRange(std::min(at, high_ - kMinimumGap), high_);
+        setRange((std::min)(at, high_ - kMinimumGap), high_);
         break;
       case Drag::High:
-        setRange(low_, std::max(at, low_ + kMinimumGap));
+        setRange(low_, (std::max)(at, low_ + kMinimumGap));
         break;
       case Drag::Both: {
         // The whole range moves, keeping its WIDTH -- and stops at the ends
@@ -164,8 +193,11 @@ private:
  */
 class IconButton : public Widget {
 public:
+  /** No icon yet. Takes no keyboard focus, so Tab passes it by. */
   IconButton() { setCursor(MouseCursor::Pointing); }
 
+  /** A click released inside the button -- after the state flipped, for a
+   *  toggleable one -- and setToggled with `notify`. */
   std::function<void()> onClick;
 
   /** Parsed once and kept. A button re-parsing its icon thirty times a second
@@ -175,11 +207,20 @@ public:
     repaint();
   }
 
+  /** The parsed icon; empty until setIcon is given SVG that parses. */
   const Drawable& icon() const { return icon_; }
+  /** Whether there is an icon to draw. */
   bool hasIcon() const { return !icon_.isEmpty(); }
 
+  /** Make each click flip isToggled before onClick runs. There is no onToggle:
+   *  onClick reads isToggled. */
   void setToggleable(bool canToggle) { toggleable_ = canToggle; }
+  /** Whether clicks flip it. */
+  bool isToggleable() const { return toggleable_; }
+  /** The toggle's state; false until toggled. */
   bool isToggled() const { return toggled_; }
+  /** Set the state directly. Unlike Button::setToggled, `notify` is false by
+   *  default, and notifying calls onClick. */
   void setToggled(bool on, bool notify = false) {
     if (on == toggled_) return;
     toggled_ = on;
@@ -198,7 +239,11 @@ public:
     LookAndFeel& lf = lookAndFeel();
     const WidgetState state = stateFor(pressed_);
     lf.drawIconButtonBackground(g, localBounds(), state, toggled_);
-    if (!icon_.isEmpty()) icon_.draw(g, localBounds().reduced(inset_));
+    // currentColor is the theme's: an icon set's icon follows the text
+    // colour, the toggle and the disabled state. Drawn in the SVG's own
+    // default -- black -- it all but vanished on the dark plate under it.
+    if (!icon_.isEmpty())
+      icon_.draw(g, localBounds().reduced(inset_), lf.iconButtonColour(state, toggled_));
   }
 
   void mouseDown(const MouseEvent&) override {
@@ -259,17 +304,21 @@ private:
  */
 class ImageComponent : public Widget {
 public:
+  /** Shows nothing until setImage. Clicks pass through it. */
   ImageComponent() {
     // A picture is not a control. Clicks pass through to whatever is behind,
     // which is what makes a logo safe to put over a panel.
     setInterceptsMouse(false);
   }
 
+  /** Not owned: the bitmap must outlive this component, or be replaced first.
+   *  Null shows nothing. */
   void setImage(const Bitmap* image) {
     image_ = image;
     repaint();
   }
 
+  /** The bitmap shown, or null. */
   const Bitmap* image() const { return image_; }
 
   /** How the picture fits its box. Contain by default -- the one that never
@@ -313,18 +362,24 @@ private:
  */
 class HyperlinkButton : public Widget {
 public:
+  /** No text and no URL yet. Takes keyboard focus; Space or Return follows it. */
   HyperlinkButton() {
     setWantsKeyboardFocus(true);
     setCursor(MouseCursor::Pointing);
   }
 
+  /** The words shown -- also its accessible name when none was set. */
   void setText(std::string text) {
     text_ = std::move(text);
     repaint();
   }
+  /** The words shown. */
   const std::string& text() const { return text_; }
 
+  /** What onFollow is handed, and what a reader gives as the description when
+   *  none was set. Nothing here opens it: see the class comment. */
   void setUrl(std::string url) { url_ = std::move(url); }
+  /** The URL setUrl set. */
   const std::string& url() const { return url_; }
 
   /** What to do about it. Given the URL, so a caller can open it, copy it, or

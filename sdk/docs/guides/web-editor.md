@@ -1,0 +1,142 @@
+# The web editor
+
+A plugin's face as an HTML page, shown in the operating system's webview and
+wired to the plugin through `window.sonore`. The bridge is the same one the
+Sonorie studio's browser preview provides, so a page approved there opens
+unchanged in a DAW.
+
+## Supplying the page
+
+Define `SONORE_UI_HTML` as the whole document, and `SONORE_UI_WIDTH` and
+`SONORE_UI_HEIGHT` as its size (700 by 420 when left out), before the last
+include. With a page and `PluginDescriptor::editor` left at
+`sonore::EditorKind::Auto`, the plugin opens the webview.
+
+```cpp
+// test-run
+#define SONORE_NUM_PARAMS 2
+#include <sonore/dsp.h>
+
+struct SonoreDsp {
+  sonore::Smooth driveSm;
+
+  void prepare(const sonore::ProcessSpec& spec) {
+    driveSm.setup((float) spec.sampleRate, 12.0f);
+    driveSm.snap(1.0f);
+  }
+
+  void process(sonore::AudioBlock<float>& io, const float* p) {
+    const float out = sonore::dbToGain(p[1]);
+    for (size_t i = 0; i < io.getNumSamples(); ++i) {
+      const float drive = driveSm.next(p[0]);
+      for (size_t c = 0; c < io.getNumChannels(); ++c) {
+        float& x = io.getChannelPointer(c)[i];
+        x = std::tanh(x * drive) * out;
+      }
+    }
+  }
+};
+
+#include <sonore/plugin.h>
+
+static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
+    {"drive", "Drive", "x", 1.0f, 20.0f, 2.0f},
+    {"output", "Output", "dB", -24.0f, 12.0f, 0.0f},
+};
+
+static const sonore::PluginDescriptor kDesc = {
+    "com.mycompany.webdrive", "Web Drive", "My Company", "1.0.0",
+    "A drive with a page for a face.", "",
+    false, kParamTable, SONORE_NUM_PARAMS,
+};
+
+#define SONORE_UI_WIDTH 420
+#define SONORE_UI_HEIGHT 160
+#define SONORE_UI_HTML R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<style>body{margin:0;padding:16px;font:13px system-ui,sans-serif;background:#16181c;color:#e6e6e6}
+label{display:flex;gap:12px;align-items:center;margin:8px 0}input{flex:1}</style></head>
+<body><div id="rows"></div><script>
+window.addEventListener('sonore:ready', function () {
+  var rows = document.getElementById('rows');
+  sonore.params.forEach(function (p, i) {
+    var label = document.createElement('label');
+    var name = document.createElement('span'); name.textContent = p.label;
+    var input = document.createElement('input');
+    input.type = 'range'; input.min = 0; input.max = 1; input.step = 0.001;
+    var text = document.createElement('span');
+    var show = function (v) {
+      input.value = sonore.toNormalised(i, v);
+      text.textContent = sonore.format(i, v); // the host's own text
+    };
+    // A drag is one gesture: one automation pass, one undo step in the host.
+    input.addEventListener('pointerdown', function () { sonore.begin(i); });
+    input.addEventListener('input', function () {
+      sonore.set(i, sonore.fromNormalised(i, Number(input.value)));
+      text.textContent = sonore.format(i);
+    });
+    input.addEventListener('change', function () { sonore.end(i); });
+    label.appendChild(name); label.appendChild(input); label.appendChild(text);
+    rows.appendChild(label);
+    show(p.value);
+    // Every change, from this page or from the host's automation.
+    sonore.on(function (values, index, value) { if (index === i) show(value); });
+  });
+});
+</script></body></html>)HTML"
+
+#include <sonore/formats.h>
+```
+
+The page starts work on the `sonore:ready` event, which fires once the bridge
+exists. A knob turned on the page emits the same parameter and gesture events a
+host-side control does, so it records as automation; values cross to the audio
+thread through a lock-free queue.
+
+## What the page gets
+
+| Member | |
+| --- | --- |
+| `sonore.name`, `sonore.vendor`, `sonore.params` | identity, and every parameter in the plugin's order: `id`, `label`, `unit`, `min`, `max`, `default`, `step`, `skew`, `readOnly`, `value`, `names` |
+| `get(p)`, `set(p, v)` | plain values; a parameter is named by index, id, label or the object itself |
+| `begin(p)`, `end(p)` | a gesture around a drag |
+| `on(cb)` | `cb(values, index, value)` on any change |
+| `format(p, v)`, `toNormalised(p, v)`, `fromNormalised(p, n)` | the host's text, and its automation curve |
+| `onLevel(cb)`, `onVU(cb)` | meters, up to about thirty times a second while the level moves (not a clock) |
+| `noteOn(note, velocity)`, `noteOff(note)`, `onNotes(cb)` | on-screen keyboards for an instrument |
+| `presets`, `loadPreset(i)` | factory presets by name, applied in the plugin |
+| `chooseFile(purpose)`, `onFile(cb)` | a native file dialog; the path also reaches the DSP's `loadFile(purpose, path)` |
+| `state`, `onState(cb)` | the plugin's state beyond its parameters, as strings |
+| `contextMenu(p, x, y)` | the HOST's menu for a control: MIDI learn, automation |
+| `captureKeys(on)` | take the keyboard for something that reads keys and is not a text field; a focused text field takes it by itself |
+
+The complete list, with types, is `sonore/sonore.d.ts`, installed with the
+headers: reference it from TypeScript and the compiler checks the page against
+it. `npm run verify:bridge-types` checks that file against the bridge `gui.h`
+generates, member for member.
+
+## Per platform
+
+- **Windows**: Edge WebView2. Its SDK (BSD-3-Clause) is fetched from nuget.org
+  when CMake configures and linked statically. `SONORE_WEBVIEW2_DIR` (a CMake
+  or environment variable) keeps the download where it survives the build, and
+  `-DSONORE_GUI=OFF` leaves the webview out. A machine without the Edge
+  runtime gets the native editor in a CLAP or VST3. The page is served from
+  memory at an address of the plugin's own,
+  `https://<plugin id>-<hash>.sonore.invalid/editor.html`, which never leaves
+  the process: it reloads like any page, and `localStorage` and IndexedDB
+  work, kept per plugin (shared by its instances, not by other plugins) and
+  across sessions. Keep anything the session must restore in the plugin's
+  state (`sonore.state`), not there: a project moved to another machine does
+  not carry it.
+- **Linux**: GTK3 and WebKitGTK, loaded at run time, newest WebKit first, so
+  the plugin loads on distributions with either version and builds with no GTK
+  development packages installed.
+- **macOS**: WKWebView, driven through the Objective-C runtime, so a project
+  stays plain C++.
+
+On Linux and macOS the page is loaded as a string with no address of its own,
+so a page that has to run on every platform should not depend on
+`localStorage` or on reloading itself.
+
+Only embedded windows are supported: the page lives inside the host's plugin
+window, never in a floating one.

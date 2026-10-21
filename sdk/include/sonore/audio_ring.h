@@ -45,15 +45,49 @@ public:
     read_.store(0, std::memory_order_relaxed);
     dropped_.store(0, std::memory_order_relaxed);
     starved_.store(0, std::memory_order_relaxed);
+    primed_ = false;
   }
 
+  /** A cushion for a reader on another clock: read() gives silence until
+   *  this many frames are waiting, and waits for it again after any read
+   *  that came up short. Zero, the default, reads whatever is there.
+   *
+   *  Two devices that agree on the rate do not agree on the beat -- capture
+   *  hands over one packet size, the output asks for another -- so a reader
+   *  that starts the moment anything arrives comes up short again and again
+   *  while the ring finds its level (a burst of crackles every time input
+   *  starts), and once more whenever scheduling runs later than it has yet.
+   *  One packet plus one period of cushion absorbs the phase up front, for
+   *  exactly that much latency. [before the reader starts] */
+  void setPrime(size_t frames) {
+    prime_ = frames < capacityFrames() ? frames : capacityFrames();
+    primed_ = false;
+  }
+
+  /** The most frames the ring holds at once: at least what reset() asked
+   *  for (the power of two above it, 64 or more, less the one frame kept
+   *  free). 0 before reset(). */
   size_t capacityFrames() const { return data_.empty() ? 0 : (mask_ + 1) - 1; }
+  /** Samples per interleaved frame, as reset() set it: 2 by default, at
+   *  least 1. */
   int channels() const { return channels_; }
 
+  /** [any thread] Frames written and not yet read, counting any still held
+   *  back by the cushion (see readable()). 0 before reset(). */
   size_t available() const {
     const size_t w = write_.load(std::memory_order_acquire);
     const size_t r = read_.load(std::memory_order_acquire);
     return (w - r) & mask_;
+  }
+
+  /** What read() would hand over now: nothing while the cushion is still
+   *  filling, which available() does not know about. A reader paced by the
+   *  device waits on THIS -- paced by available(), it read silence from a
+   *  ring that had a packet in it, as fast as it could loop, and a recording
+   *  could be silent from start to end. [reader] */
+  size_t readable() const {
+    const size_t have = available();
+    return prime_ > 0 && !primed_ && have < prime_ ? 0 : have;
   }
 
   /** Capture side. Frames that do not fit are DROPPED and counted, never
@@ -87,6 +121,16 @@ public:
     const size_t r = read_.load(std::memory_order_relaxed);
     const size_t w = write_.load(std::memory_order_acquire);
     const size_t have = (w - r) & mask_;
+    if (prime_ > 0 && !primed_) {
+      // Filling the cushion: silence, and not a shortfall -- this is the
+      // latency the cushion costs, paid once.
+      if (have < prime_) {
+        std::memset(left, 0, frames * sizeof(float));
+        std::memset(right, 0, frames * sizeof(float));
+        return;
+      }
+      primed_ = true;
+    }
     const size_t take = frames < have ? frames : have;
     const size_t ch = (size_t) channels_;
     for (size_t i = 0; i < take; ++i) {
@@ -99,11 +143,12 @@ public:
     }
     for (size_t i = take; i < frames; ++i) left[i] = right[i] = 0.0f;
     read_.store((r + take) & mask_, std::memory_order_release);
-    if (take < frames) starved_.fetch_add(frames - take, std::memory_order_relaxed);
+    if (take < frames) {
+      starved_.fetch_add(frames - take, std::memory_order_relaxed);
+      primed_ = false; // the cushion is gone: refill it rather than run on empty
+    }
   }
 
-  /** Frames the capture side could not fit. Non-zero means the render side is
-   *  not keeping up, or stopped. */
   /**
    * Drain side, interleaved and WITHOUT the silence fill.
    *
@@ -130,6 +175,8 @@ public:
     return take;
   }
 
+  /** Frames the capture side could not fit. Non-zero means the render side is
+   *  not keeping up, or stopped. */
   uint64_t droppedFrames() const { return dropped_.load(std::memory_order_relaxed); }
   /** Frames the render side wanted and did not have. Non-zero means the
    *  capture side is behind, which is what clock drift looks like from here. */
@@ -143,6 +190,9 @@ private:
   std::atomic<size_t> read_{0};
   std::atomic<uint64_t> dropped_{0};
   std::atomic<uint64_t> starved_{0};
+  // The reader's own: only read() and the setup calls before it touch these.
+  size_t prime_ = 0;
+  bool primed_ = false;
 };
 
 } // namespace sonore

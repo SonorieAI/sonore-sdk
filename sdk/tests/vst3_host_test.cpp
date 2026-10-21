@@ -7,8 +7,8 @@
 // structures, round-trips state, and creates the editor view.
 //
 // The parallel of clap_host_test, and for the same reason: what is tested is the
-// shipped artifact, not a second build of the same source. VST3's own quirks:
-// normalised parameters, stepCount being steps-BETWEEN-values, COM refcounting:
+// shipped artifact, not a second build of the same source. VST3's own quirks
+// (normalised parameters, stepCount being steps-BETWEEN-values, COM refcounting)
 // are exactly where a wrapper goes silently wrong, so each gets an assertion.
 #include <sonore/midi_ci.h>
 #include <vst3_c_api.h>
@@ -17,10 +17,12 @@
 #include <limits>
 #include <random>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <array>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -39,6 +41,18 @@ static void closeLib(LibHandle h) { dlclose(h); }
 
 static int g_failures = 0;
 static int g_checks = 0;
+
+#if defined(_WIN32)
+// The host window's own procedure, wrapped to count the keys the editor hands
+// back: a webview with focus keeps every keystroke unless it passes them on.
+static int g_spaceDown = 0, g_spaceUp = 0;
+static WNDPROC g_parentProc = nullptr;
+static LRESULT CALLBACK countKeysProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_KEYDOWN && w == VK_SPACE) ++g_spaceDown;
+  if (m == WM_KEYUP && w == VK_SPACE) ++g_spaceUp;
+  return CallWindowProcW(g_parentProc, h, m, w, l);
+}
+#endif
 
 static void check(bool ok, const char* what) {
   ++g_checks;
@@ -104,6 +118,21 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE streamTell(void* self, Steinberg
 
 static Steinberg_IBStreamVtbl g_streamVtbl = {streamQuery, streamAddRef, streamRelease,
                                               streamRead,  streamWrite, streamSeek, streamTell};
+
+// The same stream answering a short read as the VST3 SDK's own FileStream
+// does: the bytes it had, and kResultFalse because they were fewer than asked
+// for. IBStream does not say what a short read returns, and hosts differ.
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE streamReadShortIsFalse(void* self, void* buffer,
+                                                                       Steinberg_int32 numBytes,
+                                                                       Steinberg_int32* read) {
+  Steinberg_int32 got = 0;
+  streamRead(self, buffer, numBytes, &got);
+  if (read) *read = got;
+  return got == numBytes ? Steinberg_kResultOk : Steinberg_kResultFalse;
+}
+static Steinberg_IBStreamVtbl g_shortReadVtbl = {streamQuery,  streamAddRef, streamRelease,
+                                                 streamReadShortIsFalse, streamWrite,
+                                                 streamSeek,   streamTell};
 
 // ── A parameter-change queue the plugin can read ─────────────────────────────
 
@@ -477,8 +506,15 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE h2StartGroupEdit(void*) {
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE h2FinishGroupEdit(void*) {
   return Steinberg_kNotImplemented;
 }
-static Steinberg_uint32 SMTG_STDMETHODCALLTYPE hAddRef(void*) { return 1; }
-static Steinberg_uint32 SMTG_STDMETHODCALLTYPE hRelease(void*) { return 1; }
+// Counted: a plugin that keeps the handler must hold a reference to it, and
+// give it back when it is replaced or the controller terminates.
+static int g_handlerRefs = 0;
+static Steinberg_uint32 SMTG_STDMETHODCALLTYPE hAddRef(void*) {
+  return (Steinberg_uint32) (1 + ++g_handlerRefs);
+}
+static Steinberg_uint32 SMTG_STDMETHODCALLTYPE hRelease(void*) {
+  return (Steinberg_uint32) (1 + --g_handlerRefs);
+}
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE hBegin(void* self, Steinberg_Vst_ParamID) {
   ((Handler*) self)->begins++;
   return Steinberg_kResultOk;
@@ -533,7 +569,16 @@ int main(int argc, char** argv) {
    *  which answer is the correct one -- inferring it from the query would make
    *  the check agree with whatever the plugin happened to do. */
   bool expectMpe = false;
+  /** Drag the first row of a native GENERIC editor (one with no parameter
+   *  groups, so its first slider sits at a fixed place) and expect the host to
+   *  hear about it. */
+  bool dragNativeEditor = false;
+  /** The DSP opens a filter with per-note pressure (the synth example), so a
+   *  poly pressure event must make a held note audibly brighter. */
+  bool expectPressureBrightens = false;
   for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--expect-pressure") == 0) expectPressureBrightens = true;
+    if (std::strcmp(argv[i], "--drag-native-editor") == 0) dragNativeEditor = true;
     if (std::strcmp(argv[i], "--expect-native-editor") == 0) expectEditor = 1;
     if (std::strcmp(argv[i], "--expect-web-editor") == 0) expectEditor = 2;
     if (std::strcmp(argv[i], "--expect-bridge") == 0) expectBridge = true;
@@ -551,6 +596,18 @@ int main(int argc, char** argv) {
     }
   }
   std::printf("Sonore VST3 host test\n  plugin: %s\n\n", path);
+
+  // The GUI probe saves how many times its state was restored only when this
+  // is set (a count no save/load round trip can reproduce, which is what
+  // clap-validator checks of the same binary). Set before the module loads,
+  // so a plugin with its own C runtime copies it in at startup.
+  if (expectBridge) {
+#if defined(_WIN32)
+    _putenv_s("SONORE_PROBE_COUNT_LOADS", "1");
+#else
+    setenv("SONORE_PROBE_COUNT_LOADS", "1", 1);
+#endif
+  }
 
   LibHandle lib = openLib(path);
   if (!lib) {
@@ -663,6 +720,14 @@ int main(int argc, char** argv) {
       component->lpVtbl->getBusCount(component, Steinberg_Vst_MediaTypes_kEvent,
                                      Steinberg_Vst_BusDirections_kInput);
   const bool isInstrument = numEvent > 0;
+  // An event bus counts MIDI CHANNELS, and it said 1: a host may then route or
+  // map channel 1 alone, which is the end of MPE (one channel per note).
+  if (numEvent > 0) {
+    Steinberg_Vst_BusInfo ei{};
+    component->lpVtbl->getBusInfo(component, Steinberg_Vst_MediaTypes_kEvent,
+                                  Steinberg_Vst_BusDirections_kInput, 0, &ei);
+    check(ei.channelCount == 16, "the event input bus carries all 16 MIDI channels");
+  }
   if (expectMidiOut) {
     const Steinberg_int32 evOut = component->lpVtbl->getBusCount(
         component, Steinberg_Vst_MediaTypes_kEvent, Steinberg_Vst_BusDirections_kOutput);
@@ -672,6 +737,7 @@ int main(int argc, char** argv) {
                                         Steinberg_Vst_BusDirections_kOutput, 0,
                                         &ei) == Steinberg_kResultOk,
           "…and it reports its info");
+    check(ei.channelCount == 16, "…as 16 MIDI channels");
   }
 
   if (expectAuxOuts >= 0) {
@@ -875,9 +941,18 @@ int main(int argc, char** argv) {
   handler.lpVtbl = &g_hVtbl;
   g_handler2.lpVtbl = &g_h2Vtbl;
   g_handler2.owner = &handler;
+  g_handlerRefs = 0;
   check(controller->lpVtbl->setComponentHandler(
             controller, (Steinberg_Vst_IComponentHandler*) &handler) == Steinberg_kResultOk,
         "the component handler is accepted");
+  {
+    // Kept, so referenced. The plugin held a bare pointer: a host that let go
+    // of its handler, trusting COM, left the plugin calling into freed memory.
+    char line[200];
+    std::snprintf(line, sizeof(line), "the plugin holds a reference to the handler it keeps "
+                  "(%d held)", g_handlerRefs);
+    check(g_handlerRefs == 1, line);
+  }
 
   // ── Activate and process ──────────────────────────────────────────────────
   const Steinberg_int32 blockSize = 128;
@@ -891,6 +966,21 @@ int main(int argc, char** argv) {
   check(component->lpVtbl->setActive(component, 1) == Steinberg_kResultOk,
         "the component activates");
   processor->lpVtbl->setProcessing(processor, 1);
+
+  // Activation is where a host reads the latency, so the first poll after it
+  // has nothing to announce. Compared with an unseeded zero, every plugin with
+  // latency asked for a restart here -- one engine restart per instance at
+  // project load.
+  {
+    handler.latencyRestarts = 0;
+    controller->lpVtbl->getParamNormalized(controller, 0);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a freshly activated plugin (latency %u) does not announce "
+                  "a latency change on the first poll (%d restart(s))",
+                  (unsigned) processor->lpVtbl->getLatencySamples(processor),
+                  handler.latencyRestarts);
+    check(handler.latencyRestarts == 0, line);
+  }
 
   std::vector<float> inL(blockSize), inR(blockSize), outL(blockSize), outR(blockSize);
   float* inPtrs[2] = {inL.data(), inR.data()};
@@ -978,6 +1068,32 @@ int main(int argc, char** argv) {
   };
 
   const int oneSecond = 48000 / blockSize;
+
+  // ── An input bus with no channels ─────────────────────────────────────────
+  //
+  // A host that switched the input bus off may still pass it, with zero
+  // channels and the pointer array set. Every output channel past the
+  // input's width copied the input's LAST channel -- numChannels - 1, which
+  // for zero is channelBuffers32[0xFFFFFFFF].
+  if (!isInstrument) {
+    inBus.numChannels = 0;
+    std::fill(outL.begin(), outL.end(), 0.5f); // whatever the host's buffer held
+    std::fill(outR.begin(), outR.end(), 0.5f);
+    processor->lpVtbl->process(processor, &data);
+    queues.clear();
+    events.clear();
+    double peak = 0.0;
+    bool finite = true;
+    for (Steinberg_int32 i = 0; i < blockSize; ++i) {
+      if (!std::isfinite(outL[i])) finite = false;
+      if (std::fabs(outL[i]) > peak) peak = std::fabs(outL[i]);
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "an input bus with no channels is processed as silence "
+                  "(peak %.4f), not read at channel -1", peak);
+    check(finite && peak < 0.01, line);
+    inBus.numChannels = 2;
+  }
 
   if (isInstrument) {
     const Result rest = run(oneSecond / 4, true);
@@ -1391,6 +1507,8 @@ int main(int argc, char** argv) {
   // The check is that we ask for exactly what readTransport() reads. Asking
   // for less means the host may stop filling a field the wrapper still
   // dereferences; asking for more is the fault the interface exists to fix.
+  // The cycle was the field asked for less: readTransport reads its two ends,
+  // and this list, and the check, had been written before it did.
   {
     Steinberg_Vst_IProcessContextRequirements* req = nullptr;
     const bool got = component->lpVtbl->queryInterface(
@@ -1405,7 +1523,8 @@ int main(int argc, char** argv) {
           Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTempo |
           Steinberg_Vst_IProcessContextRequirements_Flags_kNeedProjectTimeMusic |
           Steinberg_Vst_IProcessContextRequirements_Flags_kNeedBarPositionMusic |
-          Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTimeSignature;
+          Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTimeSignature |
+          Steinberg_Vst_IProcessContextRequirements_Flags_kNeedCycleMusic;
       std::printf("  ---- context requirements: 0x%03x ----\n", (unsigned) flags);
       check(flags == wanted,
             "…and asks for exactly the fields the wrapper reads, no more");
@@ -1586,6 +1705,39 @@ int main(int argc, char** argv) {
         checkNear(fresh / (plain > 0.0 ? plain : 1.0), 1.0, 0.02,
                   "a NEW note is not still carrying the last one's bend");
 
+        // PRESSURE on that held note, the way VST3 sends it: a typed poly
+        // pressure EVENT, not raw MIDI. The wrapper had no case for it -- a
+        // comment claimed it would arrive as MIDI -- so every MPE
+        // controller's pressure was dropped. The synth opens its filter with
+        // pressure, so the note must get brighter: measured as the share of
+        // its energy in its sample-to-sample differences.
+        if (expectPressureBrightens) {
+        auto brightness = [](const std::vector<float>& sig) {
+          double e = 0.0, d = 0.0;
+          for (size_t i = 1; i < sig.size(); ++i) {
+            e += (double) sig[i] * sig[i];
+            const double diff = (double) sig[i] - sig[i - 1];
+            d += diff * diff;
+          }
+          return e > 1e-12 ? std::sqrt(d / e) : 0.0;
+        };
+        capture(oneSecond / 4);
+        const double before = brightness(captured);
+        Steinberg_Vst_Event press{};
+        press.type = Steinberg_Vst_Event_EventTypes_kPolyPressureEvent;
+        press.Steinberg_Vst_Event_polyPressure.channel = 0;
+        press.Steinberg_Vst_Event_polyPressure.pitch = 45;
+        press.Steinberg_Vst_Event_polyPressure.pressure = 1.0f;
+        press.Steinberg_Vst_Event_polyPressure.noteId = kNoteId + 1;
+        events.push_back(press);
+        capture(oneSecond / 4);
+        capture(oneSecond / 4);
+        const double after = brightness(captured);
+        std::printf("  ---- poly pressure 1.0 on the held note: brightness %.4f -> %.4f ----\n",
+                    before, after);
+        check(after > before * 1.2, "a VST3 poly pressure event reaches the voice it names");
+        }
+
         queues.clear();
         events.clear();
         Steinberg_Vst_Event off2{};
@@ -1635,6 +1787,21 @@ int main(int argc, char** argv) {
       check(mapping->lpVtbl->getMidiControllerAssignment(mapping, 0, 99, 1, &outOfRange) !=
                 Steinberg_kResultOk,
             "a channel that does not exist is refused rather than given an id");
+      // Program change is controller 130: refused, a VST3 build never heard
+      // one that its CLAP build did.
+      Steinberg_Vst_ParamID programId = 0, programId16 = 0, pastProgram = 0;
+      check(mapping->lpVtbl->getMidiControllerAssignment(
+                mapping, 0, 1, Steinberg_Vst_ControllerNumbers_kCtrlProgramChange, &programId) ==
+                    Steinberg_kResultOk &&
+                mapping->lpVtbl->getMidiControllerAssignment(
+                    mapping, 0, 15, Steinberg_Vst_ControllerNumbers_kCtrlProgramChange,
+                    &programId16) == Steinberg_kResultOk &&
+                programId != programId16 && programId != bendId && programId != ccId,
+            "program change has an id of its own on every channel");
+      check(mapping->lpVtbl->getMidiControllerAssignment(
+                mapping, 0, 0, Steinberg_Vst_ControllerNumbers_kCtrlProgramChange + 1, &pastProgram) !=
+                Steinberg_kResultOk,
+            "…and a controller number past it is refused");
 
       // Every mapped id must be a parameter the controller actually declares,
       // or the host writes to something that is not there.
@@ -1923,6 +2090,8 @@ int main(int argc, char** argv) {
       break;
     }
     check(foundBypass, "an effect has a parameter flagged kIsBypass");
+    check(binfo.id == 0x62797073u,
+          "...under a fixed id ('byps'), not one past the table where appending moved it");
 
     const Steinberg_uint32 L = processor->lpVtbl->getLatencySamples(processor);
 
@@ -2070,6 +2239,52 @@ int main(int argc, char** argv) {
     checkNear(controller->lpVtbl->getParamNormalized(controller, 0), 0.6, 1e-3,
               "the saved value came back");
 
+    // A host restoring a session calls the component's setState and then the
+    // controller's setComponentState with the same bytes. For a plugin whose
+    // component IS its controller that is one restore, not two: loading it
+    // twice read a sampler's file from disk twice on every project open.
+    if (expectBridge) {
+      auto loadsSoFar = [&]() {
+        MemStream now;
+        now.lpVtbl = &g_streamVtbl;
+        component->lpVtbl->getState(component, (Steinberg_IBStream*) &now);
+        const std::string text(now.bytes.begin(), now.bytes.end());
+        const size_t at = text.find("loads ");
+        return at == std::string::npos ? -1 : std::atoi(text.c_str() + at + 6);
+      };
+      const int before = loadsSoFar();
+      saved.pos = 0;
+      component->lpVtbl->setState(component, (Steinberg_IBStream*) &saved);
+      saved.pos = 0;
+      controller->lpVtbl->setComponentState(controller, (Steinberg_IBStream*) &saved);
+      const int after = loadsSoFar();
+      char line[200];
+      std::snprintf(line, sizeof(line), "setState then setComponentState with the same bytes "
+                    "restores the plugin once (%d load(s))", after - before);
+      check(before >= 0 && after - before == 1, line);
+    }
+
+    // A host whose stream ends with a short read that says kResultFalse, as
+    // the VST3 SDK's FileStream does. The wrapper read in 4 KB pieces and
+    // dropped a piece that came back with anything but kResultOk -- for a
+    // state under 4 KB, the whole of it: the session reopened at defaults
+    // and the host was told the load had failed.
+    {
+      controller->lpVtbl->setParamNormalized(controller, 0, 0.1);
+      MemStream shortReads;
+      shortReads.lpVtbl = &g_shortReadVtbl;
+      shortReads.bytes = saved.bytes;
+      char line[200];
+      std::snprintf(line, sizeof(line),
+                    "a %zu-byte state from a stream that ends on a short read loads",
+                    saved.bytes.size());
+      check(component->lpVtbl->setState(component, (Steinberg_IBStream*) &shortReads) ==
+                Steinberg_kResultOk,
+            line);
+      checkNear(controller->lpVtbl->getParamNormalized(controller, 0), 0.6, 1e-3,
+                "…and the saved value came back");
+    }
+
     MemStream junk;
     junk.lpVtbl = &g_streamVtbl;
     junk.bytes = {'n', 'o', 'p', 'e', 0, 0, 0, 0, 0, 0, 0, 0};
@@ -2208,6 +2423,29 @@ int main(int argc, char** argv) {
       check(tiny.right - tiny.left >= 320 && tiny.bottom - tiny.top >= 200,
             "a size constraint enforces a floor instead of collapsing the page");
 
+      // The same floor at 200%, in DEVICE pixels: twice the 1x one. The clamp
+      // used to compare the host's device rect with the logical limits, so at
+      // 2x it approved half the size the editor then insisted on.
+      {
+        Steinberg_IPlugViewContentScaleSupport* scale = nullptr;
+        if (view->lpVtbl->queryInterface(view, Steinberg_IPlugViewContentScaleSupport_iid,
+                                         (void**) &scale) == Steinberg_kResultOk && scale) {
+          scale->lpVtbl->setContentScaleFactor(scale, 2.0f);
+          Steinberg_ViewRect tiny2{0, 0, 10, 10};
+          view->lpVtbl->checkSizeConstraint(view, &tiny2);
+          char line[200];
+          std::snprintf(line, sizeof(line), "at 2x the size-constraint floor is %dx%d device pixels, "
+                        "twice the 1x %dx%d", (int) (tiny2.right - tiny2.left),
+                        (int) (tiny2.bottom - tiny2.top), (int) (tiny.right - tiny.left),
+                        (int) (tiny.bottom - tiny.top));
+          check(tiny2.right - tiny2.left == 2 * (tiny.right - tiny.left) &&
+                    tiny2.bottom - tiny2.top == 2 * (tiny.bottom - tiny.top),
+                line);
+          scale->lpVtbl->setContentScaleFactor(scale, 1.0f);
+          scale->lpVtbl->release(scale);
+        }
+      }
+
       Steinberg_ViewRect resized{0, 0, 640, 380};
       check(view->lpVtbl->onSize(view, &resized) == Steinberg_kResultOk, "the view accepts a size");
       view->lpVtbl->getSize(view, &rect);
@@ -2222,6 +2460,8 @@ int main(int argc, char** argv) {
                                     640, 380, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
       check(parent != nullptr, "the test host created a parent window");
       if (parent) {
+        g_spaceDown = g_spaceUp = 0;
+        g_parentProc = (WNDPROC) SetWindowLongPtrW(parent, GWLP_WNDPROC, (LONG_PTR) countKeysProc);
         check(view->lpVtbl->attached(view, parent, platform) == Steinberg_kResultOk,
               "the view attaches to a real host window");
 
@@ -2258,13 +2498,172 @@ int main(int argc, char** argv) {
         pump(400);
         check(true, "the editor survived two seconds of a real message loop");
 
+        // ── The native editor's edits reach the HOST ──────────────────────
+        //
+        // The page has always reported its edits through IComponentHandler.
+        // The native editor only queued them for the DSP -- enough in CLAP,
+        // where the audio thread reports them back, and nothing at all in
+        // VST3: a knob moved on it recorded no automation and made no undo
+        // step. So a real drag, posted to the editor's own window, on the
+        // first row of the generic editor, and the host must see a gesture
+        // open, values arrive, and the gesture close.
+        if (dragNativeEditor) {
+          HWND editorHwnd = GetWindow(parent, GW_CHILD);
+          // The window's own DPI, asked the way the peer asks it; LOGPIXELSX
+          // would be the system's answer, not this window's.
+          UINT dpi = 96;
+          typedef UINT(WINAPI * GetDpiForWindowFn)(HWND);
+          HMODULE user32 = GetModuleHandleW(L"user32.dll");
+          const auto getDpi =
+              user32 ? (GetDpiForWindowFn) GetProcAddress(user32, "GetDpiForWindow") : nullptr;
+          if (getDpi && editorHwnd) dpi = getDpi(editorHwnd);
+          const double scale = (double) dpi / 96.0;
+          // GenericEditor's first row: below the preset bar (PresetBar::kHeight
+          // 30), kPadding 12 and half of kRowHeight 34 down; across, kPadding +
+          // kLabelWidth 108 + its 8 px spacer, and 40 more to land on the
+          // track rather than its end.
+          const int x = (int) ((12.0 + 108.0 + 8.0 + 40.0) * scale);
+          const int y = (int) ((30.0 + 12.0 + 17.0) * scale);
+          const int to = x + (int) (60.0 * scale);
+          const int begins0 = handler.begins, edits0 = handler.edits, ends0 = handler.ends;
+          SendMessageW(editorHwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+          SendMessageW(editorHwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(to, y));
+          SendMessageW(editorHwnd, WM_LBUTTONUP, 0, MAKELPARAM(to, y));
+          pump(4);
+          char line[200];
+          std::snprintf(line, sizeof(line),
+                        "a drag on the native editor opened a gesture with the host "
+                        "(beginEdit x%d, endEdit x%d)",
+                        handler.begins - begins0, handler.ends - ends0);
+          check(handler.begins > begins0 && handler.ends > ends0, line);
+          std::snprintf(line, sizeof(line), "…and told it each value through performEdit (x%d)",
+                        handler.edits - edits0);
+          check(handler.edits > edits0, line);
+          check(handler.begins - begins0 == handler.ends - ends0,
+                "…with every beginEdit closed by an endEdit");
+          check(handler.lastId == 0, "…on the parameter that was dragged");
+
+          // ── The host's menu, where the user right-clicked, at 200% ──
+          //
+          // The editor reports a right-click in logical pixels, and the menu
+          // is placed in the view's coordinates, which carry the content
+          // scale. Unconverted, the menu opened halfway to the click.
+          {
+            Steinberg_IPlugViewContentScaleSupport* scaleSupport = nullptr;
+            if (view->lpVtbl->queryInterface(view, Steinberg_IPlugViewContentScaleSupport_iid,
+                                             (void**) &scaleSupport) == Steinberg_kResultOk &&
+                scaleSupport) {
+              scaleSupport->lpVtbl->setContentScaleFactor(scaleSupport, 2.0f);
+              pump(4);
+              const int popupsBefore = g_menuPopups;
+              const int rx = (int) ((12.0 + 108.0 + 8.0 + 40.0) * 2.0);
+              const int ry = (int) ((30.0 + 12.0 + 17.0) * 2.0);
+              SendMessageW(editorHwnd, WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM(rx, ry));
+              SendMessageW(editorHwnd, WM_RBUTTONUP, 0, MAKELPARAM(rx, ry));
+              pump(4);
+              char where[200];
+              std::snprintf(where, sizeof(where), "at 200%% the host's menu opens where the "
+                            "native editor was right-clicked (%d,%d, want %d,%d)", g_menuX,
+                            g_menuY, rx, ry);
+              check(g_menuPopups > popupsBefore && std::abs(g_menuX - rx) <= 2 &&
+                        std::abs(g_menuY - ry) <= 2,
+                    where);
+              scaleSupport->lpVtbl->setContentScaleFactor(scaleSupport, 1.0f);
+              pump(4);
+              scaleSupport->lpVtbl->release(scaleSupport);
+            }
+          }
+
+          // And put it back the way a host would, so the checks after this
+          // one measure the plugin at its defaults rather than this drag.
+          Steinberg_Vst_ParameterInfo first{};
+          if (controller->lpVtbl->getParameterInfo(controller, 0, &first) == Steinberg_kResultOk) {
+            ValueQueue vq;
+            vq.lpVtbl = &g_vqVtbl;
+            vq.id = first.id;
+            vq.value = first.defaultNormalizedValue;
+            queues.push_back(vq);
+            processor->lpVtbl->process(processor, &data);
+            queues.clear();
+            events.clear();
+            controller->lpVtbl->setParamNormalized(controller, first.id,
+                                                   first.defaultNormalizedValue);
+          }
+        }
+
+        // ── A key held across a flush ─────────────────────────────────────
+        //
+        // A host with the transport stopped calls process() with no samples to
+        // deliver parameters. The on-screen keyboard's notes were drained from
+        // the editor's queue into that call's MIDI -- and cleared, unplayed, at
+        // the start of the next one. A lost note-on is a key that does not
+        // sound; a lost note-off is one that never stops.
+        if (expectEditor == 1 && isInstrument) {
+          HWND editorHwnd = GetWindow(parent, GW_CHILD);
+          RECT client{};
+          GetClientRect(editorHwnd, &client);
+          const int x = (client.right - client.left) / 2;
+          // The keyboard is the editor's last row, but the editor keeps its own
+          // height inside a taller window, so it is found rather than computed:
+          // up from the bottom edge until a press sounds. Every press goes
+          // through a flush before any audio runs.
+          run(2 * oneSecond, true); // let anything still ringing die away
+          double loudest = 0.0;
+          bool finite = true;
+          for (int y = client.bottom - 6; y > client.bottom - 140 && loudest <= 1e-3; y -= 8) {
+            SendMessageW(editorHwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+            const Steinberg_int32 frames = data.numSamples;
+            data.numSamples = 0; // the flush
+            processor->lpVtbl->process(processor, &data);
+            data.numSamples = frames;
+            const Result held = run(oneSecond / 4, true);
+            if (!held.finite) finite = false;
+            if (held.peak > loudest) loudest = held.peak;
+            SendMessageW(editorHwnd, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+            run(oneSecond, true);
+          }
+          char line[200];
+          std::snprintf(line, sizeof(line), "a key pressed on the native editor across a host's "
+                        "flush still sounds (peak %.4f)", loudest);
+          check(finite && loudest > 1e-3, line);
+        }
+
         if (expectBridge) {
+          // Before ANY process() call: once the page has told the host
+          // (performEdit), the controller must already report the value. Only
+          // the page's echo was written on the main thread, so until the audio
+          // thread drained the queue the host read the old value back -- for
+          // good, with processing suspended -- and the next tick pushed it to
+          // the page, flicking the knob back.
+          for (int i = 0; i < 800 && handler.edits == 0; ++i) pump(2);
+          {
+            // The probe's page presses the spacebar and leaves it alone; it
+            // must reach the host window, where it is transport.
+            for (int i = 0; i < 800 && g_spaceUp == 0; ++i) pump(2);
+            char line[200];
+            std::snprintf(line, sizeof(line), "a space the page did not use reaches the host window "
+                          "(%d down, %d up)", g_spaceDown, g_spaceUp);
+            check(g_spaceDown >= 1 && g_spaceUp >= 1, line);
+          }
+          if (handler.edits > 0) {
+            const double unprocessed = controller->lpVtbl->normalizedParamToPlain(
+                controller, 1, controller->lpVtbl->getParamNormalized(controller, 1));
+            char line[200];
+            std::snprintf(line, sizeof(line), "a value the page set reads back at once, with no "
+                          "audio processed (%.4f, want 0.777)", unprocessed);
+            check(std::fabs(unprocessed - 0.777) < 1e-3, line);
+          }
+
           // The probe's page drives parameter 1 to 0.777 on load. Seeing it here
           // proves the whole VST3 editor chain: view attached, webview created,
           // bridge injected, message parsed, queue drained on the audio thread,
           // AND that the host was told, through IComponentHandler.
+          // Every wait on the page here is bounded at eight seconds and leaves
+          // the moment its answer arrives. WebView2 starts in its own
+          // processes, and under a parallel ctest the two-second bounds these
+          // had were occasionally not enough.
           double probe = 0.0;
-          for (int i = 0; i < 200; ++i) {
+          for (int i = 0; i < 800; ++i) {
             pump(2);
             processor->lpVtbl->process(processor, &data);
             queues.clear();
@@ -2280,7 +2679,7 @@ int main(int argc, char** argv) {
           // a state object arrives with a host name in it, so this value is
           // the bag having crossed rather than a coincidence.
           double gain = 0.0;
-          for (int i = 0; i < 200; ++i) {
+          for (int i = 0; i < 800; ++i) {
             pump(2);
             processor->lpVtbl->process(processor, &data);
             queues.clear();
@@ -2299,7 +2698,7 @@ int main(int argc, char** argv) {
           // populated with the host's own items, and pops it up. Without it a
           // user cannot MIDI-learn a knob or remove its automation -- those
           // live in that menu and nowhere else.
-          for (int i = 0; i < 100 && g_menuPopups == 0; ++i) pump(2);
+          for (int i = 0; i < 800 && g_menuPopups == 0; ++i) pump(2);
           std::printf("  ---- context menu: %d created, %d popup(s) for param %u at %d,%d, "
                       "%d release(s) ----\n",
                       g_menuCreated, g_menuPopups, (unsigned) g_menuParamId, g_menuX, g_menuY,
@@ -2518,6 +2917,42 @@ int main(int argc, char** argv) {
 #endif
       view->lpVtbl->release(view);
       check(true, "the view releases cleanly");
+
+#if defined(_WIN32)
+      // A host that releases an ATTACHED view without calling removed()
+      // first -- a crash recovery path, a sloppy host. The editor stayed in
+      // the host's window with nothing owning it, its resize callback still
+      // holding the view just freed.
+      {
+        HWND parent2 = CreateWindowExW(0, L"STATIC", L"sonore vst3 host 2", WS_OVERLAPPEDWINDOW,
+                                       0, 0, 640, 380, nullptr, nullptr, GetModuleHandleW(nullptr),
+                                       nullptr);
+        auto pumpFor = [](int ms) {
+          const DWORD until = GetTickCount() + (DWORD) ms;
+          while (GetTickCount() < until) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+              TranslateMessage(&msg);
+              DispatchMessageW(&msg);
+            }
+            Sleep(5);
+          }
+        };
+        Steinberg_IPlugView* again = controller->lpVtbl->createView(controller, "editor");
+        if (parent2 && again &&
+            again->lpVtbl->attached(again, parent2, Steinberg_kPlatformTypeHWND) ==
+                Steinberg_kResultOk) {
+          pumpFor(300);
+          const bool opened = GetWindow(parent2, GW_CHILD) != nullptr;
+          again->lpVtbl->release(again); // no removed()
+          pumpFor(100);
+          const bool gone = GetWindow(parent2, GW_CHILD) == nullptr;
+          check(opened && gone, "an attached view released without removed() takes its editor "
+                                "with it");
+        }
+        if (parent2) DestroyWindow(parent2);
+      }
+#endif
     }
   }
 
@@ -2587,7 +3022,43 @@ int main(int argc, char** argv) {
     component->lpVtbl->setActive(component, 0);
   }
 
+  // ── References counted from two threads at once ──────────────────────────
+  //
+  // A host touches the processor from its audio thread and the controller and
+  // view from its UI thread, and every one of those calls can add or drop a
+  // reference to the same object. The count was a plain integer: two threads
+  // incrementing it at once lose one, and the object is then freed while a
+  // reference is still out -- or never freed at all.
+  {
+    const Steinberg_uint32 before = component->lpVtbl->addRef(component) - 1;
+    component->lpVtbl->release(component);
+    auto hammer = [](auto* object) {
+      for (int i = 0; i < 300000; ++i) {
+        object->lpVtbl->addRef(object);
+        object->lpVtbl->release(object);
+      }
+    };
+    std::thread a([&] { hammer(component); });
+    std::thread b([&] { hammer(processor); });
+    std::thread c([&] { hammer(controller); });
+    a.join();
+    b.join();
+    c.join();
+    const Steinberg_uint32 after = component->lpVtbl->addRef(component) - 1;
+    component->lpVtbl->release(component);
+    char line[200];
+    std::snprintf(line, sizeof(line), "references counted from three threads at once come out "
+                  "even (%u before, %u after)", (unsigned) before, (unsigned) after);
+    check(after == before, line);
+  }
+
   component->lpVtbl->terminate(component);
+  {
+    char line[200];
+    std::snprintf(line, sizeof(line), "terminate gives the handler back (%d still held)",
+                  g_handlerRefs);
+    check(g_handlerRefs == 0, line);
+  }
 
   controller->lpVtbl->release(controller);
   processor->lpVtbl->release(processor);

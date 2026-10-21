@@ -23,13 +23,27 @@
 //
 // This file on its own is not a screen reader integration -- it is what a
 // bridge READS. gfx/uia_win32.h is the Windows bridge and is verified against a
-// real UI Automation client; macOS has none yet and the map carries that as a
-// real gap. So on Windows a reader hears a plugin built with this, and on macOS
-// it does not.
+// real UI Automation client. gfx/accessibility_mac.h is the macOS bridge, onto
+// NSAccessibility, and as of 2026-10-14 it has been COMPILED against a shim of
+// Apple's declarations and never run: no Mac is in this loop. So on Windows a
+// reader is known to hear a plugin built with this; on macOS it should, and
+// tests/mac_input_selftest.cpp is what a Mac developer runs to find out.
 //
 // (This paragraph said "nothing here reaches UI Automation" until the Windows
-// bridge landed one commit later. A header comment that describes a limitation
-// is a claim with an expiry date, and this one is dated deliberately.)
+// bridge landed one commit later, and "macOS has none yet" until the Mac one
+// did. A header comment that describes a limitation is a claim with an expiry
+// date, and this one is dated deliberately.)
+//
+// ── Operating a control, not only reading it ───────────────────────────────
+//
+// A reader also ACTS: VoiceOver's "increment" on a slider, "press" on a
+// button, typing a value straight into a field. Those go to the component
+// itself (Component::performAccessibleAction, setAccessibleValue,
+// setAccessibleText), which answers through the same code its keys and clicks
+// use -- a slider stepped by a reader brackets the edit exactly as an arrow key
+// does, so the host records one gesture either way. What a control will do is
+// part of its description (`actions`, `valueSettable`) so a bridge can list
+// it without asking the live tree from another thread.
 //
 // ── Why roles are a small closed set ───────────────────────────────────────
 //
@@ -78,6 +92,8 @@ enum class AccessibleRole {
   MusicalKeyboard,
 };
 
+/** The role in plain lower-case English ("toggle button"), for logs and
+ *  tests; "unknown" for Unknown. Not localised. */
 inline const char* accessibleRoleName(AccessibleRole role) {
   switch (role) {
     case AccessibleRole::Group: return "group";
@@ -101,6 +117,31 @@ inline const char* accessibleRoleName(AccessibleRole role) {
 }
 
 /**
+ * What a reader may ask a control to DO. Bits, so a description can carry the
+ * set a control offers right now.
+ *
+ * The four every platform has a name for: UIA's Invoke and RangeValue,
+ * NSAccessibility's AXPress, AXIncrement, AXDecrement and AXShowMenu. A
+ * fifth invented here would be one no reader has a gesture for.
+ */
+enum class AccessibleAction : unsigned {
+  Press = 1u,  ///< press, click or activate it
+  Increment = 2u,  ///< one step up
+  Decrement = 4u,  ///< one step down
+  /** The control's context menu -- on a parameter, the HOST's menu (MIDI
+   *  learn, automation), which is the menu a sighted user reaches with a
+   *  right click. */
+  ShowMenu = 8u,
+};
+
+/** The action's bit, for AccessibleInfo::actions. */
+inline unsigned accessibleActionBit(AccessibleAction action) { return (unsigned) action; }
+
+/** A two-state control's state, for the platforms that read it as a number
+ *  (NSAccessibility's AXCheckBox value is 0 or 1) rather than as the text. */
+enum class AccessibleToggle { NotToggle, /**< not a two-state control */ Off, /**< off */ On /**< on */ };
+
+/**
  * Everything a screen reader would want about one component.
  *
  * Built on demand rather than kept as state: the value of a knob is already in
@@ -108,7 +149,7 @@ inline const char* accessibleRoleName(AccessibleRole role) {
  * be stale at exactly the moment somebody asks.
  */
 struct AccessibleInfo {
-  AccessibleRole role = AccessibleRole::Unknown;
+  AccessibleRole role = AccessibleRole::Unknown;  ///< what kind of control it is
   /** What it IS -- "Gain". Not what it reads. */
   std::string name;
   /** What it READS -- "-6.0 dB". The same text drawn on screen, because a
@@ -118,17 +159,31 @@ struct AccessibleInfo {
   /** Longer help, for a control whose name does not explain it. */
   std::string description;
 
-  bool focusable = false;
-  bool focused = false;
-  bool enabled = true;
+  bool focusable = false;  ///< it can take the keyboard focus
+  bool focused = false;  ///< it has the keyboard focus now
+  bool enabled = true;  ///< it accepts input now
 
   /** For a ranged control, so a bridge can offer the platform's own range
    *  interface -- which is what lets a reader say "40 percent" and lets
    *  assistive software set a value directly rather than synthesising drags. */
   bool hasRange = false;
-  double minValue = 0.0;
-  double maxValue = 1.0;
-  double currentValue = 0.0;
+  double minValue = 0.0;  ///< the range's lower end, in the control's own units
+  double maxValue = 1.0;  ///< the range's upper end
+  double currentValue = 0.0;  ///< where it is now, between the two
+
+  /** AccessibleAction bits this control will perform NOW -- a disabled one
+   *  offers none, and a reader offered an action that then does nothing
+   *  says the control is broken. */
+  unsigned actions = 0;
+  /** Whether setAccessibleValue (a ranged control) or setAccessibleText (a
+   *  field) will take a value a reader types. False for a read-only field. */
+  bool valueSettable = false;
+  AccessibleToggle toggle = AccessibleToggle::NotToggle;  ///< on or off, for a two-state control
+  /** The current one of a set -- the open tab, the chosen row. */
+  bool selected = false;
+
+  /** Whether `action`'s bit is set in `actions`. */
+  bool offers(AccessibleAction action) const { return (actions & accessibleActionBit(action)) != 0; }
 
   /** In the ROOT's coordinates, which is what answers "what is at this
    *  position". Filled in by the traversal, not by the component: a component

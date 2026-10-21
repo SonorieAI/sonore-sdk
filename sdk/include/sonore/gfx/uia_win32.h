@@ -26,20 +26,27 @@
 //   RootProvider      -- the window itself, and the fragment root
 //   ElementProvider   -- one per accessible component
 //
-// Both are built from a SNAPSHOT of collectAccessible, refreshed whenever UIA
-// asks the root for its children. That is deliberate: UIA calls in on its own
-// thread, and walking a live component tree from there would race with the
-// editor's own 33 ms clock repainting it. A snapshot is a copy of small structs
-// taken under the same lock nothing else needs, and it cannot dangle.
+// Both read a SNAPSHOT of collectAccessible, and only the window's own thread
+// takes it: when UIA calls the root there, and on the editor's 33 ms clock
+// while any client is listening. UIA calls in on its OWN threads as well --
+// measured: an element's properties, values and navigation arrive on a UIA
+// worker while the root's arrive on the window's thread -- and the first
+// version walked the live component tree from whichever thread asked, while
+// the clock was rewriting the very strings it read, and rebuilt the snapshot
+// under elements still reading it. Now a walk off the window's thread keeps
+// the last snapshot, and every read copies what it needs under a lock, so no
+// pointer into the snapshot ever leaves it.
 //
-// ── What is deliberately not here ───────────────────────────────────────────
+// ── Events ──────────────────────────────────────────────────────────────────
 //
-// Events. UiaRaiseAutomationEvent lets a provider tell a reader that a value
-// changed without being asked, which is what makes automation audible while a
-// knob moves under the host's control. It needs the editor's clock to notice
-// changes and a stable element identity to raise them against, and doing it
-// wrong means either silence or a reader that will not stop talking. It is the
-// next piece, and it is named here rather than left to be discovered missing.
+// A reader is told, without asking, when the focus moves to another control
+// and when the focused control's value changes -- which is what makes
+// automation audible while a knob moves under the host's hand. Raised from
+// the editor's clock (announce(), on the window's thread, never from inside
+// a call UIA made), against the element's index, which is its runtime id.
+// Only the FOCUSED control's value, and at most four times a second with the
+// last value always said: every value of every meter at 30 Hz is a reader
+// that will not stop talking.
 #pragma once
 
 #if defined(_WIN32)
@@ -69,6 +76,8 @@
 #pragma comment(lib, "oleaut32.lib")
 #endif
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -96,41 +105,23 @@ inline BSTR toBstr(const std::string& utf8) {
  * Our roles in UIA's vocabulary.
  *
  * The mapping is the whole reason AccessibleRole is a closed set: it happens
- * once, here, and a second platform maps the same enum to its own names
- * without either being able to change what the other says.
+ * once, in accessibility.h's accessibleRoleMapping table -- which the macOS
+ * bridge reads too, and which carries the reasoning for each row (why a
+ * ToggleButton is a Button, why a Table is not a DataGrid, why Unknown is a
+ * Pane). The table holds UIA's ids as numbers so it needs no Windows header;
+ * these asserts are what keep those numbers UIA's.
  */
+static_assert(UIA_ButtonControlTypeId == 50000 && UIA_ComboBoxControlTypeId == 50003 &&
+                  UIA_EditControlTypeId == 50004 && UIA_ListItemControlTypeId == 50007 &&
+                  UIA_ListControlTypeId == 50008 && UIA_ProgressBarControlTypeId == 50012 &&
+                  UIA_ScrollBarControlTypeId == 50014 && UIA_SliderControlTypeId == 50015 &&
+                  UIA_TextControlTypeId == 50020 && UIA_GroupControlTypeId == 50026 &&
+                  UIA_WindowControlTypeId == 50032 && UIA_PaneControlTypeId == 50033 &&
+                  UIA_TableControlTypeId == 50036,
+              "accessibleRoleMapping's UIA control type ids are not UIAutomationClient.h's");
+
 inline long controlTypeFor(AccessibleRole role) {
-  switch (role) {
-    case AccessibleRole::Button: return UIA_ButtonControlTypeId;
-    // A ToggleButton is a Button that also implements the Toggle pattern.
-    // UIA has no separate control type, and inventing one would produce an
-    // element no reader has a phrase for.
-    case AccessibleRole::ToggleButton: return UIA_ButtonControlTypeId;
-    case AccessibleRole::Slider: return UIA_SliderControlTypeId;
-    case AccessibleRole::Label: return UIA_TextControlTypeId;
-    case AccessibleRole::TextField: return UIA_EditControlTypeId;
-    case AccessibleRole::ComboBox: return UIA_ComboBoxControlTypeId;
-    case AccessibleRole::List: return UIA_ListControlTypeId;
-    case AccessibleRole::ListItem: return UIA_ListItemControlTypeId;
-    // Table, not DataGrid. DataGrid promises the GridPattern -- a client may
-    // ask for the cell at row 4 column 2 and expect an element back -- and
-    // claiming a pattern that is not implemented is worse than claiming a
-    // simpler control type: the reader asks, gets nothing, and says nothing.
-    case AccessibleRole::Table: return UIA_TableControlTypeId;
-    case AccessibleRole::ScrollBar: return UIA_ScrollBarControlTypeId;
-    case AccessibleRole::ProgressBar: return UIA_ProgressBarControlTypeId;
-    case AccessibleRole::Dialog: return UIA_WindowControlTypeId;
-    case AccessibleRole::Window: return UIA_WindowControlTypeId;
-    // Group for both, and MusicalKeyboard deliberately: no platform has that
-    // role, and a Group named "Keyboard" is a phrase every reader can say.
-    case AccessibleRole::Group:
-    case AccessibleRole::MusicalKeyboard: return UIA_GroupControlTypeId;
-    case AccessibleRole::Unknown: break;
-  }
-  // Pane, not Custom. A Custom element makes a reader ask the provider for a
-  // localized type it would then have to invent; Pane is the honest "a region
-  // that holds things".
-  return UIA_PaneControlTypeId;
+  return accessibleRoleMapping(role).uiaControlType;
 }
 
 class RootProvider;
@@ -138,16 +129,28 @@ class RootProvider;
 /**
  * One accessible component, as UIA sees it.
  *
- * Holds a COPY of the info rather than a Component*, for the reason in the
- * header: UIA calls on its own thread and the editor is repainting on another.
+ * Holds an ID rather than a Component*, for the reason in the header: UIA
+ * calls on its own thread and the editor is repainting on another. The id
+ * names the CONTROL, carried across snapshots for as long as its component
+ * and role last (detail::matchAccessibleNodes, as the macOS bridge carries its
+ * elements). It was the control's position in the snapshot, so a reader
+ * holding the third control heard the fourth once a panel above it closed --
+ * its name, its value and its runtime id -- and an element whose control had
+ * gone answered for whatever came next. Now it answers
+ * UIA_E_ELEMENTNOTAVAILABLE, which is how a provider says "that one is gone".
  */
 class ElementProvider : public IRawElementProviderSimple,
                         public IRawElementProviderFragment,
                         public IValueProvider,
                         public IRangeValueProvider {
 public:
-  ElementProvider(RootProvider* root, int index) : root_(root), index_(index) {}
-  virtual ~ElementProvider() = default;
+  /** Holds a REFERENCE to its root, taken here and given back in the
+   *  destructor (both defined below, where RootProvider is complete). A reader
+   *  keeps elements as long as it likes; with a raw pointer, one still holding
+   *  a slider after the window closed and UIA dropped the root called into
+   *  freed memory. */
+  ElementProvider(RootProvider* root, int id);
+  virtual ~ElementProvider();
 
   // ── IUnknown ───────────────────────────────────────────────────────────
   ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG) InterlockedIncrement(&refs_); }
@@ -219,13 +222,15 @@ public:
     return S_OK;
   }
 
-  int index() const { return index_; }
+  int id() const { return id_; }
 
 private:
-  const AccessibleInfo* info() const;
+  /** A COPY of this element's info, taken under the root's lock: false when
+   *  the element is gone (the window closed, or its control left the tree). */
+  bool info(AccessibleInfo& out) const;
 
   RootProvider* root_;
-  int index_;
+  int id_;
   LONG refs_ = 1;
 };
 
@@ -241,8 +246,11 @@ class RootProvider : public IRawElementProviderSimple,
                      public IRawElementProviderFragment,
                      public IRawElementProviderFragmentRoot {
 public:
+  /** Constructed on the window's own thread, which is the only one that may
+   *  walk `content`. */
   RootProvider(HWND hwnd, Component* content, std::string windowName)
-      : hwnd_(hwnd), content_(content), name_(std::move(windowName)) {}
+      : hwnd_(hwnd), content_(content), name_(std::move(windowName)),
+        uiThread_(GetCurrentThreadId()) {}
 
   virtual ~RootProvider() = default;
 
@@ -251,7 +259,9 @@ public:
    *  UIA can and does call in after a window has closed. */
   void detach() {
     content_ = nullptr;
+    std::lock_guard<std::mutex> guard(lock_);
     snapshot_.clear();
+    ids_.clear();
   }
 
   // ── IUnknown ───────────────────────────────────────────────────────────
@@ -333,7 +343,6 @@ public:
     if (!out) return E_INVALIDARG;
     *out = nullptr;
     refresh();
-    if (snapshot_.empty()) return S_OK;
     if (direction == NavigateDirection_FirstChild) *out = makeChild(firstTopLevel());
     else if (direction == NavigateDirection_LastChild) *out = makeChild(lastTopLevel());
     return S_OK;
@@ -379,16 +388,21 @@ public:
     refresh();
     POINT p{(LONG) x, (LONG) y};
     ScreenToClient(hwnd_, &p);
-    // Backwards, so the TOPMOST element at a point wins -- the snapshot is in
-    // paint order and the last thing drawn is the thing the user sees.
-    for (size_t i = snapshot_.size(); i-- > 0;) {
-      const Rect& b = snapshot_[i].info.bounds;
-      const float lx = (float) p.x / scale_, ly = (float) p.y / scale_;
-      if (lx >= b.x && ly >= b.y && lx < b.right() && ly < b.bottom()) {
-        *out = makeChild((int) i);
-        return S_OK;
+    const float lx = (float) p.x / scale(), ly = (float) p.y / scale();
+    int hit = -1;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      // Backwards, so the TOPMOST element at a point wins -- the snapshot is
+      // in paint order and the last thing drawn is the thing the user sees.
+      for (size_t i = snapshot_.size(); i-- > 0;) {
+        const Rect& b = snapshot_[i].info.bounds;
+        if (lx >= b.x && ly >= b.y && lx < b.right() && ly < b.bottom()) {
+          hit = (int) i;
+          break;
+        }
       }
     }
+    *out = makeChild(hit);
     return S_OK;
   }
 
@@ -396,29 +410,69 @@ public:
     if (!out) return E_INVALIDARG;
     *out = nullptr;
     refresh();
-    for (size_t i = 0; i < snapshot_.size(); ++i)
-      if (snapshot_[i].info.focused) {
-        *out = makeChild((int) i);
-        return S_OK;
-      }
+    int focused = -1;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      for (size_t i = 0; i < snapshot_.size(); ++i)
+        if (snapshot_[i].info.focused) {
+          focused = (int) i;
+          break;
+        }
+    }
+    *out = makeChild(focused);
     return S_OK;
   }
 
-  // ── Used by ElementProvider ────────────────────────────────────────────
-  const AccessibleInfo* infoAt(int index) const {
-    if (index < 0 || index >= (int) snapshot_.size()) return nullptr;
-    return &snapshot_[(size_t) index].info;
+  // ── Used by ElementProvider, on any thread ─────────────────────────────
+  //
+  // By the element's id, looked up in the snapshot under the same lock as
+  // the read, so a refresh between the two cannot hand back another
+  // control's answer. The results are positions in the snapshot, which
+  // makeChild turns back into ids.
+
+  bool copyInfo(int id, AccessibleInfo& out) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    const int index = indexOfId(id);
+    if (index < 0) return false;
+    out = snapshot_[(size_t) index].info;
+    return true;
   }
 
-  int parentOf(int index) const {
-    if (index < 0 || index >= (int) snapshot_.size()) return -1;
-    return snapshot_[(size_t) index].parent;
+  bool exists(int id) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    return indexOfId(id) >= 0;
   }
 
-  /** The next or previous sibling of `index`, or -1. Linear over a list that
+  /** Where `id`'s parent is, -1 for the fragment root; false when `id` is
+   *  gone. */
+  bool parentOf(int id, int* parent) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    const int index = indexOfId(id);
+    if (index < 0) return false;
+    *parent = snapshot_[(size_t) index].parent;
+    return true;
+  }
+
+  /** `id`'s first or last child, or -1. */
+  int childOf(int id, bool last) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    const int index = indexOfId(id);
+    if (index < 0) return -1;
+    int found = -1;
+    for (int i = 0; i < (int) snapshot_.size(); ++i)
+      if (snapshot_[(size_t) i].parent == index) {
+        found = i;
+        if (!last) break;
+      }
+    return found;
+  }
+
+  /** The next or previous sibling of `id`, or -1. Linear over a list that
    *  is a handful of controls long; a plugin editor is not a document. */
-  int siblingOf(int index, bool next) const {
-    if (index < 0 || index >= (int) snapshot_.size()) return -1;
+  int siblingOf(int id, bool next) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    const int index = indexOfId(id);
+    if (index < 0) return -1;
     const int parent = snapshot_[(size_t) index].parent;
     int previous = -1;
     bool passed = false;
@@ -435,50 +489,197 @@ public:
   }
 
   int firstChildOf(int index) const {
+    std::lock_guard<std::mutex> guard(lock_);
     for (int i = 0; i < (int) snapshot_.size(); ++i)
       if (snapshot_[(size_t) i].parent == index) return i;
     return -1;
   }
 
   int lastChildOf(int index) const {
+    std::lock_guard<std::mutex> guard(lock_);
     int last = -1;
     for (int i = 0; i < (int) snapshot_.size(); ++i)
       if (snapshot_[(size_t) i].parent == index) last = i;
     return last;
   }
 
+  /** The element for the control at `index` in the snapshot, or null. */
   IRawElementProviderFragment* makeChild(int index) {
-    if (index < 0 || index >= (int) snapshot_.size()) return nullptr;
-    return static_cast<IRawElementProviderFragment*>(new ElementProvider(this, index));
+    int id = 0;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      if (index < 0 || index >= (int) ids_.size()) return nullptr;
+      id = ids_[(size_t) index];
+    }
+    return static_cast<IRawElementProviderFragment*>(new ElementProvider(this, id));
   }
 
   HWND hwnd() const { return hwnd_; }
-  float scale() const { return scale_; }
+  float scale() const { return scale_.load(); }
   void setScale(float scale) { scale_ = scale > 0.0f ? scale : 1.0f; }
 
-  /** Retake the snapshot. Called at the top of every navigation, because a
-   *  client walks the tree at whatever moment it likes and the editor may have
-   *  changed a value since the last one. */
+  /** Retake the snapshot -- on the window's thread, and only there; anywhere
+   *  else this keeps the last one. Called at the top of every navigation that
+   *  reaches the window's thread, because a client walks the tree at whatever
+   *  moment it likes, and by the window on its clock while a client is
+   *  listening, so what UIA's own threads read is never more than a tick old.
+   *  Walked outside the lock -- the walk is the window thread's own business
+   *  -- and swapped in under it. */
   void refresh() {
-    snapshot_.clear();
-    if (content_) collectAccessible(content_, snapshot_);
+    if (GetCurrentThreadId() != uiThread_ || !content_) return;
+    std::vector<AccessibleNode> fresh;
+    collectAccessible(content_, fresh);
+    // A control has the keyboard focus only while the user is IN this
+    // editor: the OS focus on this window, inside it, or on a window that
+    // holds it -- the host's plugin frame, which keeps the OS focus while a
+    // knob is focused so the host's space bar still works (see
+    // syncKeyboardFocus). The component tree keeps its focused control when
+    // the user clicks elsewhere in the host, and a reader told
+    // HasKeyboardFocus -- and sent focus and value events -- for an editor in
+    // the background talked over what the user was doing. Asked here, on the
+    // window's thread, which is the one GetFocus answers for.
+    const HWND focus = ::GetFocus();
+    const bool inHere = focus && (focus == hwnd_ || IsChild(hwnd_, focus) || IsChild(focus, hwnd_));
+    if (!inHere)
+      for (AccessibleNode& node : fresh) node.info.focused = false;
+    // Each control keeps its id while its component and role last, and a new
+    // one gets a new id -- never a number a gone control had, which a reader
+    // may still hold. Matched against the last snapshot without the lock:
+    // this thread is the only one that writes it.
+    const std::vector<int> match = detail::matchAccessibleNodes(snapshot_, fresh);
+    std::vector<int> freshIds(fresh.size());
+    for (size_t i = 0; i < fresh.size(); ++i)
+      freshIds[i] = match[i] >= 0 ? ids_[(size_t) match[i]] : nextId_++;
+    std::lock_guard<std::mutex> guard(lock_);
+    snapshot_.swap(fresh);
+    ids_.swap(freshIds);
+  }
+
+  /** On the window's clock, after refresh(): tell a listening reader what
+   *  changed since it was last told -- the focus moving to another control,
+   *  or the focused control's value. Compared against what was ANNOUNCED,
+   *  not against the previous snapshot, which a UIA call on this thread may
+   *  have retaken in between. `nowMs` is the clock's time, for the rate
+   *  limit on values. */
+  void announce(unsigned long long nowMs) {
+    if (GetCurrentThreadId() != uiThread_) return;
+    int focused = -1, focusedId = 0;
+    AccessibleInfo info;
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      for (size_t i = 0; i < snapshot_.size(); ++i)
+        if (snapshot_[i].info.focused) {
+          focused = (int) i;
+          focusedId = ids_[i];
+          info = snapshot_[i].info;
+          break;
+        }
+    }
+    if (focused < 0) {
+      // Out of the editor: nothing to say, and the next control focused is
+      // news even if it is the one that had it before.
+      announcedId_ = 0;
+      return;
+    }
+    // The same control by its id -- its component and role -- not by name: a
+    // focused button whose label changes is still the button, and comparing
+    // names raised a focus event -- the whole control said again -- on every
+    // change. Nor by position, which a panel closing above it changes.
+    const bool sameControl = focusedId == announcedId_;
+    if (!sameControl) {
+      IRawElementProviderFragment* element = makeChild(focused);
+      if (element) {
+        IRawElementProviderSimple* simple = nullptr;
+        element->QueryInterface(__uuidof(IRawElementProviderSimple), (void**) &simple);
+        if (simple) {
+          UiaRaiseAutomationEvent(simple, UIA_AutomationFocusChangedEventId);
+          simple->Release();
+        }
+        element->Release();
+      }
+      announcedId_ = focusedId;
+      announced_ = info;
+      valuePending_ = false;
+      lastValueMs_ = nowMs;
+      return;
+    }
+    const bool changed = info.value != announced_.value ||
+                         (info.hasRange && info.currentValue != announced_.currentValue);
+    if (changed) valuePending_ = true;
+    if (!valuePending_ || nowMs - lastValueMs_ < 250) return;
+    IRawElementProviderFragment* element = makeChild(focused);
+    if (!element) return;
+    IRawElementProviderSimple* simple = nullptr;
+    element->QueryInterface(__uuidof(IRawElementProviderSimple), (void**) &simple);
+    if (simple) {
+      if (info.value != announced_.value) {
+        VARIANT before, after;
+        VariantInit(&before);
+        VariantInit(&after);
+        before.vt = VT_BSTR;
+        before.bstrVal = toBstr(announced_.value);
+        after.vt = VT_BSTR;
+        after.bstrVal = toBstr(info.value);
+        UiaRaiseAutomationPropertyChangedEvent(simple, UIA_ValueValuePropertyId, before, after);
+        VariantClear(&before);
+        VariantClear(&after);
+      }
+      if (info.hasRange && info.currentValue != announced_.currentValue) {
+        VARIANT before, after;
+        VariantInit(&before);
+        VariantInit(&after);
+        before.vt = VT_R8;
+        before.dblVal = announced_.currentValue;
+        after.vt = VT_R8;
+        after.dblVal = info.currentValue;
+        UiaRaiseAutomationPropertyChangedEvent(simple, UIA_RangeValueValuePropertyId, before, after);
+      }
+      simple->Release();
+    }
+    element->Release();
+    announced_ = info;
+    valuePending_ = false;
+    lastValueMs_ = nowMs;
   }
 
   int firstTopLevel() const { return firstChildOf(-1); }
   int lastTopLevel() const { return lastChildOf(-1); }
 
 private:
+  /** Where control `id` is in the snapshot, or -1. The caller holds lock_. */
+  int indexOfId(int id) const {
+    for (size_t i = 0; i < ids_.size(); ++i)
+      if (ids_[i] == id) return (int) i;
+    return -1;
+  }
+
   HWND hwnd_;
-  Component* content_;
+  Component* content_; // the window thread's alone
   std::string name_;
+  DWORD uiThread_;
+  mutable std::mutex lock_; // over snapshot_ and ids_
   std::vector<AccessibleNode> snapshot_;
-  float scale_ = 1.0f;
+  /** Each snapshot node's id, which its element holds. */
+  std::vector<int> ids_;
+  int nextId_ = 1; // the window thread's alone
+  // What a reader was last told, on the window's thread only.
+  int announcedId_ = 0;
+  AccessibleInfo announced_;
+  bool valuePending_ = false;
+  unsigned long long lastValueMs_ = 0;
+  std::atomic<float> scale_{1.0f};
   LONG refs_ = 1;
 };
 
 // ── ElementProvider, now that RootProvider is complete ────────────────────
 
-inline const AccessibleInfo* ElementProvider::info() const { return root_->infoAt(index_); }
+inline ElementProvider::ElementProvider(RootProvider* root, int id) : root_(root), id_(id) {
+  root_->AddRef();
+}
+
+inline ElementProvider::~ElementProvider() { root_->Release(); }
+
+inline bool ElementProvider::info(AccessibleInfo& out) const { return root_->copyInfo(id_, out); }
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::QueryInterface(REFIID iid, void** out) {
   if (!out) return E_INVALIDARG;
@@ -502,16 +703,16 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::GetPatternProvider(PATTERNID p
                                                                     IUnknown** out) {
   if (!out) return E_INVALIDARG;
   *out = nullptr;
-  const AccessibleInfo* i = info();
-  if (!i) return S_OK;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
 
   // Value for anything that reads something, Range only for what genuinely has
   // one. Offering RangeValue on a button would give a reader a percentage to
   // announce for a thing that has no position.
-  if (pattern == UIA_ValuePatternId && !i->value.empty()) {
+  if (pattern == UIA_ValuePatternId && !i.value.empty()) {
     *out = static_cast<IValueProvider*>(this);
     AddRef();
-  } else if (pattern == UIA_RangeValuePatternId && i->hasRange) {
+  } else if (pattern == UIA_RangeValuePatternId && i.hasRange) {
     *out = static_cast<IRangeValueProvider*>(this);
     AddRef();
   }
@@ -522,36 +723,36 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::GetPropertyValue(PROPERTYID pr
                                                                   VARIANT* out) {
   if (!out) return E_INVALIDARG;
   VariantInit(out);
-  const AccessibleInfo* i = info();
-  if (!i) return S_OK;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
 
   switch (property) {
     case UIA_NamePropertyId:
       out->vt = VT_BSTR;
-      out->bstrVal = toBstr(i->name);
+      out->bstrVal = toBstr(i.name);
       if (!out->bstrVal) VariantInit(out);
       return S_OK;
     case UIA_HelpTextPropertyId:
-      if (i->description.empty()) return S_OK;
+      if (i.description.empty()) return S_OK;
       out->vt = VT_BSTR;
-      out->bstrVal = toBstr(i->description);
+      out->bstrVal = toBstr(i.description);
       if (!out->bstrVal) VariantInit(out);
       return S_OK;
     case UIA_ControlTypePropertyId:
       out->vt = VT_I4;
-      out->lVal = controlTypeFor(i->role);
+      out->lVal = controlTypeFor(i.role);
       return S_OK;
     case UIA_IsEnabledPropertyId:
       out->vt = VT_BOOL;
-      out->boolVal = i->enabled ? VARIANT_TRUE : VARIANT_FALSE;
+      out->boolVal = i.enabled ? VARIANT_TRUE : VARIANT_FALSE;
       return S_OK;
     case UIA_IsKeyboardFocusablePropertyId:
       out->vt = VT_BOOL;
-      out->boolVal = i->focusable ? VARIANT_TRUE : VARIANT_FALSE;
+      out->boolVal = i.focusable ? VARIANT_TRUE : VARIANT_FALSE;
       return S_OK;
     case UIA_HasKeyboardFocusPropertyId:
       out->vt = VT_BOOL;
-      out->boolVal = i->focused ? VARIANT_TRUE : VARIANT_FALSE;
+      out->boolVal = i.focused ? VARIANT_TRUE : VARIANT_FALSE;
       return S_OK;
     case UIA_IsControlElementPropertyId:
     case UIA_IsContentElementPropertyId:
@@ -570,7 +771,8 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::Navigate(NavigateDirection dir
   *out = nullptr;
   switch (direction) {
     case NavigateDirection_Parent: {
-      const int parent = root_->parentOf(index_);
+      int parent = -1;
+      if (!root_->parentOf(id_, &parent)) return UIA_E_ELEMENTNOTAVAILABLE;
       if (parent < 0) {
         // The fragment ROOT is the parent of a top-level element. Returning
         // null instead detaches the whole subtree from the window, and a
@@ -581,32 +783,33 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::Navigate(NavigateDirection dir
       return S_OK;
     }
     case NavigateDirection_NextSibling:
-      *out = root_->makeChild(root_->siblingOf(index_, /*next=*/true));
-      return S_OK;
+      *out = root_->makeChild(root_->siblingOf(id_, /*next=*/true));
+      break;
     case NavigateDirection_PreviousSibling:
-      *out = root_->makeChild(root_->siblingOf(index_, /*next=*/false));
-      return S_OK;
+      *out = root_->makeChild(root_->siblingOf(id_, /*next=*/false));
+      break;
     case NavigateDirection_FirstChild:
-      *out = root_->makeChild(root_->firstChildOf(index_));
-      return S_OK;
+      *out = root_->makeChild(root_->childOf(id_, /*last=*/false));
+      break;
     case NavigateDirection_LastChild:
-      *out = root_->makeChild(root_->lastChildOf(index_));
-      return S_OK;
+      *out = root_->makeChild(root_->childOf(id_, /*last=*/true));
+      break;
     default:
       break;
   }
-  return S_OK;
+  // Nothing found is "none" only for an element that still exists.
+  return *out || root_->exists(id_) ? S_OK : UIA_E_ELEMENTNOTAVAILABLE;
 }
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::GetRuntimeId(SAFEARRAY** out) {
   if (!out) return E_INVALIDARG;
-  // UiaAppendRuntimeId plus our index: the first tells UIA to prefix the
+  // UiaAppendRuntimeId plus our id: the first tells UIA to prefix the
   // window's own id, so two plugin windows in one host cannot produce colliding
   // element ids. Without it a client caching elements from one editor would
   // hand them back for another.
   SAFEARRAY* array = SafeArrayCreateVector(VT_I4, 0, 2);
   if (!array) return E_OUTOFMEMORY;
-  int values[2] = {UiaAppendRuntimeId, index_ + 1};
+  int values[2] = {UiaAppendRuntimeId, id_};
   for (LONG i = 0; i < 2; ++i) SafeArrayPutElement(array, &i, &values[i]);
   *out = array;
   return S_OK;
@@ -615,19 +818,19 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::GetRuntimeId(SAFEARRAY** out) 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::get_BoundingRectangle(UiaRect* out) {
   if (!out) return E_INVALIDARG;
   *out = UiaRect{0, 0, 0, 0};
-  const AccessibleInfo* i = info();
-  if (!i) return S_OK;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
 
   // Logical to device, then client to screen. UIA speaks SCREEN pixels, and a
   // provider that answered in its own coordinates puts a reader's highlight
   // rectangle in the top-left corner of the desktop.
   const float scale = root_->scale();
-  POINT origin{(LONG) (i->bounds.x * scale), (LONG) (i->bounds.y * scale)};
+  POINT origin{(LONG) (i.bounds.x * scale), (LONG) (i.bounds.y * scale)};
   ClientToScreen(root_->hwnd(), &origin);
   out->left = origin.x;
   out->top = origin.y;
-  out->width = i->bounds.w * scale;
-  out->height = i->bounds.h * scale;
+  out->width = i.bounds.w * scale;
+  out->height = i.bounds.h * scale;
   return S_OK;
 }
 
@@ -639,29 +842,37 @@ inline HRESULT STDMETHODCALLTYPE ElementProvider::get_FragmentRoot(
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::get_Value(BSTR* out) {
   if (!out) return E_INVALIDARG;
-  const AccessibleInfo* i = info();
-  *out = i ? toBstr(i->value) : nullptr;
+  *out = nullptr;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
+  *out = toBstr(i.value);
   return S_OK;
 }
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::get_Value(double* out) {
   if (!out) return E_INVALIDARG;
-  const AccessibleInfo* i = info();
-  *out = i ? i->currentValue : 0.0;
+  *out = 0.0;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
+  *out = i.currentValue;
   return S_OK;
 }
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::get_Maximum(double* out) {
   if (!out) return E_INVALIDARG;
-  const AccessibleInfo* i = info();
-  *out = i ? i->maxValue : 0.0;
+  *out = 0.0;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
+  *out = i.maxValue;
   return S_OK;
 }
 
 inline HRESULT STDMETHODCALLTYPE ElementProvider::get_Minimum(double* out) {
   if (!out) return E_INVALIDARG;
-  const AccessibleInfo* i = info();
-  *out = i ? i->minValue : 0.0;
+  *out = 0.0;
+  AccessibleInfo i;
+  if (!info(i)) return UIA_E_ELEMENTNOTAVAILABLE;
+  *out = i.minValue;
   return S_OK;
 }
 

@@ -8,13 +8,27 @@
 //     void process(sonore::AudioBlock<float>& io, const float* p);            // effect
 //     void process(sonore::AudioBlock<float>& io, const float* p,
 //                  sonore::MidiBuffer& midi);                                 // instrument
+//     void reset();                                       // optional, see below
 //   };
+//
+// prepare() is where buffers are sized, but it is not only called from the
+// main thread. A host's "start over" -- CLAP's reset(), an Audio Unit's Reset
+// -- comes on the AUDIO thread with the rate and block size unchanged. Give
+// the DSP a reset() that forgets what is sounding and keeps what prepare()
+// sized, and those resets call it instead. Without one they call prepare()
+// again, which must then neither allocate nor free when nothing it sizes from
+// has changed. An LV2 host's switch into or out of freewheeling also comes on
+// the audio thread, and calls prepare() whether or not there is a reset(),
+// because spec.offline is what changed and LV2 offers no other moment to say
+// so; the same rule holds there. A DSP taking ProcessContext also has
+// ctx.offline, block by block.
 //
 // Everything here is allocation-free and real-time safe: AudioBlock is a view
 // over host-owned channel pointers, MidiBuffer is a fixed-capacity inline
 // array. The same header compiles under MSVC/clang/gcc AND emscripten, so the
 // browser preview and the shipped native plugin run the identical DSP source.
 #pragma once
+#include "version.h"
 #include <cstddef> // std::size_t: MSVC leaks it via other headers, clang does not
 #include <cstdint>
 #include <cmath>
@@ -28,19 +42,29 @@ using std::size_t;
 // Universal constants live here rather than in dsp.h so every header that needs
 // them (transport, effects, the toolkit) can include just this one without a
 // dependency cycle.
+/** Pi, as a float: half a turn in radians. */
 constexpr float kPi = 3.14159265358979323846f;
+/** Two pi, as a float: one whole turn in radians, the factor that turns a
+ *  frequency in cycles into a phase increment in radians. */
 constexpr float kTwoPi = 6.28318530717958647692f;
 
 /** What prepare() learns about the host: rate, worst-case block, channels. */
 struct ProcessSpec {
+  /** Samples per second, in Hz, of every block until the next prepare(). */
   double sampleRate = 48000.0;
+  /** The most frames one process() call will be handed. The plugin wrappers
+   *  keep to it -- a longer host block is run as pieces no longer than this,
+   *  or in AU refused as the format says -- so a scratch buffer sized from it
+   *  in prepare() is big enough. */
   uint32_t maximumBlockSize = 128;
+  /** Channels of the main bus, as negotiated with the host: the width of the
+   *  AudioBlock that process() receives. */
   uint32_t numChannels = 2;
   /** Is this an OFFLINE render rather than live playback?
    *
    *  When a host bounces, nothing has to keep up with a clock. A DSP that
-   *  normally trades quality for CPU: fewer oversampling stages, a cheaper
-   *  interpolator, a shorter FFT: can spend what it likes here, and the
+   *  normally trades quality for CPU (fewer oversampling stages, a cheaper
+   *  interpolator, a shorter FFT) can spend what it likes here, and the
    *  result the user keeps is the better one. That is the whole point:
    *  monitoring is a preview, the bounce is the product.
    *
@@ -59,6 +83,11 @@ struct ProcessSpec {
 template <typename SampleType>
 class AudioBlock {
 public:
+  /** A view of `numChannels` channels of `numSamples` samples each, starting
+   *  `startOffset` samples into every one of the `channels` buffers. Nothing
+   *  is copied: the array of channel pointers, as well as the samples it
+   *  points at, must outlive the block, and each buffer must hold at least
+   *  `startOffset + numSamples` samples. */
   AudioBlock(SampleType* const* channels, size_t numChannels, size_t numSamples,
              size_t startOffset = 0)
       : chans_(channels), numChannels_(numChannels), numSamples_(numSamples),
@@ -69,11 +98,21 @@ public:
    *  rather than needing a null check. */
   AudioBlock() = default;
 
+  /** How many channels the view covers; 0 for an empty block. */
   size_t getNumChannels() const { return numChannels_; }
+  /** How many samples, per channel, the view covers; 0 for an empty block. */
   size_t getNumSamples() const { return numSamples_; }
+  /** The first sample of this view in `channel` (0-based), for a loop that
+   *  works on the raw array; getNumSamples() samples follow it. Not
+   *  bounds-checked: `channel` must be below getNumChannels(). */
   SampleType* getChannelPointer(size_t channel) const { return chans_[channel] + offset_; }
 
+  /** Sample `i` of `channel`, both 0-based and counted from the start of this
+   *  view. Not bounds-checked. */
   SampleType getSample(size_t channel, size_t i) const { return chans_[channel][i + offset_]; }
+  /** Write sample `i` of `channel`, both 0-based and counted from the start of
+   *  this view. Not bounds-checked. Const because the view does not change;
+   *  the samples it points at are not const. */
   void setSample(size_t channel, size_t i, SampleType v) const {
     chans_[channel][i + offset_] = v;
   }
@@ -171,8 +210,6 @@ private:
   size_t offset_ = 0;
 };
 
-/** One 3-byte MIDI channel message (note on/off, CC, pitch bend, aftertouch). */
-
 // ── What a status byte is ───────────────────────────────────────────────────
 //
 // Written ONCE. Every wrapper used to carry its own copy of the same test --
@@ -213,6 +250,7 @@ inline bool isSystemCommon(int status) { return status >= 0xF1 && status < 0xF8;
  *  scripts/feature-map.mjs. */
 inline bool isSysexStart(int status) { return status == 0xF0; }
 
+inline int shortMessageLength(int status);
 /**
  * Whether a three-byte MIDI event should be handed to a DSP.
  *
@@ -225,21 +263,81 @@ inline bool isSysexStart(int status) { return status == 0xF0; }
  * a DSP that does could not previously find out.
  */
 inline bool deliverableToDsp(int status) {
-  return isChannelMessage(status) || isSystemCommon(status) || isSystemRealtime(status);
+  // A message with a length: a channel message, a defined system common
+  // one, or a realtime byte. isSystemCommon() alone let through the
+  // undefined 0xF4 and 0xF5 and a stray 0xF7 terminator, which reached a
+  // DSP as [F4 xx yy] events made of whatever bytes followed.
+  return shortMessageLength(status) > 0;
 }
 
+/**
+ * How many bytes a short message occupies on the wire, status included: 3, 2
+ * or 1. Zero for anything that is not a short message -- SysEx (0xF0/0xF7),
+ * a bare data byte, the undefined 0xF4/0xF5.
+ *
+ * Every output that writes bytes rather than a packed word needs exactly
+ * this, and getting it wrong does not fail loudly: a clock byte sent as
+ * F8 00 00 is read by a receiver using running status as the clock and then
+ * one more event made of the two zeros.
+ */
+inline int shortMessageLength(int status) {
+  if (status >= 0xF8) return 1; // realtime: clock, start, continue, stop, sensing, reset
+  switch (status) {
+    case 0xF1: return 2;        // MTC quarter frame
+    case 0xF2: return 3;        // song position pointer
+    case 0xF3: return 2;        // song select
+    case 0xF6: return 1;        // tune request
+    default: break;
+  }
+  if (status >= 0xF0 || status < 0x80) return 0;
+  const int kind = status & 0xF0;
+  return (kind == 0xC0 || kind == 0xD0) ? 2 : 3;
+}
+
+/**
+ * One short MIDI message -- a status byte and up to two data bytes -- as a DSP
+ * reads it out of a MidiBuffer.
+ *
+ * Mirrors the reference's MidiMessage for the channel messages a plugin acts
+ * on, and only those: SysEx travels beside these in MidiBuffer's arena, never
+ * inside one. A plain value of three bytes, free to make and copy on the
+ * audio thread.
+ *
+ * The channel numbering is not symmetric, and the README says so as well: the
+ * factories (noteOn, controlChange and the rest) take a channel from 0 to 15,
+ * while getChannel() answers 1 to 16, as MIDI is written --
+ * `noteOn(m.getChannel() - 1, ...)` is the round trip. Data bytes are masked
+ * to 7 bits on the way in, so an out-of-range note number wraps instead of
+ * spilling into the status byte. A note-on with velocity 0 is a note-off, to
+ * isNoteOff() as on the wire.
+ */
 class MidiMessage {
 public:
+  /** Three zero bytes. Status 0 is not a message, and every type test below
+   *  (isNoteOn() and the rest) answers false for it. */
   MidiMessage() = default;
+  /** From raw bytes: the status byte (channel in its low nibble) and two data
+   *  bytes. The status is kept to 8 bits and each data byte to 7; nothing
+   *  checks that the status is one a DSP would be handed (see
+   *  deliverableToDsp()). Pass 0 for a data byte the message does not use. */
   MidiMessage(int status, int data1, int data2)
-      : status_(status & 0xff), d1_(data1 & 0x7f), d2_(data2 & 0x7f) {}
+      : status_((uint8_t) (status & 0xff)), d1_((uint8_t) (data1 & 0x7f)),
+        d2_((uint8_t) (data2 & 0x7f)) {}
 
+  /** A note-on. `channel` is 0 to 15, `note` and `velocity` 0 to 127. A
+   *  velocity of 0 makes it a note-off, as isNoteOff() and the wire both
+   *  read it. */
   static MidiMessage noteOn(int channel, int note, int velocity) {
     return MidiMessage(0x90 | (channel & 0x0f), note, velocity);
   }
+  /** A note-off (0x80) with release velocity 0. `channel` is 0 to 15, `note`
+   *  0 to 127. */
   static MidiMessage noteOff(int channel, int note) {
     return MidiMessage(0x80 | (channel & 0x0f), note, 0);
   }
+  /** A control change. `channel` is 0 to 15; `controller` and `value` are 0
+   *  to 127. Controllers 120 to 127 are the channel mode messages (all sound
+   *  off, all notes off and the rest). */
   static MidiMessage controlChange(int channel, int controller, int value) {
     return MidiMessage(0xb0 | (channel & 0x0f), controller, value);
   }
@@ -254,51 +352,105 @@ public:
   static MidiMessage channelPressure(int channel, int value) {
     return MidiMessage(0xd0 | (channel & 0x0f), value, 0);
   }
+  /** Polyphonic (per-note) pressure. `channel` is 0 to 15; `note` and
+   *  `value` are 0 to 127. */
   static MidiMessage polyPressure(int channel, int note, int value) {
     return MidiMessage(0xa0 | (channel & 0x0f), note, value);
   }
 
+  /** A note-on with a velocity above 0. A note-on at velocity 0 is a
+   *  note-off, and answers false here. */
   bool isNoteOn() const { return (status_ & 0xf0) == 0x90 && d2_ > 0; }
+  /** A note-off, or a note-on with velocity 0, which means the same. */
   bool isNoteOff() const {
     return (status_ & 0xf0) == 0x80 || ((status_ & 0xf0) == 0x90 && d2_ == 0);
   }
+  /** A control change (0xB0), the channel mode messages 120 to 127
+   *  included. */
   bool isController() const { return (status_ & 0xf0) == 0xb0; }
+  /** A pitch bend (0xE0); read it with getPitchWheelValue(). */
   bool isPitchWheel() const { return (status_ & 0xf0) == 0xe0; }
+  /** Channel pressure (0xD0); read it with getChannelPressureValue(). */
   bool isChannelPressure() const { return (status_ & 0xf0) == 0xd0; }
+  /** A program change (0xC0); read it with getProgramChangeNumber(). */
+  bool isProgramChange() const { return (status_ & 0xf0) == 0xc0; }
+  /** The program of a program change, 0 to 127 as it is on the wire.
+   *  Meaningless for any other message. */
+  int getProgramChangeNumber() const { return d1_; }
+  /** Polyphonic pressure (0xA0): the note in getNoteNumber(), the pressure
+   *  in getPolyPressureValue(). */
   bool isPolyPressure() const { return (status_ & 0xf0) == 0xa0; }
 
+  /** The channel, 1 to 16 as MIDI is written -- one more than the 0 to 15
+   *  the factories take. Meaningless for a system message. */
   int getChannel() const { return (status_ & 0x0f) + 1; } // 1-based, MIDI convention
+  /** The note number, 0 to 127, of a note-on, note-off or poly pressure. */
   int getNoteNumber() const { return d1_; }
+  /** The velocity of a note-on or note-off, 0 to 127. */
   int getVelocity() const { return d2_; }
+  /** The velocity as 0 to 1: getVelocity() divided by 127. */
   float getFloatVelocity() const { return (float) d2_ / 127.0f; }
+  /** The controller number of a control change, 0 to 127. */
   int getControllerNumber() const { return d1_; }
+  /** The value of a control change, 0 to 127. */
   int getControllerValue() const { return d2_; }
+  /** The bend of a pitch bend, 0 to 16383 with 8192 at centre: both data
+   *  bytes, LSB first on the wire, joined back into 14 bits. */
   int getPitchWheelValue() const { return (d2_ << 7) | d1_; } // 0..16383, 8192 = center
   /** Channel pressure carries its value in the FIRST data byte, unlike poly
    *  pressure which puts the note there and the pressure second. */
   int getChannelPressureValue() const { return d1_; }
+  /** The pressure of a poly pressure message, 0 to 127 (the second data
+   *  byte; the note is the first). */
   int getPolyPressureValue() const { return d2_; }
+  /** The whole status byte, 0 to 255: the message type in the high nibble
+   *  and, for a channel message, the 0-based channel in the low one. */
   int getRawStatus() const { return status_; }
+  /** The first data byte, 0 to 127, whatever the message is. */
   int getRawData1() const { return d1_; }
+  /** The second data byte, 0 to 127. The factories leave it 0 in a message
+   *  that has only one. */
   int getRawData2() const { return d2_; }
 
+  /** The frequency, in Hz, of MIDI note `note` in twelve-tone equal
+   *  temperament with note 69 (A4) at `a4Hz`. Any int is accepted -- notes
+   *  outside 0 to 127 simply continue the scale -- and nothing allocates. */
   static double getMidiNoteInHertz(int note, double a4Hz = 440.0) {
     return a4Hz * std::pow(2.0, (note - 69) / 12.0);
   }
 
 private:
-  int status_ = 0, d1_ = 0, d2_ = 0;
+  // Bytes, which is all the constructor ever lets in: it masks the status to
+  // eight bits and the data to seven, and every accessor widens back to the
+  // int it returned. As three ints each message was 12 bytes, a MidiBuffer
+  // entry 16, and the two buffers every plugin instance holds 37 KB of an
+  // effect's 74; as bytes an entry is 8 and the pair 20 KB.
+  uint8_t status_ = 0, d1_ = 0, d2_ = 0;
 };
 
 /** Fixed-capacity, sample-ordered event list for one processing block.
  *  Iterate with a range-for; each entry carries the message + frame offset. */
 class MidiBuffer {
 public:
-  static constexpr int kMaxEvents = 64;
+  /** 1024, and it was 64. 64 is beyond any keyboard, and a keyboard is not
+   *  what fills a block: an MPE controller sends pitch, pressure and timbre
+   *  per finger at hundreds of messages a second each, and a host rendering
+   *  offline hands over thousands of frames at once. Past 64 the newest
+   *  events were dropped in silence -- note-offs among them, so notes hung.
+   *  8 KB per buffer, and every buffer in the SDK is a member or a static. */
+  static constexpr int kMaxEvents = 1024;
 
+  /** One event of the block: the message, and the frame it falls on counted
+   *  from the start of the block. Shaped like the reference's per-event
+   *  metadata (a samplePosition and a getMessage()), so a loop written
+   *  against that reads the same here. */
   struct Entry {
+    /** The message itself. */
     MidiMessage message;
+    /** The frame it falls on, 0-based from the start of the block. The
+     *  buffer keeps entries in ascending order of it. */
     int samplePosition = 0;
+    /** The message, under the name the reference's metadata gives it. */
     const MidiMessage& getMessage() const { return message; }
   };
 
@@ -318,29 +470,69 @@ public:
   // message size and defaults it to 512 bytes. Four of those in one block is
   // already unusual traffic, and a universal SysEx past 2 KB is a firmware
   // dump rather than something a plugin answers in real time.
+  /** Bytes in the SysEx arena, shared by every message in the block. A
+   *  message that does not fit in what is left is refused by addSysex(). */
   static constexpr int kSysexCapacity = 2048;
+  /** The most SysEx messages one block holds, however short they are. */
   static constexpr int kMaxSysex = 8;
 
+  /** Where one SysEx message sits in the arena -- an offset and a length into
+   *  it -- and the frame it falls on. The entry is not the message: its bytes,
+   *  0xF0 and 0xF7 included, come from sysexData(entry), and stay valid until
+   *  the buffer is cleared. */
   struct SysexEntry {
+    /** Where the message's first byte (its 0xF0) sits in the arena. */
     uint16_t offset = 0;
+    /** The message's length in bytes, 0xF0 and 0xF7 included. */
     uint16_t length = 0;
+    /** The frame it falls on, 0-based from the start of the block. SysEx
+     *  entries keep the order they were added in, not sorted by this. */
     int samplePosition = 0;
   };
 
+  /** Empty the buffer: the events, the SysEx and the dropped count. Every
+   *  SysexEntry and sysexData() pointer taken before is stale after it. No
+   *  allocation. A DSP need not call it on the buffers a wrapper hands it:
+   *  the wrapper clears those between blocks. */
   void clear() {
     count_ = 0;
+    dropped_ = 0;
     sysexCount_ = 0;
     sysexUsed_ = 0;
   }
+  /** How many three-byte events the block holds, 0 to kMaxEvents. SysEx is
+   *  counted apart, by getNumSysex(). */
   int getNumEvents() const { return count_; }
   /** Empty means NOTHING, SysEx included. A caller testing this before
    *  skipping a block would otherwise skip a MIDI-CI request. */
   bool isEmpty() const { return count_ == 0 && sysexCount_ == 0; }
+  /** No room for another event. A producer that can wait -- a live input
+   *  queue -- stops here and keeps the rest for the next block. */
+  bool isFull() const { return count_ >= kMaxEvents; }
+  /** Events this block lost to a full buffer since the last clear(). */
+  int getNumDropped() const { return dropped_; }
 
-  /** Insert keeping sample order (stable for equal offsets). Silently drops
-   *  events past capacity: a full block's 64 events is beyond any keyboard. */
+  /**
+   * Insert keeping sample order (stable for equal offsets).
+   *
+   * Past capacity the event is dropped and counted -- with one exception: a
+   * NOTE-OFF evicts the latest continuous event (a controller, a bend, a
+   * pressure value) to make room. Losing one step of a pitch bend is
+   * inaudible; losing a note-off leaves a note sounding until the transport
+   * stops, which is the failure a full buffer actually produced.
+   */
   void addEvent(const MidiMessage& m, int samplePosition) {
-    if (count_ >= kMaxEvents) return;
+    if (count_ >= kMaxEvents) {
+      ++dropped_;
+      if (!m.isNoteOff()) return;
+      int victim = count_ - 1;
+      while (victim >= 0 && (events_[victim].message.isNoteOn() ||
+                             events_[victim].message.isNoteOff()))
+        --victim;
+      if (victim < 0) return; // nothing but notes: the newest one is what gives
+      for (int k = victim; k < count_ - 1; ++k) events_[k] = events_[k + 1];
+      --count_;
+    }
     int i = count_;
     while (i > 0 && events_[i - 1].samplePosition > samplePosition) {
       events_[i] = events_[i - 1];
@@ -350,8 +542,29 @@ public:
     ++count_;
   }
 
+  /** The first event, for a range-for over the block in frame order. The
+   *  entries live inside the buffer: adding an event while iterating moves
+   *  them under the loop. */
   const Entry* begin() const { return events_; }
+  /** One past the last event. */
   const Entry* end() const { return events_ + count_; }
+
+  /** Every event at or past `numSamples` moved onto the block's last frame,
+   *  and any before 0 onto its first. The order holds: the buffer is sorted
+   *  and the clamp keeps it so. For a format that hears of events before it
+   *  knows how long their block is -- AU's MIDI arrives ahead of the render
+   *  call -- and so cannot clamp each one as it comes. */
+  void clampPositions(int numSamples) {
+    const int last = numSamples > 0 ? numSamples - 1 : 0;
+    for (int i = 0; i < count_; ++i) {
+      int& at = events_[i].samplePosition;
+      at = at < 0 ? 0 : (at > last ? last : at);
+    }
+    for (int i = 0; i < sysexCount_; ++i) {
+      int& at = sysex_[i].samplePosition;
+      at = at < 0 ? 0 : (at > last ? last : at);
+    }
+  }
 
   /**
    * Add one COMPLETE SysEx message, 0xF0 through 0xF7 inclusive.
@@ -379,8 +592,12 @@ public:
     return true;
   }
 
+  /** How many SysEx messages the block holds, 0 to kMaxSysex. */
   int getNumSysex() const { return sysexCount_; }
+  /** The first SysEx entry, in the order they were added; pass each to
+   *  sysexData() for its bytes. */
   const SysexEntry* sysexBegin() const { return sysex_; }
+  /** One past the last SysEx entry. */
   const SysexEntry* sysexEnd() const { return sysex_ + sysexCount_; }
 
   /** The bytes of one message, including its 0xF0 and its 0xF7. */
@@ -394,6 +611,7 @@ public:
 private:
   Entry events_[kMaxEvents];
   int count_ = 0;
+  int dropped_ = 0;
   SysexEntry sysex_[kMaxSysex];
   uint8_t sysexBytes_[kSysexCapacity];
   int sysexCount_ = 0, sysexUsed_ = 0;
@@ -425,13 +643,13 @@ inline void forwardSysex(const MidiBuffer& in, MidiBuffer& out) {
  *  instrument; an MPE controller (Osmose, LinnStrument, Seaboard) bends,
  *  presses and brightens each finger independently. The ids are CLAP's. */
 enum NoteExpression : uint8_t {
-  kExprVolume = 0,     // gain, 0..4 (linear, 1 = unity)
-  kExprPan = 1,        // 0 left .. 1 right
-  kExprTuning = 2,     // SEMITONES away from the key, -120..120
-  kExprVibrato = 3,    // 0..1
-  kExprExpression = 4, // 0..1
-  kExprBrightness = 5, // 0..1
-  kExprPressure = 6,   // 0..1
+  kExprVolume = 0,     ///< gain, 0..4 (linear, 1 = unity)
+  kExprPan = 1,        ///< 0 left .. 1 right, 0.5 centre
+  kExprTuning = 2,     ///< SEMITONES away from the key, -120..120
+  kExprVibrato = 3,    ///< vibrato, 0..1
+  kExprExpression = 4, ///< expression, 0..1, as CLAP defines it
+  kExprBrightness = 5, ///< timbre, 0..1; what MPE's CC 74 becomes
+  kExprPressure = 6,   ///< pressure, 0..1; what MPE's channel pressure becomes
 };
 
 /** One block's expression events, sample-ordered like MidiBuffer.
@@ -441,21 +659,35 @@ enum NoteExpression : uint8_t {
  *  they also carry a note id. Matching on the pair is what works everywhere. */
 class NoteExpressionBuffer {
 public:
+  /** The most expression events one block holds; addEvent() drops the
+   *  newest past it, without a count. */
   static constexpr int kMaxEvents = 128;
 
+  /** One expression change for one note, at a frame within the block: which
+   *  note (host id, key and channel -- match on key and channel, as the class
+   *  comment says), which expression (a NoteExpression id), and the new value
+   *  in that expression's own range, which is not always 0..1. Past
+   *  kMaxEvents in a block, addEvent drops the newest without a count. */
   struct Entry {
-    int32_t noteId = -1; // host's note id, or -1 when the format has none
-    int16_t key = -1;    // MIDI note number, -1 = every note
-    int16_t channel = -1;
-    uint8_t expression = kExprTuning;
-    float value = 0.0f;
-    int samplePosition = 0;
+    int32_t noteId = -1; ///< host's note id, or -1 when the format has none
+    int16_t key = -1;    ///< MIDI note number, -1 = every note
+    int16_t channel = -1; ///< MIDI channel 0..15 (0-based), -1 = every channel
+    uint8_t expression = kExprTuning; ///< which expression: a NoteExpression id
+    float value = 0.0f; ///< the new value, in that expression's own range
+    int samplePosition = 0; ///< the frame, 0-based from the start of the block
   };
 
+  /** Empty the buffer. No allocation; the wrappers clear the one they hand a
+   *  DSP between blocks. */
   void clear() { count_ = 0; }
+  /** How many events the block holds, 0 to kMaxEvents. */
   int getNumEvents() const { return count_; }
+  /** No events this block. */
   bool isEmpty() const { return count_ == 0; }
 
+  /** Insert `e` keeping frame order; an event at the same frame as others
+   *  goes after them. Past kMaxEvents it is dropped without a count. No
+   *  allocation. */
   void addEvent(const Entry& e) {
     if (count_ >= kMaxEvents) return;
     int i = count_;
@@ -467,7 +699,9 @@ public:
     ++count_;
   }
 
+  /** The first event, for a range-for over the block in frame order. */
   const Entry* begin() const { return events_; }
+  /** One past the last event. */
   const Entry* end() const { return events_ + count_; }
 
 private:
@@ -475,20 +709,13 @@ private:
   int count_ = 0;
 };
 
-/** Turns MPE's channel-per-note MIDI into expression events.
- *
- *  MPE spells per-note control as ordinary MIDI on a member channel: pitch
- *  bend is that note's tuning, channel pressure is its pressure, CC74 its
- *  brightness. The decoder tracks which note owns which channel, because the
- *  bend arrives with no note number attached -- that mapping IS the protocol.
- *  Pitch bend range defaults to MPE's own ±48 semitones, not a keyboard's ±2. */
 /** One Registered or Non-Registered Parameter, once it has been assembled. */
 struct RpnMessage {
-  int channel = 1;         // 1-based, MIDI convention
-  int parameterNumber = 0; // 14-bit
-  int value = 0;           // 7-bit, or 14-bit when is14Bit
-  bool isNrpn = false;
-  bool is14Bit = false;
+  int channel = 1;         ///< 1-based, MIDI convention
+  int parameterNumber = 0; ///< 14-bit, 0..16383: the selecting MSB times 128 plus its LSB
+  int value = 0;           ///< 7-bit, or 14-bit when is14Bit
+  bool isNrpn = false;     ///< selected with CC 99/98 (non-registered), not 101/100
+  bool is14Bit = false;    ///< `value` includes the data entry LSB (CC 38)
 };
 
 /**
@@ -514,6 +741,8 @@ struct RpnMessage {
  */
 class RpnDetector {
 public:
+  /** Forget every channel's selected parameter and partial value, as if
+   *  each had been sent RPN NULL. */
   void reset() {
     for (int i = 0; i < 16; ++i) channels_[i] = State();
   }
@@ -576,8 +805,14 @@ public:
   }
 
 private:
+  /** What one channel has been told so far: the parameter selected and the
+   *  value's MSB, each -1 until it arrives. Cleared by RPN NULL (101 and 100
+   *  both at 127) and by reset(). */
   struct State {
+    /** The selected parameter's MSB and LSB and the value's MSB and LSB,
+     *  7 bits each, or -1 until they arrive. */
     int paramMsb = -1, paramLsb = -1, valueMsb = -1, valueLsb = -1;
+    /** The selection came through CC 99/98 rather than 101/100. */
     bool isNrpn = false;
   };
   State channels_[16];
@@ -585,8 +820,8 @@ private:
 
 /** The registered parameters this SDK acts on. */
 enum : int {
-  kRpnPitchBendSensitivity = 0,
-  kRpnMpeConfiguration = 6, // the MPE Configuration Message
+  kRpnPitchBendSensitivity = 0, ///< bend range: semitones in the MSB, cents in the LSB
+  kRpnMpeConfiguration = 6, ///< the MPE Configuration Message
 };
 
 /**
@@ -645,25 +880,6 @@ inline void sendPitchBendRange(MidiBuffer& out, int channel, int semitones, int 
 
 
 /**
- * An MPE zone: which channel is the MASTER, and how many members follow it.
- *
- * MPE splits a controller's sixteen channels into a zone with one master
- * channel and a run of member channels. A note lives on a member channel and
- * its bend, pressure and timbre are that finger's alone. The master channel
- * carries the same three things for the ZONE -- the player's whole hand
- * pushing, a global bend, the sustain pedal -- and they apply to every note
- * sounding in it.
- *
- * That distinction is not decoration. A controller sending a global bend on
- * its master channel has no note on that channel, so a decoder that treats
- * every channel alike drops the message on the floor.
- *
- * A zone is announced with the MPE Configuration Message: RPN 6 on channel 1
- * for the lower zone or channel 16 for the upper, valued with the number of
- * member channels. Zero turns the zone off, which is also how a controller
- * says "I am an ordinary MIDI instrument now".
- */
-/**
  * Which host is running this plugin.
  *
  * Nobody wants to need this and everybody ends up needing it. Hosts have bugs
@@ -681,8 +897,19 @@ inline void sendPitchBendRange(MidiBuffer& out, int channel, int semitones, int 
  * itself, and a plugin that assumes a name will find one missing.
  */
 struct HostInfo {
+  /** The host's name as it gives it, UTF-8: from CLAP's host description,
+   *  VST3's host application, or the name an Audio Unit host sets in
+   *  kAudioUnitProperty_AUHostIdentifier; the standalone app gives its own.
+   *  Empty when the host did not say, which in LV2 is always. Match it with
+   *  is(), not with ==. */
   std::string name;
+  /** The host's vendor, as CLAP reports it. VST3 and Audio Units give only a
+   *  name and a version, so this stays empty there. */
   std::string vendor;
+  /** The host's version string, free-form, as CLAP reports it; from an
+   *  Audio Unit host, its version number as "major.minor.bugfix" (see
+   *  detail::auHostVersionText()); empty from VST3. Compare it only for a
+   *  host already matched by name. */
   std::string version;
 
   /** Case-insensitive substring match, because host names are not stable
@@ -697,6 +924,42 @@ struct HostInfo {
     return lowerName.find(lowerNeedle) != std::string::npos;
   }
 };
+
+namespace detail {
+
+/**
+ * An Audio Unit host's version as text, from the UInt32 it sets beside its
+ * name in kAudioUnitProperty_AUHostIdentifier (AUHostVersionIdentifier's
+ * hostVersion). The field was a NumVersion, and Apple redefined it as a UInt32
+ * of the same four bytes, so it reads as one: the major version in the top
+ * byte, in BCD; the minor and the bug-fix version one digit each in the next;
+ * then the release stage and the pre-release revision, not shown. 0x10410000
+ * is "10.4.1". A major byte that is not BCD -- a host that wrote the number in
+ * binary -- is read as binary: 0x0A400000 is "10.4.0". 0, no version given,
+ * is "".
+ */
+inline std::string auHostVersionText(uint32_t hostVersion) {
+  if (hostVersion == 0) return std::string();
+  const unsigned majorByte = (hostVersion >> 24) & 0xFFu;
+  const unsigned tens = majorByte >> 4, units = majorByte & 0xFu;
+  // Not "major" and "minor": the BSD and glibc headers define those as macros.
+  const unsigned majorPart = tens <= 9 && units <= 9 ? tens * 10 + units : majorByte;
+  const unsigned minorPart = (hostVersion >> 20) & 0xFu, bugfixPart = (hostVersion >> 16) & 0xFu;
+  return std::to_string(majorPart) + "." + std::to_string(minorPart) + "." +
+         std::to_string(bugfixPart);
+}
+
+/** The HostInfo an Audio Unit host's identifier makes, as the AU wrapper
+ *  hands it to setHostInfo(): `utf8Name` (null is no name) and the version
+ *  as auHostVersionText() reads it. No vendor: the property carries none. */
+inline HostInfo auHostInfo(const char* utf8Name, uint32_t hostVersion) {
+  HostInfo info;
+  if (utf8Name) info.name = utf8Name;
+  info.version = auHostVersionText(hostVersion);
+  return info;
+}
+
+} // namespace detail
 
 /**
  * The track this instance was dropped onto.
@@ -720,20 +983,28 @@ struct HostInfo {
  * bug in the host.
  */
 struct TrackInfo {
+  /** The host named the track. While false, `name` means nothing. */
   bool hasName = false;
+  /** The track's name, UTF-8, when hasName. */
   std::string name;
 
+  /** The host gave the track a colour. While false the components below
+   *  mean nothing, colourHex() is empty and luminance() is 0. */
+  bool hasColour = false;
+  ///@{
   /** 8 bits per component. Alpha is normally opaque; a host that sends a
    *  transparent track colour means it, and a plugin that ignores alpha will
    *  paint a colour the user never chose. */
-  bool hasColour = false;
   unsigned char red = 0, green = 0, blue = 0, alpha = 255;
+  ///@}
 
   /** WHERE in the session, which is the part that changes a default rather
    *  than a pixel. A host that does not say leaves all three false, and
    *  "probably an ordinary track" is the right thing to assume then. */
   bool isReturnTrack = false;
+  /** The plugin sits on a bus (a group or submix) rather than a track. */
   bool isBus = false;
+  /** The plugin sits on the master bus. */
   bool isMaster = false;
 
   /** How many channels the track carries, or -1 when the host did not say.
@@ -741,7 +1012,7 @@ struct TrackInfo {
    *  cannot double as "unknown". */
   int audioChannelCount = -1;
 
-  /** The colour as #RRGGBB, which is what a web UI wants and what every
+  /** The colour as `#RRGGBB`, which is what a web UI wants and what every
    *  caller would otherwise write out by hand. Alpha is deliberately left
    *  off: CSS hex with alpha is not understood everywhere, and a UI that
    *  wants it can read the components. */
@@ -768,10 +1039,35 @@ struct TrackInfo {
   }
 };
 
+/**
+ * An MPE zone: which channel is the MASTER, and how many members follow it.
+ *
+ * MPE splits a controller's sixteen channels into a zone with one master
+ * channel and a run of member channels. A note lives on a member channel and
+ * its bend, pressure and timbre are that finger's alone. The master channel
+ * carries the same three things for the ZONE -- the player's whole hand
+ * pushing, a global bend, the sustain pedal -- and they apply to every note
+ * sounding in it.
+ *
+ * That distinction is not decoration. A controller sending a global bend on
+ * its master channel has no note on that channel, so a decoder that treats
+ * every channel alike drops the message on the floor.
+ *
+ * A zone is announced with the MPE Configuration Message: RPN 6 on channel 1
+ * for the lower zone or channel 16 for the upper, valued with the number of
+ * member channels. Zero turns the zone off, which is also how a controller
+ * says "I am an ordinary MIDI instrument now".
+ */
 struct MpeZone {
+  /** A controller has configured this zone. While false MPE is off for it:
+   *  every query below answers false and each channel stands alone. */
   bool active = false;
+  /** The lower zone (master channel 1, members above it) rather than the
+   *  upper (master channel 16, members below it). */
   bool isLowerZone = true;
-  int masterChannel = 0;     // 0-based
+  int masterChannel = 0;     ///< 0-based: 0 for the lower zone, 15 for the upper
+  /** How many member channels follow the master, 1 to 15 while active; a
+   *  controller asking for more is clamped to 15. */
   int numMemberChannels = 0;
 
   /** Member channels run UP from the master in the lower zone and DOWN from
@@ -782,15 +1078,29 @@ struct MpeZone {
     if (isLowerZone) return channel > masterChannel && channel <= masterChannel + numMemberChannels;
     return channel < masterChannel && channel >= masterChannel - numMemberChannels;
   }
+  /** Whether `channel` (0-based) is this zone's master channel. False for
+   *  every channel while the zone is inactive. */
   bool isMaster(int channel) const { return active && channel == masterChannel; }
 };
 
+/** Turns MPE's channel-per-note MIDI into expression events.
+ *
+ *  MPE spells per-note control as ordinary MIDI on a member channel: pitch
+ *  bend is that note's tuning, channel pressure is its pressure, CC74 its
+ *  brightness. The decoder tracks which notes sound on which channel, because
+ *  the bend arrives with no note number attached -- that mapping IS the
+ *  protocol. A channel message reaches EVERY note sounding on its channel:
+ *  one under MPE, a whole chord from a plain keyboard.
+ *  Pitch bend range defaults to MPE's own ±48 semitones, not a keyboard's ±2. */
 class MpeDecoder {
 public:
   /** Override the range manually. Whatever a controller announces through
    *  RPN 0 takes precedence from the moment it arrives -- the instrument
    *  knows how it is configured and this does not. */
   void setPitchBendRange(float semitones) { bendRange_ = semitones; }
+  /** The per-note (member channel) bend range in semitones: a full bend
+   *  either way moves a note this far. 48 until set or announced; a zone
+   *  being configured puts it back to 48. */
   float pitchBendRange() const { return bendRange_; }
 
   /** The zone, if a controller has announced one. Inactive until then, and
@@ -798,6 +1108,8 @@ public:
    *  exactly what a plain MIDI keyboard needs and what this did before zones
    *  existed. */
   const MpeZone& lowerZone() const { return lower_; }
+  /** The upper zone (master channel 16), on the same terms as
+   *  lowerZone(). */
   const MpeZone& upperZone() const { return upper_; }
 
   /** The master channel's own bend range. MPE gives it a different default
@@ -807,13 +1119,38 @@ public:
    *  twenty-four times too wide. */
   float masterBendRange() const { return masterBendRange_; }
 
+  /** Forget what is sounding and what the controller said: held notes, each
+   *  channel's last bend, pressure and CC 74, half-sent RPNs, and both zones,
+   *  which go back to inactive. The two bend ranges are kept. No
+   *  allocation. */
   void reset() {
-    for (int i = 0; i < 16; ++i) noteOnChannel_[i] = -1;
+    for (int i = 0; i < 16; ++i) {
+      for (bool& key : held_[i]) key = false;
+      bend_[i] = 8192;
+      pressure_[i] = -1;
+      timbre_[i] = -1;
+    }
     rpn_.reset();
     lower_ = MpeZone();
     upper_ = MpeZone();
   }
 
+  /**
+   * Read one block's MIDI and APPEND the expression it carries to `out`,
+   * which is not cleared first.
+   *
+   * Every message is read, none consumed: `in` is left as it was. Pitch
+   * bend becomes kExprTuning in semitones (the note's own bend at
+   * pitchBendRange() plus, in a zone, the master's at masterBendRange()),
+   * channel pressure kExprPressure and CC 74 kExprBrightness, both 0 to 1.
+   * Each goes out once per note it reaches -- every note held on its
+   * channel, or on a zone's master channel every note in the zone -- at the
+   * message's frame, with key and a 0-based channel filled and noteId -1.
+   * A note-on also sends whatever its channel was given before it. RPN 0
+   * and the MPE Configuration Message update the bend ranges and the zones
+   * as they arrive. No allocation; the wrappers call it on the audio thread
+   * for a DSP whose descriptor says supportsMpe.
+   */
   void process(const MidiBuffer& in, NoteExpressionBuffer& out) {
     for (const auto& ev : in) {
       // Watch for the instrument announcing its own bend range before doing
@@ -845,43 +1182,61 @@ public:
       }
       const MidiMessage& m = ev.message;
       const int ch = (m.getRawStatus() & 0x0f);
+      if (m.isPitchWheel()) bend_[ch] = m.getPitchWheelValue();
+      else if ((m.getRawStatus() & 0xf0) == 0xd0) pressure_[ch] = m.getRawData1();
+      else if (m.isController() && m.getControllerNumber() == 74) timbre_[ch] = m.getControllerValue();
       if (m.isNoteOn()) {
-        noteOnChannel_[ch] = m.getNoteNumber();
+        held_[ch][m.getNoteNumber()] = true;
+        startNote(ch, m.getNoteNumber(), ev.samplePosition, out);
         continue;
       }
       if (m.isNoteOff()) {
-        if (noteOnChannel_[ch] == m.getNoteNumber()) noteOnChannel_[ch] = -1;
+        held_[ch][m.getNoteNumber()] = false;
+        continue;
+      }
+      if (m.isController() && (m.getControllerNumber() == 120 || m.getControllerNumber() == 123)) {
+        // All sound / all notes off -- what a host sends on stop instead of
+        // a note-off per key. On a master channel it ends the whole zone.
+        const MpeZone* zone = lower_.isMaster(ch) ? &lower_ : (upper_.isMaster(ch) ? &upper_ : nullptr);
+        for (int c = 0; c < 16; ++c)
+          if (c == ch || (zone && zone->hasMember(c)))
+            for (bool& key : held_[c]) key = false;
         continue;
       }
       // A message on the MASTER channel belongs to every note in the zone, not
       // to one of them. This is what a controller uses for a global bend or a
       // whole-hand press, and it arrives on a channel with no note of its own
-      // -- so the old code, which looked up noteOnChannel_ and gave up when it
-      // found nothing, discarded it.
+      // -- so the old code, which looked up the note on this channel and gave
+      // up when it found nothing, discarded it.
       if (lower_.isMaster(ch) || upper_.isMaster(ch)) {
         const MpeZone& zone = lower_.isMaster(ch) ? lower_ : upper_;
+        NoteExpressionBuffer::Entry g;
+        g.samplePosition = ev.samplePosition;
+        if (!fillExpression(m, g, masterBendRange_)) continue;
         for (int member = 0; member < 16; ++member) {
-          if (!zone.hasMember(member) || noteOnChannel_[member] < 0) continue;
-          NoteExpressionBuffer::Entry g;
-          g.key = (int16_t) noteOnChannel_[member];
-          g.channel = (int16_t) member;
-          g.samplePosition = ev.samplePosition;
-          if (!fillExpression(m, g, masterBendRange_)) break;
-          out.addEvent(g);
+          if (!zone.hasMember(member)) continue;
+          for (int key = 0; key < 128; ++key) {
+            if (!held_[member][key]) continue;
+            g.key = (int16_t) key;
+            g.channel = (int16_t) member;
+            // A zone bend moves each note from where its own bend has it:
+            // MPE ADDS the two. Sent as the zone's bend alone, it replaced
+            // the finger's -- a note slid up twelve semitones dropped to the
+            // master's one the moment the pitch wheel moved, and jumped back
+            // at the finger's next message.
+            if (g.expression == kExprTuning) g.value = tuningOf(member);
+            out.addEvent(g);
+          }
         }
         continue;
       }
 
-      const int key = noteOnChannel_[ch];
-      if (key < 0) continue; // nothing sounding on this channel to express
-
       NoteExpressionBuffer::Entry e;
-      e.key = (int16_t) key;
       e.channel = (int16_t) ch;
       e.samplePosition = ev.samplePosition;
       if (m.isPitchWheel()) {
         e.expression = kExprTuning;
-        e.value = ((float) m.getPitchWheelValue() - 8192.0f) / 8192.0f * bendRange_;
+        e.value = tuningOf(ch); // its own bend, and its zone's on top
       } else if ((m.getRawStatus() & 0xf0) == 0xd0) { // channel pressure
         e.expression = kExprPressure;
         e.value = (float) m.getRawData1() / 127.0f;
@@ -891,12 +1246,76 @@ public:
       } else {
         continue;
       }
-      out.addEvent(e);
+      // Every note on the channel. One slot per channel held only the LAST
+      // note-on: a plain keyboard's chord bent one note of three under the
+      // wheel, and once that key was let go the wheel bent nothing at all
+      // while the other two still sounded.
+      for (int key = 0; key < 128; ++key) {
+        if (!held_[ch][key]) continue;
+        e.key = (int16_t) key;
+        out.addEvent(e);
+      }
     }
   }
 
 private:
-  int noteOnChannel_[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  /** Which keys sound on each channel, set by note-on and cleared by
+   *  note-off. */
+  bool held_[16][128] = {};
+  /** Each channel's last pitch bend, as the 14-bit value it arrived as, so
+   *  a note's tuning can be told whole whichever half of it moved: a member
+   *  channel's at the per-note range, plus its zone master's at the master
+   *  range. Kept raw, so a range announced later reads it at that range. */
+  int bend_[16] = {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+                   8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192};
+  /** Each channel's last pressure and CC 74, or -1 while it has had none. */
+  int pressure_[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+  int timbre_[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+
+  /** A note starts with what its channel was given BEFORE it.
+   *
+   *  MPE has a controller send a new note's bend, pressure and CC 74 ahead
+   *  of its note-on -- where the finger landed, how hard, how high on the
+   *  key -- and this SDK's own MPE keyboard sends them in that order. With
+   *  no note on the channel yet, each was dropped, and the note started at
+   *  the DSP's defaults: the initial timbre lost until the finger moved,
+   *  a note landed off-centre sounding on the key. They are the channel's
+   *  state, so they go out at the note-on's frame, after it, where a DSP
+   *  that starts its notes first finds the voice. A bend of nothing is the
+   *  note's own default and is not sent. */
+  void startNote(int channel, int key, int samplePosition, NoteExpressionBuffer& out) const {
+    NoteExpressionBuffer::Entry e;
+    e.key = (int16_t) key;
+    e.channel = (int16_t) channel;
+    e.samplePosition = samplePosition;
+    const float tuning = tuningOf(channel);
+    if (tuning != 0.0f) {
+      e.expression = kExprTuning;
+      e.value = tuning;
+      out.addEvent(e);
+    }
+    if (pressure_[channel] >= 0) {
+      e.expression = kExprPressure;
+      e.value = (float) pressure_[channel] / 127.0f;
+      out.addEvent(e);
+    }
+    if (timbre_[channel] >= 0) {
+      e.expression = kExprBrightness;
+      e.value = (float) timbre_[channel] / 127.0f;
+      out.addEvent(e);
+    }
+  }
+
+  /** The tuning, in semitones, of a note on `channel`: its own bend, and
+   *  the zone's from the master channel when it is a member of one. */
+  float tuningOf(int channel) const {
+    float semitones = ((float) bend_[channel] - 8192.0f) / 8192.0f * bendRange_;
+    const MpeZone* zone =
+        lower_.hasMember(channel) ? &lower_ : (upper_.hasMember(channel) ? &upper_ : nullptr);
+    if (zone)
+      semitones += ((float) bend_[zone->masterChannel] - 8192.0f) / 8192.0f * masterBendRange_;
+    return semitones;
+  }
   /** Turn one message into an expression entry, or say it is not one. Shared
    *  by the per-note and the zone-wide paths so the two cannot interpret the
    *  same message differently. */
@@ -965,27 +1384,27 @@ private:
  *  lookup table. That coincidence is asserted in the test suite rather than
  *  trusted. */
 enum ChannelRole : uint8_t {
-  kChannelFL = 0,   // front left
-  kChannelFR = 1,   // front right
-  kChannelFC = 2,   // front centre
-  kChannelLFE = 3,  // low frequency effects
-  kChannelBL = 4,   // back left
-  kChannelBR = 5,   // back right
-  kChannelFLC = 6,  // front left of centre
-  kChannelFRC = 7,  // front right of centre
-  kChannelBC = 8,   // back centre
-  kChannelSL = 9,   // side left
-  kChannelSR = 10,  // side right
-  kChannelTC = 11,  // top centre
-  kChannelTFL = 12, // top front left
-  kChannelTFC = 13, // top front centre
-  kChannelTFR = 14, // top front right
-  kChannelTBL = 15, // top back left
-  kChannelTBC = 16, // top back centre
-  kChannelTBR = 17, // top back right
-  kChannelTSL = 18, // top side left
-  kChannelTSR = 19, // top side right
-  kChannelUnknown = 255,
+  kChannelFL = 0,   ///< front left
+  kChannelFR = 1,   ///< front right
+  kChannelFC = 2,   ///< front centre
+  kChannelLFE = 3,  ///< low frequency effects
+  kChannelBL = 4,   ///< back left
+  kChannelBR = 5,   ///< back right
+  kChannelFLC = 6,  ///< front left of centre
+  kChannelFRC = 7,  ///< front right of centre
+  kChannelBC = 8,   ///< back centre
+  kChannelSL = 9,   ///< side left
+  kChannelSR = 10,  ///< side right
+  kChannelTC = 11,  ///< top centre
+  kChannelTFL = 12, ///< top front left
+  kChannelTFC = 13, ///< top front centre
+  kChannelTFR = 14, ///< top front right
+  kChannelTBL = 15, ///< top back left
+  kChannelTBC = 16, ///< top back centre
+  kChannelTBR = 17, ///< top back right
+  kChannelTSL = 18, ///< top side left
+  kChannelTSR = 19, ///< top side right
+  kChannelUnknown = 255, ///< no role known: what roleOf() answers when the host gave none
 };
 
 /** The layout the industry means by "N channels", as a role bitmask. Hosts may
@@ -1021,9 +1440,15 @@ inline uint64_t defaultChannelMask(uint32_t width) {
  *  Both CLAP and VST3 order their channels this way, so one rule serves both.
  *  Writes at most `capacity` roles and returns how many it wrote. */
 inline uint32_t rolesFromMask(uint64_t mask, uint8_t* out, uint32_t capacity) {
+  // The set bits only, lowest first: the wrappers rebuild this every block,
+  // and walking all 64 bits was 67 ns of it.
   uint32_t n = 0;
-  for (uint8_t role = 0; role < 64 && n < capacity; ++role)
-    if (mask & ((uint64_t) 1 << role)) out[n++] = role;
+  while (mask && n < capacity) {
+    uint8_t role = 0;
+    for (uint64_t m = mask; !(m & 1u); m >>= 1) ++role;
+    out[n++] = role;
+    mask &= mask - 1; // clear the lowest set bit
+  }
   return n;
 }
 
@@ -1054,10 +1479,14 @@ struct ProcessContextT {
    *  auxOutputs. Their contents are UNDEFINED on entry: a DSP that writes
    *  only some frames must clear the rest. */
   AudioBlock<SampleType>* aux;
+  /** How many entries `aux` has: the descriptor's aux output count (at most
+   *  32), whether or not the host connected them. */
   size_t numAux;
   /** The key input, silence-filled when the host routed nothing. Zero width
    *  when the DSP never declared a sidechain. */
   AudioBlock<SampleType>& sidechain;
+  /** The MIDI the host sent for this block: its events in frame order, and
+   *  its SysEx -- what the simple instrument signature is handed. */
   MidiBuffer& midi;
   /** MIDI the plugin EMITS this block, empty on entry. Add events with
    *  frame offsets exactly as they arrive on the input side; the wrapper
@@ -1075,7 +1504,7 @@ struct ProcessContextT {
   /** Which ports the host has told us it is actually using.
    *
    *  A host that routes nothing out of an aux bus, or has nothing patched into
-   *  the sidechain, can say so: CLAP calls this audio-ports-activation. The
+   *  the sidechain, can say so. CLAP calls this audio-ports-activation. The
    *  buffers are still handed over and still zero-filled, so this changes
    *  nothing about correctness; what it buys is the chance to SKIP the work.
    *  A three-way splitter whose Mid and High bands go nowhere can run one
@@ -1084,6 +1513,10 @@ struct ProcessContextT {
    *  Defaults mean "assume everything is in use", so a DSP that ignores these
    *  behaves exactly as it did before they existed. */
   const bool* auxActive = nullptr;
+  /** False when the host has said nothing is patched into the sidechain,
+   *  so the DSP may skip its key detection. The sidechain block is handed
+   *  over either way, so ignoring this is always correct. True when the
+   *  host never said. */
   bool sidechainActive = true;
   /** Offline render, same meaning as ProcessSpec::offline. Repeated here so a
    *  DSP can react per block rather than only at prepare(). */
@@ -1093,15 +1526,22 @@ struct ProcessContextT {
    *  otherwise, which is the common case and the safe one. */
   bool isAuxActive(size_t index) const { return !auxActive || index >= numAux || auxActive[index]; }
 
+  /** What main-bus channel `channel` (0-based) means; kChannelUnknown when
+   *  the host gave no roles or the channel is past the bus's width. */
   ChannelRole roleOf(size_t channel) const {
     if (!channelRoles || channel >= main.getNumChannels()) return kChannelUnknown;
     return (ChannelRole) channelRoles[channel];
   }
 
+  /** Aux output bus `i`, 0-based in declaration order. Not bounds-checked:
+   *  `i` must be below numAux. */
   AudioBlock<SampleType>& auxOut(size_t i) const { return aux[i]; }
+  /** Frames in this block: the main bus's length, which every bus shares. */
   size_t getNumSamples() const { return main.getNumSamples(); }
 };
 
+/** The ProcessContext of 32-bit float processing, the one a DSP declares in
+ *  `process(sonore::ProcessContext& ctx, const float* params)`. */
 using ProcessContext = ProcessContextT<float>;
 
 } // namespace sonore

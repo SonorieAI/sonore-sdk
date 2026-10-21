@@ -27,6 +27,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "va_filters.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 #include "fast_math.h"
@@ -48,22 +51,42 @@ namespace sonore {
  */
 class DiodeLadder {
 public:
+  /** At 48 kHz with the 1 kHz default cutoff, designed. Nothing set the
+   *  coefficients at construction, and until setSampleRate() or setCutoff()
+   *  ran the ladder put out silence. */
+  DiodeLadder() { setSampleRate(48000.0f); }
+  /** The rate in Hz (1 or less means 48 kHz), and the coefficients worked
+   *  out again for the current cutoff. Call it in prepare(). No
+   *  allocation. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     update();
   }
+  /** The sections' corner in Hz, 1 kHz by default, clamped to 20 Hz up to
+   *  0.45 of the rate: the circuit's control, not the filter's -3 dB point
+   *  (see above). Recomputes the coefficients, a tangent and a few
+   *  divisions; no allocation. */
   void setCutoff(float hz) {
     cutoff_ = clampf(hz, 20.0f, sr_ * 0.45f);
     update();
   }
-  /** 0..1. Self-oscillation arrives at the top (K = 17). */
-  void setResonance(float r) { k_ = clampf(r, 0.0f, 1.0f) * 17.0f; }
+  /** 0..1. Self-oscillation arrives near the top -- with saturation on,
+   *  which is what bounds it. Linear, the top stops just short. */
+  void setResonance(float r) {
+    res_ = clampf(r, 0.0f, 1.0f);
+    applyResonance();
+  }
   /** Input drive into the ladder's tanh; 0 = linear. */
-  void setSaturation(float s) { sat_ = clampf(s, 0.0f, 4.0f); }
+  void setSaturation(float s) {
+    sat_ = clampf(s, 0.0f, 4.0f);
+    applyResonance();
+  }
+  /** Clear the four stages' state; the settings are kept. */
   void reset() {
     for (auto& s : stage_) s.reset();
   }
 
+  /** [audio-thread] One sample through the ladder. No allocation. */
   inline float process(float x) {
     // Each stage's feedback is the NEXT stage's state, top down.
     stage_[3].feedback = 0.0f;
@@ -81,13 +104,35 @@ public:
   }
 
 private:
+  /** K = 17 is where an oscillation stops decaying, at every cutoff and rate,
+   *  and a linear loop has nothing to bound one: a -26 dBFS tone at the ring
+   *  frequency came out at +24 dBFS and climbing. So without saturation the
+   *  control tops out here, about a 10 dB peak -- as LadderFilter tops out
+   *  short of its own threshold. Kept apart from the control, so turning the
+   *  saturation on gives the full range back whichever was set first. */
+  static constexpr float kLinearMaxK = 16.5f;
+  /** With saturation, the top of the control goes 5% past the threshold, as
+   *  LadderFilter's goes to 4.2 against its 4. Exactly AT 17 an oscillation
+   *  neither grows nor decays, so "self-oscillation at the top" was a ring
+   *  that held whatever level it started at: a 0.001 impulse rang at
+   *  4.7e-6 for ever, where LadderFilter sustains 0.43. */
+  static constexpr float kSaturatedMaxK = 17.85f;
+  void applyResonance() {
+    k_ = res_ * (sat_ > 0.0f ? kSaturatedMaxK : 17.0f);
+    if (sat_ <= 0.0f && k_ > kLinearMaxK) k_ = kLinearMaxK;
+  }
+
   /** A TPT one-pole with the extra inputs the diode ladder needs: a feedback
    *  term, and coefficients that make it part of a coupled chain. */
   struct Stage {
     float alpha = 0.0f, beta = 0.0f, gamma = 1.0f, delta = 0.0f, epsilon = 0.0f, a0 = 1.0f;
     float z1 = 0.0f, feedback = 0.0f;
 
+    /** What this stage hands the stage before it: its state plus its own
+     *  feedback through delta, scaled by beta. */
     inline float feedbackOut() const { return beta * (z1 + feedback * delta); }
+    /** One sample through the one-pole, the coupling terms added to its
+     *  input. */
     inline float process(float x) {
       x = x * gamma + feedback + epsilon * feedbackOut();
       const float vn = (a0 * x - z1) * alpha;
@@ -95,6 +140,7 @@ private:
       z1 = flushDenormal(vn + lp);
       return lp;
     }
+    /** Clear the state and the feedback; the coefficients are kept. */
     void reset() {
       z1 = 0.0f;
       feedback = 0.0f;
@@ -138,7 +184,7 @@ private:
 
   Stage stage_[4];
   float sg_[4]{}, gammaAll_ = 0.0f;
-  float sr_ = 48000.0f, cutoff_ = 1000.0f, k_ = 0.0f, sat_ = 0.0f;
+  float sr_ = 48000.0f, cutoff_ = 1000.0f, k_ = 0.0f, sat_ = 0.0f, res_ = 0.0f;
 };
 
 // ── Sallen-Key (Korg35) ──────────────────────────────────────────────────────
@@ -157,13 +203,23 @@ private:
  */
 class SallenKeyFilter {
 public:
-  enum class Mode { Lowpass, Highpass };
+  /** Which of the MS-20's two circuits: Lowpass, the default, or Highpass. */
+  enum class Mode { Lowpass, /**< the two-pole lowpass */ Highpass /**< the two-pole highpass */ };
 
+  /** At 48 kHz with the 1 kHz default cutoff, designed. Nothing set the
+   *  coefficient at construction, and until setSampleRate() or setCutoff()
+   *  ran the lowpass put out silence. */
+  SallenKeyFilter() { setSampleRate(48000.0f); }
+  /** The rate in Hz (1 or less means 48 kHz), and the coefficient worked out
+   *  again for the current cutoff. Call it in prepare(). No allocation. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     update();
   }
+  /** Lowpass or Highpass, from the next sample; the state is not cleared. */
   void setMode(Mode m) { mode_ = m; }
+  /** The cutoff in Hz, 1 kHz by default, clamped to 20 Hz up to 0.45 of the
+   *  rate. Recomputes the coefficient, a tangent; no allocation. */
   void setCutoff(float hz) {
     cutoff_ = clampf(hz, 20.0f, sr_ * 0.45f);
     update();
@@ -172,8 +228,11 @@ public:
   void setResonance(float r) { k_ = clampf(r, 0.0f, 1.0f) * 1.99f; }
   /** The diode clipper in the resonance loop, 0 = linear. */
   void setSaturation(float s) { sat_ = clampf(s, 0.0f, 4.0f); }
+  /** Clear the three one-poles' state; the settings are kept. */
   void reset() { s1_ = s2_ = sH_ = 0.0f; }
 
+  /** [audio-thread] One sample through the filter in the current mode. No
+   *  allocation. */
   inline float process(float x) {
     const float G = G_, oneMinusG = 1.0f - G_;
     if (mode_ == Mode::Lowpass) {

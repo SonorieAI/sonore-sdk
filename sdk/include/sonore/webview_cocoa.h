@@ -13,7 +13,7 @@
 // macOS specifics that shape this file:
 //
 //  - CLAP's cocoa API uses LOGICAL points, and the OS handles Retina scaling,
-//    so set_scale is (correctly) ignored: as it is on Windows.
+//    so set_scale is (correctly) ignored, as it is on Windows.
 //
 //  - A script message handler is an Objective-C object with a required method.
 //    There is no such class in the frameworks, so one is REGISTERED at runtime
@@ -74,6 +74,7 @@ struct CGRectStruct { CGPointStruct origin; CGSizeStruct size; };
  *  didReceiveScriptMessage:` forwards to the host that owns it. */
 class WebViewHost;
 inline void handleScriptMessage(id self, SEL, id, id message);
+inline void decideNavigationPolicy(id self, SEL, id webView, id action, id decisionHandler);
 
 /** A runtime class name that is unique to THIS binary.
  *
@@ -97,6 +98,10 @@ inline Class messageHandlerClass() {
     if (!c) return (Class) objc_getClass(name); // already registered by this image
     class_addMethod(c, sel_registerName("userContentController:didReceiveScriptMessage:"),
                     (IMP) handleScriptMessage, "v@:@@");
+    // The same object is the view's navigation delegate (WKNavigationDelegate
+    // is looked up by selector, so no protocol needs declaring).
+    class_addMethod(c, sel_registerName("webView:decidePolicyForNavigationAction:decisionHandler:"),
+                    (IMP) decideNavigationPolicy, "v@:@@@?");
     // One instance variable: the WebViewHost that should receive the message.
     class_addIvar(c, "owner", sizeof(void*), (uint8_t) log2(sizeof(void*)), "^v");
     objc_registerClassPair(c);
@@ -185,6 +190,11 @@ public:
       return false;
     }
 
+    // The page stays the page (webviewMayNavigate). The delegate property is
+    // weak; handler_ is what keeps the object alive. With no UI delegate,
+    // window.open already opens nothing.
+    msg<void>(webview_, sel_registerName("setNavigationDelegate:"), handler_);
+
     // Fill the parent as it resizes: NSViewWidthSizable | NSViewHeightSizable.
     msg<void>(webview_, sel_registerName("setAutoresizingMask:"), (unsigned long) (2 | 16));
 
@@ -196,6 +206,16 @@ public:
     timer_ = msg<id>(cls("NSTimer"),
                      sel_registerName("scheduledTimerWithTimeInterval:repeats:block:"),
                      (double) 0.033, (BOOL) YES, makeTimerBlock());
+    // In the COMMON modes too: a scheduled timer fires in the default mode
+    // only, and the editor froze while a host held its loop in a modal or
+    // mouse-tracking mode -- a menu open, a fader dragged, a dialog up.
+    // NSRunLoopCommonModes is the string "kCFRunLoopCommonModes".
+    if (timer_) {
+      id loop = msg<id>(cls("NSRunLoop"), sel_registerName("currentRunLoop"));
+      if (loop)
+        msg<void>(loop, sel_registerName("addTimer:forMode:"), timer_,
+                  nsString("kCFRunLoopCommonModes"));
+    }
     ready_ = true;
     return true;
   }
@@ -209,6 +229,7 @@ public:
     // may still deliver a queued script message after the view is torn down,
     // and a handler whose owner is a destroyed WebViewHost would hand it a
     // freed object.
+    if (webview_) msg<void>(webview_, sel_registerName("setNavigationDelegate:"), (id) nullptr);
     if (handler_) {
       object_setInstanceVariable(handler_, "owner", nullptr);
       msg<void>(handler_, sel_registerName("release"));
@@ -220,6 +241,7 @@ public:
       webview_ = nullptr;
     }
     ready_ = false;
+    captureKeys = false; // the page that asked is gone (see webview_win32.h)
   }
 
   bool ready() const { return ready_; }
@@ -245,7 +267,7 @@ public:
   }
 
   void eval(const std::string& js) {
-    if (!ready_ || !webview_) return;
+    if (js.empty() || !ready_ || !webview_) return; // an empty script still wakes the page
     msg<void>(webview_, sel_registerName("evaluateJavaScript:completionHandler:"),
               nsString(js), (id) nullptr);
   }
@@ -314,8 +336,38 @@ inline void handleScriptMessage(id self, SEL, id, id message) {
   void* owner = nullptr;
   object_getInstanceVariable(self, "owner", &owner);
   if (!owner) return;
+  // From the page's own document only: the channel is reachable from every
+  // frame, and the bridge is injected into the main one alone.
+  id frame = msg<id>(message, sel_registerName("frameInfo"));
+  if (!frame || !msg<BOOL>(frame, sel_registerName("isMainFrame"))) return;
+  // A string, or nothing. The bridge always posts one, but a page may call
+  // window.webkit.messageHandlers.sonore.postMessage itself, with an object:
+  // WebKit hands that over as an NSDictionary, UTF8String is not a method
+  // of it, and the NSInvalidArgumentException unwound through C++ frames
+  // and took the host down.
   id body = msg<id>(message, sel_registerName("body"));
+  if (!body || !msg<BOOL>(body, sel_registerName("isKindOfClass:"), (Class) objc_getClass("NSString")))
+    return;
   static_cast<WebViewHost*>(owner)->deliver(fromNsString(body));
+}
+
+/** WKNavigationDelegate's policy method: allow only what webviewMayNavigate
+ *  allows. The decision handler is a block, called through its invoke
+ *  pointer, which follows isa, flags and reserved in every block's layout.
+ *  WKNavigationActionPolicyCancel is 0, Allow is 1. */
+inline void decideNavigationPolicy(id, SEL, id, id action, id decisionHandler) {
+  id request = action ? msg<id>(action, sel_registerName("request")) : nullptr;
+  id url = request ? msg<id>(request, sel_registerName("URL")) : nullptr;
+  id text = url ? msg<id>(url, sel_registerName("absoluteString")) : nullptr;
+  const bool allowed = text && webviewMayNavigate(fromNsString(text));
+  struct BlockHeader {
+    void* isa;
+    int flags;
+    int reserved;
+    void (*invoke)(void*, long);
+  };
+  auto* block = reinterpret_cast<BlockHeader*>(decisionHandler);
+  if (block && block->invoke) block->invoke(block, allowed ? 1L : 0L);
 }
 
 } // namespace cocoa

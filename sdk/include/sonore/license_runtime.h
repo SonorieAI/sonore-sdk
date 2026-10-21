@@ -27,6 +27,7 @@
 // personal export defines neither and compiles byte-identically to before.
 
 #include "license.h"
+#include "path_io.h"
 
 #include <atomic>
 #include <cstdint>
@@ -85,7 +86,7 @@ inline std::string persistedDeviceId() {
 #else
   const std::string path = dir + "/device-id";
 #endif
-  if (FILE* f = std::fopen(path.c_str(), "rb")) {
+  if (FILE* f = ::sonore::pathio::open(path.c_str(), "rb")) {
     char buf[80];
     const size_t n = std::fread(buf, 1, sizeof(buf), f);
     std::fclose(f);
@@ -108,7 +109,7 @@ inline std::string persistedDeviceId() {
     for (int i = 15; i >= 0; --i) id.push_back(kHex[(a >> (i * 4)) & 0xF]);
     for (int i = 15; i >= 0; --i) id.push_back(kHex[(b >> (i * 4)) & 0xF]);
   }
-  if (FILE* f = std::fopen(path.c_str(), "wb")) {
+  if (FILE* f = ::sonore::pathio::open(path.c_str(), "wb")) {
     std::fwrite(id.data(), 1, id.size(), f);
     std::fclose(f);
   }
@@ -196,7 +197,7 @@ inline std::string rawDeviceId() {
   // is not just our own privacy preference -- it is what systemd's own
   // documentation requires of anyone exposing this value outside the machine.
   for (const char* path : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
-    if (FILE* f = std::fopen(path, "rb")) {
+    if (FILE* f = ::sonore::pathio::open(path, "rb")) {
       char buf[128];
       const size_t n = std::fread(buf, 1, sizeof(buf), f);
       std::fclose(f);
@@ -244,11 +245,13 @@ inline std::string machineId(const std::string& productCode) {
  *  place a plugin can write without being installed as an administrator. */
 inline std::string licDir() {
 #if defined(_WIN32)
-  const char* base = std::getenv("APPDATA");
-  if (!base || !*base) base = std::getenv("USERPROFILE");
-  if (!base || !*base) return std::string();
-  const std::string dir = std::string(base) + "\\Sonore";
-  _mkdir(dir.c_str());
+  // UTF-8, as every other path here: a profile named after its user came back
+  // from getenv as question marks, and the licence could not be stored.
+  std::string base = ::sonore::pathio::environment("APPDATA");
+  if (base.empty()) base = ::sonore::pathio::environment("USERPROFILE");
+  if (base.empty()) return std::string();
+  const std::string dir = base + "\\Sonore";
+  ::sonore::pathio::makeDirectory(dir.c_str());
   return dir;
 #else
   const char* home = std::getenv("HOME");
@@ -294,7 +297,7 @@ struct LicFile {
 inline bool readLic(const std::string& productCode, LicFile* out) {
   const std::string path = licPath(productCode);
   if (path.empty() || !out) return false;
-  FILE* f = std::fopen(path.c_str(), "rb");
+  FILE* f = ::sonore::pathio::open(path.c_str(), "rb");
   if (!f) return false;
   std::string all;
   char buf[1024];
@@ -323,7 +326,7 @@ inline bool readLic(const std::string& productCode, LicFile* out) {
 inline bool writeLic(const std::string& productCode, const LicFile& in) {
   const std::string path = licPath(productCode);
   if (path.empty()) return false;
-  FILE* f = std::fopen(path.c_str(), "wb");
+  FILE* f = ::sonore::pathio::open(path.c_str(), "wb");
   if (!f) return false;
   const std::string body = in.token + "\n" + in.email + "\n" + in.key + "\n";
   const size_t wrote = std::fwrite(body.data(), 1, body.size(), f);

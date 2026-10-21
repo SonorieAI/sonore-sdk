@@ -16,10 +16,14 @@
 #include <sonore/gfx/widgets.h>
 #include <sonore/gfx/window_win32.h>
 
+#include <chrono>
 #include <cstdio>
 #include <vector>
+#include <atomic>
+#include <mutex>
 #include <thread>
 #include <string>
+#include <type_traits>
 #include <uiautomation.h>
 #include <objbase.h>
 #include <cstring>
@@ -32,6 +36,17 @@ static void check(bool ok, const char* what) {
 }
 
 using namespace sonore::gfx;
+
+// The window procedure holds a pointer to its NativeWindow, and the window
+// owns its router, UI Automation root and drop target by raw pointer. It was
+// copyable: a copy of an open window, destroyed with the original, released
+// the UI Automation root a second time -- a use-after-free under ASan -- and
+// would have deleted the router twice. Neither copied nor moved, as the X11
+// and Cocoa peers already were not.
+static_assert(!std::is_copy_constructible<NativeWindow>::value && !std::is_copy_assignable<NativeWindow>::value,
+              "a NativeWindow is never copied");
+static_assert(!std::is_move_constructible<NativeWindow>::value && !std::is_move_assignable<NativeWindow>::value,
+              "nor moved");
 
 /** Let the window process everything queued. */
 static void pump() {
@@ -286,6 +301,206 @@ static void testUiaProvider() {
   if (hostWindow) DestroyWindow(hostWindow);
 }
 
+// ── A screen reader, told without asking ─────────────────────────────────────
+//
+// The reader above ASKS. A reader also LISTENS: for the focus moving and for
+// the focused control's value changing, which is how a value the host's
+// automation moves gets said aloud. A real UIA client on a worker thread
+// registers for both events, the editor's focus moves with Tab, and the host
+// moves the focused parameter; the client must hear the focus land on Gain
+// and Gain's new value.
+// final: Release() deletes through `this`, and COM interfaces have no virtual
+// destructor, so nothing may derive from it.
+struct UiaEventSink final : public IUIAutomationFocusChangedEventHandler,
+                            public IUIAutomationPropertyChangedEventHandler {
+  LONG refs = 1;
+  std::mutex lock;
+  std::vector<std::wstring> focused; // the names focus landed on
+  std::vector<std::wstring> values;  // the new values said
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG) InterlockedIncrement(&refs); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG left = InterlockedDecrement(&refs);
+    if (left == 0) delete this;
+    return (ULONG) left;
+  }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+    if (!out) return E_INVALIDARG;
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IUIAutomationFocusChangedEventHandler))
+      *out = static_cast<IUIAutomationFocusChangedEventHandler*>(this);
+    else if (iid == __uuidof(IUIAutomationPropertyChangedEventHandler))
+      *out = static_cast<IUIAutomationPropertyChangedEventHandler*>(this);
+    else {
+      *out = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement* sender) override {
+    BSTR name = nullptr;
+    if (sender && SUCCEEDED(sender->get_CurrentName(&name)) && name) {
+      std::lock_guard<std::mutex> guard(lock);
+      focused.push_back(name);
+      SysFreeString(name);
+    }
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(IUIAutomationElement*, PROPERTYID property,
+                                                       VARIANT value) override {
+    if (property == UIA_ValueValuePropertyId && value.vt == VT_BSTR && value.bstrVal) {
+      std::lock_guard<std::mutex> guard(lock);
+      values.push_back(value.bstrVal);
+    }
+    return S_OK;
+  }
+};
+
+static void testUiaEvents() {
+  using namespace sonore;
+  using namespace sonore::gfx;
+  std::printf("\n-- accessibility events, heard by a UI Automation client --\n");
+  char msg[400];
+
+  static const ParamInfo kParams[2] = {
+      {"gain", "Gain", "dB", -60.0f, 6.0f, 0.0f, 0},
+      {"freq", "Freq", "Hz", 20.0f, 20000.0f, 440.0f, 0},
+  };
+  float values[2] = {-6.0f, 440.0f};
+  EditorHost host;
+  host.getParameter = [&](int i) { return values[i]; };
+  host.setParameter = [&](int i, float v) { values[i] = v; };
+  host.beginGesture = [](int) {};
+  host.endGesture = [](int) {};
+
+  WNDCLASSW hostClass{};
+  hostClass.lpfnWndProc = DefWindowProcW;
+  hostClass.hInstance = GetModuleHandleW(nullptr);
+  hostClass.lpszClassName = L"SonoreUiaEventHost";
+  RegisterClassW(&hostClass);
+  HWND hostWindow = CreateWindowExW(0, L"SonoreUiaEventHost", L"", WS_OVERLAPPEDWINDOW, 0, 0, 500,
+                                    340, nullptr, nullptr, hostClass.hInstance, nullptr);
+  NativeEditor editor;
+  if (!hostWindow || !editor.open(hostWindow, kParams, 2, host, 420, 200)) {
+    check(false, "the editor opens for the UIA event check");
+    if (hostWindow) DestroyWindow(hostWindow);
+    return;
+  }
+  HWND hwnd = (HWND) editor.handle();
+
+  UiaEventSink* sink = new UiaEventSink();
+  std::atomic<int> stage{0}; // 1: listening, 2: done, -1: no client
+  std::thread listener([&]() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IUIAutomation* automation = nullptr;
+    IUIAutomationElement* window = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                                __uuidof(IUIAutomation), (void**) &automation)) || !automation ||
+        FAILED(automation->ElementFromHandle(hwnd, &window)) || !window) {
+      stage = -1;
+      if (automation) automation->Release();
+      CoUninitialize();
+      return;
+    }
+    PROPERTYID wanted[1] = {UIA_ValueValuePropertyId};
+    automation->AddFocusChangedEventHandler(nullptr, sink);
+    automation->AddPropertyChangedEventHandlerNativeArray(window, TreeScope_Subtree, nullptr, sink,
+                                                          wanted, 1);
+    stage = 1;
+    while (stage.load() == 1) Sleep(10);
+    automation->RemoveAllEventHandlers();
+    window->Release();
+    automation->Release();
+    CoUninitialize();
+  });
+
+  // Pumping, so the editor's clock runs and UIA's calls into it are answered.
+  auto pumpFor = [&](DWORD ms) {
+    const DWORD until = GetTickCount() + ms;
+    while (GetTickCount() < until) {
+      MSG m;
+      while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+      }
+      Sleep(5);
+    }
+  };
+  const DWORD waitUntil = GetTickCount() + 10000;
+  while (stage.load() == 0 && GetTickCount() < waitUntil) pumpFor(20);
+  check(stage.load() == 1, "a UI Automation client listens for focus and value changes");
+  bool editorHadFocus = false;
+  size_t saidBeforeLeaving = 0;
+  if (stage.load() == 1) {
+    // The editor's window takes the keyboard focus, as a click into it
+    // gives it: a control is only focused for a reader while it has.
+    ShowWindow(hostWindow, SW_SHOWNOACTIVATE);
+    SetFocus(hwnd);
+    pumpFor(300);
+    editorHadFocus = GetFocus() == hwnd;
+    // Tab: the editor's keyboard focus moves onto its first control.
+    SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+    SendMessageW(hwnd, WM_KEYUP, VK_TAB, 0);
+    pumpFor(600);
+    // The host automates the focused parameter.
+    values[0] = -12.0f;
+    pumpFor(800);
+    values[0] = -18.0f;
+    pumpFor(800);
+    // The user clicks elsewhere in the host -- its track list, a window
+    // beside the editor rather than one holding it -- and the host goes on
+    // automating. Gain is still the editor's focused control, but nobody is
+    // in the editor to hear it.
+    {
+      std::lock_guard<std::mutex> guard(sink->lock);
+      saidBeforeLeaving = sink->values.size();
+    }
+    HWND trackList = CreateWindowExW(0, L"SonoreUiaEventHost", L"", WS_CHILD | WS_VISIBLE, 430, 0,
+                                     60, 60, hostWindow, nullptr, hostClass.hInstance, nullptr);
+    SetFocus(trackList);
+    pumpFor(300);
+    values[0] = -24.0f;
+    pumpFor(800);
+    if (trackList) DestroyWindow(trackList);
+  }
+  if (stage.load() == 1) stage = 2;
+  listener.join();
+
+  std::vector<std::wstring> focused, said;
+  {
+    std::lock_guard<std::mutex> guard(sink->lock);
+    focused = sink->focused;
+    said = sink->values;
+  }
+  sink->Release();
+  bool heardGain = false, heardTwelve = false, heardEighteen = false, heardInBackground = false;
+  for (const std::wstring& f : focused) {
+    std::printf("       focus heard on: \"%ls\"\n", f.c_str());
+    if (f == L"Gain") heardGain = true;
+  }
+  for (size_t i = 0; i < said.size(); ++i) {
+    const std::wstring& v = said[i];
+    std::printf("       value said: \"%ls\"\n", v.c_str());
+    if (v.find(L"-12") != std::wstring::npos) heardTwelve = true;
+    if (v.find(L"-18") != std::wstring::npos) heardEighteen = true;
+    if (i >= saidBeforeLeaving) heardInBackground = true;
+  }
+  check(editorHadFocus, "the editor's window takes the keyboard focus");
+  std::snprintf(msg, sizeof(msg), "Tab moves the focus, and the reader hears it land on Gain "
+                "(%d focus event(s) heard)", (int) focused.size());
+  check(heardGain, msg);
+  std::snprintf(msg, sizeof(msg), "automation moving the focused Gain is said: -12 and then -18 "
+                "(%d value event(s), %s)", (int) said.size(),
+                heardTwelve && heardEighteen ? "both" : "not both");
+  check(heardTwelve && heardEighteen, msg);
+  check(said.size() <= 8, "and said a few times, not at every tick of the clock");
+  check(!heardInBackground,
+        "and once the user is in the host instead, the editor's automated value is not said");
+
+  editor.close();
+  DestroyWindow(hostWindow);
+}
+
 int main() {
   // UNBUFFERED, deliberately. This test drives a real window through real
   // messages, and when it crashes it crashes inside the OS message loop --
@@ -521,6 +736,76 @@ int main() {
   // its own events alone -- automation, a preset load and host undo all move
   // parameters with nobody touching the window -- and without a timer those
   // changes appear only the next time the mouse happens to move.
+  // ── The keyboard, inside a host ─────────────────────────────────────────
+  //
+  // Nothing in the SDK called SetFocus, and a child window does not take the
+  // keyboard just because it was clicked: inside a DAW no WM_KEYDOWN or
+  // WM_CHAR ever reached the editor, so a value could not be typed. Every
+  // other keyboard test here SendMessages straight to the window and so could
+  // not notice. Taking focus on every click would be the opposite bug -- the
+  // host's space bar swallowed by a knob -- so the rule is: the editor takes
+  // the keyboard when a TEXT field is focused, and gives it back when not.
+  std::printf("\n── keyboard focus inside a host ──\n");
+  {
+    static const sonore::ParamInfo kFocusParams[1] = {
+        {"gain", "Gain", "dB", -60.0f, 6.0f, 0.0f, 0},
+    };
+    float value = 0.0f;
+    EditorHost focusHost;
+    focusHost.getParameter = [&](int) { return value; };
+    focusHost.setParameter = [&](int, float v) { value = v; };
+    HWND hostFrame = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPEDWINDOW, 0, 0, 440, 220,
+                                     nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    NativeEditor focusEditor;
+    if (hostFrame && focusEditor.open(hostFrame, kFocusParams, 1, focusHost, 380, 160)) {
+      HWND child = (HWND) focusEditor.handle();
+      SetFocus(hostFrame);
+      const float rowY = GenericEditor::kPadding + GenericEditor::kRowHeight * 0.5f;
+      const float trackX = GenericEditor::kPadding + GenericEditor::kLabelWidth + 30.0f;
+      SendMessageW(child, WM_LBUTTONDOWN, MK_LBUTTON, at((int) trackX, (int) rowY));
+      SendMessageW(child, WM_LBUTTONUP, 0, at((int) trackX, (int) rowY));
+      check(GetFocus() != child, "clicking a knob leaves the keyboard with the host");
+
+      const float editorW = focusEditor.content() ? focusEditor.content()->bounds().w : 380.0f;
+      const float valueX = editorW - GenericEditor::kPadding - GenericEditor::kValueWidth * 0.5f;
+      SendMessageW(child, WM_LBUTTONDBLCLK, MK_LBUTTON, at((int) valueX, (int) rowY));
+      SendMessageW(child, WM_LBUTTONUP, 0, at((int) valueX, (int) rowY));
+      int cx = 0, cy = 0;
+      PlatformWindow* peer = focusEditor.window();
+      if (peer && peer->compositionPoint(&cx, &cy)) {
+        check(GetFocus() == child, "double-clicking the value field gives the editor the keyboard");
+        SendMessageW(child, WM_KEYDOWN, VK_RETURN, 0);
+        check(GetFocus() == hostFrame, "...and Return, ending the edit, hands it back to the host");
+      } else {
+        std::printf("  ---- no text field took focus (no typeface?); focus hand-off not exercised ----\n");
+      }
+
+      // The host window dragged to a monitor with another DPI. A CHILD window
+      // never receives WM_DPICHANGED; per-monitor-aware Windows sends it
+      // WM_DPICHANGED_AFTERPARENT instead, which went unhandled, so an
+      // embedded editor kept the scale it had until a host happened to call
+      // setScale. Here the editor holds a scale that is not this window's
+      // (as after a monitor change) and is sent the message.
+      {
+        typedef UINT(WINAPI * GetDpiForWindowFn)(HWND);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        auto getDpi = user32 ? (GetDpiForWindowFn) GetProcAddress(user32, "GetDpiForWindow")
+                             : nullptr;
+        const float actual = getDpi ? (float) getDpi(child) / 96.0f : 1.0f;
+        focusEditor.setScale(actual * 2.0f);
+        SendMessageW(child, 0x02E3 /* WM_DPICHANGED_AFTERPARENT */, 0, 0);
+        char line[200];
+        std::snprintf(line, sizeof(line), "an embedded editor takes its window's DPI when the parent's "
+                      "changes (scale %.2f, window %.2f)", (double) focusEditor.scale(), (double) actual);
+        check(std::fabs(focusEditor.scale() - actual) < 0.01f, line);
+      }
+      focusEditor.close();
+    } else {
+      check(false, "a native editor opens inside a host window");
+    }
+    if (hostFrame) DestroyWindow(hostFrame);
+  }
+
   std::printf("\n── native editor ──\n");
   {
     static const char* kShapes[] = {"Sine", "Saw", "Square"};
@@ -652,6 +937,45 @@ int main() {
                       "right-click was declined and not merely missed", (double) values[0]);
         check(values[0] != valueBefore, msg);
         check(menuCalls == 1, "…and a left click asks for no menu");
+      }
+
+      // ── A drop-down at 200% ──
+      //
+      // The combo's position is logical and the window's client area is device
+      // pixels; the menu was anchored by adding the first to the second, so at
+      // 200% it opened at half the combo's distance from the editor's corner,
+      // and at the monitor's 100% -- half the size of the control under it.
+      // The Shape row is the third: its combo spans x 128.. and y 82..106,
+      // logical, so its menu belongs at (256, 212) device pixels from the
+      // corner and twice its own preferred height.
+      {
+        editor.setScale(2.0f);
+        editor.tick();
+        POINT corner{0, 0};
+        ClientToScreen(editorHwnd, &corner);
+        SendMessageW(editorHwnd, WM_LBUTTONDOWN, MK_LBUTTON, at(2 * 160, 2 * 94));
+        SendMessageW(editorHwnd, WM_LBUTTONUP, 0, at(2 * 160, 2 * 94));
+        pump();
+        HWND menuHwnd = GetCapture();
+        const bool isMenu = menuHwnd && menuHwnd != editorHwnd && GetParent(menuHwnd) == nullptr;
+        check(isMenu, "at 200% a click on the Shape combo opens its menu");
+        if (isMenu) {
+          RECT r{};
+          GetWindowRect(menuHwnd, &r);
+          const int dx = (int) (r.left - corner.x), dy = (int) (r.top - corner.y);
+          const int wantH = (int) (2.0f * (2.0f * PopupMenu::kPaddingY + 3.0f * PopupMenu::kItemHeight));
+          std::snprintf(msg, sizeof(msg), "...anchored under the combo in device pixels (at %d,%d "
+                        "from the corner, want 256,212)", dx, dy);
+          check(std::abs(dx - 256) <= 2 && std::abs(dy - 212) <= 2, msg);
+          std::snprintf(msg, sizeof(msg), "...and drawn at the editor's scale (%ld px tall, want "
+                        "%d)", (long) (r.bottom - r.top), wantH);
+          check(std::abs((int) (r.bottom - r.top) - wantH) <= 2, msg);
+          SendMessageW(menuHwnd, WM_LBUTTONDOWN, MK_LBUTTON, at(-50, -50));
+          pump();
+        }
+        editor.tick();
+        editor.setScale(1.0f);
+        editor.tick();
       }
 
       // ── Where an input method would put its candidate list ──
@@ -843,6 +1167,93 @@ int main() {
   // reaches it anyway. That last one is the whole mechanism -- without the
   // capture, a click outside goes to whatever is behind, the menu stays open,
   // and two things respond to one gesture.
+  // -- An element keeps its root alive --
+  //
+  // A screen reader holds elements for as long as it likes. Each element
+  // reached its root through a raw pointer it never counted, so once the
+  // window closed and UIA dropped the root, a reader still holding a slider
+  // called into freed memory. An element now holds a reference to its root.
+  std::printf("\n-- accessibility ownership --\n");
+  {
+    Component page;
+    page.setBounds({0.0f, 0.0f, 200.0f, 60.0f});
+    Slider slider;
+    slider.setAccessibleName("Gain");
+    slider.setBounds({10.0f, 10.0f, 120.0f, 24.0f});
+    page.addChild(&slider);
+    auto* root = new uia::RootProvider(nullptr, &page, "ownership");
+    root->refresh();
+    IRawElementProviderFragment* element = root->makeChild(0);
+    check(element != nullptr, "the root hands out an element for its first control");
+    if (element) {
+      const ULONG counted = root->AddRef();
+      root->Release();
+      std::snprintf(msg, sizeof(msg), "the element holds a reference to its root (root count "
+                    "%lu with one element out, want 3)", (unsigned long) counted);
+      check(counted == 3, msg);
+      root->detach();
+      root->Release(); // the window lets go
+      UiaRect box{};
+      check(element->get_BoundingRectangle(&box) == (HRESULT) UIA_E_ELEMENTNOTAVAILABLE,
+            "...so the element still answers after the window let go: it is gone");
+      element->Release(); // the last reference, and the root with it
+    } else {
+      root->Release();
+    }
+    page.removeChild(&slider);
+  }
+
+  // -- An element is its control, not its place in the list --
+  //
+  // A reader keeps the element it is on. Elements were positions in the
+  // snapshot, so once a control above closed, the reader's element read the
+  // NEXT control -- its name, its value, its runtime id -- and an element
+  // whose own control had gone answered for whatever followed it.
+  {
+    Component strip;
+    strip.setBounds({0.0f, 0.0f, 400.0f, 60.0f});
+    strip.setAccessibilityIgnored(true);
+    Button alpha("Alpha"), beta("Beta"), gamma("Gamma");
+    Button* buttons[3] = {&alpha, &beta, &gamma};
+    for (int i = 0; i < 3; ++i) {
+      buttons[i]->setBounds({(float) i * 120.0f, 10.0f, 100.0f, 30.0f});
+      strip.addChild(buttons[i]);
+    }
+    auto* root = new uia::RootProvider(nullptr, &strip, "identity");
+    root->refresh();
+    IRawElementProviderFragment* held = root->makeChild(1); // Beta
+    auto nameOf = [](IRawElementProviderFragment* e, HRESULT* hr) {
+      IRawElementProviderSimple* simple = nullptr;
+      e->QueryInterface(__uuidof(IRawElementProviderSimple), (void**) &simple);
+      VARIANT v;
+      VariantInit(&v);
+      *hr = simple ? simple->GetPropertyValue(UIA_NamePropertyId, &v) : E_FAIL;
+      std::wstring name = v.vt == VT_BSTR && v.bstrVal ? v.bstrVal : L"";
+      VariantClear(&v);
+      if (simple) simple->Release();
+      return name;
+    };
+    HRESULT hr = S_OK;
+    check(held && nameOf(held, &hr) == L"Beta", "a reader holds the element for Beta");
+    if (held) {
+      strip.removeChild(&alpha);
+      root->refresh();
+      std::wstring now = nameOf(held, &hr);
+      std::snprintf(msg, sizeof(msg), "Alpha removed above it, the element still reads \"%ls\"", now.c_str());
+      check(now == L"Beta" && hr == S_OK, msg);
+      strip.removeChild(&beta);
+      root->refresh();
+      now = nameOf(held, &hr);
+      std::snprintf(msg, sizeof(msg), "Beta itself removed, it reads \"%ls\" (hr 0x%08lx), not Gamma: "
+                    "UIA_E_ELEMENTNOTAVAILABLE", now.c_str(), (unsigned long) hr);
+      check(now.empty() && hr == (HRESULT) UIA_E_ELEMENTNOTAVAILABLE, msg);
+      held->Release();
+    }
+    root->detach();
+    root->Release();
+    strip.removeChild(&gamma);
+  }
+
   std::printf("\n-- popup window --\n");
   {
     auto face = systemTypeface();
@@ -918,6 +1329,57 @@ int main() {
     PopupMenu nothing;
     check(!popup.show(nothing, font, 0.0f, 0.0f, 0.0f, 1920.0f, 1080.0f, [](int) {}),
           "an empty menu refuses to open rather than showing an empty box");
+
+    // -- Opened from a click, the way a ComboBox opens it --
+    //
+    // A combo opens its menu on mouse-UP, inside the editor's WM_LBUTTONUP --
+    // and the editor then called ReleaseCapture(), which releases the
+    // THREAD's capture: by then the menu's. Clicks outside no longer reached
+    // it, and the menu stayed on top of everything until an item was picked.
+    // The standalone popup above opens outside any click, so it never saw it.
+    {
+      struct Opener : Component {
+        PopupWindow* popup = nullptr;
+        PopupMenu* menu = nullptr;
+        Font* font = nullptr;
+        int* chosen = nullptr;
+        void mouseUp(const MouseEvent&) override {
+          popup->show(*menu, *font, 20.0f, 20.0f, 24.0f, 1920.0f, 1080.0f,
+                      [this](int id) { *chosen = id; });
+        }
+      };
+      Component page;
+      page.setBounds({0.0f, 0.0f, 200.0f, 80.0f});
+      Opener opener;
+      opener.setBounds({10.0f, 10.0f, 120.0f, 30.0f});
+      page.addChild(&opener);
+      PopupWindow fromClick;
+      int picked = -999;
+      opener.popup = &fromClick;
+      opener.menu = &menu;
+      opener.font = &font;
+      opener.chosen = &picked;
+
+      NativeWindow host;
+      if (host.open(nullptr, page, 200, 80)) {
+        HWND hh = (HWND) host.handle();
+        SendMessageW(hh, WM_LBUTTONDOWN, MK_LBUTTON, at(40, 20));
+        SendMessageW(hh, WM_LBUTTONUP, 0, at(40, 20));
+        pump();
+        check(fromClick.isOpen(), "a click on the opener opens the menu");
+        if (fromClick.isOpen()) {
+          HWND menuHwnd = (HWND) fromClick.handle();
+          check(GetCapture() == menuHwnd,
+                "...and the menu still holds the mouse after the click that opened it");
+          SendMessageW(menuHwnd, WM_LBUTTONDOWN, MK_LBUTTON, at(-50, -50));
+          pump();
+          fromClick.tick();
+          check(!fromClick.isOpen() && picked == 0, "...so a click outside dismisses it");
+        }
+        fromClick.close();
+        host.close();
+      }
+    }
   }
 
   // -- Keys, through a real window ------------------------------------------
@@ -950,6 +1412,17 @@ int main() {
       keyWindow.router()->setFocus(&field);
       check(field.hasKeyboardFocus(), "and the field has focus");
 
+      // WM_CHAR is synthesised, but the window proc reads the PHYSICAL modifier
+      // state for it (GetKeyState), so a Ctrl or Alt held anywhere on the
+      // desktop -- somebody pressing Ctrl+C in another window while this runs
+      // -- turns "H" into a shortcut and the field stays empty. That is the
+      // machine, not the editor: skip loudly rather than report a defect.
+      const bool modifierHeld = (GetKeyState(VK_CONTROL) & 0x8000) ||
+                                (GetKeyState(VK_MENU) & 0x8000) ||
+                                (GetKeyState(VK_SHIFT) & 0x8000);
+      if (modifierHeld) {
+        std::printf("  SKIPPED typing checks: a modifier key is physically held on this desktop\n");
+      } else {
       for (const char* c = "Hi"; *c; ++c) SendMessageW(kh, WM_CHAR, (WPARAM) *c, 0);
       pump();
       std::snprintf(msg, sizeof(msg), "two WM_CHARs typed \"%s\"", field.getText().c_str());
@@ -976,11 +1449,33 @@ int main() {
                     field.caretPosition(), (int) field.getText().size());
       check(field.caretPosition() == 1 && field.getText().size() == 4, msg);
 
+      // AltGr. On a German or French layout @, the euro sign, braces and the
+      // pipe are typed with AltGr, which Windows REPORTS as Ctrl+Alt -- and the
+      // window passed those modifiers on, so the text field refused the
+      // character as a shortcut. Simulated through the thread's own keyboard
+      // state, which is what GetKeyState reads, and restored afterwards.
+      {
+        BYTE keys[256], saved[256];
+        GetKeyboardState(keys);
+        std::memcpy(saved, keys, sizeof(keys));
+        keys[VK_CONTROL] = keys[VK_LCONTROL] = 0x80;
+        keys[VK_MENU] = keys[VK_RMENU] = 0x80;
+        SetKeyboardState(keys);
+        field.setText("");
+        SendMessageW(kh, WM_CHAR, (WPARAM) L'@', 0);
+        SendMessageW(kh, WM_CHAR, (WPARAM) 0x20AC, 0); // the euro sign
+        SetKeyboardState(saved);
+        pump();
+        check(field.getText() == "@" "\xE2\x82\xAC",
+              "characters typed with AltGr (reported as Ctrl+Alt) reach the text field");
+      }
+
       // A key nothing handles must not be swallowed. The window returns it to
       // DefWindowProc, which is what lets a host keep its own shortcuts.
       keyWindow.router()->setFocus(nullptr);
       const LRESULT unhandled = SendMessageW(kh, WM_KEYDOWN, VK_F5, 0);
       check(unhandled == 0 || true, "an unhandled key falls through to the system");
+      }
     }
     keyWindow.close();
     page2.removeChild(&field);
@@ -1084,6 +1579,355 @@ int main() {
   }
 
   testUiaProvider();
+  testUiaEvents();
+
+  // ── The host closes the editor with the button still down ──
+  //
+  // A shortcut pressed mid-drag, a track deleted: the window goes and the
+  // release never comes. The router went with it and nothing ended the
+  // press, so a dragged slider left the host's gesture open (one begin, no
+  // end) and a key held on the on-screen keyboard never sent its note-off
+  // -- a note stuck sounding with no editor left to stop it.
+  std::printf("\n── closed mid-gesture ──\n");
+  {
+    static const sonore::ParamInfo kGain[1] = {{"gain", "Gain", "dB", -60.0f, 6.0f, 0.0f, 0}};
+    float value = 0.0f;
+    int begins = 0, ends = 0, ons = 0, offs = 0;
+    EditorHost host;
+    host.getParameter = [&](int) { return value; };
+    host.setParameter = [&](int, float v) { value = v; };
+    host.beginGesture = [&](int) { ++begins; };
+    host.endGesture = [&](int) { ++ends; };
+    host.noteOn = [&](int, float) { ++ons; };
+    host.noteOff = [&](int) { ++offs; };
+    NativeEditor editor;
+    if (editor.open(nullptr, kGain, 1, host, 420, 200)) {
+      HWND h = (HWND) editor.handle();
+      const int rowY = (int) (GenericEditor::kPadding + GenericEditor::kRowHeight * 0.5f);
+      const int trackX = (int) (GenericEditor::kPadding + GenericEditor::kLabelWidth + 30.0f);
+      SendMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, at(trackX, rowY));
+      SendMessageW(h, WM_MOUSEMOVE, MK_LBUTTON, at(trackX + 40, rowY));
+      editor.close();
+      std::snprintf(msg, sizeof(msg), "a slider dragged as the editor closes ends its gesture "
+                    "(%d begin, %d end)", begins, ends);
+      check(begins == 1 && ends == 1, msg);
+    } else {
+      check(false, "the editor opens for the mid-drag close");
+    }
+    if (editor.open(nullptr, kGain, 1, host, 420, 200) && editor.content() &&
+        editor.content()->keyboard()) {
+      MidiKeyboard* keys = editor.content()->keyboard();
+      const Point p = keys->localToRoot({keys->bounds().w * 0.3f, keys->bounds().h * 0.9f});
+      SendMessageW((HWND) editor.handle(), WM_LBUTTONDOWN, MK_LBUTTON, at((int) p.x, (int) p.y));
+      editor.close();
+      std::snprintf(msg, sizeof(msg), "a key held as the editor closes is released "
+                    "(%d note-on, %d note-off)", ons, offs);
+      check(ons == 1 && offs == 1, msg);
+    } else {
+      check(false, "an instrument's editor opens with a keyboard");
+    }
+  }
+
+  // ── A plugin's own editor, in the same window ──
+  //
+  // NativeEditor only ever built GenericEditor, so a plugin that wanted a face
+  // of its own had the webview or nothing: no hook took a component. The
+  // content factory is that hook, and everything the generic editor gets from
+  // the window -- the clock, the size, the drop-down menus, a font -- has to
+  // reach the plugin's editor too, or "native editor" means "generic editor".
+  {
+    struct OwnEditor : AudioProcessorEditor {
+      ComboBox box;
+      int ticks = 0;
+      OwnEditor() {
+        box.setItems({"One", "Two", "Three"});
+        box.onOpenMenu = [this](ComboBox& b) { openComboMenu(b); };
+        addChild(&box);
+      }
+      void resized() override { box.setBounds({10.0f, 10.0f, 120.0f, 24.0f}); }
+      void editorTick(double) override { ++ticks; }
+      void paint(Graphics& g) override { g.fillAll(Colour::fromRGB(0x203040)); }
+    };
+    float value = 0.5f;
+    EditorHost host;
+    host.getParameter = [&](int) { return value; };
+    host.setParameter = [&](int, float v) { value = v; };
+    OwnEditor* made = nullptr;
+    int factoryCalls = 0;
+    NativeEditor editor;
+    editor.setContentFactory([&](const EditorHost& h) {
+      ++factoryCalls;
+      check((bool) h.getParameter, "the plugin's editor is handed the wrapper's host");
+      std::unique_ptr<OwnEditor> e(new OwnEditor());
+      made = e.get();
+      return std::unique_ptr<AudioProcessorEditor>(std::move(e));
+    });
+    static const sonore::ParamInfo kOne[1] = {{"gain", "Gain", "", 0.0f, 1.0f, 0.5f, 0}};
+    check(editor.open(nullptr, kOne, 1, host, 320, 200), "a native editor with a plugin's own content opens");
+    check(factoryCalls == 1 && editor.customContent() == made && made != nullptr,
+          "and shows what the factory made");
+    check(editor.content() == nullptr, "instead of the generic editor, not beside it");
+    if (made) {
+      check(made->bounds().w == 320.0f && made->bounds().h == 200.0f,
+            "the plugin's editor fills the window it opened at");
+      check(made->font().isValid() == editor.hasText(),
+            "and draws in the system face when it chose none");
+      const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+      while (made->ticks < 3 && std::chrono::steady_clock::now() < until) {
+        pump();
+        Sleep(10);
+      }
+      check(made->ticks >= 3, "editorTick runs on the window's clock");
+      editor.setSize(420, 260);
+      check(made->bounds().w == 420.0f && made->bounds().h == 260.0f,
+            "a host's resize reaches the plugin's editor");
+      made->box.onOpenMenu(made->box);
+      check(editor.popup().isOpen(), "its ComboBox drops down the window's real menu");
+      editor.popup().close();
+    }
+    editor.close();
+    check(editor.customContent() == nullptr && !editor.isOpen(), "closing the editor destroys it");
+    // ── A drop-down whose box is rebuilt while it is open ──
+    //
+    // The menu is a window of its own and lives on after the editor's tick
+    // has rebuilt the page under it -- automation moving a parameter the
+    // page is laid out by. Its answer was written into the box it was
+    // opened from, by raw pointer, after that box had been destroyed.
+    {
+      struct Rebuilding : AudioProcessorEditor {
+        std::unique_ptr<ComboBox> box;
+        int changes = 0;
+        Rebuilding() { rebuild(); }
+        void rebuild() {
+          box.reset(new ComboBox());
+          box->setItems({"One", "Two", "Three"});
+          box->onOpenMenu = [this](ComboBox& b) { openComboMenu(b); };
+          box->onChange = [this](int) { ++changes; };
+          box->setBounds({10.0f, 10.0f, 120.0f, 24.0f});
+          addChild(box.get());
+        }
+        void paint(Graphics& g) override { g.fillAll(Colour::fromRGB(0x203040)); }
+      };
+      Rebuilding* shown = nullptr;
+      NativeEditor rebuilt;
+      rebuilt.setContentFactory([&](const EditorHost&) {
+        std::unique_ptr<Rebuilding> e(new Rebuilding());
+        shown = e.get();
+        return std::unique_ptr<AudioProcessorEditor>(std::move(e));
+      });
+      if (rebuilt.open(nullptr, kOne, 1, host, 320, 200) && shown) {
+        shown->box->onOpenMenu(*shown->box);
+        const bool opened = rebuilt.popup().isOpen() && rebuilt.popup().content();
+        shown->rebuild(); // the box the menu belongs to is gone
+        if (opened) rebuilt.popup().content()->dismissWith(2); // "Two"
+        rebuilt.popup().tick();
+        check(opened && shown->changes == 0 && shown->box->selectedIndex() == 0,
+              "a choice from a menu whose box was rebuilt under it goes nowhere");
+      } else {
+        check(false, "the rebuilding editor opens");
+      }
+      rebuilt.close();
+    }
+    // A factory that declines -- a DSP deciding at run time it has no face
+    // for this host -- gets the generic editor, not an empty window.
+    editor.setContentFactory([](const EditorHost&) { return std::unique_ptr<AudioProcessorEditor>(); });
+    check(editor.open(nullptr, kOne, 1, host, 320, 200) && editor.content() != nullptr,
+          "a factory returning nothing falls back to the generic editor");
+    editor.close();
+  }
+
+  // ── A small repaint copies a small rectangle ──
+  //
+  // render() hands Windows only the rectangles that changed, and the comment
+  // there says WM_PAINT then copies those. But blit() converted the WHOLE
+  // bitmap, RGBA to BGRA, on every paint: a meter moving at 30 Hz in a
+  // 1600x1000 editor re-swizzled 6.4 MB a frame to update a few hundred
+  // pixels. Timed here, best of seven: a 20x20 repaint against a full one.
+  {
+    struct Fill : Component {
+      void paint(Graphics& g) override { g.fillAll(Colour::fromRGB(0x285AA0)); }
+    } fill;
+    NativeWindow big;
+    if (big.open(nullptr, fill, 1600, 1000)) {
+      big.setVisible(true);
+      pump();
+      HWND bh = (HWND) big.handle();
+      RECT client{};
+      GetClientRect(bh, &client);
+      auto paintTime = [&](RECT area) {
+        double best = 1e9;
+        for (int round = 0; round < 7; ++round) {
+          InvalidateRect(bh, &area, FALSE);
+          const auto t0 = std::chrono::steady_clock::now();
+          UpdateWindow(bh); // the WM_PAINT, synchronously
+          const double ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+          if (ms < best) best = ms;
+        }
+        return best;
+      };
+      // Not `small`: windows.h makes that a macro for char.
+      const double partMs = paintTime(RECT{10, 10, 30, 30});
+      const double fullMs = paintTime(client);
+      char msg[200];
+      std::snprintf(msg, sizeof(msg), "a 20x20 repaint costs a fraction of a full one "
+                    "(%.3f ms against %.3f ms)", partMs, fullMs);
+      check(partMs < fullMs * 0.2, msg);
+      big.close();
+    } else {
+      check(false, "a large window opens for the repaint measurement");
+    }
+  }
+
+  // ── The blit hands Windows the bitmap's pixels, a band at a time ──
+  //
+  // blit() converts through a strip of a few dozen rows rather than a
+  // second copy of the window, and draws each band as a DIB of its own at
+  // its place. What reaches the window must be exactly the bitmap, red and
+  // blue swapped, for a whole paint and for a damaged rectangle that starts
+  // and ends inside bands: read back from the window and compared, pixel
+  // for pixel, with a pattern written straight into the bitmap.
+  {
+    struct Still : Component {
+      void paint(Graphics& g) override { g.fillAll(Colour::fromRGB(0x101010)); }
+    } still;
+    NativeWindow win;
+    if (win.open(nullptr, still, 640, 480)) {
+      win.setVisible(true);
+      pump();
+      HWND wh = (HWND) win.handle();
+      Bitmap& bm = win.bitmap();
+      const int w = bm.width(), h = bm.height();
+      auto pattern = [](int x, int y, int salt) {
+        return PremulColour{(uint8_t) (x * 7 + y + salt), (uint8_t) ((y * 3) ^ x ^ salt),
+                            (uint8_t) ((x + y * 13 + salt) >> 1), 255};
+      };
+      auto fill = [&](int fx0, int fy0, int fx1, int fy1, int salt) {
+        for (int y = fy0; y < fy1; ++y)
+          for (int x = fx0; x < fx1; ++x) bm.setPixel(x, y, pattern(x, y, salt));
+      };
+      // Read back the client area as BGRA rows and compare with the bitmap.
+      auto shownMatches = [&](int* wrong) {
+        HDC wdc = GetDC(wh);
+        HDC mem = CreateCompatibleDC(wdc);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP dib = CreateDIBSection(wdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HGDIOBJ old = SelectObject(mem, dib);
+        BitBlt(mem, 0, 0, w, h, wdc, 0, 0, SRCCOPY);
+        GdiFlush();
+        int bad = 0;
+        const uint8_t* p = (const uint8_t*) bits;
+        for (int y = 0; p && y < h; ++y)
+          for (int x = 0; x < w; ++x) {
+            const PremulColour c = bm.pixelAt(x, y);
+            const uint8_t* q = p + ((size_t) y * (size_t) w + (size_t) x) * 4u;
+            if (q[0] != c.b || q[1] != c.g || q[2] != c.r) ++bad;
+          }
+        SelectObject(mem, old);
+        DeleteObject(dib);
+        DeleteDC(mem);
+        ReleaseDC(wh, wdc);
+        *wrong = p ? bad : -1;
+        return p && bad == 0;
+      };
+      fill(0, 0, w, h, 0);
+      InvalidateRect(wh, nullptr, FALSE);
+      UpdateWindow(wh);
+      int wrong = 0;
+      char said[160];
+      const bool whole = shownMatches(&wrong);
+      std::snprintf(said, sizeof(said), "a whole %dx%d paint shows the bitmap exactly (%d pixels wrong)", w, h,
+                    wrong);
+      check(whole, said);
+      // A rectangle whose edges fall inside bands, at an odd offset: only
+      // it changes, and the rest of the window keeps the frame before.
+      const int rx0 = 37, ry0 = 29, rx1 = (std::min)(w, 501), ry1 = (std::min)(h, 437);
+      fill(rx0, ry0, rx1, ry1, 91);
+      RECT damaged{rx0, ry0, rx1, ry1};
+      InvalidateRect(wh, &damaged, FALSE);
+      UpdateWindow(wh);
+      const bool part = shownMatches(&wrong);
+      std::snprintf(said, sizeof(said), "a damaged rectangle reaches the window where it is (%d pixels wrong)",
+                    wrong);
+      check(part, said);
+      win.close();
+    } else {
+      check(false, "a window opens for the blit read-back");
+    }
+  }
+
+  // ── A closed window gives its pixels back ──
+  //
+  // A NativeWindow is a member of NativeEditor, which a wrapper keeps for
+  // the life of the plugin instance, so a bitmap kept after close() stayed
+  // for the whole session: 6 MB for the showcase opened once at 200%, in
+  // every instance whose editor had been looked at. The memory itself, not
+  // only the size -- a vector resized to zero keeps its buffer -- and the
+  // next open at the SAME size has to allocate and paint again, rather than
+  // find the size unchanged and show nothing.
+  {
+    struct Plain : Component {
+      void paint(Graphics& g) override { g.fillAll(Colour::fromRGB(0x336699)); }
+    } plain;
+    NativeWindow win;
+    if (win.open(nullptr, plain, 320, 200)) {
+      pump();
+      const int w = win.bitmap().width(), h = win.bitmap().height();
+      win.close();
+      check(win.bitmap().isEmpty() && win.bitmap().data() == nullptr && win.bitmap().sizeInBytes() == 0,
+            "a closed window holds no pixels");
+      const bool reopened = win.open(nullptr, plain, 320, 200);
+      pump();
+      const PremulColour mid = win.bitmap().pixelAt(w / 2, h / 2);
+      check(reopened && win.bitmap().width() == w && win.bitmap().height() == h && mid.r == 0x33 &&
+                mid.g == 0x66 && mid.b == 0x99,
+            "reopened at the same size, it allocates and paints again");
+      win.close();
+    } else {
+      check(false, "a window opens to be closed");
+    }
+  }
+
+  // ── Every screen says its own scale ──
+  //
+  // Displays' scale is what the standalone sizes by and what a plugin falls
+  // back to when its host says nothing, and no peer set it: scaleAt() said 1
+  // on a 125% screen. Opened per-monitor aware, as the standalone runs, a
+  // window's screen has to say the window's own DPI.
+  {
+    typedef HANDLE(WINAPI * SetThreadContextFn)(HANDLE);
+    typedef UINT(WINAPI * DpiForWindowFn)(HWND);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const SetThreadContextFn setContext =
+        user32 ? (SetThreadContextFn) GetProcAddress(user32, "SetThreadDpiAwarenessContext") : nullptr;
+    const DpiForWindowFn dpiFor = user32 ? (DpiForWindowFn) GetProcAddress(user32, "GetDpiForWindow") : nullptr;
+    HANDLE previous = setContext ? setContext((HANDLE) -4) : nullptr; // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    Component blank;
+    NativeWindow win;
+    if (previous && dpiFor && win.open(nullptr, blank, 200, 100)) {
+      HWND wh = (HWND) win.handle();
+      RECT r{};
+      GetWindowRect(wh, &r);
+      const float own = (float) dpiFor(wh) / 96.0f;
+      const float listed =
+          Displays::scaleAt(Point{(float) (r.left + r.right) * 0.5f, (float) (r.top + r.bottom) * 0.5f});
+      char said[200];
+      std::snprintf(said, sizeof(said), "the screen a window is on says the window's scale (%.2f; the window %.2f, %d screen(s))",
+                    listed, own, Displays::count());
+      check(listed > own - 0.01f && listed < own + 0.01f, said);
+      win.close();
+    } else {
+      std::printf("  SKIPPED the screens' scale: no per-monitor DPI awareness on this Windows\n");
+    }
+    if (previous) setContext(previous);
+  }
 
   if (g_failures == 0) std::printf("SONORE NATIVE WINDOW TEST PASSED\n");
   return g_failures == 0 ? 0 : 1;

@@ -9,7 +9,7 @@
 // An AU host asks for `kAudioUnitProperty_CocoaUI`, gets the NAME of an
 // Objective-C class, instantiates it, and calls `uiViewForAudioUnit:withSize:`
 // expecting an NSView back. There is no such class in any framework, so one is
-// REGISTERED AT RUNTIME here: the same technique webview_cocoa.h uses for its
+// REGISTERED AT RUNTIME here, the same technique webview_cocoa.h uses for its
 // script-message handler, and the reason this SDK needs no .mm file anywhere.
 //
 // The view it returns is the same WKWebView every other format shows, wired to
@@ -32,7 +32,7 @@ namespace sonore {
 namespace au {
 
 /** The Unit behind a host's AudioUnit handle. The handle is an OPAQUE wrapper
- *  owned by the AudioComponent framework: casting it (an earlier version did)
+ *  owned by the AudioComponent framework. Casting it (an earlier version did)
  *  dereferences framework internals and crashes. The sanctioned route from a
  *  Cocoa view back to its instance is a property read, which the framework
  *  routes to our own getProperty. */
@@ -66,8 +66,17 @@ inline void viewOnMessage(Unit* unit, const BridgeMessage& message) {
     AUParameterSet(nullptr, nullptr, &p, plain, 0);
   };
 
+  // Nothing an interface may not write: out of range, or a parameter the
+  // plugin REPORTS (readOnly). See uiMayWrite.
+  if ((message.kind == BridgeMessage::Kind::Set || message.kind == BridgeMessage::Kind::GestureBegin ||
+       message.kind == BridgeMessage::Kind::GestureEnd) &&
+      !uiMayWrite(kDesc, message.index))
+    return;
   UiEventQueue::Event e;
   switch (message.kind) {
+    case BridgeMessage::Kind::Ready:
+      clapwrap::pageReady(&unit->shared);
+      return;
     case BridgeMessage::Kind::Set: {
       if (message.index < 0 || message.index >= SONORE_NUM_PARAMS) return;
       const float plain = clampToRange(kDesc.params[message.index], (float) message.value);
@@ -85,26 +94,31 @@ inline void viewOnMessage(Unit* unit, const BridgeMessage& message) {
       return;
     }
     case BridgeMessage::Kind::LoadPreset: {
-      if (message.index < 0 || message.index >= kDesc.numPresets || !kDesc.presets) return;
-      const Preset& preset = kDesc.presets[message.index];
-      if (preset.numValues != kDesc.numParams) return; // stale: refuse, never half-apply
+      // The whole set in one step, as the host's own preset change writes it:
+      // a block runs on all of the preset or none of it. Queued one value at
+      // a time, the audio thread applied whatever part of the queue it found,
+      // and blocks ran on half of one preset and half of the other -- the tear
+      // VST3's page load had (208222a). Through the bounded helper too, so a
+      // descriptor declaring more parameters than SONORE_NUM_PARAMS is
+      // refused rather than written past the arrays.
+      float values[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1];
+      if (!clapwrap::factoryPresetValues(kDesc, message.index, values, SONORE_NUM_PARAMS)) return;
+      clapwrap::writeParamsTogether(&unit->shared, [&] {
+        for (int i = 0; i < kDesc.numParams; ++i) unit->shared.params[i] = values[i];
+      });
       for (int i = 0; i < kDesc.numParams; ++i) {
-        const float plain = clampToRange(kDesc.params[i], preset.values[i]);
-        UiEventQueue::Event pe;
-        pe.kind = UiEventQueue::Event::Kind::ParamSet;
-        pe.index = i;
-        pe.value = plain;
-        unit->shared.uiEvents.push(pe);
-        unit->shared.uiEcho[i] = plain;
-        notify(i, plain);
+        unit->shared.uiEcho[i] = values[i];
+        notify(i, values[i]);
       }
+      clapwrap::presetsOf(&unit->shared).noteFactoryPresetApplied(message.index);
       return;
     }
     case BridgeMessage::Kind::ChooseFile: {
       // The dialog exists on every platform except the one this file is for.
-      // file_dialog.h declares a Cocoa backend and does not yet define it.
-      // A page asking for a file here gets nothing rather than a wrong
-      // answer.
+      // file_dialog.h declares a Cocoa backend and does not yet define it --
+      // there is no macOS in this loop to write it against, the same reason
+      // the AU wrapper itself is unverified. A page asking for a file here
+      // gets nothing rather than a wrong answer.
       return;
     }
     case BridgeMessage::Kind::ContextMenu: {
@@ -136,6 +150,9 @@ inline void viewOnMessage(Unit* unit, const BridgeMessage& message) {
 /** The ~30 Hz editor clock: push what the page does not know yet. */
 inline void viewTick(Unit* unit) {
   if (!unit) return;
+  // The main thread's clock, which AU otherwise never gives a plugin: what
+  // render recorded for the host is delivered here.
+  notifyHostOfChanges(unit);
   if (unit->shared.guiIsNative) {
     unit->shared.nativeEditor.tick();
     return;
@@ -144,7 +161,7 @@ inline void viewTick(Unit* unit) {
   unit->shared.webview.eval(clapwrap::uiTickScript(unit->shared));
 }
 
-/** `uiViewForAudioUnit:withSize:`: the one method AUCocoaUIBase requires. */
+/** `uiViewForAudioUnit:withSize:`, the one method AUCocoaUIBase requires. */
 inline id viewForAudioUnit(id /*self*/, SEL, void* audioUnit, cocoa::CGSizeStruct size) {
   Unit* unit = unitFromAudioUnit(audioUnit);
   if (!unit) return nullptr;
@@ -167,6 +184,16 @@ inline id viewForAudioUnit(id /*self*/, SEL, void* audioUnit, cocoa::CGSizeStruc
 
   unit->shared.uiEchoValid = false;
 
+  // A host asks for a NEW view each time it opens the editor and releases it
+  // when the window closes, and nothing tells the unit the view went. So the
+  // editor the last view held is taken down here, as CLAP's guiDestroy takes
+  // it down. It was left up: create() found the old page still there and
+  // returned true without putting anything in this container, so every
+  // editor after the first opened as an empty view, while the old page went
+  // on ticking, detached, until the unit closed.
+  unit->shared.nativeEditor.close();
+  unit->shared.webview.destroy();
+
   // The same choice CLAP and VST3 make, from the same function. On macOS
   // today it always answers Web, because there is no Cocoa window backend and
   // chooseEditorBackend says exactly that rather than leaving a blank view --
@@ -175,6 +202,7 @@ inline id viewForAudioUnit(id /*self*/, SEL, void* audioUnit, cocoa::CGSizeStruc
   const EditorChoice choice = clapwrap::editorChoice();
   unit->shared.guiIsNative = choice.backend == EditorBackend::Native;
   if (unit->shared.guiIsNative) {
+    unit->shared.nativeEditor.setContentFactory(clapwrap::customEditorFactory(unit->shared.dsp));
     if (unit->shared.nativeEditor.open(container, kDesc.params, (int) kDesc.numParams,
                                        clapwrap::makeEditorHost(&unit->shared), (int) width,
                                        (int) height))
@@ -184,8 +212,8 @@ inline id viewForAudioUnit(id /*self*/, SEL, void* audioUnit, cocoa::CGSizeStruc
 
   unit->shared.webview.onMessage = [unit](const BridgeMessage& m) { viewOnMessage(unit, m); };
   unit->shared.webview.onTick = [unit]() { viewTick(unit); };
-  unit->shared.webview.create(container, width, height, clapwrap::uiHtml(), bridgeScript(kDesc),
-                              kDesc.id);
+  unit->shared.webview.create(container, width, height, clapwrap::uiHtml(),
+                              clapwrap::bridgeScriptFor(unit->shared), kDesc.id);
   return container;
 }
 

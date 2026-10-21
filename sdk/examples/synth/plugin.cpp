@@ -27,7 +27,10 @@ struct Voice {
   void setTone(float cutoffHz, float res) {
     cutoff = cutoffHz;
     resonance = res;
-    filter.set(cutoff, resonance);
+    // Leant open by the note's pressure, as setPressure() leaves it. Set
+    // plain, a cutoff knob nudged by a hertz -- or automated, every block --
+    // closed the filter under a finger still pressing, until it moved again.
+    filter.set(cutoff * (1.0f + 3.0f * pressure), resonance);
   }
   void setEnvelope(float attack, float release) {
     sonore::ADSR::Parameters p;
@@ -41,13 +44,23 @@ struct Voice {
     velocity = vel;
     key = note;
     bendSemis = 0.0f;
+    // The filter goes back with the pressure. Zeroing only the number left
+    // the ladder where the voice's last note had leant it -- four times the
+    // cutoff after a full press -- and the next note's own "no pressure" was
+    // no change by that number, so it played the whole note that bright.
     pressure = 0.0f;
+    filter.set(cutoff, resonance);
     retune();
     osc.reset();
     filter.reset();
     env.noteOn();
   }
   void noteOff() { env.noteOff(); }
+  /** Silent now, with no release: what a reset means. */
+  void kill() {
+    env.reset();
+    filter.reset();
+  }
   bool isActive() const { return env.isActive(); }
 
   /** Per-note expression, the whole point of MPE: this finger's bend and
@@ -84,6 +97,7 @@ public:
 struct SonoreDsp {
   sonore::VoiceManager<Voice, 8> voices;
   sonore::Smooth levelSm;
+  bool levelArrived = false; // the smoother has been put on the control
   float lastCutoff = -1.0f, lastRes = -1.0f, lastAttack = -1.0f, lastRelease = -1.0f;
 
   /** What a host needs to draw a voice meter and to decide how many MPE
@@ -100,9 +114,19 @@ struct SonoreDsp {
 
   void prepare(const sonore::ProcessSpec& spec) {
     const float sr = (float) spec.sampleRate;
-    for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setSampleRate(sr);
+    // Every voice is silenced, not left to finish. The wrapper prepares a DSP
+    // with no reset() of its own in place of one -- CLAP's reset(), an AU's
+    // Reset -- and both promise the host that every voice is gone: it sends
+    // no note-off for a note it started before, and the wrapper forgets the
+    // keys it had down. Kept, a held note sounded for ever; across a change
+    // of rate it sounded at the wrong pitch as well, its oscillator still
+    // stepping at the old rate's increment.
+    for (int i = 0; i < voices.kNumVoices; ++i) {
+      voices.voice(i).kill();
+      voices.voice(i).setSampleRate(sr);
+    }
     levelSm.setup(sr, 15.0f);
-    levelSm.snap(0.3f);
+    levelArrived = false; // it lands on the control in the next block
     lastCutoff = lastRes = lastAttack = lastRelease = -1.0f;
   }
 
@@ -134,8 +158,20 @@ struct SonoreDsp {
     const sonore::NoteExpressionBuffer::Entry* exprEnd =
         ctx.expression ? ctx.expression->end() : nullptr;
 
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float levelTarget = sonore::dbToGain(p[4]);
+    // The first block after prepare() LANDS on the control rather than
+    // gliding to it: there is no earlier level to come from. It was snapped
+    // to a fixed 0.3 in prepare() -- which also answers a reset and the
+    // switch to offline rendering -- and a note at the top of a bounce
+    // played its first 50 ms from there: 30 times too loud at -40 dB.
+    if (!levelArrived) {
+      levelSm.snap(levelTarget);
+      levelArrived = true;
+    }
     for (size_t i = 0; i < n; ++i) {
-      // Notes apply at their exact frame, that is what keeps a synth tight.
+      // Notes apply at their exact frame: that is what keeps a synth tight.
       while (event != end && (size_t) event->samplePosition <= i) {
         const sonore::MidiMessage& m = event->getMessage();
         // The CHANNEL travels with the note. Under MPE every finger has its
@@ -162,7 +198,7 @@ struct SonoreDsp {
         }
         ++expr;
       }
-      const float s = voices.render() * levelSm.next(sonore::dbToGain(p[4]));
+      const float s = voices.render() * levelSm.next(levelTarget);
       L[i] = s;
       R[i] = s;
     }
@@ -211,27 +247,4 @@ static const sonore::PluginDescriptor kDesc = {
     true,     // …but it DOES play expressively: per-note bend and pressure
 };
 
-#include <sonore/clap_wrapper.h>
-
-// The same source builds a VST3 as well: the CLAP wrapper owns the shared
-// machinery and the VST3 one adapts it, so the two formats cannot drift.
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-// …and an Audio Unit on macOS, from the same sources again.
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-// …and an LV2 bundle for the Linux-native hosts (the same file also builds
-// the TTL generator under SONORE_LV2_TTLGEN).
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-// …and a runnable application, no DAW required. standalone.h defines main().
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

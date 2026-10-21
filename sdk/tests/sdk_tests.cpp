@@ -11,11 +11,16 @@
 // Deliberately dependency-free (no gtest): one binary, exit code is the verdict.
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <new>
+#include <optional>
 #include <atomic>
 #include <cstring>
+#include <sstream>
 #include <chrono>
+#include <filesystem>
+#include <thread>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -30,6 +35,7 @@
 #include <sonore/dsp.h>
 #include <sonore/gui.h>
 #include <vst3_c_api.h>
+#include <sonore/vst3_uid.h>
 
 #include <sonore/midi_ci.h>
 #include <sonore/midi_file.h>
@@ -39,6 +45,7 @@
 #include <sonore/sample_stream.h>
 #include <sonore/filter_design.h>
 #include <sonore/asio_format.h>
+#include <sonore/audio_asio.h>
 #include <sonore/hash.h>
 #include <sonore/thumbnail.h>
 #include <sonore/undo.h>
@@ -78,6 +85,7 @@
 #include <sonore/json.h>
 #include <sonore/random.h>
 #include <sonore/gfx/popup.h>
+#include <sonore/gfx/text_area.h>
 #include <sonore/gfx/text_editor.h>
 #include <sonore/gfx/tooltip.h>
 #include <sonore/gfx/audio_display.h>
@@ -97,6 +105,12 @@
 #include <sonore/gfx/file_browser.h>
 #include <sonore/gfx/selection.h>
 #include <sonore/gfx/splitter.h>
+
+#if defined(_WIN32)
+// FSCTL_SET_SPARSE, for the 2 GB streaming test: the SDK's headers bring in
+// windows.h lean, without the device-control codes.
+#include <winioctl.h>
+#endif
 #include <sonore/gfx/table.h>
 #include <sonore/gfx/treeview.h>
 #include <sonore/gfx/accessibility.h>
@@ -119,10 +133,22 @@
 #include <sonore/wav.h>
 #include <sonore/audiofile.h>
 #include <sonore/plugin.h>
+#include <sonore/plugin_host_type.h>
 
 #include <clocale>
 
 static constexpr double kTestPi = 3.14159265358979323846;
+
+/** Whether this is an optimised build. The suite runs in Debug too -- what
+ *  Visual Studio builds when no configuration is named -- but a speed
+ *  comparison between two pieces of unoptimised code measures the missing
+ *  inliner, not the change, so the timing checks report there and do not
+ *  fail. Everything else they assert still counts. */
+#if defined(NDEBUG)
+static constexpr bool kOptimisedBuild = true;
+#else
+static constexpr bool kOptimisedBuild = false;
+#endif
 
 static int g_failures = 0;
 // ── Counting allocations ────────────────────────────────────────────────────
@@ -161,10 +187,20 @@ static int g_failures = 0;
 #if SONORE_TESTS_HAVE_ALLOC_COUNTER
 static std::atomic<bool> g_allocArmed{false};
 static std::atomic<long> g_allocCount{0};
+/** The largest single request while armed: what tells a small bookkeeping
+ *  allocation from a copy of the audio. */
+static std::atomic<size_t> g_allocLargest{0};
+/** Armed for ONE thread: what an audio callback allocates, while a worker it
+ *  hands off to allocates as much as it likes. */
+static thread_local bool t_allocArmedHere = false;
 
 void* operator new(std::size_t n) {
-  if (g_allocArmed.load(std::memory_order_relaxed))
+  if (g_allocArmed.load(std::memory_order_relaxed) || t_allocArmedHere) {
     g_allocCount.fetch_add(1, std::memory_order_relaxed);
+    size_t seen = g_allocLargest.load(std::memory_order_relaxed);
+    while (n > seen && !g_allocLargest.compare_exchange_weak(seen, n)) {
+    }
+  }
   void* p = std::malloc(n ? n : 1);
   if (!p) throw std::bad_alloc();
   return p;
@@ -178,10 +214,16 @@ void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 static void armAllocationCounter(bool armed) {
   g_allocArmed.store(armed, std::memory_order_relaxed);
 }
+static void armAllocationCounterOnThisThread(bool armed) { t_allocArmedHere = armed; }
 static long allocationCount() { return g_allocCount.load(std::memory_order_relaxed); }
+static size_t largestAllocation() { return g_allocLargest.load(std::memory_order_relaxed); }
+static void resetLargestAllocation() { g_allocLargest.store(0, std::memory_order_relaxed); }
 #else
 static void armAllocationCounter(bool) {}
+static void armAllocationCounterOnThisThread(bool) {}
 static long allocationCount() { return 0; }
+static size_t largestAllocation() { return 0; }
+static void resetLargestAllocation() {}
 #endif
 
 using sonoretest::tempPath; // every file a test writes goes under ONE temp
@@ -207,6 +249,35 @@ static void checkNear(double got, double want, double tol, const char* what) {
     ++g_failures;
     std::printf("  FAIL %s: got %.4f, want %.4f +/- %.4f\n", what, got, want, tol);
   }
+}
+
+// ── Relative cost, measured so a busy machine cannot decide it ─────────────
+//
+// Several checks claim one implementation is cheaper than another, and timing
+// them in two separate phases let a burst of load from the parallel suite
+// land on one phase and decide the ratio: those checks failed under ctest -j3
+// with nothing wrong. Here the two are timed in ALTERNATION, best of five
+// each, and that is repeated up to three times, stopping at the first attempt
+// within `bound`. Load can only make a passing ratio fail, and three attempts
+// make that rare; a real regression cannot clear the bound by load at all.
+template <typename Ours, typename Old>
+static double relativeCost(Ours&& ours, Old&& old, double bound) {
+  auto once = [](auto&& body) {
+    const auto t0 = std::chrono::steady_clock::now();
+    body();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+  double ratio = 0.0;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    double a = 1e9, b = 1e9;
+    for (int round = 0; round < 5; ++round) {
+      a = std::min(a, once(ours));
+      b = std::min(b, once(old));
+    }
+    ratio = a / b;
+    if (ratio < bound) break;
+  }
+  return ratio;
 }
 
 // ── Measurement helpers ──────────────────────────────────────────────────────
@@ -377,6 +448,166 @@ static void testOscillator() {
   std::vector<float> sineOut((size_t) n);
   for (int i = 0; i < n; ++i) sineOut[(size_t) i] = sine.sine();
   checkNear(magnitudeAt(sineOut, 1000.0, sr), 1.0, 0.05, "sine amplitude is unity");
+
+  // A NaN frequency or rate is a bad setting, not a broken oscillator.
+  // clampf() let NaN through, a phase accumulator took it, and a NaN phase
+  // never wraps back: each of these put out NaN for good -- after the next
+  // good setting too, until reset(). An LFO's NaN also reached the delay
+  // read points of the chorus, the stereo delay and the plate, which read
+  // their shortest delay from then on. Each gets a NaN, then a good value,
+  // and must be finite 256 samples later.
+  {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::string broken;
+    auto settle = [&](const char* name, auto&& next) {
+      bool finite = true;
+      for (int i = 0; i < 256; ++i) finite = finite && std::isfinite(next());
+      if (!finite) broken += std::string(broken.empty() ? "" : ", ") + name;
+    };
+    sonore::Oscillator osc;
+    osc.setSampleRate((float) sr);
+    osc.setFreq(nan);
+    osc.saw();
+    osc.setFreq(440.0f);
+    settle("Oscillator", [&] { return osc.saw(); });
+
+    sonore::Lfo lfo;
+    lfo.setSampleRate((float) sr);
+    lfo.setRate(nan);
+    lfo.next();
+    lfo.setRate(2.0f);
+    settle("Lfo", [&] { return lfo.next(); });
+
+    static sonore::Wavetable<> table; // 88 KB: never a local
+    table.buildAdditive([](int h) { return 1.0f / (float) h; });
+    sonore::WavetableOscillator<> wave;
+    wave.setTable(&table);
+    wave.setSampleRate((float) sr);
+    wave.setFreq(nan);
+    wave.next();
+    wave.setFreq(220.0f);
+    settle("WavetableOscillator", [&] { return wave.next(); });
+
+    sonore::FmOperator fm;
+    fm.setSampleRate((float) sr);
+    fm.setFreq(nan);
+    fm.render();
+    fm.setFreq(330.0f);
+    settle("FmOperator", [&] { return fm.render(); });
+
+    sonore::HardSyncOscillator sync;
+    sync.setSampleRate((float) sr);
+    sync.setMasterFreq(nan);
+    sync.next();
+    sync.setMasterFreq(110.0f);
+    settle("HardSyncOscillator", [&] { return sync.next(); });
+
+    sonore::FrequencyShifter shifter;
+    shifter.setSampleRate((float) sr);
+    shifter.setShift(nan);
+    shifter.process(0.5f);
+    shifter.setShift(30.0f);
+    int at = 0;
+    settle("FrequencyShifter", [&] { return shifter.process((float) std::sin(0.05 * (double) at++)); });
+
+    sonore::ProcessSpec spec;
+    spec.sampleRate = sr;
+    // The chorus and the plate read their shortest delay rather than NaN,
+    // so they are held against twins that were never given the NaN.
+    auto matches = [&](const char* name, int samples, auto&& next, auto&& twin) {
+      double apart = 0.0;
+      for (int i = 0; i < samples; ++i) {
+        const float a = next(), b = twin();
+        apart = std::isfinite(a) ? std::max(apart, (double) std::fabs(a - b)) : 1e9;
+      }
+      if (apart > 1e-3) broken += std::string(broken.empty() ? "" : ", ") + name;
+    };
+    sonore::Chorus chorus, chorusTwin;
+    chorus.prepare(spec);
+    chorusTwin.prepare(spec);
+    chorus.setMix(1.0f);
+    chorusTwin.setMix(1.0f);
+    chorus.setRate(nan);
+    float l = 0.5f, r = 0.5f;
+    chorus.process(l, r);
+    l = r = 0.5f;
+    chorusTwin.process(l, r);
+    chorus.setRate(0.6f);
+    at = 0;
+    int twinAt = 0;
+    matches("Chorus", 256, [&] {
+      float a = (float) std::sin(0.05 * (double) at++), b = a;
+      chorus.process(a, b);
+      return a;
+    }, [&] {
+      float a = (float) std::sin(0.05 * (double) twinAt++), b = a;
+      chorusTwin.process(a, b);
+      return a;
+    });
+
+    auto delay = std::make_unique<sonore::StereoDelay<>>();
+    delay->prepare(spec);
+    sonore::StereoDelay<>::Parameters dp;
+    dp.mix = 1.0f;
+    dp.modDepthMs = 2.0f;
+    dp.timeMs = 20.0f;
+    dp.modRateHz = nan;
+    delay->setParameters(dp);
+    delay->setTimeChange(sonore::StereoDelay<>::TimeChange::Glide);
+    l = r = 0.5f;
+    delay->process(l, r);
+    dp.timeMs = nan;
+    delay->setParameters(dp);
+    delay->process(l, r);
+    dp.modRateHz = 0.5f;
+    dp.timeMs = 20.0f;
+    delay->setParameters(dp);
+    at = 0;
+    // Finite, and a 20 ms delay again: the impulse comes back ~960 later.
+    for (int i = 0; i < 4800; ++i) {
+      float a = 0.0f, b = 0.0f;
+      delay->process(a, b);
+    }
+    int arrival = -1;
+    for (int i = 0; i < 4800 && arrival < 0; ++i) {
+      float a = i == 0 ? 1.0f : 0.0f, b = a;
+      delay->process(a, b);
+      if (!std::isfinite(a)) broken += ", StereoDelay";
+      if (std::fabs(a) > 0.1f) arrival = i;
+    }
+    if (arrival < 860 || arrival > 1060) broken += std::string(broken.empty() ? "" : ", ") + "StereoDelay time";
+
+    auto plate = std::make_unique<sonore::PlateReverb>(), plateTwin = std::make_unique<sonore::PlateReverb>();
+    plate->prepare(spec);
+    plateTwin->prepare(spec);
+    sonore::PlateReverb::Parameters pp;
+    pp.mix = 1.0f;
+    pp.modRateHz = 0.7f;
+    plateTwin->setParameters(pp);
+    pp.modRateHz = nan;
+    plate->setParameters(pp);
+    l = r = 0.5f;
+    plate->process(l, r);
+    l = r = 0.5f;
+    plateTwin->process(l, r);
+    pp.modRateHz = 0.7f;
+    plate->setParameters(pp);
+    at = 0;
+    twinAt = 0;
+    matches("PlateReverb", 9600, [&] {
+      float a = (float) std::sin(0.05 * (double) at++), b = a;
+      plate->process(a, b);
+      return a;
+    }, [&] {
+      float a = (float) std::sin(0.05 * (double) twinAt++), b = a;
+      plateTwin->process(a, b);
+      return a;
+    });
+
+    check(broken.empty(), broken.empty() ? "a NaN frequency or LFO rate, then a good one: every oscillator, "
+                                           "LFO and modulated delay is finite and back on time"
+                                         : ("latched by a NaN rate: " + broken).c_str());
+  }
 }
 
 static void testDynamics() {
@@ -423,7 +654,7 @@ static void testDynamics() {
   check(peak > 0.2f && peak <= 1.0f, "ADSR rises during attack");
   for (int i = 0; i < (int) (sr * 0.2); ++i) env.getNextSample();
   checkNear(env.getNextSample(), 0.5, 0.02, "ADSR holds sustain");
-  // The declared release time must be the MEASURED -60 dB time, that is the
+  // The declared release time must be the MEASURED -60 dB time: that is the
   // convention the shipped synth's `release` acceptance probe measures against.
   env.noteOff();
   const float start = env.getNextSample();
@@ -436,6 +667,137 @@ static void testDynamics() {
 
   for (int i = 0; i < (int) (sr * 0.5); ++i) env.getNextSample();
   check(!env.isActive(), "ADSR releases to idle");
+
+  // A sustain that is not a number. The decay took the level to NaN, a NaN
+  // level never reached its target or fell under the release floor, and
+  // neither noteOff nor the next noteOn brought it back: the voice sounded
+  // NaN and stayed active until reset(), so a voice manager never had it
+  // back. Dahdsr the same.
+  {
+    const float bad[] = {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()};
+    bool settles = true;
+    for (float sustain : bad) {
+      sonore::ADSR a;
+      a.setSampleRate((float) sr);
+      sonore::ADSR::Parameters ap;
+      ap.sustain = sustain;
+      a.setParameters(ap);
+      sonore::Dahdsr d;
+      d.setSampleRate((float) sr);
+      sonore::Dahdsr::Parameters dp;
+      dp.sustain = sustain;
+      d.setParameters(dp);
+      a.noteOn();
+      d.noteOn();
+      for (int i = 0; i < (int) (sr * 0.5); ++i)
+        settles = settles && std::isfinite(a.getNextSample()) && std::isfinite(d.getNextSample());
+      a.noteOff();
+      d.noteOff();
+      for (int i = 0; i < (int) sr; ++i) {
+        a.getNextSample();
+        d.getNextSample();
+      }
+      settles = settles && !a.isActive() && !d.isActive();
+    }
+    check(settles, "an ADSR or DAHDSR given a NaN or infinite sustain stays finite and goes idle "
+                   "after its release");
+  }
+  // Times that are not a number, infinite, or hours long. Converted to
+  // samples straight from the float, each was undefined behaviour; held to a
+  // range first, a NaN or negative stage lasts one sample and a huge one is
+  // capped, and the envelope stays a number throughout.
+  {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    bool finite = true, idle = true;
+    for (float t : {nan, inf, -inf, 1.0e12f, -5.0f}) {
+      sonore::Dahdsr d;
+      d.setSampleRate((float) sr);
+      sonore::Dahdsr::Parameters dp;
+      dp.delay = dp.attack = dp.hold = dp.decay = t;
+      dp.release = std::isfinite(t) && t > 0.0f ? 0.01f : t;
+      d.setParameters(dp);
+      d.noteOn();
+      for (int i = 0; i < 256; ++i) finite = finite && std::isfinite(d.getNextSample());
+      d.noteOff();
+      for (int i = 0; i < (int) sr; ++i) finite = finite && std::isfinite(d.getNextSample());
+      idle = idle && !d.isActive();
+    }
+    check(finite && idle, "a DAHDSR given NaN, infinite, negative or hours-long stage times stays "
+                          "finite and goes idle after its release");
+  }
+
+  // A smoother settling on zero must not keep a subnormal in its state. It
+  // flushed the value it RETURNED but stored the raw one, so after every
+  // control that came to rest at zero it spent thousands of samples doing
+  // subnormal arithmetic -- a CPU spike per knob on any thread without
+  // flush-to-zero set.
+  {
+    sonore::Smooth knob;
+    knob.setup((float) sr, 8.0f);
+    knob.snap(1.0f);
+    int subnormal = 0;
+    for (int i = 0; i < 100000; ++i) {
+      knob.next(0.0f);
+      if (std::fpclassify(knob.value()) == FP_SUBNORMAL) ++subnormal;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "a smoother settling on zero never holds a subnormal (%d "
+                  "samples did)", subnormal);
+    check(subnormal == 0 && knob.value() == 0.0f, line);
+  }
+
+  // A voice's envelope runs every sample of every voice, so its curves are
+  // coefficients worked out when the settings change -- not an exp() per
+  // sample per voice, which is what decay and release cost. Timed on a long
+  // release against the curve's multiply alone, on this machine: what is left
+  // over is the envelope's own bookkeeping, or an exp().
+  //
+  // In ALTERNATION, best of five each. The two used to be timed in separate
+  // phases, so a burst of load from the parallel suite during one of them
+  // decided the ratio: 3.4x under ctest -j3, about 1.5x alone. And 4x, not
+  // 2.5x: an exp() per sample costs ten times the multiply or more, so the
+  // bound still catches what it exists for, with room for a busy runner.
+  {
+    sonore::ADSR slow;
+    slow.setSampleRate((float) sr);
+    sonore::ADSR::Parameters q;
+    q.attack = 0.0001f; q.decay = 0.0001f; q.sustain = 1.0f; q.release = 60.0f;
+    slow.setParameters(q);
+    double best = 1e9, reference = 1e9;
+    volatile float sink = 0.0f;
+    for (int round = 0; round < 5; ++round) {
+      slow.reset();
+      slow.noteOn();
+      slow.getNextSample();
+      slow.noteOff();
+      auto t0 = std::chrono::steady_clock::now();
+      float acc = 0.0f;
+      for (int i = 0; i < 2000000; ++i) acc += slow.getNextSample();
+      sink = acc;
+      double ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0).count();
+      if (ms < best) best = ms;
+
+      float level = 1.0f;
+      acc = 0.0f;
+      const float k = 0.99999f;
+      t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < 2000000; ++i) {
+        level *= k;
+        acc += level;
+      }
+      sink = acc;
+      ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+               .count();
+      if (ms < reference) reference = ms;
+    }
+    (void) sink;
+    char line[200];
+    std::snprintf(line, sizeof(line), "two million release samples take %.2f ms, %.1fx a bare "
+                  "multiply loop (alternating, best of five)", best, best / reference);
+    check(best < reference * 4.0, line);
+  }
 }
 
 // ── Rate conversion ──────────────────────────────────────────────────────────
@@ -453,7 +815,7 @@ static void testOversampling() {
     for (int i = 0; i < n; ++i)
       in[(size_t) i] = 0.5f * (float) std::sin(2.0 * kTestPi * 700.0 * i / sr);
 
-    // Every factor, including the deepest cascade, that is where a stage
+    // Every factor, including the deepest cascade: that is where a stage
     // ordering or state bug would hide, and it would still look like audio.
     auto roundTrip = [&](auto& os, int latency, const char* what) {
       os.reset();
@@ -581,7 +943,7 @@ static void testOversampling() {
 
   std::printf("       (in-band alias: raw %.1f dB, 2x %.1f, 4x %.1f, 8x %.1f, 16x %.1f, 32x %.1f)\n",
               rawDb, db2, db4, db8, db16, db32);
-  // 2x cannot remove the 7th harmonic's fold, that one needs 4x, so ~11 dB
+  // 2x cannot remove the 7th harmonic's fold (that one needs 4x), so ~11 dB
   // is the honest figure here, not the 20 a first guess suggests.
   check(db2 < rawDb - 10.0, "2x oversampling cuts in-band aliasing by >10 dB");
   check(db4 < db2 - 6.0, "4x beats 2x by a further 6 dB (it also removes the 7th's fold)");
@@ -649,7 +1011,7 @@ static void testOversampling() {
   check(db32 <= db16 + 1.0, "32x is no worse than 16x");
 
   // ── The minimum-phase alternative ─────────────────────────────────────
-  // Same job, a quarter of the multiplies, and no latency worth reporting:
+  // Same job, a quarter of the multiplies, and no latency worth reporting,
   // paid for with a phase response that is not flat. It has to suppress
   // aliasing comparably, or the trade is not worth making.
   {
@@ -677,6 +1039,26 @@ static void testOversampling() {
     std::vector<float> body(flat.begin() + 2048, flat.end());
     const double db = 20.0 * std::log10(magnitudeAt(body, 1000.0, sr) / 0.5 + 1e-12);
     checkNear(db, 0.0, 0.5, "the IIR oversampler's passband is transparent");
+
+    // One sample that is not a number, or is infinite, passes and is
+    // forgotten. The allpass sections flushed what they returned but kept
+    // the raw value as their own state, so it came back through every later
+    // sample: the output was zero from then on -- a saturator silent for
+    // good, where the FIR oversampler beside it played on.
+    for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+      iir.reset();
+      double after = 0.0;
+      for (int i = 0; i < n; ++i) {
+        const float x = i == 100 ? bad : 0.5f * (float) std::sin(2.0 * kTestPi * 1000.0 * i / sr);
+        const float y = iir.process(x, [](float v) { return v; });
+        if (i >= n / 2) after += (double) y * y;
+      }
+      const double level = std::sqrt(after / (double) (n - n / 2));
+      char line[200];
+      std::snprintf(line, sizeof(line), "the IIR oversampler plays on after one %s sample (rms %.4f, the tone's 0.3536)",
+                    std::isnan(bad) ? "NaN" : "infinite", level);
+      checkNear(level, 0.3536, 0.01, line);
+    }
   }
 
   // Oversampling must not colour the passband: a quiet tone well inside the
@@ -705,6 +1087,86 @@ static void testOversampling() {
     };
     checkNear(measure(2000.0), 0.0, 0.5, "the half-band passes well below fs/4");
     check(measure(20000.0) < -40.0, "…and stops well above fs/4 by >40 dB");
+  }
+
+  // The polyphase form against the direct one. Up, each low-rate sample was
+  // zero-stuffed and BOTH high-rate outputs filtered through all the taps,
+  // half of them meeting zeros; down, every high-rate sample was filtered
+  // and every second result thrown away. The 8x cascade must give the same
+  // BITS as that, rebuilt here from HalfBandFilter::process, for less work.
+  {
+    constexpr int kStages = 3;
+    sonore::Oversampler<kStages> os;
+    os.reset();
+    sonore::HalfBandFilter<33> up[kStages], down[kStages];
+    for (int s = 0; s < kStages; ++s) {
+      up[s].reset();
+      down[s].reset();
+    }
+    auto shaper = [](float x) { return std::tanh(x * 3.0f); };
+    auto direct = [&](float x) {
+      float buffer[8], expanded[8];
+      buffer[0] = x;
+      int count = 1;
+      for (int s = 0; s < kStages; ++s) {
+        for (int i = 0; i < count; ++i) {
+          expanded[i * 2] = up[s].process(buffer[i] * 2.0f);
+          expanded[i * 2 + 1] = up[s].process(0.0f);
+        }
+        count *= 2;
+        for (int i = 0; i < count; ++i) buffer[i] = expanded[i];
+      }
+      for (int i = 0; i < count; ++i) buffer[i] = shaper(buffer[i]);
+      for (int s = kStages - 1; s >= 0; --s) {
+        const int half = count / 2;
+        for (int i = 0; i < half; ++i) {
+          buffer[i] = down[s].process(buffer[i * 2]);
+          down[s].process(buffer[i * 2 + 1]);
+        }
+        count = half;
+      }
+      return buffer[0];
+    };
+    sonore::WhiteNoise noise(29);
+    int differing = 0;
+    for (int i = 0; i < 48000; ++i) {
+      const float x = 0.7f * noise.next();
+      if (os.process(x, shaper) != direct(x)) ++differing;
+    }
+    auto cheap = [](float x) { return x * (1.5f - 0.5f * x * x); }; // so the filters dominate
+    float sink = 0.0f;
+    auto oursBody = ([&] { for (int i = 0; i < 100000; ++i) sink += os.process((float) (i & 63) * 0.01f, cheap); });
+    auto oldBody = ([&] {
+      for (int i = 0; i < 100000; ++i) {
+        float buffer[8], expanded[8];
+        buffer[0] = (float) (i & 63) * 0.01f;
+        int count = 1;
+        for (int s = 0; s < kStages; ++s) {
+          for (int j = 0; j < count; ++j) {
+            expanded[j * 2] = up[s].process(buffer[j] * 2.0f);
+            expanded[j * 2 + 1] = up[s].process(0.0f);
+          }
+          count *= 2;
+          for (int j = 0; j < count; ++j) buffer[j] = expanded[j];
+        }
+        for (int j = 0; j < count; ++j) buffer[j] = cheap(buffer[j]);
+        for (int s = kStages - 1; s >= 0; --s) {
+          const int half = count / 2;
+          for (int j = 0; j < half; ++j) {
+            buffer[j] = down[s].process(buffer[j * 2]);
+            down[s].process(buffer[j * 2 + 1]);
+          }
+          count = half;
+        }
+        sink += buffer[0];
+      }
+    });
+    const double ratio = relativeCost(oursBody, oldBody, 0.7);
+    char line[200];
+    std::snprintf(line, sizeof(line), "the polyphase 8x oversampler gives the direct form's bits "
+                  "(%d of 48000 samples differ) at %.2fx its cost", differing, ratio);
+    check(differing == 0 && ratio < 0.7, line);
+    if (sink == 12345.0f) std::printf(" ");
   }
 }
 
@@ -772,6 +1234,45 @@ static void testResampler() {
     std::vector<float> body(out.begin() + 128, out.end() - 128);
     const double alias = magnitudeAt(body, 22050.0 - 15000.0, outRate); // 7.05 kHz
     check(alias < 0.1, "downsampling attenuates content above the new Nyquist");
+  }
+
+  // ...and as well at four to one as at two. The kernel spanned a fixed number
+  // of INPUT samples, so the harder it decimated the fewer crossings of the
+  // stretched sinc it held: 192k -> 48k let a 30 kHz tone fold to 18 kHz at
+  // -17 dB, which the check above (-20 dB, at 2:1) could never see, and cut a
+  // 20 kHz tone in the passband by 2.4 dB.
+  {
+    const double inRate4 = 192000.0, outRate = 48000.0, ratio = outRate / inRate4;
+    const size_t inLen = 65536;
+    auto through = [&](double tone, double measure) {
+      std::vector<float> in(inLen);
+      for (size_t i = 0; i < inLen; ++i)
+        in[i] = (float) std::sin(2.0 * kTestPi * tone * (double) i / inRate4);
+      std::vector<float> out(sonore::Resampler::outputLength(inLen, ratio));
+      sonore::Resampler::resample(in.data(), inLen, out.data(), out.size(), ratio);
+      std::vector<float> body(out.begin() + 256, out.end() - 256);
+      return magnitudeAt(body, measure, outRate);
+    };
+    const double alias = through(30000.0, 18000.0);
+    const double pass = through(20000.0, 20000.0);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "192k -> 48k: a 30 kHz tone folds to 18 kHz at %.1f dB, a 20 kHz one passes at "
+                  "%.2f dB",
+                  20.0 * std::log10(alias + 1e-12), 20.0 * std::log10(pass + 1e-12));
+    check(alias < 0.001 && std::fabs(20.0 * std::log10(pass)) < 0.5, line);
+  }
+
+  // The length is exact for a rational ratio. floor(n * ratio) in doubles put
+  // 49 samples at a ratio of 1/49 at 0.99999... and answered 0.
+  {
+    int wrong = 0;
+    for (int p = 1; p <= 50; ++p)
+      for (int q = 1; q <= 50; ++q)
+        for (size_t n = 1; n <= 500; ++n)
+          if (sonore::Resampler::outputLength(n, (double) p / (double) q) != n * (size_t) p / (size_t) q)
+            ++wrong;
+    check(wrong == 0, "outputLength is floor(n * p / q) exactly for every ratio p/q up to 50/50");
   }
 
   // A ratio of 1 is a copy, not an approximation.
@@ -912,6 +1413,23 @@ static void testVoiceStealingAndPedals() {
     check(voices.voiceForNote(52) >= 0, "\u2026so a held note is left alone");
   }
 
+  // A key struck again while its last note is still in its tail sounds on
+  // two voices, and expression for that key -- the wheel, the pressure, the
+  // tuning an MPE note starts with -- is about the note just struck. The
+  // lookup found the first voice in the array, the old tail: a repeated note
+  // under a bent wheel played unbent while its dying predecessor bent.
+  {
+    sonore::VoiceManager<PlainVoice, 4> voices;
+    voices.noteOn(60, 1.0f, 0);
+    voices.noteOff(60, 0);
+    for (int i = 0; i < 10; ++i) voices.render();
+    voices.noteOn(60, 1.0f, 0);
+    const int any = voices.voiceForNote(60), onChannel = voices.voiceForNote(60, 0);
+    check(any >= 0 && !voices.voice(any).releasing_,
+          "a re-struck key's lookup finds the new note, not the old one's tail");
+    check(onChannel == any, "\u2026by channel as well as without one");
+  }
+
   // ── The damper pedal ──────────────────────────────────
   {
     sonore::VoiceManager<PlainVoice, 4> voices;
@@ -931,6 +1449,39 @@ static void testVoiceStealingAndPedals() {
     voices.sustainPedal(false);
     for (int i = 0; i < 200; ++i) voices.render();
     check(voices.voiceForNote(64) >= 0, "the pedal lifting does not cut a key that is still down");
+  }
+
+  // A key struck again while the pedal holds its last note. Each strike took
+  // a voice of its own and the old one stayed on the pedal, so a note
+  // repeated under the pedal stacked copies of itself -- with a sustaining
+  // envelope, four strikes were four voices at full level until the pedal
+  // came up. The old note is released, as the reference does and as a
+  // re-struck string is: one note per key, plus the tails of the old ones.
+  {
+    sonore::VoiceManager<PlainVoice, 8> voices;
+    voices.sustainPedal(true);
+    for (int strike = 0; strike < 4; ++strike) {
+      voices.noteOn(60, 1.0f, 0);
+      for (int i = 0; i < 10; ++i) voices.render();
+      voices.noteOff(60, 0);
+    }
+    int held = 0;
+    for (int i = 0; i < 8; ++i)
+      if (voices.voice(i).active_ && !voices.voice(i).releasing_) ++held;
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "a key struck four times under the pedal holds one note, not four (%d held)", held);
+    check(held == 1, line);
+    // Another finger on the same key, on another channel (MPE), is another
+    // note and keeps sounding.
+    voices.noteOn(60, 1.0f, 2);
+    voices.noteOff(60, 2);
+    voices.noteOn(60, 1.0f, 0);
+    held = 0;
+    for (int i = 0; i < 8; ++i)
+      if (voices.voice(i).active_ && !voices.voice(i).releasing_) ++held;
+    check(held == 2, "…and a note on the same key on another channel is not released by it");
+    voices.sustainPedal(false);
   }
 
   // ── The sostenuto pedal ───────────────────────────────
@@ -1087,6 +1638,104 @@ static void removeDir(const std::string& path) {
  * environment variables the path logic reads, so nothing here touches the
  * real one on the machine running it.
  */
+// ── Paths the way users name things ─────────────────────────────────────────
+// Every path in the SDK is UTF-8. On Windows fopen, _mkdir, rename and getenv
+// read the ANSI code page instead, so a folder called "José" named another
+// file and one called "Музыка" named none: samples that would not load,
+// recordings and settings that could not be written -- only for the users
+// whose names and languages are not English. Everything here goes through one
+// folder whose name the ANSI code page cannot hold, created with the wide API
+// the way Explorer creates it.
+static void testUnicodePaths() {
+#if defined(_WIN32)
+  std::printf("unicode paths\n");
+  using namespace sonore;
+  wchar_t tempW[MAX_PATH] = {0};
+  GetTempPathW(MAX_PATH, tempW);
+  const std::wstring dirW = std::wstring(tempW) + L"sonore-\u0442\u0435\u0441\u0442-\u00f1";
+  std::filesystem::remove_all(std::filesystem::path(dirW));
+  CreateDirectoryW(dirW.c_str(), nullptr);
+  char dirUtf8[1024] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, dirW.c_str(), -1, dirUtf8, (int) sizeof(dirUtf8), nullptr,
+                      nullptr);
+  const std::string dir = dirUtf8;
+  char line[300];
+  // The SAME bytes read as the ANSI code page: the folder the narrow API
+  // actually used. A round trip through it "works" -- read back from the same
+  // wrong place -- so every write below is also looked for at the real path.
+  wchar_t mojibakeW[MAX_PATH] = {0};
+  MultiByteToWideChar(CP_ACP, 0, dirUtf8, -1, mojibakeW, MAX_PATH);
+  std::error_code ignored;
+  std::filesystem::remove_all(std::filesystem::path(mojibakeW), ignored);
+  auto atRealPath = [&](const wchar_t* leaf) {
+    struct _stat64 st {};
+    return _wstat64((dirW + leaf).c_str(), &st) == 0;
+  };
+
+  // A WAV, written and read back, then streamed.
+  const std::string wavPath = dir + "/tone.wav";
+  std::vector<float> tone(4800);
+  for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.25f * (float) std::sin(0.05 * (double) i);
+  const bool wrote = writeWav(wavPath.c_str(), tone.data(), tone.size(), 1, 48000);
+  WavData back;
+  const bool read = wrote && readWav(wavPath.c_str(), &back);
+  std::snprintf(line, sizeof(line), "a WAV is written and read back inside a folder named in "
+                "Cyrillic (%s, %s)", wrote ? "written" : "NOT written", read ? "read" : "NOT read");
+  check(read && back.samples.size() == tone.size() && atRealPath(L"/tone.wav"), line);
+  AudioFileReader stream;
+  check(stream.open(wavPath.c_str()) && stream.numFrames() == tone.size(),
+        "...streamed from there");
+  stream.close();
+  check(!hash::sha256File(wavPath.c_str()).empty(), "...and hashed from there");
+
+  // A MIDI file.
+  MidiFileData song;
+  MidiTrack track;
+  MidiFileEvent on;
+  on.message = MidiMessage::noteOn(0, 60, 100);
+  track.events.push_back(on);
+  song.tracks.push_back(track);
+  const std::string midPath = dir + "/song.mid";
+  MidiFileData songBack;
+  check(writeMidiFile(midPath.c_str(), song) && readMidiFile(midPath.c_str(), &songBack) &&
+            atRealPath(L"/song.mid"),
+        "a MIDI file is written and read back there");
+
+  // Settings, under an APPDATA that is itself such a folder -- a Windows
+  // profile is named after its user.
+  const wchar_t* oldAppData = _wgetenv(L"APPDATA");
+  const std::wstring savedAppData = oldAppData ? oldAppData : L"";
+  _wputenv_s(L"APPDATA", dirW.c_str());
+  {
+    UserSettings prefs("com.sonorie.test.unicode");
+    prefs.values().setInt("answer", 42);
+    const bool saved = prefs.save();
+    UserSettings again("com.sonorie.test.unicode");
+    const bool loaded = again.load();
+    std::snprintf(line, sizeof(line), "settings save and load under a Cyrillic profile folder "
+                  "(%s, %s)", saved ? "saved" : "NOT saved", loaded ? "loaded" : "NOT loaded");
+    check(saved && loaded && again.values().getInt("answer", 0) == 42, line);
+  }
+  _wputenv_s(L"APPDATA", savedAppData.c_str());
+
+  // The log a user is asked to send.
+  {
+    Logger& log = Logger::get();
+    const std::string logPath = dir + "/logs/plugin.log";
+    log.setFile(logPath);
+    log.write("hello from a folder with a name");
+    struct _stat64 st {};
+    const std::wstring logW = dirW + L"/logs/plugin.log";
+    check(_wstat64(logW.c_str(), &st) == 0 && st.st_size > 0,
+          "the log is created where it was asked to be");
+    log.setFile({});
+  }
+
+  std::filesystem::remove_all(std::filesystem::path(dirW), ignored);
+  std::filesystem::remove_all(std::filesystem::path(mojibakeW), ignored);
+#endif
+}
+
 static void testUserSettings() {
   std::printf("user settings\n");
 
@@ -1135,9 +1784,15 @@ static void testUserSettings() {
   // settings rather than half the new ones. A leftover .tmp means the rename
   // did not happen, and what is on disk is not what was written.
   {
-    std::FILE* leftover = std::fopen((path + ".tmp").c_str(), "rb");
-    check(leftover == nullptr, "the atomic write leaves no temporary behind");
-    if (leftover) std::fclose(leftover);
+    // Every temporary is "<file>.tmp-<process>-<n>", so look for the prefix.
+    int leftovers = 0;
+    const size_t cut = path.find_last_of("/\\");
+    const std::string leaf = path.substr(cut + 1) + ".tmp";
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(std::filesystem::u8path(path.substr(0, cut)), ec))
+      if (entry.path().filename().u8string().rfind(leaf, 0) == 0) ++leftovers;
+    check(leftovers == 0, "the atomic write leaves no temporary behind");
   }
 
   // \u2500\u2500 Writing one key keeps the others \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -1177,6 +1832,67 @@ static void testUserSettings() {
     sonore::UserSettings again(kId);
     check(again.load() && again.values().getInt("editorScale", 0) == 150,
           "\u2026leaving a usable file behind");
+  }
+
+  // Several writers at once: two instances of a plugin in one host, or two
+  // hosts each running one. Every save went through the same "<file>.tmp",
+  // so each writer truncated the others' half-written temporary and one of
+  // them renamed a mixture into place. Each writer here saves its own letter
+  // at its own length; what is left must be all one writer's, and no
+  // temporary may outlive the saves.
+  {
+    constexpr int kWriters = 6, kRounds = 30;
+    std::atomic<int> failedSaves{0};
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w) {
+      writers.emplace_back([&, w] {
+        for (int r = 0; r < kRounds; ++r) {
+          sonore::UserSettings mine(kId);
+          mine.values().setInt("writer", w);
+          mine.values().setString("blob", std::string((size_t) (3000 + 700 * w), (char) ('a' + w)));
+          if (!mine.save()) failedSaves.fetch_add(1);
+        }
+      });
+    }
+    for (auto& t : writers) t.join();
+    sonore::UserSettings back(kId);
+    const bool loads = back.load();
+    const int w = (int) back.values().getInt("writer", -1);
+    const bool whole = loads && w >= 0 && w < kWriters &&
+                       back.values().getString("blob") ==
+                           std::string((size_t) (3000 + 700 * w), (char) ('a' + w));
+    int leftovers = 0;
+    const size_t cut = path.find_last_of("/\\");
+    const std::string folder = path.substr(0, cut), leaf = path.substr(cut + 1);
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::u8path(folder), ec)) {
+      const std::string name = entry.path().filename().u8string();
+      if (name != leaf && name.rfind(leaf, 0) == 0) ++leftovers;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "six writers saving at once leave one writer's whole file "
+                  "(%s, %d failed saves, %d temporaries left)", whole ? "whole" : "MIXED OR UNREADABLE",
+                  failedSaves.load(), leftovers);
+    check(whole && failedSaves.load() == 0 && leftovers == 0, line);
+  }
+
+  // A value too big for load(): the file it would make is never written. The
+  // load refused it, every other preference went with it, and the next save
+  // of anything at all wrote the empty bag over the file for good.
+  {
+    sonore::UserSettings small(kId);
+    small.values().setString("theme", "dark");
+    check(small.save(), "a settings file with one ordinary value");
+    sonore::UserSettings big(kId);
+    big.load();
+    big.values().setString("cache", std::string((size_t) 5 * 1024 * 1024, 'x')); // past load's 4 MB
+    const bool saved = big.save();
+    sonore::UserSettings back(kId);
+    const bool loads = back.load();
+    char line[200];
+    std::snprintf(line, sizeof(line), "a save larger than load() reads is refused (saved=%d), and "
+                  "the file still loads with what it had (loads=%d)", (int) saved, (int) loads);
+    check(!saved && loads && back.values().getString("theme") == "dark", line);
   }
 
   // A plugin with no id has nowhere to put anything, and says so rather than
@@ -1299,10 +2015,15 @@ static void testUncalledDsp() {
   // the one failure a listener hears instantly.
   {
     struct Shaper { const char* name; float (*fn)(float); float bound; };
+    // cubic() too, at two drives. Its hold sat at +-1.5, past the curve's
+    // peak at 1: from there it fell back to 0.5625, so a harder drive was a
+    // quieter note -- Distortion's Cubic curve, past 0 dB into it.
     const Shaper shapers[] = {
         {"hardClip", sonore::hardClip, 1.0f},
         {"softClip", sonore::softClip, 1.0f},
         {"tanhClip", sonore::tanhClip, 1.0f},
+        {"cubic x1", [](float x) { return sonore::cubic(x, 1.0f); }, 1.0f},
+        {"cubic x4", [](float x) { return sonore::cubic(x, 4.0f); }, 1.0f},
     };
     for (const Shaper& sh : shapers) {
       bool bounded = true, odd = true, monotonic = true, finite = true;
@@ -1328,6 +2049,11 @@ static void testUncalledDsp() {
     checkNear(sonore::softClip(0.001f), 0.001, 2e-6, "softClip is near-unity for small signals");
     checkNear(sonore::tanhClip(0.001f), 0.001, 2e-6, "\u2026and so is tanhClip");
     check(sonore::hardClip(2.0f) == 1.0f, "hardClip clamps flat, which is what makes it hard");
+    char cubicLine[160];
+    std::snprintf(cubicLine, sizeof(cubicLine),
+                  "cubic() holds at its peak of 1 past full drive (cubic(4, 1) = %.4f), not lower",
+                  sonore::cubic(4.0f, 1.0f));
+    check(sonore::cubic(4.0f, 1.0f) == 1.0f && sonore::cubic(-4.0f, 1.0f) == -1.0f, cubicLine);
   }
 
   // \u2500\u2500 LFO shapes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -1431,6 +2157,14 @@ static void testFileDialog() {
     check(sonore::filterExtensions("*.*").empty(), "a match-anything pattern yields nothing");
     check(sonore::filterExtensions("*").empty(), "\u2026and so does a bare star");
     check(sonore::filterExtensions("").empty(), "\u2026and an empty list");
+
+    // What the Windows and GTK dialogs are given. Both match each pattern
+    // literally, so "*.wav,*.aif" and "wav" showed no files there.
+    const std::vector<std::string> p = sonore::detail::filterPatterns("*.wav, *.aif;wav; .flac;;*;kick?.mp3");
+    check(p == std::vector<std::string>{"*.wav", "*.aif", "*.wav", "*.flac", "*", "kick?.mp3"},
+          "dialog patterns split at ',' and ';', and a bare extension becomes *.ext");
+    check(sonore::detail::filterPatterns("").empty() && sonore::detail::filterPatterns(" ; . ,").empty(),
+          "\u2026and nothing becomes no pattern, which the dialogs read as every file");
   }
 
   // \u2500\u2500 Naming a saved file \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -1472,6 +2206,35 @@ static void testFileDialog() {
 
     check(sonore::ensureExtension("anything", {}).empty() == false,
           "with no extensions offered the name is returned unchanged");
+
+    // "kit" typed, kit.wav on disk: the dialog's overwrite check saw "kit",
+    // and kit.wav was replaced unasked. Now the user is asked again, by the
+    // full name, in the same folder -- and only then is the name returned.
+    {
+      std::vector<std::pair<std::string, std::string>> asked;
+      std::vector<std::string> answers = {"/songs/kit", "/songs/kit.wav"};
+      auto ask = [&](const std::string& name, const std::string& folder) {
+        asked.push_back({name, folder});
+        return asked.size() <= answers.size() ? answers[asked.size() - 1] : std::string();
+      };
+      auto exists = [](const std::string& path) { return path == "/songs/kit.wav"; };
+      const std::string got =
+          sonore::detail::saveWithExtension(ask, exists, audio, "untitled", "/home");
+      check(got == "/songs/kit.wav" && asked.size() == 2 && asked[1].first == "kit.wav" &&
+                asked[1].second == "/songs",
+            "a save that would replace a file under the added extension asks again, by that name");
+      asked.clear();
+      answers = {"C:\\songs\\kit", ""};
+      auto existsWin = [](const std::string&) { return true; };
+      check(sonore::detail::saveWithExtension(ask, existsWin, audio, "", "").empty() &&
+                asked.size() == 2 && asked[1].first == "kit.wav" && asked[1].second == "C:\\songs",
+            "...and cancelling that second question writes nothing");
+      asked.clear();
+      answers = {"/songs/new"};
+      check(sonore::detail::saveWithExtension(ask, exists, audio, "", "") == "/songs/new.wav" &&
+                asked.size() == 1,
+            "...while a new name is asked for once");
+    }
     check(sonore::ensureExtension("anything", {}) == "anything", "\u2026exactly");
   }
 
@@ -1531,6 +2294,31 @@ static void testFileBridge() {
         sonore::parseBridgeMessage("{\"type\":\"file\",\"mode\":\"open\"}");
     check(nameless.kind == sonore::BridgeMessage::Kind::None,
           "a request with no purpose does nothing, rather than something arbitrary");
+
+    // JSON.stringify escapes a quote and a backslash, and the field ended at
+    // the first quote, escaped or not: `kick "A"` arrived as `kick \`.
+    const sonore::BridgeMessage quoted = sonore::parseBridgeMessage(
+        "{\"type\":\"file\",\"purpose\":\"kick \\\"A\\\" \\\\ \\u00e9\\ud83c\\udfb5\",\"mode\":\"open\"}");
+    check(quoted.kind == sonore::BridgeMessage::Kind::ChooseFile &&
+              quoted.purpose == "kick \"A\" \\ \xC3\xA9\xF0\x9F\x8E\xB5" && quoted.mode == "open",
+          "a purpose with a quote, a backslash and \\u escapes arrives as the page wrote it");
+    const sonore::BridgeMessage broken =
+        sonore::parseBridgeMessage("{\"type\":\"file\",\"purpose\":\"a\\q\"}");
+    check(broken.kind == sonore::BridgeMessage::Kind::None,
+          "and a malformed escape does nothing");
+
+    // A NUL is no character a purpose can hold, and every C string after
+    // this one ends there. The LV2 interface hands its plugin
+    // "purpose\0path": a purpose of "sample\u0000C:\\secret.wav" made the
+    // plugin load the PAGE's path, whatever file the user picked.
+    const sonore::BridgeMessage nul = sonore::parseBridgeMessage(
+        "{\"type\":\"file\",\"purpose\":\"sample\\u0000C:\\\\secret.wav\",\"mode\":\"open\"}");
+    check(nul.kind == sonore::BridgeMessage::Kind::None,
+          "a purpose with a NUL in it does nothing, rather than choosing the file itself");
+    const sonore::BridgeMessage nulName = sonore::parseBridgeMessage(
+        "{\"type\":\"device\",\"backend\":\"asio\",\"name\":\"A\\u0000B\"}");
+    check(nulName.deviceName.find('\0') == std::string::npos,
+          "...and no other field carries one either");
   }
 
   // \u2500\u2500 What comes back \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -1561,6 +2349,27 @@ static void testFileBridge() {
     check(odd.find('<') == std::string::npos, "\u2026and an angle bracket cannot close a script tag");
   }
 }
+
+#if defined(_WIN32)
+/** Holds one thread inside a copy, deterministically: the block it is copying
+ *  from has a guard page in the middle, and the first touch of that page
+ *  waits here until the test lets it go. EXCEPTION_CONTINUE_EXECUTION then
+ *  retries the load, which succeeds -- the OS lifts a guard on its first
+ *  violation. Only for the thread named; any other passes through. */
+struct HeldCopy {
+  static HANDLE& paused() { static HANDLE h = nullptr; return h; }
+  static HANDLE& resume() { static HANDLE h = nullptr; return h; }
+  static std::atomic<DWORD>& thread() { static std::atomic<DWORD> id{0}; return id; }
+  static LONG CALLBACK onGuard(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION ||
+        GetCurrentThreadId() != thread().load())
+      return EXCEPTION_CONTINUE_SEARCH;
+    SetEvent(paused());
+    WaitForSingleObject(resume(), 10000);
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+};
+#endif
 
 /**
  * Recording to disk while audio is playing.
@@ -1644,6 +2453,48 @@ static void testWavRecorder() {
   }
   std::remove(kPath);
 
+  // \u2500\u2500 A take that never gets to stop() \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  //
+  // A crash, a full disk, a power cut: the header is never patched. It said
+  // zero, so the take read back as an empty file in front of its own audio.
+  // Read here while the recorder is still running, which is the file a crash
+  // would leave behind.
+  {
+    sonore::WavRecorder rec;
+    check(rec.start(kPath, 48000.0, 2), "a recorder for an interrupted take opens");
+    const int kFrames = 48000;
+    std::vector<float> ramp((size_t) kFrames * 2);
+    for (int i = 0; i < kFrames; ++i) {
+      ramp[(size_t) i * 2] = (float) i;
+      ramp[(size_t) i * 2 + 1] = -(float) i;
+    }
+    for (int at = 0; at < kFrames; at += 1000) rec.write(ramp.data() + (size_t) at * 2, 1000);
+    for (int wait = 0; wait < 400 && rec.framesWritten() < (uint64_t) kFrames; ++wait)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    sonore::WavData whole;
+    sonore::AudioFileReader streamed;
+    const bool readWhole = sonore::readWav(kPath, &whole);
+    const bool readStreamed = streamed.open(kPath);
+    bool inOrder = readWhole && whole.numChannels == 2 && whole.samples.size() % 2 == 0;
+    for (size_t i = 0; inOrder && i < whole.numFrames(); ++i)
+      inOrder = whole.samples[i * 2] == (float) i && whole.samples[i * 2 + 1] == -(float) i;
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a take read before stop() has its audio: %zu and %llu of %d frames, in order",
+                  readWhole ? whole.numFrames() : (size_t) 0,
+                  (unsigned long long) (readStreamed ? streamed.numFrames() : 0), kFrames);
+    // A buffer's worth may not have left the C library yet; the rest must be
+    // there.
+    check(inOrder && whole.numFrames() >= (size_t) kFrames - 1024 &&
+              readStreamed && streamed.numFrames() >= (uint64_t) kFrames - 1024,
+          line);
+    rec.stop();
+    sonore::WavData finished;
+    check(sonore::readWav(kPath, &finished) && finished.numFrames() == (size_t) kFrames,
+          "\u2026and stop() still writes its exact length");
+  }
+  std::remove(kPath);
+
   // \u2500\u2500 When the disk cannot keep up \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
   //
   // Frames that do not fit are DROPPED and counted, never written over ones
@@ -1678,6 +2529,187 @@ static void testWavRecorder() {
     check(!bad.start(tempPath("sonore-recorder-test.wav"), 48000.0, 0), "\u2026and so is no channels");
   }
   std::remove(kPath);
+
+#if defined(_WIN32)
+  // \u2500\u2500 A take ended and the next begun while a block is being copied in \u2500\u2500
+  //
+  // The audio thread does not stop calling write() because the user pressed
+  // stop; stop() and the next start() run beside it. The flag stopped the
+  // NEXT write(), not one already past it: stop() drained and closed while
+  // that block was still being copied, and start() reset the ring under
+  // the copy -- so the block vanished from its own take and the next take
+  // began with a run of silence and the rest of it (and a ring start() grew
+  // was freed under the copy: heap-use-after-free under ASan). The writer is
+  // held mid-copy by a guard page, deterministically.
+  {
+    const std::string pathA = tempPath("sonore-recorder-held-a.wav");
+    const std::string pathB = tempPath("sonore-recorder-held-b.wav");
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const size_t page = si.dwPageSize;
+    float* held = (float*) VirtualAlloc(nullptr, page * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    const size_t heldFrames = page * 2 / (2 * sizeof(float));
+    for (size_t i = 0; i < heldFrames; ++i) {
+      held[i * 2] = 1.0f + (float) i;
+      held[i * 2 + 1] = -1.0f - (float) i;
+    }
+    DWORD was = 0;
+    VirtualProtect((char*) held + page, page, PAGE_READWRITE | PAGE_GUARD, &was);
+    HeldCopy::paused() = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HeldCopy::resume() = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    void* handler = AddVectoredExceptionHandler(1, &HeldCopy::onGuard);
+
+    sonore::WavRecorder rec;
+    rec.start(pathA.c_str(), 48000.0, 2, 4096);
+    std::thread audio([&] {
+      HeldCopy::thread() = GetCurrentThreadId();
+      rec.write(held, heldFrames); // held halfway through, inside the copy
+    });
+    const bool wasHeld = WaitForSingleObject(HeldCopy::paused(), 5000) == WAIT_OBJECT_0;
+    std::atomic<bool> stopped{false};
+    std::thread ui([&] {
+      rec.stop();
+      stopped = true;
+      rec.start(pathB.c_str(), 48000.0, 2, 4096);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const bool stopWaited = !stopped.load();
+    SetEvent(HeldCopy::resume());
+    audio.join();
+    ui.join();
+    RemoveVectoredExceptionHandler(handler);
+    HeldCopy::thread() = 0;
+    CloseHandle(HeldCopy::paused());
+    CloseHandle(HeldCopy::resume());
+    VirtualFree(held, 0, MEM_RELEASE);
+
+    // The next take, written after the restart: a ramp of its own.
+    std::vector<float> next(1000 * 2);
+    for (int i = 0; i < 1000; ++i) {
+      next[(size_t) i * 2] = 5000.0f + (float) i;
+      next[(size_t) i * 2 + 1] = -5000.0f - (float) i;
+    }
+    rec.write(next.data(), 1000);
+    rec.stop();
+
+    sonore::WavData a, b;
+    const bool readA = sonore::readWav(pathA.c_str(), &a);
+    const bool readB = sonore::readWav(pathB.c_str(), &b);
+    bool aWhole = readA && a.numChannels == 2 && a.numFrames() == heldFrames;
+    for (size_t i = 0; aWhole && i < heldFrames; ++i)
+      aWhole = a.samples[i * 2] == 1.0f + (float) i && a.samples[i * 2 + 1] == -1.0f - (float) i;
+    bool bOwn = readB && b.numChannels == 2 && b.numFrames() == 1000;
+    for (size_t i = 0; bOwn && i < 1000; ++i)
+      bOwn = b.samples[i * 2] == 5000.0f + (float) i && b.samples[i * 2 + 1] == -5000.0f - (float) i;
+    char line[240];
+    std::snprintf(line, sizeof(line),
+                  "stop() waits for a block the audio thread is copying in (held: %s; stop %s)",
+                  wasHeld ? "yes" : "NO", stopWaited ? "waited" : "returned under it");
+    check(wasHeld && stopWaited, line);
+    std::snprintf(line, sizeof(line),
+                  "\u2026that block is in the take it was written to (%zu of %zu frames, in order)",
+                  readA ? a.numFrames() : (size_t) 0, heldFrames);
+    check(aWhole, line);
+    std::snprintf(line, sizeof(line),
+                  "\u2026and the next take holds only its own audio (%zu frames of 1000; first %g)",
+                  readB ? b.numFrames() : (size_t) 0,
+                  readB && !b.samples.empty() ? (double) b.samples[0] : -1.0);
+    check(bOwn, line);
+    std::remove(pathA.c_str());
+    std::remove(pathB.c_str());
+  }
+
+  // ── A disk that refuses writes for a while, then takes them again ──
+  //
+  // A full disk, or one unplugged and back. A byte-range lock on the take
+  // past its first 16 KB makes WriteFile fail as a full disk does, and
+  // lifting it lets writes through again. The refused writes were skipped
+  // silently: write() went on saying everything fitted, framesDropped()
+  // stayed 0, framesWritten() counted frames the disk never took, and once
+  // the lock was gone the take carried on part of a frame out of step --
+  // every sample after the gap read from the wrong bytes.
+  {
+    const std::string path = tempPath("sonore-recorder-refused.wav");
+    sonore::WavRecorder rec;
+    rec.start(path.c_str(), 48000.0, 2);
+    const std::wstring wide = sonore::pathio::widenPath(path.c_str());
+    HANDLE other = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    OVERLAPPED region{};
+    region.Offset = 16384;
+    const bool locked = other != INVALID_HANDLE_VALUE &&
+                        LockFileEx(other, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0,
+                                   0xFFFFFFFFu, 0, &region);
+    uint64_t handed = 0;
+    std::vector<float> block(480 * 2);
+    auto send = [&]() {
+      for (size_t i = 0; i < 480; ++i) {
+        block[i * 2] = (float) (handed + i);
+        block[i * 2 + 1] = -(float) (handed + i);
+      }
+      handed += 480;
+      return rec.write(block.data(), 480);
+    };
+    int refused = 0;
+    for (int i = 0; i < 100; ++i) { // a second of audio, at a device's pace
+      if (!send()) ++refused;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const uint64_t droppedDuring = rec.framesDropped();
+    if (locked) UnlockFileEx(other, 0, 0xFFFFFFFFu, 0, &region);
+    if (other != INVALID_HANDLE_VALUE) CloseHandle(other);
+    for (int i = 0; i < 20; ++i) { // and more once the disk takes writes again
+      send();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    rec.stop();
+
+    char line[240];
+    std::snprintf(line, sizeof(line),
+                  "a disk that refuses writes is reported (lock %s; %d of 100 write() calls "
+                  "false, %llu frames dropped meanwhile)",
+                  locked ? "held" : "NOT TAKEN", refused, (unsigned long long) droppedDuring);
+    check(locked && refused > 0 && droppedDuring > 0, line);
+    std::snprintf(line, sizeof(line),
+                  "…every frame handed over is written or counted dropped (%llu + %llu of %llu)",
+                  (unsigned long long) rec.framesWritten(), (unsigned long long) rec.framesDropped(),
+                  (unsigned long long) handed);
+    check(rec.framesWritten() + rec.framesDropped() == handed, line);
+    sonore::WavData taken;
+    const bool read = sonore::readWav(path.c_str(), &taken);
+    bool inOrder = read && taken.numChannels == 2 && taken.numFrames() > 0;
+    size_t firstWrong = 0;
+    for (size_t i = 0; inOrder && i < taken.numFrames(); ++i) {
+      inOrder = taken.samples[i * 2] == (float) i && taken.samples[i * 2 + 1] == -(float) i;
+      if (!inOrder) firstWrong = i;
+    }
+    std::snprintf(line, sizeof(line),
+                  "…and the take stops at the refusal, every frame in it in order (%zu frames "
+                  "read, %llu written; %s %zu)",
+                  read ? taken.numFrames() : (size_t) 0, (unsigned long long) rec.framesWritten(),
+                  inOrder ? "in order to frame" : "out of order from frame",
+                  inOrder ? (read ? taken.numFrames() : (size_t) 0) : firstWrong);
+    check(inOrder && taken.numFrames() == rec.framesWritten(), line);
+    std::remove(path.c_str());
+  }
+#endif
+
+  // Past 4 GB a take's lengths are clamped, and must stay a header a reader
+  // accepts: the RIFF length is the data length plus 36. Clamped to
+  // 0xFFFFFFF0, the data pushed that sum past 32 bits and it wrapped to 20.
+  {
+    uint8_t h[44];
+    const uint64_t fourHoursStereo = (uint64_t) 48000 * 3600 * 4; // 5.5 GB of float stereo
+    sonore::WavRecorder::header(h, fourHoursStereo, 2, 48000);
+    auto u32 = [&](int at) {
+      return (uint32_t) h[at] | ((uint32_t) h[at + 1] << 8) | ((uint32_t) h[at + 2] << 16) |
+             ((uint32_t) h[at + 3] << 24);
+    };
+    char line[200];
+    std::snprintf(line, sizeof(line), "a take past 4 GB keeps a coherent header (RIFF %u, data %u: "
+                  "data + 36 == RIFF, whole frames)", u32(4), u32(40));
+    check(u32(4) == u32(40) + 36u && u32(4) > 0xF0000000u && u32(40) % 8u == 0, line);
+  }
 }
 
 /**
@@ -1739,6 +2771,39 @@ static void testStateToPage() {
     sonore::StateBag empty;
     check(sonore::bagToJson(empty) == "{}", "an empty bag is an empty object, not a broken one");
   }
+
+  // Infinity and NaN round-trip. setDouble wrote "inf" and "-inf" and they
+  // read back as the FALLBACK: a fader saved at -inf dB reopened wherever the
+  // fallback put it.
+  {
+    sonore::StateBag bag;
+    bag.setDouble("floor", -std::numeric_limits<double>::infinity());
+    bag.setDouble("ceiling", std::numeric_limits<double>::infinity());
+    bag.setDouble("unset", std::numeric_limits<double>::quiet_NaN());
+    std::vector<uint8_t> blob;
+    bag.serialise(blob);
+    sonore::StateBag back;
+    back.deserialise(blob.data(), blob.size());
+    check(back.getDouble("floor", 0.0) == -std::numeric_limits<double>::infinity() &&
+              back.getDouble("ceiling", 0.0) == std::numeric_limits<double>::infinity() &&
+              std::isnan(back.getDouble("unset", 0.0)),
+          "-inf, inf and NaN come back as themselves, not as the fallback");
+  }
+
+  // A damaged blob is refused and the bag is left as it was. It was emptied
+  // first and filled as far as the damage: false, with half a session in it.
+  {
+    sonore::StateBag good;
+    good.setString("sample", "kick.wav");
+    good.setInt("root", 60);
+    std::vector<uint8_t> blob;
+    good.serialise(blob);
+    sonore::StateBag bag;
+    bag.setString("previous", "kept");
+    const bool ok = bag.deserialise(blob.data(), blob.size() - 3); // cut short
+    check(!ok && bag.size() == 1 && bag.getString("previous", "") == "kept",
+          "a truncated blob is refused and leaves the bag exactly as it was");
+  }
 }
 
 /**
@@ -1790,6 +2855,23 @@ static void testParamSkew() {
   // into a session and reads back as something else. Checked across the whole
   // range rather than at a few points, because a power law is exactly where a
   // clamp or a sign error hides at one end.
+  // A STEPPED control ignores the skew. A host steps it evenly in normalised
+  // space -- k / (positions - 1) -- and a power curve applied before the snap
+  // bunched the positions: four steps with skew 0.5 read back 0, 0, 1, 3, so
+  // the third position could not be reached from the host's list at all.
+  {
+    sonore::ParamInfo ratio = {"r", "Ratio", "", 0.0f, 3.0f, 0.0f, 4};
+    ratio.skew = 0.5f;
+    bool everyStep = true;
+    for (int k = 0; k <= 3; ++k) {
+      const double plain = sonore::toPlainValue(ratio, (double) k / 3.0);
+      if (std::lround(plain) != k) everyStep = false;
+      if (std::fabs(sonore::toNormalisedValue(ratio, (double) k) - (double) k / 3.0) > 1e-9)
+        everyStep = false;
+    }
+    check(everyStep, "a stepped control with a skew still reaches every step from the host's list");
+  }
+
   {
     sonore::ParamInfo cutoff = {"c", "Cutoff", "Hz", 20.0f, 20000.0f, 1000.0f, 0};
     cutoff.skew = sonore::skewForCentre(20.0f, 20000.0f, 1000.0f);
@@ -1923,6 +3005,76 @@ static void testFastSine() {
     checkNear(sonore::fastmath::sinTurns(0.5f), 0.0, 1e-6, "\u2026and so is half a turn");
   }
 
+  // \u2500\u2500 fast_math.h: every stated error, measured across its stated range \u2500\u2500
+  //
+  // The header's promise is that each approximation states its worst error
+  // and the tests measure it. None of them was measured, and two were off by
+  // orders of magnitude: fastSin's series ran to +/-pi unfolded (6.9e-3, not
+  // 1.1e-5) and fastLog's was a Taylor series of ln(1 + m) taken to m = 1,
+  // 0.076 off -- 0.66 dB in fastGainToDb, which exists for meters.
+  {
+    auto worstOver = [](double lo, double hi, int steps, auto&& error) {
+      double worst = 0.0;
+      for (int i = 0; i <= steps; ++i) {
+        const double e = error((float) (lo + (hi - lo) * (double) i / (double) steps));
+        if (!(e <= worst)) worst = e; // a NaN is the worst there is
+      }
+      return worst;
+    };
+    char line[200];
+    const double tanhErr = worstOver(-5.0, 5.0, 2000000, [](float x) {
+      return std::fabs((double) sonore::fastTanh(x) - std::tanh((double) x));
+    });
+    std::snprintf(line, sizeof(line), "fastTanh is within 2.5e-4 over [-5, 5] (measured %.2e)", tanhErr);
+    check(tanhErr <= 2.5e-4, line);
+
+    const double expErr = worstOver(-8.0, 8.0, 2000000, [](float x) {
+      return std::fabs((double) sonore::fastExp(x) / std::exp((double) x) - 1.0);
+    });
+    std::snprintf(line, sizeof(line), "fastExp is within 2e-5 relative over [-8, 8] (measured %.2e)", expErr);
+    check(expErr <= 2e-5, line);
+
+    const double pi = 3.14159265358979323846;
+    const double sinErr = worstOver(-pi, pi, 2000000, [](float x) {
+      return std::fabs((double) sonore::fastSin(x) - std::sin((double) x));
+    });
+    const double cosErr = worstOver(-pi, pi, 2000000, [](float x) {
+      return std::fabs((double) sonore::fastCos(x) - std::cos((double) x));
+    });
+    std::snprintf(line, sizeof(line), "fastSin and fastCos are within 3e-7 over [-pi, pi] "
+                  "(measured %.2e, %.2e)", sinErr, cosErr);
+    check(sinErr <= 3e-7 && cosErr <= 3e-7, line);
+
+    // Every positive normal float, geometrically.
+    const double lnMin = std::log(1.17549435e-38), lnMax = std::log(3.40282e38);
+    double logErr = 0.0, logErrMid = 0.0;
+    for (int i = 0; i <= 2000000; ++i) {
+      const float x = (float) std::exp(lnMin + (lnMax - lnMin) * (double) i / 2000000.0);
+      if (!(x >= 1.17549435e-38f) || !std::isfinite(x)) continue;
+      const double e = std::fabs((double) sonore::fastLog(x) - std::log((double) x));
+      if (!(e <= logErr)) logErr = e;
+      if (x >= 1e-6f && x <= 1e6f && !(e <= logErrMid)) logErrMid = e;
+    }
+    std::snprintf(line, sizeof(line), "fastLog is within 1e-5 over every positive normal float, "
+                  "2e-6 over [1e-6, 1e6] (measured %.2e, %.2e)", logErr, logErrMid);
+    check(logErr <= 1e-5 && logErrMid <= 2e-6, line);
+
+    const double dbErr = worstOver(std::log(1e-5), std::log(4.0), 2000000, [](float t) {
+      const float g = (float) std::exp((double) t);
+      return std::fabs((double) sonore::fastGainToDb(g) - 20.0 * std::log10((double) g));
+    });
+    std::snprintf(line, sizeof(line), "fastGainToDb is within 2e-5 dB from -100 to +12 dB (measured %.2e)", dbErr);
+    check(dbErr <= 2e-5, line);
+
+    // Below the normal range the answer is the floor: finite, never a NaN or
+    // -inf that would poison a meter's smoothing for good.
+    const float floor = sonore::fastLog(1.17549435e-38f);
+    check(sonore::fastLog(0.0f) <= floor + 1e-3f && sonore::fastLog(-1.0f) <= floor + 1e-3f &&
+              sonore::fastLog(std::nanf("")) <= floor + 1e-3f && sonore::fastLog(1e-40f) <= floor + 1e-3f &&
+              std::isfinite(sonore::fastLog(1e-40f)),
+          "fastLog of zero, a negative, a NaN or a subnormal is the log of the smallest normal float");
+  }
+
   // ── Speed, reported and not asserted ───────────────────────────────
   //
   // A timing assertion fails on a busy machine and teaches people to re-run
@@ -1943,6 +3095,32 @@ static void testFastSine() {
     std::printf("  ---- %d calls: fast %.1f ms, std::sin %.1f ms (%.2fx) ----\n",
                 kRuns, fast * 1000.0, exact * 1000.0, exact > 0 ? fast / exact : 0.0);
   }
+}
+
+// SONORE_DEPRECATED has to compile where the API will use it -- on an inline
+// function, at namespace scope -- under every compiler this builds with; a
+// probe that is never called, so it warns nobody.
+SONORE_DEPRECATED("1.0: a probe of the macro, never called") inline int sonoreDeprecatedProbe() { return 1; }
+
+// A VST3 class id is the same TEXT on every platform and different BYTES on
+// Windows, where the VST3 SDK stores a GUID's first three fields COM-style.
+// vst3_c_api.h's own SMTG_INLINE_UID is the oracle: an interface id it built
+// must be what our conversion makes of the GUID, and must read back as it.
+static void testVst3Uid() {
+  std::printf("VST3 class ids\n");
+  const uint8_t canonical[16] = {0x22, 0x88, 0x8D, 0xDB, 0x15, 0x6E, 0x45, 0xAE,
+                                 0x83, 0x58, 0xB3, 0x48, 0x08, 0x19, 0x06, 0x25};
+  uint8_t native[16];
+  sonore::vst3uid::canonicalToNative(canonical, native);
+  check(std::memcmp(native, Steinberg_IPluginBase_iid, 16) == 0,
+        "a GUID stored as this platform's VST3 SDK stores it (IPluginBase from vst3_c_api.h)");
+  check(sonore::vst3uid::toText(Steinberg_IPluginBase_iid) == "22888DDB156E45AE8358B34808190625",
+        "and its text is the GUID's own order, as FUID::toString writes it");
+  uint8_t back[16];
+  sonore::vst3uid::nativeToCanonical(native, back);
+  check(std::memcmp(back, canonical, 16) == 0, "the two conversions undo each other");
+  check(sonore::vst3uid::toText(Steinberg_FUnknown_iid) == "0000000000000000C000000000000046",
+        "FUnknown reads as its GUID, 00000000-0000-0000-C000-000000000046");
 }
 
 static void testHostileFiles() {
@@ -2149,12 +3327,21 @@ static void testMalformedWav() {
     if (opened) check(reader.numFrames() < 1000000, "\u2026and it does not invent a length");
   }
 
-  // A chunk of size zero: the walk must not sit on it for ever.
+  // A chunk of size zero: the walk must not sit on it for ever -- nor stop at
+  // it. An empty chunk is legal, and its header alone moves the walk on; the
+  // walk took it for "no progress" and never reached the data chunk after
+  // it, so the streaming reader refused a file readWav plays.
   {
     check(write(build(0)), "a file with a zero-size chunk is written");
     sonore::AudioFileReader reader;
-    reader.open(kPath);
-    check(true, "a zero-size chunk does not stall the walk");
+    sonore::WavData whole;
+    const bool opened = reader.open(kPath);
+    std::printf("  ---- zero-size chunk: stream %s \"%s\", %llu frames ----\n",
+                opened ? "opened" : "refused", reader.error().c_str(),
+                (unsigned long long) reader.numFrames());
+    check(sonore::readWav(kPath, &whole) && whole.numFrames() == 2,
+          "a zero-size chunk does not stall the walk, and readWav finds the data after it");
+    check(opened && reader.numFrames() == 2, "…and so does the streaming reader");
   }
 
   // And the ordinary case still works, which is what says the guard did not
@@ -2166,6 +3353,157 @@ static void testMalformedWav() {
     check(reader.open(kPath), "\u2026and still opens");
     check(reader.numChannels() == 2 && reader.sampleRate() == 48000,
           "\u2026with its format read correctly");
+  }
+
+  // A 16-bit channel count taken at its word. Every buffer downstream is
+  // sized from it -- a sample stream's window was 65536 x channels floats --
+  // so 65535 channels in a sixty-byte header was a 17 GB allocation and a
+  // host brought down by the bad_alloc. The whole-file readers stopped at 32;
+  // the streaming one did not.
+  {
+    std::vector<uint8_t> wide = build(4);
+    wide[22] = 0xFF; // fmt's channel count, 65535
+    wide[23] = 0xFF;
+    check(write(wide), "a WAV claiming 65535 channels is written");
+    sonore::AudioFileReader reader;
+    const bool opened = reader.open(kPath);
+    std::printf("  ---- 65535 channels: %s \"%s\" ----\n", opened ? "OPENED" : "refused",
+                reader.error().c_str());
+    check(!opened, "\u2026and refused, rather than sized for");
+  }
+
+  // AIFF's two fields that fed unchecked arithmetic: an 80-bit rate whose
+  // exponent says 2^16000 (+inf, cast to an integer: undefined behaviour), and
+  // an SSND offset past the end of the file (a frame count in the billions).
+  {
+    auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+      for (int s = 24; s >= 0; s -= 8) v.push_back((uint8_t) (x >> s));
+    };
+    auto aiff = [&](uint16_t rateExponent, uint32_t ssndOffset) {
+      std::vector<uint8_t> v = {'F', 'O', 'R', 'M'};
+      be32(v, 0);
+      v.insert(v.end(), {'A', 'I', 'F', 'F', 'C', 'O', 'M', 'M'});
+      be32(v, 18);
+      v.insert(v.end(), {0, 2});   // channels
+      be32(v, 4);                  // frames
+      v.insert(v.end(), {0, 16});  // bits
+      // 48000 is 0xBB80 x 2^15: exponent 16383 + 15, mantissa 0xBB80 at the top.
+      v.push_back((uint8_t) (rateExponent >> 8));
+      v.push_back((uint8_t) rateExponent);
+      v.insert(v.end(), {0xBB, 0x80, 0, 0, 0, 0, 0, 0});
+      v.insert(v.end(), {'S', 'S', 'N', 'D'});
+      be32(v, 8 + 16);
+      be32(v, ssndOffset);
+      be32(v, 0);
+      for (int i = 0; i < 16; ++i) v.push_back(0);
+      return v;
+    };
+    sonore::AudioFileReader reader;
+    check(write(aiff(16383 + 15, 0)) && reader.open(kPath) && reader.sampleRate() == 48000,
+          "a hand-built 48 kHz AIFF opens, at 48 kHz");
+    sonore::AudioFileReader infinite;
+    check(write(aiff(16383 + 16000, 0)) && !infinite.open(kPath),
+          "an AIFF whose rate's exponent says 2^16000 is refused, not cast from +inf");
+    sonore::AudioFileReader pastEnd;
+    const bool opened = write(aiff(16383 + 15, 0x7FFFFFF0u)) && pastEnd.open(kPath);
+    check(!opened, "an AIFF whose sound data starts past the end of the file is refused");
+    // An empty NAME between COMM and SSND, as a tool with no name to give
+    // writes one: the walk stopped at it and never found the sound.
+    {
+      std::vector<uint8_t> named = aiff(16383 + 15, 0);
+      const uint8_t emptyName[] = {'N', 'A', 'M', 'E', 0, 0, 0, 0};
+      named.insert(named.begin() + 38, emptyName, emptyName + 8); // after COMM's 8 + 18
+      sonore::AudioFileReader r;
+      sonore::WavData whole;
+      check(write(named) && sonore::readAiff(kPath, &whole) && whole.numFrames() == 4 &&
+                r.open(kPath) && r.numFrames() == 4,
+            "an AIFF with an empty NAME chunk before its sound opens in both readers");
+    }
+    // 65535 channels in COMM: refused by readAiff as by readWav, which caps at
+    // 32. It was read as given, and every consumer sized its per-channel
+    // work from it.
+    {
+      std::vector<uint8_t> wide = aiff(16383 + 15, 0);
+      wide[20] = 0xFF; // COMM's channel count, after FORM(8) AIFF(4) COMM(8)
+      wide[21] = 0xFF;
+      sonore::WavData data;
+      check(write(wide) && !sonore::readAiff(kPath, &data),
+            "an AIFF that claims 65535 channels is refused, as a WAV past 32 is");
+    }
+
+    // Compressed audio, which the streaming reader took for PCM and played as
+    // full-scale noise: a WAV tagged WMA (0x0161) and AC-3 (0x0092), and
+    // AIFF-C in u-law and IMA ADPCM. "twos" is PCM, and both readers take it.
+    auto aifc = [&](const char* type) {
+      std::vector<uint8_t> v = {'F', 'O', 'R', 'M'};
+      be32(v, 0);
+      v.insert(v.end(), {'A', 'I', 'F', 'C', 'C', 'O', 'M', 'M'});
+      be32(v, 24);
+      v.insert(v.end(), {0, 2});  // channels
+      be32(v, 4);                 // frames
+      v.insert(v.end(), {0, 16}); // bits
+      v.insert(v.end(), {0x40, 0x0E, 0xBB, 0x80, 0, 0, 0, 0, 0, 0}); // 48000
+      v.insert(v.end(), type, type + 4);
+      v.insert(v.end(), {0, 0}); // an empty name, padded
+      v.insert(v.end(), {'S', 'S', 'N', 'D'});
+      be32(v, 8 + 16);
+      be32(v, 0);
+      be32(v, 0);
+      for (int i = 0; i < 16; ++i) v.push_back(0x55);
+      return v;
+    };
+    bool refused = true;
+    std::string why;
+    for (uint16_t tag : {(uint16_t) 0x0161, (uint16_t) 0x0092}) {
+      std::vector<uint8_t> wav = build(4);
+      wav[20] = (uint8_t) (tag & 0xff);
+      wav[21] = (uint8_t) (tag >> 8);
+      sonore::AudioFileReader r;
+      refused = refused && write(wav) && !r.open(kPath);
+      why = r.error();
+    }
+    for (const char* type : {"ulaw", "ima4"}) {
+      sonore::AudioFileReader r;
+      refused = refused && write(aifc(type)) && !r.open(kPath);
+      why += "; " + r.error();
+    }
+    std::printf("  ---- compressed: %s ----\n", why.c_str());
+    check(refused, "WMA and AC-3 WAVs and u-law and IMA AIFF-C are refused by the streaming reader");
+
+    // A WAV whose rate is zero: every position and length divides by it.
+    {
+      std::vector<uint8_t> zeroRate = build(4);
+      for (int k = 24; k < 28; ++k) zeroRate[(size_t) k] = 0;
+      sonore::AudioFileReader r;
+      check(write(zeroRate) && !r.open(kPath), "a WAV whose sample rate is zero is refused by the streaming reader");
+    }
+
+    // The decoded-size ceiling, in the two whole-file readers that had none
+    // (and a writer that wrapped its lengths past 4 GB).
+    {
+      std::vector<float> tone(4800);
+      for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.5f * (float) std::sin(0.05 * (double) i);
+      const char* aiffPath = tempPath("sonore-ceiling.aiff");
+      const char* wavPath = tempPath("sonore-ceiling.wav");
+      sonore::WavData under, over;
+      const bool aiff = sonore::writeAiff(aiffPath, tone.data(), tone.size(), 1, 48000, 16) &&
+                        sonore::readAiff(aiffPath, &under, 4800) && !sonore::readAiff(aiffPath, &over, 4799);
+      const bool wav = sonore::writeWav(wavPath, tone.data(), tone.size(), 1, 48000) &&
+                       sonore::readWav(wavPath, &under, 4800) && !sonore::readWav(wavPath, &over, 4799);
+      std::remove(aiffPath);
+      std::remove(wavPath);
+      check(aiff && wav, "readAiff and readWav refuse a file past their decoded-size ceiling");
+      const float one = 0.0f;
+      check(!sonore::writeAiff(aiffPath, &one, (size_t) 1 << 31, 2, 48000, 24) &&
+                !sonore::writeAiff(aiffPath, &one, 1, 1, 0, 24),
+            "writeAiff refuses 12 GB of sound, which its 32-bit lengths cannot say, and a zero rate");
+      std::remove(aiffPath);
+    }
+    sonore::AudioFileReader twos;
+    sonore::WavData twosWhole;
+    check(write(aifc("twos")) && twos.open(kPath) && twos.numFrames() == 4 &&
+              sonore::readAudioFile(kPath, &twosWhole) && twosWhole.numFrames() == 4,
+          "...and AIFF-C 'twos' opens in both readers");
   }
 
   std::remove(kPath);
@@ -2347,9 +3685,90 @@ static void testParamFormatting() {
   check(!sonore::parseParamValue(hz, "nan", &parsed), "...and so is \"nan\", which strtod accepts");
   check(!sonore::parseParamValue(hz, "inf", &parsed), "...and \"inf\"");
 
+  // Small values keep their figures. From the range alone, an attack of 0.1 to
+  // 2000 ms printed everything below half a millisecond as "0 ms".
+  {
+    const sonore::ParamInfo attack = {"attack", "Attack", "ms", 0.1f, 2000.0f, 10.0f, 0};
+    char a[32], b[32], c[32];
+    sonore::formatParamValue(attack, 0.4f, a, sizeof(a));
+    sonore::formatParamValue(attack, 5.5f, b, sizeof(b));
+    sonore::formatParamValue(attack, 50.0f, c, sizeof(c));
+    char l[160];
+    std::snprintf(l, sizeof(l), "a 0.1-2000 ms control prints 0.4, 5.5 and 50 as \"%s\", \"%s\", \"%s\"", a,
+                  b, c);
+    check(std::strcmp(a, "0.40 ms") == 0 && std::strcmp(b, "5.5 ms") == 0 && std::strcmp(c, "50 ms") == 0, l);
+  }
+
+  // Text that is a number followed by something other than the unit is not a
+  // value of this control. It was read up to the number and the rest ignored.
+  {
+    const sonore::ParamInfo ms = {"t", "Time", "ms", 0.0f, 1000.0f, 10.0f, 0};
+    float v = -1.0f;
+    check(!sonore::parseParamValue(ms, "12abc", &v) && !sonore::parseParamValue(ms, "5 s", &v) &&
+              v == -1.0f,
+          "\"12abc\" and \"5 s\" on a millisecond control are refused");
+    check(sonore::parseParamValue(ms, "5ms", &v) && v == 5.0f && sonore::parseParamValue(ms, " 7 MS ", &v) &&
+              v == 7.0f,
+          "...while the number with its own unit, spaced or not, any case, parses");
+    check(sonore::parseParamValue(hz, "2.3k", &v) && std::fabs(v - 2300.0f) < 0.01f,
+          "...and so does \"2.3k\" on a Hz control");
+  }
+
+  // Whatever the C locale. A host that sets a comma locale made strtod read
+  // "-3.5" as -3 and snprintf write "-3,5 dB"; and a person in that locale
+  // types a comma.
+  {
+    const sonore::ParamInfo gain = {"g", "Gain", "dB", -24.0f, 12.0f, 0.0f, 0};
+    float comma = 0.0f;
+    check(sonore::parseParamValue(gain, "-3,5 dB", &comma) && comma == -3.5f,
+          "a decimal comma parses: \"-3,5 dB\" is -3.5");
+    const char* const kCommaLocales[] = {"de-DE", "de_DE.UTF-8", "de_DE", "German", "fr_FR.UTF-8"};
+    const char* got = nullptr;
+    for (const char* name : kCommaLocales)
+      if ((got = std::setlocale(LC_NUMERIC, name)) != nullptr && sonore::numtext::localeDecimalPoint() == ',')
+        break;
+    if (got && sonore::numtext::localeDecimalPoint() == ',') {
+      char text[32];
+      sonore::formatParamValue(gain, -3.5f, text, sizeof(text));
+      float back = 0.0f;
+      const bool read = sonore::parseParamValue(gain, "-3.5 dB", &back);
+      std::setlocale(LC_NUMERIC, "C");
+      char l[160];
+      std::snprintf(l, sizeof(l), "in a comma locale -3.5 prints as \"%s\" and \"-3.5 dB\" reads back as %g",
+                    text, (double) back);
+      check(std::strcmp(text, "-3.5 dB") == 0 && read && back == -3.5f, l);
+    } else {
+      std::setlocale(LC_NUMERIC, "C");
+      std::printf("  ---- no comma locale on this machine: the locale check did not run ----\n");
+    }
+  }
+
   const sonore::ParamInfo db = {"out", "Output", "dB", -24.0f, 12.0f, 0.0f, 0};
   sonore::formatParamValue(db, -6.0f, buf, sizeof(buf));
   check(std::strcmp(buf, "-6.0 dB") == 0, "dB formatting");
+  {
+    // Found in REAPER (scripts/reaper-host-test.mjs): it keeps a VST3
+    // parameter's normalised position in single precision, so a default of
+    // 0 dB came back from the round trip a millionth of a dB off zero, and
+    // the generic panel said "-0.000 dB" (trim) and "0.000 dB" (every
+    // Output) where the CLAP build said "0.0 dB".
+    const sonore::ParamInfo trim = {"gain", "Gain", "dB", -60.0f, 12.0f, 0.0f, 0};
+    char a[32], b[32];
+    const float viaTrim = (float) sonore::toPlainValue(trim, (double) (float) sonore::toNormalisedValue(trim, 0.0));
+    const float viaOut = (float) sonore::toPlainValue(db, (double) (float) sonore::toNormalisedValue(db, 0.0));
+    sonore::formatParamValue(trim, viaTrim, a, sizeof(a));
+    sonore::formatParamValue(db, viaOut, b, sizeof(b));
+    char l[160];
+    std::snprintf(l, sizeof(l), "0 dB through a single-precision normalised round trip prints \"%s\" and \"%s\" "
+                  "(%.3g and %.3g dB), not \"-0.000 dB\"", a, b, (double) viaTrim, (double) viaOut);
+    check(std::strcmp(a, "0.0 dB") == 0 && std::strcmp(b, "0.0 dB") == 0, l);
+    sonore::formatParamValue(trim, -0.0f, a, sizeof(a));
+    check(std::strcmp(a, "0.0 dB") == 0, "negative zero prints as 0.0 dB");
+    // ...without eating a value that IS small: four thousandths of a dB on a
+    // 72 dB range is still fifty times more than a millionth of it.
+    sonore::formatParamValue(trim, -0.004f, a, sizeof(a));
+    check(std::strcmp(a, "-0.004 dB") == 0, "a genuinely small value keeps its digits (-0.004 dB)");
+  }
   checkNear(sonore::clampToRange(db, 99.0f), 12.0, 0.0001, "values clamp to range");
   {
     // A NaN fails both comparisons of a clamp, so the first clamp passed it
@@ -2444,6 +3863,23 @@ static void testMidiBuffer() {
   check(first.getMessage().isNoteOn() && first.getMessage().getNoteNumber() == 64,
         "the earliest event is first");
 
+  // Clamped into a 64-frame block after the fact, as AU needs: its MIDI
+  // arrives before the render call says how long the block is.
+  {
+    sonore::MidiBuffer late;
+    late.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), -5);
+    late.addEvent(sonore::MidiMessage::noteOn(0, 61, 100), 20);
+    late.addEvent(sonore::MidiMessage::noteOff(0, 62), 64);
+    late.addEvent(sonore::MidiMessage::noteOff(0, 63), 900);
+    const uint8_t sysex[] = {0xF0, 0x7E, 0xF7};
+    late.addSysex(sysex, sizeof(sysex), 70);
+    late.clampPositions(64);
+    const sonore::MidiBuffer::Entry* e = late.begin();
+    check(e[0].samplePosition == 0 && e[1].samplePosition == 20 && e[2].samplePosition == 63 &&
+              e[3].samplePosition == 63 && late.sysexBegin()->samplePosition == 63,
+          "clampPositions puts every event inside the block, in order");
+  }
+
   // A note-on with velocity 0 is a note-off: the classic running-status idiom.
   check(sonore::MidiMessage(0x90, 60, 0).isNoteOff(), "note-on velocity 0 reads as note-off");
   checkNear(sonore::MidiMessage::getMidiNoteInHertz(69), 440.0, 0.001, "A4 is 440 Hz");
@@ -2451,8 +3887,49 @@ static void testMidiBuffer() {
 
   // Overflow must drop, never corrupt.
   sonore::MidiBuffer full;
-  for (int i = 0; i < 200; ++i) full.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), i);
-  check(full.getNumEvents() == sonore::MidiBuffer::kMaxEvents, "the buffer caps instead of overrunning");
+  const int kCap = sonore::MidiBuffer::kMaxEvents;
+  for (int i = 0; i < kCap + 200; ++i) full.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), i);
+  check(full.getNumEvents() == kCap, "the buffer caps instead of overrunning");
+  check(full.getNumDropped() == 200, "...and counts what it dropped");
+
+  // An MPE block's worth fits. Ten fingers sending pitch, pressure and timbre
+  // at 500 Hz each is 320 events in a 1024-frame block at 48 kHz -- five
+  // times what the buffer used to hold, which is when the note-offs went.
+  {
+    sonore::MidiBuffer mpe;
+    for (int i = 0; i < 320; ++i)
+      mpe.addEvent(sonore::MidiMessage(0xE0 | (i % 10 + 1), i % 128, 64), i * 3);
+    check(mpe.getNumEvents() == 320 && mpe.getNumDropped() == 0,
+          "a dense MPE block fits whole");
+  }
+
+  // A FULL buffer still takes a note-off, by giving up a continuous event: a
+  // missing bend step is inaudible and a missing note-off is a hung note.
+  {
+    sonore::MidiBuffer busy;
+    busy.addEvent(sonore::MidiMessage::noteOn(0, 64, 100), 0);
+    for (int i = 1; i < kCap; ++i) busy.addEvent(sonore::MidiMessage(0xB0, 1, i % 128), i);
+    check(busy.isFull(), "a buffer of controllers fills");
+    busy.addEvent(sonore::MidiMessage(0xB0, 1, 0), kCap);
+    busy.addEvent(sonore::MidiMessage::noteOff(0, 64), kCap + 1);
+    int offs = 0, ons = 0;
+    for (const auto& e : busy) {
+      if (e.message.isNoteOff()) ++offs;
+      if (e.message.isNoteOn()) ++ons;
+    }
+    check(busy.getNumEvents() == kCap && ons == 1 && offs == 1,
+          "...and still takes the note-off, evicting a controller rather than the note");
+    int last = -1;
+    bool ordered = true;
+    for (const auto& e : busy) {
+      if (e.samplePosition < last) ordered = false;
+      last = e.samplePosition;
+    }
+    check(ordered, "...in sample order");
+    busy.clear();
+    check(busy.getNumEvents() == 0 && busy.getNumDropped() == 0,
+          "clear() empties it and resets the count");
+  }
 }
 
 // ── Frequency domain ─────────────────────────────────────────────────────────
@@ -2509,6 +3986,19 @@ static void testFft() {
     if (db[i] > db[top]) top = i;
   checkNear(spectrum.binFrequency(top), 1000.0, 100.0, "the analyser finds a 1 kHz tone");
   checkNear(db[top], 0.0, 1.0, "…and reads it near 0 dBFS");
+  // A full-scale DC, and a full-scale tone at Nyquist, read 0 dBFS too: the
+  // sine's factor of two was applied to them as well, and both read +6 dB.
+  {
+    sonore::SpectrumAnalyser<512> dc, nyquist;
+    for (int i = 0; i < 4096; ++i) {
+      dc.push(1.0f);
+      nyquist.push((i & 1) ? -1.0f : 1.0f);
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "the analyser reads full-scale DC and Nyquist at 0 dBFS too (%+.2f, %+.2f dB)",
+                  dc.magnitudeDb()[0], nyquist.magnitudeDb()[nyquist.numBins() - 1]);
+    check(std::fabs(dc.magnitudeDb()[0]) < 0.1f && std::fabs(nyquist.magnitudeDb()[nyquist.numBins() - 1]) < 0.1f, l);
+  }
 }
 
 static void testConvolution() {
@@ -2547,6 +4037,182 @@ static void testConvolution() {
     worst = std::max(worst, std::fabs((double) out2[i] - want));
   }
   check(worst < 1e-3, "a two-tap impulse convolves exactly");
+
+  // A new impulse while running continues the stream. Loading reset the
+  // history, so the next block was silence and the output stepped back in.
+  // The same impulse reloaded mid-stream must change nothing at all.
+  {
+    static sonore::Convolver<64, 8> steady, reloaded;
+    std::vector<float> taps(300);
+    sonore::WhiteNoise tapNoise(61);
+    for (auto& v : taps) v = 0.3f * tapNoise.next();
+    steady.loadImpulse(taps.data(), taps.size());
+    reloaded.loadImpulse(taps.data(), taps.size());
+    double differ = 0.0;
+    int silent = 0;
+    for (int n = 0; n < 2000; ++n) {
+      if (n == 1017) reloaded.loadImpulse(taps.data(), taps.size());
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * 1000.0 * n / 48000.0);
+      const float a = steady.process(x), b = reloaded.process(x);
+      differ = std::max(differ, (double) std::fabs(a - b));
+      if (n >= 1017 && n < 1017 + 64 && b == 0.0f) ++silent;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "reloading an impulse mid-stream continues it (%d silent samples, differs by %.2g)", silent,
+                  differ);
+    check(silent == 0 && differ < 1e-6, line);
+  }
+
+  // The first impulse loaded mid-stream, and unloading it mid-stream, carry
+  // on too. A one-sample impulse sounds exactly like the passthrough, so the
+  // output is the input a block late throughout; both used to reset, and a
+  // whole block came out as exact zeros.
+  {
+    static sonore::Convolver<64, 8> conv;
+    const float unit[1] = {1.0f};
+    std::vector<float> in(3000), out(3000);
+    for (int n = 0; n < 3000; ++n) in[(size_t) n] = 0.5f * (float) std::sin(2.0 * kTestPi * 700.0 * n / 48000.0);
+    for (int n = 0; n < 3000; ++n) {
+      if (n == 1017) conv.loadImpulse(unit, 1);
+      if (n == 2041) conv.loadImpulse(nullptr, 0);
+      if (n == 2600) conv.loadImpulse(unit, 1); // the first again, after an unload
+      out[(size_t) n] = conv.process(in[(size_t) n]);
+    }
+    double worst = 0.0;
+    for (int n = 64; n < 3000; ++n)
+      worst = std::max(worst, (double) std::fabs(out[(size_t) n] - in[(size_t) n - 64]));
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "loading a first impulse and unloading it mid-stream leave no gap (off by %.2g at worst)", worst);
+    check(worst < 1e-5, line);
+  }
+
+  // No impulse at all is a passthrough at the latency it reports.
+  {
+    sonore::Convolver<64, 8> empty;
+    int at = -1;
+    for (int n = 0; n < 200; ++n) {
+      const float y = empty.process(n == 10 ? 1.0f : 0.0f);
+      if (at < 0 && y != 0.0f) at = n;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "with no impulse the input comes out %d samples late, the %zu it reports",
+                  at - 10, sonore::Convolver<64, 8>::latency());
+    check(at - 10 == (int) sonore::Convolver<64, 8>::latency(), line);
+  }
+
+  // An impulse longer than the convolver holds is cut, says so, and is faded
+  // into the cut rather than stopped dead.
+  {
+    static sonore::Convolver<64, 8> shortConv;
+    std::vector<float> flat(600, 0.5f);
+    const size_t played = shortConv.loadImpulse(flat.data(), flat.size());
+    std::vector<float> response(64 + 600);
+    for (size_t n = 0; n < response.size(); ++n) response[n] = shortConv.process(n == 0 ? 1.0f : 0.0f);
+    const size_t lat = sonore::Convolver<64, 8>::latency();
+    const double middle = std::fabs(response[lat + 200]), last = std::fabs(response[lat + 511]);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a 600-tap impulse in a 512-tap convolver plays %zu taps, faded to %.3f at the cut (from %.3f)",
+                  played, last, middle);
+    check(played == 512 && std::fabs(middle - 0.5) < 1e-4 && last < 0.01, line);
+  }
+
+  // reset() is silence. It cleared the history and the overlap but not the
+  // block process() was still handing out, so the last block of the old
+  // signal played once more into silence -- 0.5 out of nothing.
+  conv.reset();
+  double afterReset = 0.0;
+  for (int i = 0; i < 64; ++i) afterReset = std::max(afterReset, (double) std::fabs(conv.process(0.0f)));
+  check(afterReset == 0.0, "after reset, silence in is silence out from the first sample");
+
+  // A long, dense impulse, every partition in use, against direct
+  // convolution in the time domain -- and against the full-spectrum
+  // multiply-accumulate it replaced. Both signals are real, so their
+  // spectra are Hermitian: bins above the middle are the conjugates of the
+  // bins below, and accumulating them all did half the hottest loop's work
+  // for nothing. Rebuilt here: the old block, its full-spectrum MAC and all.
+  {
+    static constexpr size_t kBlock = 64, kParts = 64, kFft = kBlock * 2;
+    static sonore::Convolver<kBlock, kParts> longConv;
+    std::vector<float> irLong(kBlock * kParts);
+    sonore::WhiteNoise irNoise(41);
+    for (size_t i = 0; i < irLong.size(); ++i)
+      irLong[i] = irNoise.next() * (float) std::exp(-3.0 * (double) i / (double) irLong.size());
+    longConv.loadImpulse(irLong.data(), irLong.size());
+    std::vector<float> x(8192), y(8192);
+    sonore::WhiteNoise xNoise(43);
+    for (auto& v : x) v = 0.5f * xNoise.next();
+    for (size_t i = 0; i < x.size(); ++i) y[i] = longConv.process(x[i]);
+    double worstErr = 0.0;
+    for (size_t i = kBlock; i < x.size(); i += 7) {
+      double want = 0.0;
+      const size_t n = i - kBlock;
+      for (size_t k = 0; k < irLong.size() && k <= n; ++k) want += (double) irLong[k] * x[n - k];
+      worstErr = std::max(worstErr, std::fabs(want - (double) y[i]));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "a 64-partition convolution matches direct convolution "
+                  "(worst %.2e)", worstErr);
+    check(worstErr < 1e-4, line);
+
+    // The old block process, full spectrum, as the reference for cost.
+    static sonore::Fft<kFft> fft;
+    static float hRe[kParts][kFft], hIm[kParts][kFft], fRe[kParts][kFft], fIm[kParts][kFft];
+    for (size_t p = 0; p < kParts; ++p) {
+      float re[kFft]{}, im[kFft]{};
+      for (size_t i = 0; i < kBlock; ++i) re[i] = irLong[p * kBlock + i];
+      fft.transform(re, im, false);
+      for (size_t i = 0; i < kFft; ++i) { hRe[p][i] = re[i]; hIm[p][i] = im[i]; }
+    }
+    size_t head = 0;
+    auto oldBlock = [&](const float* in, float* outBlock) {
+      float re[kFft]{}, im[kFft]{};
+      for (size_t i = 0; i < kBlock; ++i) re[i] = in[i];
+      fft.transform(re, im, false);
+      head = (head + kParts - 1) % kParts;
+      for (size_t i = 0; i < kFft; ++i) { fRe[head][i] = re[i]; fIm[head][i] = im[i]; }
+      float aRe[kFft]{}, aIm[kFft]{};
+      for (size_t p = 0; p < kParts; ++p) {
+        const size_t slot = (head + p) % kParts;
+        size_t i = 0;
+        for (; i + 4 <= kFft; i += 4) {
+          const sonore::simd::Vec4f a = sonore::simd::Vec4f::load(fRe[slot] + i);
+          const sonore::simd::Vec4f b = sonore::simd::Vec4f::load(fIm[slot] + i);
+          const sonore::simd::Vec4f c = sonore::simd::Vec4f::load(hRe[p] + i);
+          const sonore::simd::Vec4f d = sonore::simd::Vec4f::load(hIm[p] + i);
+          (sonore::simd::Vec4f::load(aRe + i) + a * c - b * d).store(aRe + i);
+          (sonore::simd::Vec4f::load(aIm + i) + a * d + b * c).store(aIm + i);
+        }
+      }
+      fft.transform(aRe, aIm, true);
+      for (size_t i = 0; i < kBlock; ++i) outBlock[i] = aRe[i];
+    };
+    float sink = 0.0f;
+    auto oursBody = ([&] {
+      for (size_t i = 0; i < 64 * 1024; ++i) sink += longConv.process(x[i & 8191]);
+    });
+    // Wrapped per sample exactly as Convolver::process wraps its block, so
+    // the comparison is the block's work and nothing else.
+    float oldIn[kBlock]{}, oldOut[kBlock]{};
+    size_t oldFill = 0;
+    auto oldBody = ([&] {
+      for (size_t i = 0; i < 64 * 1024; ++i) {
+        const float yOld = oldOut[oldFill];
+        oldIn[oldFill] = x[i & 8191];
+        if (++oldFill >= kBlock) {
+          oldFill = 0;
+          oldBlock(oldIn, oldOut);
+        }
+        sink += yOld;
+      }
+    });
+    const double ratio = relativeCost(oursBody, oldBody, 0.85);
+    std::snprintf(line, sizeof(line), "...at %.2fx the cost of accumulating the full spectrum", ratio);
+    check(ratio < 0.85, line);
+    if (sink == 12345.0f) std::printf(" ");
+  }
 }
 
 // ── Musical time ─────────────────────────────────────────────────────────────
@@ -2577,6 +4243,27 @@ static void testTransport() {
   t.positionBeats = 6.0;
   t.barStartBeats = 4.0;
   checkNear(t.barPhase(), 0.5, 1e-9, "two beats into a 4/4 bar is halfway");
+
+  // A BAR IN QUARTER NOTES, which is what positionBeats counts. Six eight is
+  // six EIGHTHS, so the bar is three quarters and not six -- reading the
+  // numerator as the bar length puts every bar-synced shape a third out in
+  // three four and twice out in six eight. The rule was inline in barPhase()
+  // and the wasm ABI had its own copy that answered four whatever the song
+  // was, so a browser plugin syncing to a bar was simply wrong.
+  {
+    sonore::TransportInfo b;
+    b.hasBeats = true;
+    checkNear(b.beatsPerBar(), 4.0, 1e-12, "four four is four quarters to the bar");
+    b.timeSigNumerator = 3; b.timeSigDenominator = 4;
+    checkNear(b.beatsPerBar(), 3.0, 1e-12, "...three four is three");
+    b.timeSigNumerator = 6; b.timeSigDenominator = 8;
+    checkNear(b.beatsPerBar(), 3.0, 1e-12, "...and six eight is three, not six");
+    b.timeSigNumerator = 7; b.timeSigDenominator = 8;
+    checkNear(b.beatsPerBar(), 3.5, 1e-12, "...seven eight is three and a half");
+    b.timeSigNumerator = 5; b.timeSigDenominator = 4;
+    b.positionBeats = 2.5; b.barStartBeats = 0.0;
+    checkNear(b.barPhase(), 0.5, 1e-12, "...and half of a five four bar is two and a half beats in");
+  }
 
   // A synced LFO must take its phase from the timeline, not free-run.
   sonore::SyncedLfo lfo;
@@ -2636,6 +4323,98 @@ static void testEffects() {
     float l = 0.5f, r = -0.25f;
     dry.process(l, r);
     checkNear(l, 0.5, 1e-6, "a fully dry reverb passes the signal untouched");
+  }
+
+  // The tail's colour must not depend on the host's rate. The tunings are
+  // samples at 44.1 kHz; scaled to another rate they came out fractional, and
+  // a linear read of a fractional delay is a lowpass -- inside four feedback
+  // loops, so it compounds on every pass. And the damping pole was a per-pass
+  // coefficient, so its cutoff in hertz moved with the rate. Measured as the
+  // T60 at 8 kHz, where both show: the same room must ring as long at 44.1,
+  // 48 and 96 kHz.
+  {
+    auto t60At8k = [](double rate, float damping) -> double {
+      std::unique_ptr<sonore::Reverb> verb(new sonore::Reverb());
+      sonore::ProcessSpec s;
+      s.sampleRate = rate;
+      s.maximumBlockSize = 128;
+      s.numChannels = 2;
+      verb->prepare(s);
+      sonore::Reverb::Parameters p;
+      p.roomSize = 0.9f;
+      p.damping = damping;
+      p.width = 1.0f;
+      p.mix = 1.0f;
+      verb->setParameters(p);
+      sonore::Biquad band;
+      band.setSampleRate((float) rate);
+      band.bandpass(8000.0f, 2.0f);
+      const int window = (int) (rate * 0.02);
+      std::vector<double> energy;
+      double acc = 0.0;
+      int n = 0;
+      for (int i = 0; i < (int) (rate * 6.0); ++i) {
+        float l = i == 0 ? 1.0f : 0.0f, r = l;
+        verb->process(l, r);
+        const double y = band.process(l);
+        acc += y * y;
+        if (++n == window) {
+          energy.push_back(acc);
+          acc = 0.0;
+          n = 0;
+        }
+      }
+      size_t peak = 0;
+      for (size_t k = 1; k < energy.size(); ++k)
+        if (energy[k] > energy[peak]) peak = k;
+      size_t down = energy.size();
+      for (size_t k = peak; k < energy.size(); ++k)
+        if (energy[k] < energy[peak] * 1e-3) { // 30 dB down
+          down = k;
+          break;
+        }
+      return 2.0 * (double) (down - peak) * 0.02; // T30, doubled
+    };
+    char msg[200];
+    for (float damping : {0.0f, 0.5f}) {
+      const double a = t60At8k(44100.0, damping), b = t60At8k(48000.0, damping),
+                   c = t60At8k(96000.0, damping);
+      const double lo = std::min(a, std::min(b, c)), hi = std::max(a, std::max(b, c));
+      std::snprintf(msg, sizeof(msg), "damping %.1f: the reverb's 8 kHz T60 is %.2f s at 44.1k, "
+                    "%.2f s at 48k, %.2f s at 96k -- the same room at every rate", damping, a, b,
+                    c);
+      check(lo > 0.0 && hi / lo < (damping > 0.0f ? 1.3 : 1.1), msg);
+    }
+  }
+
+  // Past the rate its lines hold (199 kHz) the reverb is still a stereo
+  // room. Each line used to clamp its own read, so at 384 kHz every comb and
+  // allpass on both sides sat at the end of its line: one comb ringing at
+  // 62.5 Hz, and the two sides bit-identical (correlation 1.0000), whatever
+  // the width. 192 kHz reads 0.005.
+  for (double rate : {192000.0, 384000.0}) {
+    std::unique_ptr<sonore::Reverb> verb(new sonore::Reverb());
+    sonore::ProcessSpec s;
+    s.sampleRate = rate;
+    verb->prepare(s);
+    sonore::Reverb::Parameters p;
+    p.roomSize = 0.8f;
+    p.width = 1.0f;
+    p.mix = 1.0f;
+    verb->setParameters(p);
+    double ll = 0.0, rr = 0.0, lr = 0.0;
+    for (int i = 0; i < (int) rate; ++i) {
+      float l = i == 0 ? 1.0f : 0.0f, r = l;
+      verb->process(l, r);
+      ll += (double) l * l;
+      rr += (double) r * r;
+      lr += (double) l * r;
+    }
+    const double corr = lr / std::sqrt(ll * rr + 1e-30);
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "at %.0f kHz the reverb's sides are two rooms, not one: "
+                  "correlation %.4f", rate / 1000.0, corr);
+    check(ll > 0.0 && std::fabs(corr) < 0.2, msg);
   }
 
   // Limiter: nothing may exceed the ceiling, ever.
@@ -2828,6 +4607,27 @@ static void testEffects() {
   }
 
   // Chorus and phaser must move the signal without breaking it.
+  // An infinite sample does not latch into the phaser's feedback.
+  // flushDenormal clears NaN but passes Inf, and the fed-back Inf re-entered
+  // every sample.
+  {
+    sonore::Phaser latched;
+    sonore::ProcessSpec phaserSpec;
+    phaserSpec.sampleRate = 48000.0;
+    phaserSpec.maximumBlockSize = 512;
+    phaserSpec.numChannels = 2;
+    latched.prepare(phaserSpec);
+    latched.setMix(0.5f);
+    float l = std::numeric_limits<float>::infinity(), r = 0.0f;
+    latched.process(l, r);
+    for (int n = 0; n < 4800; ++n) {
+      l = 0.25f;
+      r = 0.25f;
+      latched.process(l, r);
+    }
+    check(std::isfinite(l) && std::isfinite(r), "a phaser recovers from an infinite sample");
+  }
+
   {
     sonore::Chorus chorus;
     chorus.prepare(spec);
@@ -2852,6 +4652,83 @@ static void testEffects() {
     check(finite, "chorus into phaser stays finite");
     check(energy > 0.0, "…and passes signal");
   }
+
+  // The phaser's two channels sweep together, so each stage is designed once
+  // per sample and shared, not designed per channel: the same output, bit for
+  // bit, for half the trigonometry. Checked against the per-channel version
+  // written out here, for equality and for time (best of three).
+  {
+    struct PerChannel { // the previous phaser's process(), verbatim in substance
+      sonore::Biquad stage[2][4];
+      sonore::Oscillator lfo;
+      sonore::DryWetMixer mixer;
+      float fb[2] = {0.0f, 0.0f};
+      void prepare(float rate) {
+        lfo.setSampleRate(rate);
+        lfo.setFreq(0.8f);
+        for (auto& ch : stage)
+          for (auto& st : ch) st.setSampleRate(rate);
+        mixer.setMix(0.5f);
+      }
+      void process(float& left, float& right) {
+        const float sweep = lfo.sine() * 0.5f + 0.5f;
+        const float freq = 200.0f * std::pow(40.0f, sweep * 0.7f);
+        float* io[2] = {&left, &right};
+        for (int c = 0; c < 2; ++c) {
+          float x = *io[c] + fb[c] * 0.3f;
+          for (int s = 0; s < 4; ++s) {
+            stage[c][s].allpass(freq * (1.0f + 0.1f * s), 0.7f);
+            x = stage[c][s].process(x);
+          }
+          fb[c] = sonore::flushDenormal(x);
+          *io[c] = mixer.process(*io[c], x);
+        }
+      }
+    };
+    std::unique_ptr<PerChannel> old(new PerChannel());
+    old->prepare((float) sr);
+    sonore::Phaser now;
+    now.prepare(spec);
+    now.setRate(0.8f);
+    now.setMix(0.5f);
+    bool identical = true;
+    for (int i = 0; i < 48000 && identical; ++i) {
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * 440.0 * i / sr);
+      float l1 = x, r1 = -x, l2 = x, r2 = -x;
+      old->process(l1, r1);
+      now.process(l2, r2);
+      if (l1 != l2 || r1 != r2) identical = false;
+    }
+    check(identical, "the phaser's shared design gives the per-channel output bit for bit");
+    // Timed through relativeCost, in alternation and with retries, like the
+    // suite's other cost claims: best of three, in two phases, could fail
+    // under the parallel suite's load with nothing wrong.
+    volatile float sink = 0.0f;
+    auto oldBody = [&] {
+      float acc = 0.0f;
+      for (int i = 0; i < 200000; ++i) {
+        float l = 0.1f, r = 0.1f;
+        old->process(l, r);
+        acc += l + r;
+      }
+      sink = acc;
+    };
+    auto newBody = [&] {
+      float acc = 0.0f;
+      for (int i = 0; i < 200000; ++i) {
+        float l = 0.1f, r = 0.1f;
+        now.process(l, r);
+        acc += l + r;
+      }
+      sink = acc;
+    };
+    const double ratio = relativeCost(newBody, oldBody, 0.75);
+    (void) sink;
+    char line[160];
+    std::snprintf(line, sizeof(line), "...for %.2f of the per-channel version's time%s", ratio,
+                  kOptimisedBuild ? "" : " (not judged: Debug build)");
+    check(ratio < 0.75 || !kOptimisedBuild, line);
+  }
 }
 
 // ── Platform backend resolution ──────────────────────────────────────────────
@@ -2862,7 +4739,7 @@ static void testEffects() {
 /** The Linux backend resolves GTK and WebKit by dlopen at runtime. That is
  *  where the "wrong soname" class of bug lives, and it is invisible until a
  *  user on some distribution reports a blank editor. So: either everything
- *  resolved, or the failure names the exact library that is missing: never a
+ *  resolved, or the failure names the exact library that is missing, never a
  *  vague error and never a crash. */
 static void testGtkResolution() {
   std::printf("linux webview resolution\n");
@@ -2902,7 +4779,7 @@ static void testSimd() {
     b[i] = (float) std::cos(0.023 * (double) i) * 0.5f;
   }
 
-  // Deliberately not a multiple of four, so the scalar tail is exercised too,
+  // Deliberately not a multiple of four, so the scalar tail is exercised too:
   // that remainder loop is where a vectorised helper usually goes wrong.
   for (size_t n : {size_t(0), size_t(1), size_t(3), size_t(4), size_t(7), size_t(999)}) {
     double refDot = 0.0, refSq = 0.0;
@@ -2944,11 +4821,59 @@ static void testSimd() {
       worst = std::max(worst, (double) std::fabs(got[i] - want[i]));
     check(worst < 1e-6, "multiplyAccumulate matches a plain loop");
   }
+
+  // A NaN does not hide the peaks after it. min and max are compare-and-select
+  // on every backend now; NEON's and wasm's own min/max return NaN when either
+  // operand is, and a NaN then stuck in its lane for the rest of peakAbs.
+  {
+    std::vector<float> data(64, 0.1f);
+    data[4] = std::numeric_limits<float>::quiet_NaN(); // lane 0
+    data[40] = 0.9f;                                    // lane 0, later
+    check(std::fabs(sonore::simd::peakAbs(data.data(), data.size()) - 0.9f) < 1e-6f,
+          "a NaN in a lane does not hide a later peak in that lane");
+  }
 }
 
 // ── The bridge under a hostile locale ────────────────────────────────────────
 
+// The version a plugin can test for is the one CMake builds and installs.
+static void testSdkVersion() {
+  std::printf("sdk version\n");
+  char line[160];
+  std::snprintf(line, sizeof(line), "version.h says %s, the CMake project %s", SONORE_SDK_VERSION_STRING,
+                SONORE_TEST_PROJECT_VERSION);
+  check(std::string(SONORE_SDK_VERSION_STRING) == SONORE_TEST_PROJECT_VERSION, line);
+  char parts[32];
+  std::snprintf(parts, sizeof(parts), "%d.%d.%d", SONORE_SDK_VERSION_MAJOR, SONORE_SDK_VERSION_MINOR,
+                SONORE_SDK_VERSION_PATCH);
+  check(std::string(parts) == SONORE_SDK_VERSION_STRING &&
+            SONORE_SDK_VERSION == SONORE_SDK_VERSION_MAJOR * 10000 + SONORE_SDK_VERSION_MINOR * 100 +
+                                      SONORE_SDK_VERSION_PATCH,
+        "...and its parts and its single number say the same");
+}
+
 static void testBridgeLocale() {
+  // And a number at all: inf and nan are no JS or JSON literal, and one
+  // infinite sample in a float WAV made the waveform's JSON unparseable.
+  char infText[40], nanText[40];
+  sonore::jsNumber(infText, sizeof(infText), -std::numeric_limits<double>::infinity());
+  sonore::jsNumber(nanText, sizeof(nanText), std::numeric_limits<double>::quiet_NaN());
+  check(std::strchr(infText, 'n') == nullptr && infText[0] == '-' && std::strcmp(nanText, "0") == 0,
+        "jsNumber never writes inf or nan");
+  {
+    // Six significant digits turned 1234567 into 1.23457e+06 and 12345.68
+    // into 12345.7: a page that read a value and set it back moved it.
+    char big[40], fine[40], short3[40];
+    sonore::jsNumber(big, sizeof(big), 1234567.0);
+    sonore::jsNumber(fine, sizeof(fine), (double) 12345.678f);
+    sonore::jsNumber(short3, sizeof(short3), (double) 0.3f);
+    char nl[200];
+    std::snprintf(nl, sizeof(nl), "jsNumber gives a float back exactly, in as few digits as it can (%s, %s, %s)",
+                  big, fine, short3);
+    check(std::strcmp(big, "1234567") == 0 && (float) std::strtod(fine, nullptr) == 12345.678f &&
+              std::strcmp(short3, "0.3") == 0,
+          nl);
+  }
   std::printf("bridge locale\n");
 
   // Hosts really call setlocale(). In a comma-decimal locale, %g prints "0,5",
@@ -2990,6 +4915,29 @@ static void testBridgeLocale() {
             js.find("default:1000.25") != std::string::npos,
         "…and the fractional values survived intact");
 
+  // Settings files and logos, under the same host. json.h printed with
+  // %.17g and read with atof, svg.h read with atof: [0.5] came out [0,5], two
+  // numbers to any other reader, and every SVG coordinate stopped at its
+  // point.
+  {
+    sonore::JsonValue list = sonore::JsonValue::array();
+    list.append(sonore::JsonValue(0.5));
+    list.append(sonore::JsonValue(1.0e-7));
+    const std::string text = list.toString();
+    check(text.find("0.5") != std::string::npos && text.find("0,5") == std::string::npos,
+          "JSON writes a dot under a comma locale");
+    std::string error;
+    const sonore::JsonValue back = sonore::JsonValue::parse(text, &error);
+    check(back.size() == 2 && back.at(0).asNumber() == 0.5 && back.at(1).asNumber() == 1.0e-7,
+          "…and reads both numbers back exactly");
+    const sonore::gfx::Drawable logo = sonore::gfx::Drawable::parse(
+        "<svg viewBox=\"0 0 10.5 20.25\"><rect width=\"2.5\" height=\"2.5\"/></svg>");
+    char line[160];
+    std::snprintf(line, sizeof(line), "an SVG's viewBox keeps its fractions (%.2f x %.2f, want "
+                  "10.50 x 20.25)", logo.viewBox().w, logo.viewBox().h);
+    check(logo.viewBox().w == 10.5f && logo.viewBox().h == 20.25f, line);
+  }
+
   std::setlocale(LC_NUMERIC, saved.c_str());
 }
 
@@ -3017,6 +4965,23 @@ static void testWav() {
   for (size_t i = 0; i < written.size() && i < read.samples.size(); ++i)
     worst = std::max(worst, (double) std::fabs(written[i] - read.samples[i]));
   check(worst < 1e-7, "float samples round-trip exactly");
+
+  // Written from the caller's buffer, not a copy of it. The writer built the
+  // whole file in a second vector first: a ten-minute stereo render of 230 MB
+  // asked for 230 MB more just to save it.
+#if SONORE_TESTS_HAVE_ALLOC_COUNTER
+  {
+    std::vector<float> long_(48000 * 2 * 10, 0.25f); // ten seconds of stereo, 3.8 MB
+    resetLargestAllocation();
+    armAllocationCounter(true);
+    const bool ok = sonore::writeWav(path, long_.data(), long_.size() / 2, 2, rate);
+    armAllocationCounter(false);
+    char line[160];
+    std::snprintf(line, sizeof(line), "writing a WAV copies none of the audio (largest allocation "
+                  "%zu bytes, the audio is %zu)", largestAllocation(), long_.size() * sizeof(float));
+    check(ok && largestAllocation() < 4096, line);
+  }
+#endif
 
   std::remove(path);
 
@@ -3089,6 +5054,32 @@ static void testAudioFiles() {
   check(!sonore::readFlac(path("ref16.wav").c_str(), &nope),
         "a WAV handed to the FLAC reader is refused, not misread");
 
+  // A FLAC with an ID3v2 tag in front, as some taggers leave one, and with a
+  // footer flagged. libFLAC and ffmpeg skip the tag; readFlac refused the
+  // file and readAudioFile, seeing "ID3", gave it to the MP3 decoder.
+  {
+    std::vector<uint8_t> bytes;
+    check(sonore::lossydetail::readFile(path("ref16_c8.flac").c_str(), &bytes), "ref16_c8.flac reads as bytes");
+    const char* taggedPath = tempPath("sonore-tagged.flac");
+    bool both = true;
+    for (bool footer : {false, true}) {
+      // 1000 bytes of tag body: 7 << 7 | 104 in syncsafe form.
+      std::vector<uint8_t> tagged = {'I', 'D', '3', 4, 0, (uint8_t) (footer ? 0x10 : 0), 0, 0, 7, 104};
+      tagged.resize(10 + 1000, 0);
+      if (footer) tagged.insert(tagged.end(), {'3', 'D', 'I', 4, 0, 0x10, 0, 0, 7, 104});
+      tagged.insert(tagged.end(), bytes.begin(), bytes.end());
+      if (std::FILE* f = std::fopen(taggedPath, "wb")) {
+        std::fwrite(tagged.data(), 1, tagged.size(), f);
+        std::fclose(f);
+      }
+      sonore::WavData viaFlac, viaAny;
+      both = both && sonore::readFlac(taggedPath, &viaFlac) && exact(ref, viaFlac) &&
+             sonore::readAudioFile(taggedPath, &viaAny) && exact(ref, viaAny);
+    }
+    std::remove(taggedPath);
+    check(both, "a FLAC behind an ID3v2 tag decodes SAMPLE-EXACT, through readFlac and readAudioFile");
+  }
+
   // ── Lossy formats ─────────────────────────────────────────────────────────
   // A lossy decode cannot be sample-exact, so equality is the wrong question.
   // The right one is "is this the SAME AUDIO": align the two signals by
@@ -3132,6 +5123,20 @@ static void testAudioFiles() {
 
   sonore::WavData mp3;
   check(sonore::readMp3(path("ref.mp3").c_str(), &mp3), "MP3 decodes");
+  // The same decoded-size ceiling FLAC, Ogg and WAV are held to. MP3 had
+  // none, and it expands 30-60x: a three-hour mix dropped on a sampler asked
+  // for gigabytes and the bad_alloc took the host down. Measured with a low
+  // ceiling, because the real one takes a gigabyte to reach.
+  {
+    sonore::WavData capped;
+    const size_t whole = mp3.samples.size();
+    const bool refused =
+        !sonore::readMp3(path("ref.mp3").c_str(), &capped, whole / 2) && capped.samples.empty();
+    char line[160];
+    std::snprintf(line, sizeof(line), "an MP3 that decodes past the ceiling is refused, not "
+                  "allocated (%zu samples against a ceiling of %zu)", whole, whole / 2);
+    check(whole > 0 && refused, line);
+  }
   check(mp3.sampleRate == ref.sampleRate && mp3.numChannels == ref.numChannels,
         "...at the reference's rate and channel count");
   check(allFinite(mp3.samples), "...producing finite samples");
@@ -3143,6 +5148,79 @@ static void testAudioFiles() {
   check(sonore::readWav(path("tonal.wav").c_str(), &tonalRef), "the tonal reference reads");
   check(sonore::readMp3(path("tonal.mp3").c_str(), &tonalMp3), "the tonal MP3 decodes");
   sameAudio(tonalRef, tonalMp3, "the MP3 decode is the same audio as the reference");
+  // And it lines up with it, sample for sample in time. The encoder's Info
+  // frame decoded as 1152 samples of silence and its delay and padding were
+  // never trimmed: the audio started 2257 samples late and ran long.
+  {
+    double num = 0.0, xx = 0.0, yy = 0.0;
+    const size_t n = tonalRef.numFrames() < tonalMp3.numFrames() ? tonalRef.numFrames() : tonalMp3.numFrames();
+    for (size_t i = 2000; i + 2000 < n; ++i) {
+      const double x = tonalRef.samples[i * tonalRef.numChannels];
+      const double y = tonalMp3.samples[i * tonalMp3.numChannels];
+      num += x * y;
+      xx += x * x;
+      yy += y * y;
+    }
+    const double r = xx > 0.0 && yy > 0.0 ? num / std::sqrt(xx * yy) : 0.0;
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "the MP3 decode starts where the reference does and is as long (%zu frames of %zu, "
+                  "correlation %.3f unshifted)",
+                  tonalMp3.numFrames(), tonalRef.numFrames(), r);
+    check(tonalMp3.numFrames() == tonalRef.numFrames() && r > 0.9, line);
+  }
+
+  // The same MP3 as a tagger leaves it: an ID3v1 tag at the end, or an APEv2
+  // tag and then an ID3v1. The decoder refused the last frame, which neither
+  // ended the buffer nor was followed by another frame's header, so every
+  // tagged MP3 came out one frame -- 26 ms -- short.
+  {
+    std::vector<uint8_t> bytes;
+    check(sonore::lossydetail::readFile(path("tonal.mp3").c_str(), &bytes), "tonal.mp3 reads as bytes");
+    std::vector<uint8_t> id3v1 = {'T', 'A', 'G'};
+    for (int i = 3; i < 128; ++i) id3v1.push_back(i < 33 ? (uint8_t) 'x' : (uint8_t) 0);
+    std::vector<uint8_t> ape;
+    auto le32 = [&ape](uint32_t x) {
+      for (int i = 0; i < 4; ++i) ape.push_back((uint8_t) (x >> (8 * i)));
+    };
+    const char item[] = "Title\0tonal";
+    auto apeHeader = [&](bool header) {
+      ape.insert(ape.end(), {'A', 'P', 'E', 'T', 'A', 'G', 'E', 'X'});
+      le32(2000);
+      le32(8 + (uint32_t) sizeof(item) - 1 + 32); // the item and the footer
+      le32(1);
+      le32(0x80000000u | (header ? 0x20000000u : 0u)); // has a header; this is it
+      for (int i = 0; i < 8; ++i) ape.push_back(0);
+    };
+    apeHeader(true);
+    le32(5); // value bytes
+    le32(0);
+    ape.insert(ape.end(), item, item + sizeof(item) - 1);
+    apeHeader(false);
+    const char* taggedPath = tempPath("sonore-tagged.mp3");
+    bool allSame = true;
+    size_t shortest = tonalMp3.numFrames();
+    for (int kind = 0; kind < 2; ++kind) {
+      std::vector<uint8_t> tagged = bytes;
+      if (kind == 1) tagged.insert(tagged.end(), ape.begin(), ape.end());
+      tagged.insert(tagged.end(), id3v1.begin(), id3v1.end());
+      if (std::FILE* f = std::fopen(taggedPath, "wb")) {
+        std::fwrite(tagged.data(), 1, tagged.size(), f);
+        std::fclose(f);
+      }
+      sonore::WavData back;
+      const bool read = sonore::readMp3(taggedPath, &back);
+      if (back.numFrames() < shortest) shortest = back.numFrames();
+      allSame = allSame && read && back.samples == tonalMp3.samples;
+    }
+    std::remove(taggedPath);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "an MP3 with an ID3v1 tag, or APEv2 and ID3v1, decodes as without them "
+                  "(%zu frames at the shortest, %zu untagged)",
+                  shortest, tonalMp3.numFrames());
+    check(allSame, line);
+  }
 
   sonore::WavData ogg;
   check(sonore::readOgg(path("ref.ogg").c_str(), &ogg), "Ogg Vorbis decodes");
@@ -3150,6 +5228,62 @@ static void testAudioFiles() {
         "...at the reference's rate and channel count");
   check(allFinite(ogg.samples), "...producing finite samples");
   sameAudio(ref, ogg, "the Ogg decode is the same audio as the reference");
+
+  // The same file as if captured from the middle of a broadcast: its granule
+  // positions carry on from the stream's, 200 million frames in. readOgg sized
+  // its output from the last page's granule -- the stream's END, not its
+  // length -- so this half second was refused past the decoded-size ceiling,
+  // and one captured less far in was zero-filled to hundreds of megabytes.
+  {
+    std::vector<uint8_t> bytes;
+    check(sonore::lossydetail::readFile(path("ref.ogg").c_str(), &bytes), "ref.ogg reads as bytes");
+    auto oggCrc = [](const uint8_t* d, size_t n) {
+      uint32_t crc = 0;
+      for (size_t i = 0; i < n; ++i) {
+        crc ^= (uint32_t) d[i] << 24;
+        for (int b = 0; b < 8; ++b) crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : crc << 1;
+      }
+      return crc;
+    };
+    size_t at = 0, shifted = 0;
+    while (at + 27 <= bytes.size() && std::memcmp(&bytes[at], "OggS", 4) == 0) {
+      const size_t segments = bytes[at + 26];
+      size_t length = 27 + segments;
+      for (size_t s = 0; s < segments && at + 27 + s < bytes.size(); ++s) length += bytes[at + 27 + s];
+      if (at + length > bytes.size()) break;
+      uint64_t granule = 0;
+      for (int i = 0; i < 8; ++i) granule |= (uint64_t) bytes[at + 6 + (size_t) i] << (8 * i);
+      if (granule != 0 && granule != ~0ull) { // header pages stay at zero
+        granule += 200000000u;
+        for (int i = 0; i < 8; ++i) bytes[at + 6 + (size_t) i] = (uint8_t) (granule >> (8 * i));
+        ++shifted;
+      }
+      for (int i = 0; i < 4; ++i) bytes[at + 22 + (size_t) i] = 0;
+      const uint32_t crc = oggCrc(&bytes[at], length);
+      for (int i = 0; i < 4; ++i) bytes[at + 22 + (size_t) i] = (uint8_t) (crc >> (8 * i));
+      at += length;
+    }
+    const char* capturedPath = tempPath("sonore-captured.ogg");
+    if (std::FILE* f = std::fopen(capturedPath, "wb")) {
+      std::fwrite(bytes.data(), 1, bytes.size(), f);
+      std::fclose(f);
+    }
+    sonore::WavData captured;
+    const bool opened = sonore::readOgg(capturedPath, &captured);
+    std::remove(capturedPath);
+    // stb_vorbis trims the final block only for a stream that starts at zero,
+    // so this one runs on by under a block; what is there must be the same.
+    bool same = opened && captured.numChannels == ogg.numChannels &&
+                captured.numFrames() >= ogg.numFrames() &&
+                captured.numFrames() < ogg.numFrames() + 2048;
+    for (size_t i = 0; same && i < ogg.samples.size(); ++i) same = captured.samples[i] == ogg.samples[i];
+    char line[220];
+    std::snprintf(line, sizeof(line),
+                  "an Ogg captured 200M frames into a stream (%zu pages moved) decodes to the same "
+                  "audio: %s, %zu frames, %zu floats held",
+                  shifted, opened ? "opened" : "refused", captured.numFrames(), captured.samples.capacity());
+    check(shifted > 0 && same && captured.samples.capacity() < 1000000, line);
+  }
 
   // The dispatcher has to recognise both, including MP3's two possible starts
   // (an ID3 tag or a bare frame sync).
@@ -3314,9 +5448,9 @@ static void testMidiInputQueue() {
 
   // Wrap the ring several times over: an index that wrapped wrongly would
   // either lose everything or replay stale bytes.
-  // A block's worth at a time, since MidiBuffer caps at kMaxEvents and would
-  // otherwise hide a ring bug behind its own truncation.
-  const int perRound = sonore::MidiBuffer::kMaxEvents / 2;
+  // Half a RING's worth at a time: under both the ring's capacity and the
+  // block buffer's, so neither one's limit can hide a wrap bug in the other.
+  const int perRound = sonore::midiin::MessageQueue::kCapacity / 2;
   int delivered = 0;
   for (int round = 0; round < 20; ++round) {
     for (int i = 0; i < perRound; ++i) q.push(0xB0, 7, (uint8_t) (i % 128));
@@ -3327,13 +5461,25 @@ static void testMidiInputQueue() {
   check(delivered == perRound * 20,
         "the ring wraps many times over without losing or duplicating messages");
 
-  // And the documented truncation: more events than a block can hold are
-  // dropped at the BUFFER, not torn apart in the ring.
-  for (int i = 0; i < sonore::MidiBuffer::kMaxEvents * 2; ++i) q.push(0x90, 60, 100);
-  out.clear();
-  q.drain(out);
-  check(out.getNumEvents() == sonore::MidiBuffer::kMaxEvents,
-        "a block's buffer fills to its cap and stops, rather than overrunning");
+  // A block whose buffer is nearly full already (host notes, the on-screen
+  // keyboard) takes what fits, and the rest WAITS in the ring for the next
+  // block instead of being dropped at the buffer, as it once was -- a stuck
+  // note whenever the dropped one was a note-off.
+  {
+    out.clear();
+    for (int i = 0; i < sonore::MidiBuffer::kMaxEvents - 10; ++i)
+      out.addEvent(sonore::MidiMessage(0xB0, 7, 1), 0);
+    for (int i = 0; i < 30; ++i) q.push(0x80, (uint8_t) i, 0);
+    q.drain(out);
+    check(out.isFull() && out.getNumDropped() == 0,
+          "a nearly full block takes what fits and drops nothing");
+    out.clear();
+    q.drain(out);
+    check(out.getNumEvents() == 20, "...and the other twenty arrive in the next block");
+    out.clear();
+    q.drain(out);
+    check(out.isEmpty(), "...exactly once");
+  }
 
   // Overflow must DROP, never corrupt: the device thread cannot be allowed to
   // block the audio thread, and a torn message is worse than a missing one.
@@ -3432,6 +5578,69 @@ static void testOsc() {
   }
 
   {
+    // The tags controllers send beyond i/f/s/b. Only those four were
+    // understood, so a TouchOSC toggle (",T") was refused -- and a bundle is
+    // all or nothing, so it took every message beside it down too.
+    const uint8_t toggle[8] = {'/', 't', 0, 0, ',', 'T', 0, 0};
+    Message t;
+    check(decodeMessage(toggle, sizeof(toggle), &t) && t.arguments.size() == 1 &&
+              t.arguments[0].type == Type::BoolTrue && t.arguments[0].intValue == 1,
+          "a T argument decodes, with no payload");
+    // ...and in a bundle beside an ordinary message, both arrive: the bundle
+    // is all or nothing, so one unknown tag used to cost every message in it.
+    Message vol;
+    vol.address = "/vol";
+    vol.arguments.push_back(Argument::makeFloat(0.5f));
+    const std::vector<uint8_t> volBytes = encode(vol);
+    std::vector<uint8_t> bundle = {'#', 'b', 'u', 'n', 'd', 'l', 'e', 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    auto element = [&bundle](const uint8_t* bytes, size_t n) {
+      for (int k = 3; k >= 0; --k) bundle.push_back((uint8_t) ((n >> (8 * k)) & 0xff));
+      bundle.insert(bundle.end(), bytes, bytes + n);
+    };
+    element(volBytes.data(), volBytes.size());
+    element(toggle, sizeof(toggle));
+    std::vector<Message> fromBundle;
+    const bool bundled = decodePacket(bundle.data(), bundle.size(), &fromBundle);
+    check(bundled && fromBundle.size() == 2, "a bundle with a T beside a float delivers both");
+    Message all;
+    all.address = "/all";
+    Argument h; h.type = Type::Int64; h.int64Value = -1234567890123ll;
+    Argument d; d.type = Type::Double; d.doubleValue = 0.125;
+    Argument sym; sym.type = Type::Symbol; sym.stringValue = "sym";
+    Argument c; c.type = Type::Char; c.intValue = 'x';
+    Argument r; r.type = Type::Rgba; r.intValue = (int32_t) 0xFF8000FFu;
+    Argument mi; mi.type = Type::Midi; mi.intValue = 0x00903C64;
+    Argument f; f.type = Type::BoolFalse;
+    Argument n; n.type = Type::Nil;
+    Argument i; i.type = Type::Impulse;
+    for (const Argument& a : {h, d, sym, c, r, mi, f, n, i}) all.arguments.push_back(a);
+    all.arguments.push_back(Argument::makeFloat(0.5f));
+    const std::vector<uint8_t> bytes = encode(all);
+    Message back;
+    const bool ok = decodeMessage(bytes.data(), bytes.size(), &back);
+    check(ok && back.arguments.size() == 10 && back.arguments[0].int64Value == -1234567890123ll &&
+              back.arguments[1].doubleValue == 0.125 && back.arguments[2].stringValue == "sym" &&
+              back.arguments[3].intValue == 'x' && back.arguments[4].intValue == (int32_t) 0xFF8000FFu &&
+              back.arguments[5].intValue == 0x00903C64 && back.arguments[6].type == Type::BoolFalse &&
+              back.arguments[7].type == Type::Nil && back.arguments[8].type == Type::Impulse &&
+              back.arguments[9].floatValue == 0.5f,
+          "h, d, S, c, r, m, F, N and I round-trip, and the float after them is still in place");
+
+    // A string holding a NUL is written up to it, as every reader will read
+    // it; written whole, the reader stopped at the NUL and took the rest of
+    // the string for the next argument.
+    Message nul;
+    nul.address = "/nul";
+    nul.arguments.push_back(Argument::makeString(std::string("ab\0cdefgh", 9)));
+    nul.arguments.push_back(Argument::makeInt(7));
+    const std::vector<uint8_t> nb = encode(nul);
+    Message nulBack;
+    check(decodeMessage(nb.data(), nb.size(), &nulBack) && nulBack.arguments.size() == 2 &&
+              nulBack.arguments[0].stringValue == "ab" && nulBack.arguments[1].intValue == 7,
+          "a string with a NUL in it does not shift the argument after it");
+  }
+
+  {
     // Bundles flatten to the messages inside.
     Message one, two;
     one.address = "/one";
@@ -3459,6 +5668,21 @@ static void testOsc() {
     check(decodePacket(bundle.data(), bundle.size(), &messages), "a bundle decodes");
     check(messages.size() == 2 && messages[0].address == "/one" && messages[1].address == "/two",
           "...flattening to the messages inside, in order");
+
+    // A bundle is one packet, delivered whole or not at all. With a good
+    // message followed by a broken one, decodePacket said "false" -- after
+    // handing over the good one, which the receiver delivered regardless, so
+    // half a bundle meant to apply together was applied.
+    bundle.resize(16);
+    appendSized(a);
+    const std::vector<uint8_t> broken = {'/', 'x', 0, 0, 0xff}; // no type tags, truncated
+    appendSized(broken);
+    std::vector<Message> partial;
+    const bool decoded = decodePacket(bundle.data(), bundle.size(), &partial);
+    char line[160];
+    std::snprintf(line, sizeof(line), "a bundle with one broken element delivers nothing "
+                  "(%s, %zu message(s))", decoded ? "accepted" : "refused", partial.size());
+    check(!decoded && partial.empty(), line);
   }
 
   {
@@ -3484,6 +5708,106 @@ static void testOsc() {
       }
     } else {
       std::printf("  SKIPPED the OSC socket test: %s\n", receiver.error().c_str());
+    }
+  }
+
+  {
+    // Owners move: a receiver returned from a function, senders kept in a
+    // vector that grows. Copying is deleted (a copy closed the socket twice),
+    // and deleting it took the implicit move with it -- until it was given
+    // back, neither could leave the scope that opened it.
+    auto listen = []() {
+      Receiver r;
+      r.open(0);
+      return r; // the named return is a move
+    };
+    Receiver moved = listen();
+    if (moved.port() == 0) {
+      // No UDP here at all (a sandbox): skipped, as the loopback test above is.
+      std::printf("  SKIPPED the OSC move test: %s\n", moved.error().c_str());
+    } else {
+      std::vector<Sender> senders;
+      for (int i = 0; i < 4; ++i) { // growing moves the ones already in it
+        senders.emplace_back();
+        senders.back().open("127.0.0.1", moved.port());
+      }
+      Message m;
+      m.address = "/moved";
+      check(moved.port() != 0 && senders.front().send(m),
+            "a moved receiver keeps its port, and a sender moved by a growing vector still sends");
+      std::vector<Message> got;
+      for (int i = 0; i < 200 && got.empty(); ++i) got = moved.poll();
+      check(!got.empty() && got[0].address == "/moved", "...and the datagram arrives");
+      Receiver taken = std::move(moved);
+      check(moved.port() == 0 && taken.port() != 0,
+            "moving leaves the source closed and the destination owning the socket");
+    }
+  }
+
+  // Who may drive the plugin. The receiver bound INADDR_ANY, so anybody on
+  // the same network -- a café's Wi-Fi, a venue's -- could move parameters by
+  // sending a datagram. A controller on the same machine is the default now,
+  // and the network is something a plugin asks for.
+  {
+    // This machine's address on its network: the interface a datagram to a
+    // documentation-only address would leave by. connect() on UDP sends
+    // nothing; it only picks the route.
+    uint32_t lan = 0;
+    {
+#if defined(_WIN32)
+      WSADATA wsa;
+      WSAStartup(MAKEWORD(2, 2), &wsa);
+      SOCKET probe = ::socket(AF_INET, SOCK_DGRAM, 0);
+      const bool okProbe = probe != INVALID_SOCKET;
+#else
+      int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
+      const bool okProbe = probe >= 0;
+#endif
+      if (okProbe) {
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(9);
+        inet_pton(AF_INET, "192.0.2.1", &to.sin_addr);
+        if (::connect(probe, (sockaddr*) &to, sizeof(to)) == 0) {
+          sockaddr_in me{};
+          socklen_t len = sizeof(me);
+          if (::getsockname(probe, (sockaddr*) &me, &len) == 0) lan = ntohl(me.sin_addr.s_addr);
+        }
+#if defined(_WIN32)
+        ::closesocket(probe);
+#else
+        ::close(probe);
+#endif
+      }
+    }
+    if (lan == 0 || (lan >> 24) == 127) {
+      std::printf("  ---- no network address on this machine: OSC exposure not exercised ----\n");
+    } else {
+      char host[32];
+      std::snprintf(host, sizeof(host), "%u.%u.%u.%u", lan >> 24, (lan >> 16) & 255,
+                    (lan >> 8) & 255, lan & 255);
+      auto arrivesFromNetwork = [&](Receiver& rx) {
+        Sender tx;
+        if (!tx.open(host, rx.port())) return false;
+        Message m;
+        m.address = "/intruder";
+        tx.send(m);
+        std::vector<Message> got;
+        for (int i = 0; i < 200 && got.empty(); ++i) {
+          got = rx.poll();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return !got.empty();
+      };
+      Receiver local;
+      if (local.open(0)) {
+        check(!arrivesFromNetwork(local),
+              "by default the receiver hears only this machine, not the network it is on");
+      }
+      Receiver open;
+      if (open.open(0, true)) {
+        check(arrivesFromNetwork(open), "...and hears the network when the plugin asks to");
+      }
     }
   }
 }
@@ -3636,6 +5960,19 @@ static void testShapingAndFir() {
   }
 
   // FIR: the response is what matters, measured by driving real tones through.
+  // A short lowpass at a very low cutoff still passes DC. The kernel sums to
+  // almost nothing before normalising, and a guard meant for highpass kernels
+  // -- which never reach that step -- skipped it: 3 taps at 5 Hz passed DC at
+  // 0.0002, -74 dB.
+  {
+    sonore::FirFilter lowest;
+    lowest.designLowpass(5.0f, 48000.0f, 3);
+    double dc = 0.0;
+    for (float c : lowest.coefficients()) dc += c;
+    char fl[160];
+    std::snprintf(fl, sizeof(fl), "a 3-tap lowpass at 5 Hz passes DC at unity (%.6f)", dc);
+    check(std::fabs(dc - 1.0) < 1e-5, fl);
+  }
   {
     auto responseAt = [](sonore::FirFilter& f, double hz) {
       f.reset();
@@ -3721,6 +6058,10 @@ static void testInterpolationAndBlocks() {
           "at a whole-sample delay the spline returns the sample itself");
     check(std::fabs(line.read(10.0f) - 190.0f) < 1e-3,
           "...and agrees exactly with the linear read there");
+    // A NaN delay passed the clamp and became an index ~2^31 samples away.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    check(line.read(nan) == line.read(1.0f) && line.readCubic(nan) == line.readCubic(2.0f),
+          "a NaN delay reads as the shortest delay, inside the buffer");
   }
 
   // The interpolators standing alone, against a function they should be able
@@ -3826,22 +6167,28 @@ static void testStockStages() {
     float* channels[1] = {data};
     sonore::AudioBlock<float> block(channels, 1, 8);
 
-    for (float& v : data) v = 1.0f;
+    // The ramp is a fixed 10 ms -- 480 samples here -- however short the
+    // blocks are. It was one block long, so at 8 frames it was a sixth of a
+    // millisecond, and at one frame a step.
+    auto runBlocks = [&](int count) {
+      for (int b = 0; b < count; ++b) {
+        for (float& v : data) v = 1.0f;
+        gain.process(block);
+      }
+    };
     gain.setGainLinear(0.0f);
-    gain.process(block);
-    // The last sample lands within a float epsilon of the target rather than
-    // exactly on it: the ramp accumulates a step per sample, and seven
-    // sevenths is not one. A -140 dB residue on a fade-out is inaudible, but
-    // the test must not pretend the arithmetic is exact.
-    check(data[0] == 1.0f && std::fabs(data[7]) < 1e-6f,
-          "a gain change SLIDES across the block instead of stepping");
-    check(data[3] > 0.4f && data[3] < 0.7f, "...passing through the middle on the way");
+    runBlocks(1);
+    check(data[0] < 1.0f && data[0] > data[7] && data[7] > 0.9f,
+          "a gain change SLIDES instead of stepping, ten milliseconds long");
+    runBlocks(29); // 240 samples in: half way
+    check(data[7] > 0.45f && data[7] < 0.55f, "...passing through the middle on the way");
 
-    // Once settled, it is a plain multiply again.
-    for (float& v : data) v = 1.0f;
-    gain.process(block);
+    // Once settled, it is a plain multiply again. The last step lands within a
+    // float epsilon of the target rather than exactly on it -- the ramp
+    // accumulates a step per sample -- so it is snapped there at the end.
+    runBlocks(31);
     check(std::fabs(data[0]) < 1e-6f && std::fabs(data[7]) < 1e-6f,
-          "...and holds its new value on the next block");
+          "...and holds its new value once it gets there");
 
     gain.setGainDecibels(-6.0f);
     check(std::fabs(gain.getGainLinear() - 0.5011872f) < 1e-5,
@@ -3890,6 +6237,38 @@ static void testStockStages() {
     check(std::fabs(low - 0.5) < 0.02,
           "a stock filter and gain compose in a chain, passband at the gain set");
     check(high < low * 0.05, "...and the filter in the chain really filters");
+  }
+
+  // Each of the adapter's processors runs ONE channel, and its prepare() is
+  // told so, as ProcessorDuplicator tells its own. It was handed the stage's
+  // spec as given: a stereo spec, to a processor that only ever sees one.
+  {
+    struct CountsChannels {
+      uint32_t channels = 0;
+      double rate = 0.0;
+      void prepare(const sonore::ProcessSpec& s) {
+        channels = s.numChannels;
+        rate = s.sampleRate;
+      }
+      void reset() {}
+      float process(float x) { return x; }
+    };
+    sonore::SampleStage<CountsChannels, 2> stage;
+    sonore::ProcessorDuplicator<CountsChannels, 2> duplicator;
+    sonore::ProcessSpec spec;
+    spec.sampleRate = 44100.0;
+    spec.maximumBlockSize = 256;
+    spec.numChannels = 2;
+    stage.prepare(spec);
+    duplicator.prepare(spec);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "SampleStage prepares each processor for one channel (told %u; ProcessorDuplicator %u), "
+                  "at the stage's rate",
+                  (unsigned) stage.channel(1).channels, (unsigned) duplicator.channel(1).channels);
+    check(stage.channel(0).channels == 1 && stage.channel(1).channels == 1 &&
+              duplicator.channel(1).channels == 1 && stage.channel(1).rate == 44100.0,
+          line);
   }
 
   // Bias before a shaper is what asks an odd curve for even harmonics.
@@ -4213,13 +6592,72 @@ static void testStreamedSampler() {
     }
     check(a.isActive() && b.isActive(), "a looping voice is still playing after three cycles");
     check(worst == 0.0, "and a streamed loop is identical to a resident one at the seam");
-    // ONE refill, from setLoop. A pinned window does not slide, and a refill
-    // per cycle would mean it is still following the position instead.
-    // Two, and exactly two: the initial prime, and one when playback entered
-    // the loop and the window was pinned over it. A refill per cycle would
-    // mean it is still following the position and dragging the window off the
-    // loop start every time round.
-    check(streamer.refills() == 2, "…with the window pinned rather than rebuilt each cycle");
+    // ONE refill: the initial prime. The window slides once on its own to
+    // cover the loop and is pinned there -- a refill per cycle would mean it
+    // still follows the position, and a second refill on entering the loop
+    // is the blocking rebuild that used to empty every read made during it:
+    // a dropout at the loop entry itself.
+    char msg[200];
+    std::snprintf(msg, sizeof(msg), "…with the window pinned, not rebuilt, on entering the loop "
+                  "and each cycle (%llu refills, want 1)",
+                  (unsigned long long) streamer.refills());
+    check(streamer.refills() == 1, msg);
+  }
+
+  // A loop starting ON a half boundary. The voice refills its cache from 144
+  // frames before the frame it wants, and the window was pinned with the
+  // loop's start at its very edge: after every wrap that refill began before
+  // the window and was served nothing -- 128 frames of silence per cycle.
+  {
+    SampleData resident;
+    resident.interleaved = source.data();
+    resident.numFrames = kFrames;
+    resident.numChannels = 2;
+    resident.sampleRate = 48000.0;
+    resident.rootNote = 60;
+    resident.looping = true;
+    resident.loopStart = SampleStreamer::kHalfFrames; // 32768
+    resident.loopEnd = 60000;
+
+    SampleStreamer streamer;
+    streamer.open(kPath);
+    streamer.seek(0);
+    streamer.setLoop(resident.loopStart, resident.loopEnd);
+    SampleData streamed = resident;
+    streamed.interleaved = nullptr;
+    streamed.streamer = &streamer;
+
+    SampleVoice a, b;
+    a.setSampleRate(48000.0);
+    b.setSampleRate(48000.0);
+    a.setSample(&resident);
+    b.setSample(&streamed);
+    a.noteOn(60);
+    b.noteOn(60);
+    const std::vector<float> fromMemory = renderVoice(a, nullptr, 100000);
+    const std::vector<float> fromDisk = renderVoice(b, &streamer, 100000);
+    size_t differing = 0;
+    for (size_t i = 0; i < fromMemory.size(); ++i)
+      if (fromMemory[i] != fromDisk[i]) ++differing;
+    char msg[200];
+    std::snprintf(msg, sizeof(msg),
+                  "a loop starting on the window's half boundary plays as from memory through "
+                  "its wraps (%zu samples differ, %llu underrun)",
+                  differing, (unsigned long long) streamer.underrunFrames());
+    check(differing == 0 && streamer.underrunFrames() == 0, msg);
+
+    // The same reach after a seek: a voice started a few frames past a
+    // boundary -- a sample-start offset -- reads behind where it starts.
+    SampleStreamer offset;
+    offset.open(kPath);
+    const uint64_t start = SampleStreamer::kHalfFrames + 8;
+    offset.seek(start);
+    std::vector<float> behind(64 * 2);
+    const size_t got = offset.read(start - SampleStreamer::kReachBehind, behind.data(), 64);
+    bool same = got == 64;
+    for (size_t i = 0; same && i < behind.size(); ++i)
+      same = behind[i] == source[(size_t) (start - SampleStreamer::kReachBehind) * 2 + i];
+    check(same, "a seek just past a half boundary still serves kReachBehind frames before it");
   }
 
   // A loop LONGER than the window is refused rather than glitched through.
@@ -4250,6 +6688,42 @@ static void testStreamedSampler() {
           "from the loop that did fit");
   }
 
+  // A note released mid-loop plays on PAST the loop's end, and the window must
+  // follow it there. The pin had no upper bound, so once playback had reached
+  // the loop the window stayed over it for the rest of the file: every frame
+  // from one window past the loop start came back unserved.
+  {
+    SampleStreamer streamer;
+    streamer.open(kPath);
+    streamer.setLoop(40000, 60000);
+    std::vector<float> chunk(512 * 2);
+    uint64_t pos = 0;
+    int cycles = 0;
+    size_t unserved = 0, wrong = 0;
+    while (pos < kFrames) {
+      streamer.service(pos);
+      size_t n = 512;
+      if (cycles < 2 && pos + n > 60000) n = (size_t) (60000 - pos); // held: loop twice
+      if (pos + n > kFrames) n = (size_t) (kFrames - pos);
+      const size_t got = streamer.read(pos, chunk.data(), n);
+      unserved += n - got;
+      for (size_t i = 0; i < got * 2; ++i)
+        if (chunk[i] != source[(size_t) pos * 2 + i]) ++wrong;
+      pos += n;
+      if (cycles < 2 && pos == 60000) {
+        pos = 40000;
+        ++cycles;
+      }
+    }
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "looped twice, then released to the end: every frame served (%zu unserved, "
+                  "%zu wrong)",
+                  unserved, wrong);
+    check(unserved == 0 && wrong == 0 && streamer.underrunFrames() == 0, msg);
+    check(!streamer.isPinned(), "and past the loop the window follows playback again");
+  }
+
   // A voice reused for a new note while its previous note is still releasing
   // must loop again. The allocator steals the same-key voice by design, and a
   // leftover releasing_ (only stop() cleared it before) made looping() return
@@ -4278,6 +6752,141 @@ static void testStreamedSampler() {
     check(v.isActive(),
           "a retriggered voice is still playing past the sample end -- it looped, rather than "
           "dying at loopEnd as a one-shot because releasing_ was left stuck from the note-off");
+  }
+
+  // A loop shorter than the sinc's reach reads, at its first wraps, what was
+  // PLAYED behind it: the same as the attack and the loop laid end to end in
+  // a one-shot. One flag for "has wrapped" read loop where the attack had
+  // played.
+  {
+    const int attack = 100, len = 8, reps = 3000;
+    std::vector<float> looped((size_t) (attack + len)), unrolled((size_t) (attack + len * reps));
+    for (int i = 0; i < attack; ++i)
+      looped[(size_t) i] = unrolled[(size_t) i] = 0.5f * (float) std::sin(0.37 * i) * (float) i / attack;
+    for (int i = 0; i < len; ++i) {
+      const double ph = 2.0 * kTestPi * i / len;
+      const float v = (float) (0.3 * std::sin(ph) + 0.2 * std::sin(2.0 * ph) + 0.1 * std::sin(3.0 * ph));
+      looped[(size_t) (attack + i)] = v;
+      for (int r = 0; r < reps; ++r) unrolled[(size_t) (attack + r * len + i)] = v;
+    }
+    double worst = 0.0;
+    for (double speed : {0.92, 1.84, 3.68}) {
+      SampleData a, b;
+      a.interleaved = looped.data();
+      a.numFrames = looped.size();
+      b.interleaved = unrolled.data();
+      b.numFrames = unrolled.size();
+      for (SampleData* d : {&a, &b}) {
+        d->numChannels = 1;
+        d->sampleRate = 48000.0 * speed; // the file's rate sets the speed
+        d->rootNote = 60;
+      }
+      a.looping = true;
+      a.loopStart = (size_t) attack;
+      a.loopEnd = (size_t) (attack + len);
+      SampleVoice va, vb;
+      va.setSampleRate(48000.0);
+      vb.setSampleRate(48000.0);
+      va.setSample(&a);
+      vb.setSample(&b);
+      va.noteOn(60);
+      vb.noteOn(60);
+      for (int i = 0; i < 2000; ++i) {
+        worst = std::max(worst, (double) std::fabs(va.renderChannel(0) - vb.renderChannel(0)));
+        va.advance();
+        vb.advance();
+      }
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "an 8-frame loop reads what was played behind it at its first wrap (off by %.2g at worst)", worst);
+    check(worst < 1e-5, l);
+
+    // ...and after its note-off, released on the loop's last pass into the
+    // file's tail: behind loopStart is still the loop, not the attack.
+    const int reps2 = 40, tail = 400;
+    std::vector<float> withTail((size_t) (attack + len + tail)), unrolledTail((size_t) (attack + len * reps2 + tail));
+    for (int i = 0; i < attack + len; ++i) withTail[(size_t) i] = looped[(size_t) i];
+    for (int i = 0; i < attack + len * reps2; ++i) unrolledTail[(size_t) i] = unrolled[(size_t) i];
+    for (int i = 0; i < tail; ++i) {
+      const float v = 0.4f * (float) std::exp(-i / 100.0) * (float) std::sin(0.9 * i);
+      withTail[(size_t) (attack + len + i)] = v;
+      unrolledTail[(size_t) (attack + len * reps2 + i)] = v;
+    }
+    double worstReleased = 0.0;
+    for (double speed : {1.84, 3.68}) {
+      SampleData a, b;
+      a.interleaved = withTail.data();
+      a.numFrames = withTail.size();
+      b.interleaved = unrolledTail.data();
+      b.numFrames = unrolledTail.size();
+      for (SampleData* d : {&a, &b}) {
+        d->numChannels = 1;
+        d->sampleRate = 48000.0 * speed;
+        d->rootNote = 60;
+      }
+      a.looping = true;
+      a.loopStart = (size_t) attack;
+      a.loopEnd = (size_t) (attack + len);
+      SampleVoice va, vb;
+      va.setSampleRate(48000.0);
+      vb.setSampleRate(48000.0);
+      va.setSample(&a);
+      vb.setSample(&b);
+      va.noteOn(60);
+      vb.noteOn(60);
+      // Compared for 60 frames from the release: into the tail, and well
+      // short of the files' ends, where the two would stop a frame apart.
+      int releasedAt = -1;
+      for (int i = 0; i < 4000; ++i) {
+        if (releasedAt < 0 && vb.position() >= (double) (attack + len * (reps2 - 1))) {
+          va.noteOff();
+          vb.noteOff();
+          releasedAt = i;
+        }
+        if (releasedAt >= 0 && i >= releasedAt + 60) break;
+        if (releasedAt >= 0) worstReleased = std::max(worstReleased, (double) std::fabs(va.renderChannel(0) - vb.renderChannel(0)));
+        va.advance();
+        vb.advance();
+      }
+    }
+    std::snprintf(l, sizeof(l), "...and after its note-off, into the file's tail (off by %.2g at worst)", worstReleased);
+    check(worstReleased < 1e-5, l);
+  }
+
+  // A one-frame loop holds its frame, in both reads. A length of one was taken
+  // for no loop: the voice played on past it into silence, and stayed active.
+  {
+    std::vector<float> held(1000, 0.0f);
+    held[0] = 0.5f;
+    held[1] = 0.25f;
+    held[2] = 0.1f;
+    held[3] = 0.05f;
+    SampleData one;
+    one.interleaved = held.data();
+    one.numFrames = 1000;
+    one.numChannels = 1;
+    one.sampleRate = 48000.0;
+    one.rootNote = 60;
+    one.looping = true;
+    one.loopStart = 1;
+    one.loopEnd = 2;
+    float sinc = 0.0f, cubic = 0.0f;
+    for (auto mode : {SampleVoice::Interpolation::Sinc, SampleVoice::Interpolation::Cubic}) {
+      SampleVoice v;
+      v.setSampleRate(48000.0);
+      v.setInterpolation(mode);
+      v.setSample(&one);
+      v.noteOn(60);
+      float last = 0.0f;
+      for (int i = 0; i < 4000; ++i) {
+        last = v.renderChannel(0);
+        v.advance();
+      }
+      (mode == SampleVoice::Interpolation::Sinc ? sinc : cubic) = last;
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "a one-frame loop holds its frame, 4000 frames in (%.3f sinc, %.3f cubic, of 0.25)", sinc, cubic);
+    check(std::fabs(sinc - 0.25f) < 1e-4f && std::fabs(cubic - 0.25f) < 1e-4f, l);
   }
 
   std::remove(kPath);
@@ -4418,6 +7027,76 @@ static void testSampleStreaming() {
     check(!streamer.error().empty(), "…with a reason");
     std::vector<float> block(8, 0.0f);
     check(streamer.read(0, block.data(), 4) == 0, "and an unopened streamer reads nothing");
+  }
+
+  // ── A real worker thread, and a voice that jumps back ─────────────────────
+  //
+  // Everything above runs the worker between blocks, which cannot show the
+  // one thing a second thread can: the worker acting on the position the
+  // voice published BEFORE it looped back. The slide then refilled the half
+  // the voice had just jumped into, while the voice read it -- samples from
+  // further on in the file. Here every sample IS its frame number, the loops
+  // are longer than the window holds (so the window slides inside them), and
+  // a read may come back short -- the worker is allowed to lag -- but never
+  // wrong. Before the fix 300 runs served 0.8 to 1.1 million wrong frames.
+  {
+    const char* jumpPath = tempPath("sonore-stream-jumps.wav");
+    constexpr uint32_t kJumpFrames = 400000;
+    std::vector<float> numbered((size_t) kJumpFrames * 2);
+    for (uint32_t i = 0; i < kJumpFrames; ++i) {
+      numbered[(size_t) i * 2] = (float) i;
+      numbered[(size_t) i * 2 + 1] = -(float) i;
+    }
+    check(sonore::writeWav(jumpPath, numbered.data(), kJumpFrames, 2, 48000), "a numbered file is written");
+    size_t wrong = 0, served = 0;
+    int runs = 0;
+    // Counted in runs, not seconds: a freshly written file can take a virus
+    // scanner a second or two to let go of, and a time budget then ran once.
+    // About two milliseconds a run, and before the fix nearly every run went
+    // wrong; the clock only bounds a slow machine.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (runs < 300 && std::chrono::steady_clock::now() < until) {
+      ++runs;
+      SampleStreamer streamer;
+      streamer.open(jumpPath);
+      const uint64_t loopStart = 20000 + (uint64_t) runs * 7919 % 200000;
+      const uint64_t loopEnd = loopStart + 20000 + (uint64_t) runs * 104729 % 90000;
+      streamer.setLoop(loopStart, loopEnd);
+      streamer.seek(0);
+      std::atomic<uint64_t> published{0};
+      std::atomic<bool> stop{false};
+      std::thread worker([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+          streamer.service(published.load(std::memory_order_acquire));
+          std::this_thread::yield();
+        }
+      });
+      std::vector<float> block(300 * 2);
+      uint64_t pos = 0;
+      for (int wraps = 0; wraps < 4 && pos < kJumpFrames;) {
+        const uint64_t from = pos > 144 ? pos - 144 : 0; // a voice's reach behind
+        const size_t got = streamer.read(from, block.data(), 300);
+        served += got;
+        for (size_t i = 0; i < got; ++i)
+          if (block[i * 2] != (float) (from + i) || block[i * 2 + 1] != -(float) (from + i)) ++wrong;
+        pos += 128;
+        if (pos >= loopEnd) {
+          pos = loopStart + (pos - loopEnd);
+          ++wraps;
+        }
+        published.store(pos, std::memory_order_release);
+        if ((pos / 128) % 4 == 0) std::this_thread::yield();
+      }
+      stop.store(true, std::memory_order_release);
+      worker.join();
+    }
+    std::remove(jumpPath);
+    char msg[200];
+    std::snprintf(msg, sizeof(msg),
+                  "a worker thread acting on a position from before a loop wrap never serves the "
+                  "wrong samples (%d runs, %zu frames served, %zu wrong)",
+                  runs, served, wrong);
+    check(served > 0 && wrong == 0, msg);
   }
 
   std::remove(kPath);
@@ -4571,6 +7250,22 @@ static void testWaveformFromFile() {
     check(!broken.deserialise(bytes.data(), bytes.size() - 4), "a truncated cache is refused");
     check(!broken.deserialise(bytes.data(), 8), "and one too short to hold a header");
     check(!broken.deserialise(nullptr, 100), "and a null one");
+
+    // A header whose size arithmetic wraps. channels x buckets x 8 in 64 bits
+    // overflowed for counts of 2^31 and 2^30: it came to zero, plus the
+    // 16-byte header matched a 16-byte file, and the reader then asked for
+    // 2^61 buckets -- a length_error out of a cache file on disk.
+    {
+      uint8_t wrap[16] = {'S', 'N', 'W', 'F', 1, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0x40};
+      bool refused = false, threw = false;
+      try {
+        refused = !broken.deserialise(wrap, sizeof(wrap));
+      } catch (...) {
+        threw = true;
+      }
+      check(refused && !threw, threw ? "a header whose size wraps is refused (it threw instead)"
+                                     : "a header whose size wraps is refused, not allocated");
+    }
     std::vector<uint8_t> huge = bytes;
     huge[12] = 0xff;
     huge[13] = 0xff;
@@ -4694,9 +7389,14 @@ static void testAudioStreaming() {
   // 16- and 24-bit PCM, which is what a sample library actually contains.
   // The float path is the easy one; the integer paths are where a sign
   // extension goes wrong and turns the top of the waveform into the bottom.
+  // And unsigned 8-bit and 32-bit, which readWav reads and this reader
+  // refused: a WAV the sampler loaded whole would not stream.
   {
-    for (int bits : {16, 24}) {
-      const char* path = tempPath(bits == 16 ? "sonore-stream-16.wav" : "sonore-stream-24.wav");
+    for (int bits : {16, 24, 8, 32}) {
+      const char* path = tempPath(bits == 16   ? "sonore-stream-16.wav"
+                                  : bits == 24 ? "sonore-stream-24.wav"
+                                  : bits == 8  ? "sonore-stream-8.wav"
+                                               : "sonore-stream-32.wav");
       // Written by hand, because writeWav only writes float.
       std::vector<uint8_t> file;
       const uint32_t n = 1000;
@@ -4736,6 +7436,10 @@ static void testAudioStreaming() {
         if (bits == 16) {
           const int16_t q = (int16_t) std::lround(v * 32767.0);
           u16((uint16_t) q);
+        } else if (bits == 8) {
+          file.push_back((uint8_t) (std::lround(v * 127.0) + 128));
+        } else if (bits == 32) {
+          u32((uint32_t) (int32_t) std::lround(v * 2147483647.0));
         } else {
           const int32_t q = (int32_t) std::lround(v * 8388607.0);
           file.push_back((uint8_t) (q & 0xff));
@@ -4761,11 +7465,16 @@ static void testAudioStreaming() {
       }
       // One quantisation step, which is what the format costs and nothing on
       // top of it. A sign-extension bug would be off by half of full scale.
-      const double step = bits == 16 ? 1.0 / 32768.0 : 1.0 / 8388608.0;
+      // (32-bit is held to a float's own step: that is what comes back.)
+      const double step = bits == 8 ? 1.0 / 128.0 : bits == 16 ? 1.0 / 32768.0 : 1.0 / 8388608.0;
       std::printf("  ---- %d-bit: worst error %.3g, one step is %.3g ----\n", bits, worst,
                   step);
       check(read == n, "…and reads every frame");
       check(worst < step * 2.0, "…converting to within a quantisation step");
+      WavData loaded;
+      bool agrees = readWav(path, &loaded) && loaded.samples.size() == (size_t) n;
+      for (size_t i = 0; agrees && i < read; ++i) agrees = loaded.samples[i] == got[i];
+      check(agrees, "…sample for sample what readWav reads");
       // CLOSED before the remove. Windows refuses to delete a file that is
       // still open and std::remove's failure is silent, so this file -- and
       // the AIFF below -- escaped into the working tree of the repository that
@@ -4848,6 +7557,73 @@ static void testAudioStreaming() {
     std::vector<float> buffer(8, 0.0f);
     check(reader.read(0, buffer.data(), 4) == 0, "reading a closed reader reads nothing");
   }
+
+#if defined(_WIN32)
+  // Past two gigabytes -- the files this reader exists for. Offsets went
+  // through ftell and fseek, whose `long` is 32 bits on Windows: a file of
+  // 2 GiB or more did not open, and nothing past 2 GiB could be read. A WAV
+  // of 2.2 GB, written SPARSE so it costs no disk: a header, a hole, and one
+  // sample at the very end.
+  {
+    const char* bigPath = tempPath("sonore-stream-big.wav");
+    HANDLE h = CreateFileA(bigPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD returned = 0;
+    const bool sparse = h != INVALID_HANDLE_VALUE &&
+                        DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned,
+                                        nullptr);
+    if (!sparse) {
+      if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+      std::remove(bigPath);
+      std::printf("  ---- SKIPPED the 2 GB stream: this volume cannot hold a sparse file ----\n");
+    } else {
+      const uint32_t dataBytes = 2200000000u; // 1.1 G frames of 16-bit mono
+      uint8_t header[44];
+      auto put32 = [&](int at, uint32_t v) {
+        for (int k = 0; k < 4; ++k) header[at + k] = (uint8_t) (v >> (8 * k));
+      };
+      auto put16 = [&](int at, uint16_t v) {
+        header[at] = (uint8_t) v;
+        header[at + 1] = (uint8_t) (v >> 8);
+      };
+      std::memcpy(header, "RIFF", 4);
+      put32(4, 36 + dataBytes);
+      std::memcpy(header + 8, "WAVEfmt ", 8);
+      put32(16, 16);
+      put16(20, 1);      // PCM
+      put16(22, 1);      // mono
+      put32(24, 48000);
+      put32(28, 96000);
+      put16(32, 2);
+      put16(34, 16);
+      std::memcpy(header + 36, "data", 4);
+      put32(40, dataBytes);
+      DWORD wrote = 0;
+      WriteFile(h, header, 44, &wrote, nullptr);
+      LARGE_INTEGER last;
+      last.QuadPart = 44 + (LONGLONG) dataBytes - 2;
+      SetFilePointerEx(h, last, nullptr, FILE_BEGIN);
+      const uint8_t half[2] = {0x00, 0x40}; // 0x4000 = 0.5 in 16-bit
+      WriteFile(h, half, 2, &wrote, nullptr);
+      CloseHandle(h);
+
+      AudioFileReader reader;
+      const bool opened = reader.open(bigPath);
+      char line[200];
+      std::snprintf(line, sizeof(line), "a 2.2 GB WAV opens (%s, %llu frames)",
+                    opened ? "opened" : reader.error().c_str(),
+                    (unsigned long long) reader.numFrames());
+      check(opened && reader.numFrames() == dataBytes / 2, line);
+      float tail = 0.0f;
+      const size_t got = opened ? reader.read(reader.numFrames() - 1, &tail, 1) : 0;
+      std::snprintf(line, sizeof(line), "…and its last sample, 2.2 GB in, reads back (%.3f, "
+                    "want 0.500)", tail);
+      check(got == 1 && std::fabs(tail - 0.5f) < 1e-4f, line);
+      reader.close();
+      std::remove(bigPath);
+    }
+  }
+#endif
 
   std::remove(kPath);
 }
@@ -4943,6 +7719,18 @@ static void testAnalysisWindows() {
       check(w[kSize / 2] >= peak - 1e-5f, "and its middle is as tall as it gets");
       (void) peakAt;
     }
+    // A window of one sample is that sample, whole. It was i / (n - 1) for
+    // the position, 0 / 0, and every shape but the rectangle filled it with
+    // NaN -- a caller whose length comes from a setting got an analysis of
+    // NaN at its smallest value.
+    bool single = true;
+    for (Window kind : kinds) {
+      volatile size_t one = 1; // a length known only at run time, as a caller's is
+      float w[2] = {-1.0f, -1.0f};
+      fillWindow(w, one, kind);
+      if (w[0] != 1.0f || w[1] != -1.0f) single = false;
+    }
+    check(single, "every window of one sample is 1, not NaN, and writes nothing past it");
   }
 }
 
@@ -5055,6 +7843,22 @@ static void testFirToSpec() {
     std::printf("  ---- at 12 kHz with 101 taps: Kaiser %.1f dB, Blackman %.1f dB ----\n",
                 looseStop, blackmanStop);
     check(looseStop < -60.0, "a Kaiser window at its default beta has a deep stopband");
+
+    // ...and the dial is reachable. FirWindowParams held a beta no design
+    // call took: every Kaiser kernel was beta 8.6. A small beta trades the
+    // stopband for a narrower ramp; the default params are the old kernel.
+    FirFilter byDefault, sameDefault, shallow;
+    byDefault.designHighpass(4000.0f, 48000.0f, 101, FirWindow::Kaiser);
+    sameDefault.designHighpass(4000.0f, 48000.0f, 101, FirWindow::Kaiser, FirWindowParams{});
+    shallow.designHighpass(4000.0f, 48000.0f, 101, FirWindow::Kaiser, FirWindowParams{2.0});
+    const double defaultStop = measuredGainDb(byDefault, 1000.0, kRate);
+    const double shallowStop = measuredGainDb(shallow, 1000.0, kRate);
+    std::printf("  ---- Kaiser highpass at 1 kHz, 101 taps: beta 8.6 %.1f dB, beta 2 %.1f dB ----\n",
+                defaultStop, shallowStop);
+    check(sameDefault.coefficients() == byDefault.coefficients(),
+          "a design given default FirWindowParams is the kernel it always was");
+    check(shallowStop > defaultStop + 20.0 && shallowStop < -15.0,
+          "...and FirWindowParams' beta reaches the window: beta 2 stops 20 dB less, still a stopband");
   }
 }
 
@@ -5109,6 +7913,58 @@ static void testFilterDesign() {
     // Tight, because there is nothing left to excuse: the warping is in the
     // expression now, so what remains is float arithmetic.
     check(worst < 0.02, "every order matches the Butterworth response exactly");
+  }
+
+  // Below 10 Hz too. The sections were Biquad::lowpass/highpass, which clamp
+  // the corner to 10 Hz: a 5 Hz order-4 highpass -- a rumble filter -- read
+  // -23.6 dB at its own corner.
+  {
+    double worst = 0.0;
+    for (double fc : {2.0, 5.0, 8.0})
+      for (int order = 1; order <= 6; ++order) {
+        CascadedIir<8> hp, lp;
+        hp.setSampleRate((float) kRate);
+        lp.setSampleRate((float) kRate);
+        hp.designButterworthHighpass((float) fc, order);
+        lp.designButterworthLowpass((float) fc, order);
+        worst = std::max(worst, std::fabs(hp.magnitudeDb((float) fc) + 3.0103));
+        worst = std::max(worst, std::fabs(lp.magnitudeDb((float) fc) + 3.0103));
+      }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "corners at 2, 5 and 8 Hz are -3 dB, orders 1..6, both ways (worst %.3f dB off)",
+                  worst);
+    check(worst < 0.1, line);
+  }
+
+  // And MEASURED, through the sections' own arithmetic, where a corner near DC
+  // at a high rate is hardest: a Chebyshev I order 8 at 30 Hz in a 192 kHz
+  // session read -8.06 dB at its passband edge, where -1 was designed, while
+  // float coefficients and state lost the poles a few parts in ten million
+  // from the unit circle. In double sections it is the design.
+  {
+    CascadedIir<8> cheby;
+    cheby.setSampleRate(192000.0f);
+    cheby.designChebyshevLowpass(30.0f, 8, 1.0f);
+    // Measured over WHOLE cycles after three seconds of settling: the
+    // general helper settles for 20000 samples, a tenth of a second here,
+    // which an eighth-order 30 Hz filter has nowhere near finished ringing in.
+    const double rate = 192000.0, f0 = 30.0;
+    const int settle = (int) (rate * 3.0), cycles = 60, perCycle = (int) (rate / f0);
+    double in2 = 0.0, out2 = 0.0;
+    for (int i = 0; i < settle + cycles * perCycle; ++i) {
+      const float x = (float) std::sin(2.0 * kTestPi * f0 * (double) i / rate);
+      const float y = cheby.process(x);
+      if (i >= settle) {
+        in2 += (double) x * x;
+        out2 += (double) y * y;
+      }
+    }
+    const double edge = 10.0 * std::log10(out2 / in2);
+    char cl[160];
+    std::snprintf(cl, sizeof(cl), "a Chebyshev order 8 at 30 Hz, 192 kHz, measures %.2f dB at its "
+                  "passband edge (designed -1.00)", edge);
+    check(std::fabs(edge + 1.0) < 0.1, cl);
   }
 
   // ── -3 dB at the cutoff, whatever the order ───────────────────────────────
@@ -5264,17 +8120,109 @@ static void testFilterDesign() {
     check(std::fabs(atEdge - (-1.0)) < 0.15, "…with the edge at -ripple");
     check(below < -40.0, "…and a stopband below it");
 
-    CascadedIir<8> tooHigh;
-    tooHigh.setSampleRate((float) kRate);
-    // A HIGHPASS at 20 kHz, not a lowpass. Chebyshev's poles sit at a
-    // fraction of the cutoff, so a lowpass puts every section BELOW it and
-    // always fits; a highpass divides by that fraction instead and the
-    // outermost section lands well past Nyquist. Reaching for the lowpass
-    // here tested nothing at all -- it designed happily.
-    check(!tooHigh.designChebyshevHighpass(20000.0f, 8, 1.0f),
-          "a design whose sections would pass Nyquist is refused");
-    check(tooHigh.order() == 0, "…leaving the filter undesigned rather than half rebuilt");
-    check(!tooHigh.designChebyshevLowpass(1000.0f, 6, 0.0f), "and a ripple of nothing is refused");
+    // A HIGHPASS at 20 kHz used to be REFUSED here: the cascade was built from
+    // cookbook sections at freq / scale, and a highpass's outermost ones
+    // landed past Nyquist. Built as one bilinear transform of the prototype,
+    // prewarped at the edge, it is an ordinary design -- the edge exactly at
+    // 20 kHz and every pole inside the unit circle. So the claim is now the
+    // opposite one, and stronger: it designs, it is stable, its edge is where
+    // it was asked to be.
+    CascadedIir<8> nearNyquist;
+    nearNyquist.setSampleRate((float) kRate);
+    check(nearNyquist.designChebyshevHighpass(20000.0f, 8, 1.0f),
+          "an order-8 highpass at 20 kHz designs");
+    check(std::fabs(nearNyquist.magnitudeDb(20000.0f) - (-1.0f)) < 0.05f,
+          "…with its edge at 20 kHz, -ripple");
+    check(!nearNyquist.designChebyshevLowpass(30000.0f, 6, 1.0f),
+          "a cutoff past Nyquist is still refused");
+    check(!nearNyquist.designChebyshevLowpass(1000.0f, 6, 0.0f), "and a ripple of nothing is refused");
+  }
+
+  // ── Every order, against the closed form ──────────────────────────────────
+  //
+  // Not against another implementation: a Chebyshev's magnitude HAS a closed
+  // form, and through the bilinear transform it is that form at the warped
+  // frequency W = tan(pi f / fs) / tan(pi fc / fs) (inverted for a highpass):
+  //
+  //   Type I:   |H|^2 = 1 / (1 + e^2 T_N(W)^2),  e^2 = 10^(ripple/10) - 1
+  //   Type II:  |H|^2 = e^2 T^2 / (1 + e^2 T^2), T = T_N(1/W),
+  //                                               e^2 = 1 / (10^(stop/10) - 1)
+  //
+  // Orders 1 to 8, both types, both directions, a low cutoff and two near
+  // Nyquist. Only orders 4 and 6 were ever designed before, which is how
+  // every odd order went wrong: order 3 at 1 dB ripple was 13.2 dB down at its
+  // own passband edge, and a Type II order 5 asked for 60 dB reached 46.9.
+  {
+    auto chebyT = [](int n, double x) {
+      return x <= 1.0 ? std::cos((double) n * std::acos(x)) : std::cosh((double) n * std::acosh(x));
+    };
+    const double pi = 3.14159265358979323846;
+    double worst = 0.0;
+    const char* worstWhat = "";
+    int worstOrder = 0;
+    double worstFc = 0.0, worstF = 0.0;
+    bool allDesigned = true, allStable = true;
+    for (int type = 1; type <= 2; ++type)
+      for (int hp = 0; hp <= 1; ++hp)
+        for (int order = 1; order <= 8; ++order)
+          for (double fc : {500.0, 12000.0, 20000.0}) {
+            CascadedIir<8> filter;
+            filter.setSampleRate((float) kRate);
+            const bool ok = type == 1
+                ? (hp ? filter.designChebyshevHighpass((float) fc, order, 1.0f)
+                      : filter.designChebyshevLowpass((float) fc, order, 1.0f))
+                : (hp ? filter.designChebyshev2Highpass((float) fc, order, 60.0f)
+                      : filter.designChebyshev2Lowpass((float) fc, order, 60.0f));
+            if (!ok) {
+              allDesigned = false;
+              continue;
+            }
+            const double e2 = type == 1 ? std::pow(10.0, 0.1) - 1.0 : 1.0 / (std::pow(10.0, 6.0) - 1.0);
+            for (double f = 30.0; f < kRate * 0.5 - 200.0; f *= 1.12) {
+              const double wf = std::tan(pi * f / kRate), wc = std::tan(pi * fc / kRate);
+              const double W = hp ? wc / wf : wf / wc;
+              double expected;
+              if (type == 1) {
+                const double t = chebyT(order, W);
+                expected = -10.0 * std::log10(1.0 + e2 * t * t);
+              } else {
+                const double t = chebyT(order, 1.0 / W);
+                expected = 10.0 * std::log10(e2 * t * t / (1.0 + e2 * t * t));
+              }
+              // Down to -80 dB: below that a float biquad's own coefficient
+              // rounding is the larger term, and it says nothing about the design.
+              if (expected < -80.0) continue;
+              const double err = std::fabs((double) filter.magnitudeDb((float) f) - expected);
+              if (err > worst) {
+                worst = err;
+                worstWhat = type == 1 ? (hp ? "Type I HP" : "Type I LP") : (hp ? "Type II HP" : "Type II LP");
+                worstOrder = order;
+                worstFc = fc;
+                worstF = f;
+              }
+            }
+            // And the filter you get must settle: an impulse in, five seconds
+            // out, and the last half second gone quiet. A pole that rounded
+            // onto the unit circle rings for ever; one past it, to infinity.
+            // Five seconds and not one, because the slowest HONEST pole here
+            // is order 1, Type II, 60 dB: it sits at e times its edge, 0.5 Hz
+            // for a 500 Hz edge, and takes a third of a second per neper.
+            filter.reset();
+            double tail = 0.0;
+            bool finite = true;
+            for (int i = 0; i < 240000; ++i) {
+              const float y = filter.process(i == 0 ? 1.0f : 0.0f);
+              if (!std::isfinite(y)) finite = false;
+              if (i >= 216000) tail += (double) y * (double) y;
+            }
+            if (!finite || tail > 1e-12) allStable = false;
+          }
+    std::printf("  ---- Chebyshev I and II, orders 1-8, LP and HP, three cutoffs: worst %.4f dB "
+                "from the closed form (%s order %d, fc %.0f, at %.0f Hz) ----\n",
+                worst, worstWhat, worstOrder, worstFc, worstF);
+    check(allDesigned, "every order of both types designs, up to 20 kHz, in both directions");
+    check(worst < 0.05, "…and every one matches the closed-form magnitude to 0.05 dB");
+    check(allStable, "…and every one settles after an impulse, near Nyquist included");
   }
 
   // ── Chebyshev Type II: the ripple goes where it is thrown away ────
@@ -5766,6 +8714,30 @@ static void testInterpolation() {
     check(near16 < near8, "a wider window buys accuracy where accuracy is hard");
   }
 
+  // ── The sinc table is built off the audio thread ───────────────────
+  //
+  // Its 513 rows of Kaiser-windowed sinc were built on the first read, and
+  // the first read is the first audio block: thousands of Bessel series and
+  // sin() calls, behind a static-initialisation guard, inside the callback.
+  // Constructing the interpolator now builds it. A width no other test uses,
+  // so the table is fresh here; the first block must cost a small part of
+  // what the construction did, which it cannot if the table is still to come.
+  {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    WindowedSincInterpolator<11> fresh;
+    const auto t1 = Clock::now();
+    std::vector<float> in(160, 0.25f), out(64, 0.0f);
+    fresh.process(1.5, in.data(), out.data(), 64);
+    const auto t2 = Clock::now();
+    const double constructUs = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double firstBlockUs = std::chrono::duration<double, std::micro>(t2 - t1).count();
+    char line[200];
+    std::snprintf(line, sizeof(line), "a windowed-sinc interpolator's first block builds no table "
+                  "(construction %.0f us, first block %.1f us)", constructUs, firstBlockUs);
+    check(firstBlockUs * 4.0 < constructUs, line);
+  }
+
   // ── A block boundary is not audible ────────────────────────
   //
   // The whole point of the class. Running the same material in one call and
@@ -5844,6 +8816,27 @@ static void testInterpolation() {
     check(used > 0 && out[31] != 0.0f, "a zero ratio is treated as unity rather than hanging");
     check(interp.process(1.0, nullptr, out.data(), 32) == 0, "a null input is refused");
     check(interp.process(1.0, in.data(), out.data(), 0) == 0, "and so is a zero-length block");
+  }
+
+  // A ratio that is not a number is no ratio either. It went into the read
+  // position and stayed there: every later call, at any ratio, consumed no
+  // input and returned NaN -- a voice whose pitch modulation glitched once
+  // was dead until reset().
+  {
+    std::vector<float> in(64, 0.5f);
+    std::vector<float> out(32, 0.0f);
+    CatmullRomInterpolator interp;
+    interp.reset();
+    interp.process(std::numeric_limits<double>::quiet_NaN(), in.data(), out.data(), 16);
+    const int used = interp.process(1.0, in.data(), out.data(), 32);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a NaN ratio does not stick: the next block at unity consumes %d inputs "
+                  "and reads %g (32, 0.5)", used, (double) out[31]);
+    check(used == 32 && out[31] == 0.5f, line);
+    // An infinite one pushed input for ever, reading past the block.
+    interp.reset();
+    const int usedInf = interp.process(std::numeric_limits<double>::infinity(), in.data(), out.data(), 32);
+    check(usedInf == 32 && out[31] == 0.5f, "an infinite ratio is read as unity, inside the block it was given");
   }
 }
 
@@ -5957,6 +8950,108 @@ static void testAudioInputRing() {
     check(ring.available() == 0, "…and writing to it goes nowhere, safely");
   }
 
+  // Two clocks that agree on the RATE and not on the beat: capture hands
+  // over 480-frame packets, the device asks for 512-frame periods a little
+  // early or late, and both average 48 kHz. Read as soon as anything is
+  // there, the reader comes up short again and again while the ring finds
+  // its level -- a burst of crackles every time live input starts, and one
+  // more whenever the scheduling is later than it has been. A cushion of one
+  // packet and one period, filled before the first read and again after any
+  // shortfall, absorbs the phase. Simulated, in frames of time, with the
+  // reader's timing jittered by up to 50 frames.
+  {
+    auto shortReads = [](size_t prime) {
+      AudioRing ring;
+      ring.reset(8192);
+      ring.setPrime(prime);
+      std::vector<float> packet(480 * 2, 0.25f), left(512), right(512);
+      uint64_t nextWrite = 0, reads = 0, nextRead = 100;
+      uint32_t lcg = 12345;
+      int shorts = 0;
+      for (uint64_t t = 0; t < 48000 * 10; ++t) {
+        if (t == nextWrite) {
+          ring.write(packet.data(), 480);
+          nextWrite += 480;
+        }
+        if (t == nextRead) {
+          const uint64_t before = ring.starvedFrames();
+          ring.read(left.data(), right.data(), 512);
+          if (ring.starvedFrames() != before) ++shorts;
+          ++reads;
+          lcg = lcg * 1103515245u + 12345u;
+          const int jitter = (int) ((lcg >> 8) % 101) - 50;
+          nextRead = (uint64_t) ((int64_t) (100 + 512 * reads) + jitter);
+        }
+      }
+      return shorts;
+    };
+    const int bare = shortReads(0), cushioned = shortReads(480 + 512);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a cushion of one packet and one period keeps live input from "
+                  "crackling as it starts (%d short reads without, %d with)", bare, cushioned);
+    check(bare > 0 && cushioned == 0, line);
+  }
+
+  // A reader paced by the device -- --capture -- waits until the ring has
+  // something to give. available() says a packet is there while read() is
+  // still filling the cushion with silence; paced by it, the recorder looped
+  // reading silence and a take could be silent from start to end.
+  {
+    AudioRing ring;
+    ring.reset(4096);
+    ring.setPrime(960);
+    std::vector<float> packet(480 * 2, 0.25f), left(128), right(128);
+    ring.write(packet.data(), 480);
+    const size_t early = ring.readable();
+    ring.write(packet.data(), 480);
+    const size_t full = ring.readable();
+    ring.read(left.data(), right.data(), 128);
+    const bool heard = left[0] == 0.25f && left[127] == 0.25f;
+    char line[200];
+    std::snprintf(line, sizeof(line), "a primed ring has nothing readable until the cushion is full "
+                  "(%zu of 480 waiting, then %zu), and then it reads what it holds", early, full);
+    check(early == 0 && ring.available() == 960 - 128 && full == 960 && heard &&
+              ring.readable() == 960 - 128,
+          line);
+  }
+
+  // A 17 KB Ogg file, mutated by the parser fuzzer, whose codebooks ask for
+  // 1.36 GB of setup memory: stb_vorbis allocated and touched all of it for
+  // 1.6 s before refusing the stream -- a corrupt sample in a preset bank made
+  // the plugin take over a gigabyte inside the host. The setup is capped now,
+  // and the stream refused as out of memory before anything that size.
+  {
+    std::vector<uint8_t> bomb;
+    const bool have = sonore::lossydetail::readFile(SONORE_TEST_DATA_DIR "/ogg_setup_bomb.ogg", &bomb);
+    int error = 0;
+    sonore::codec::stb_vorbis* v =
+        have ? sonore::codec::stb_vorbis_open_memory(bomb.data(), (int) bomb.size(), &error, nullptr)
+             : nullptr;
+    if (v) sonore::codec::stb_vorbis_close(v);
+    sonore::WavData refused;
+    const bool read = sonore::readAudioFile(SONORE_TEST_DATA_DIR "/ogg_setup_bomb.ogg", &refused);
+    char line[200];
+    std::snprintf(line, sizeof(line), "an Ogg file whose codebooks ask for 1.36 GB is refused as out "
+                  "of memory before any of it is allocated (error %d)", error);
+    check(have && !v && error == sonore::codec::VORBIS_outofmem && !read, line);
+  }
+
+  // A device is found again by name. Lists are numbered by position, and an
+  // unplugged device takes its number to its neighbour: the standalone
+  // reopened a lost output, remembered a choice and followed an input by
+  // number, and opened somebody else's speakers or microphone.
+  {
+    using sonore::standalone::detail::findListedDevice;
+    const std::vector<std::string> before = {"System default", "USB", "HDMI", "Speakers"};
+    const std::vector<std::string> after = {"System default", "HDMI", "Speakers"};
+    const std::vector<std::string> twins = {"System default", "Twin", "Twin"};
+    check(findListedDevice(before, 2, "HDMI") == 2 && findListedDevice(after, 2, "HDMI") == 1 &&
+              findListedDevice(after, 1, "USB") == -1 && findListedDevice(after, 3, "") == -1 &&
+              findListedDevice(twins, 2, "Twin") == 2 && findListedDevice(twins, 7, "Twin") == 1,
+          "a device is found again by name: where it was if it is still there, where it moved "
+          "to if not, nowhere once it is gone");
+  }
+
   // What the platform actually has. Empty is a normal answer on a machine
   // with no microphone; a name that is empty is not.
   {
@@ -6016,6 +9111,38 @@ static void testMidiOutputSink() {
       check(worst < 0.001, "…and at the times it was given, whatever the tempo");
       std::remove(path);
     }
+  }
+
+  // Live: the standalone hands a file sink to the audio thread while it
+  // plays, and send() appended to a vector -- an allocation each time it
+  // grew, and a copy of every event so far with it, inside the callback.
+  // startLive() puts a ring in between that a thread of the sink's own
+  // drains; send() then allocates nothing, and every event still arrives.
+  {
+    const char* path = tempPath("sonore-sink-live.mid");
+    long allocated = 0;
+    size_t written = 0;
+    {
+      midiout::FileSink sink(path, 120.0);
+      sink.startLive();
+      // This thread only: the sink's own drain thread allocates, by design.
+      armAllocationCounterOnThisThread(true);
+      const long before = allocationCount();
+      for (int i = 0; i < 20000; ++i) {
+        sink.send(MidiMessage::noteOn(0, 36 + i % 48, 100), (double) i * 0.001);
+        if (i % 64 == 63) std::this_thread::sleep_for(std::chrono::microseconds(500));
+      }
+      allocated = allocationCount() - before;
+      armAllocationCounterOnThisThread(false);
+      check(sink.close(), "a live file sink writes its file on close");
+    }
+    MidiFileData file;
+    if (readMidiFile(path, &file) && !file.tracks.empty()) written = file.tracks[0].events.size();
+    char line[200];
+    std::snprintf(line, sizeof(line), "a live file sink's send() allocates nothing, and keeps every "
+                  "event (%ld allocations, %zu of 20000 written)", allocated, written);
+    check(allocated == 0 && written == 20000, line);
+    std::remove(path);
   }
 
   // A sink that cannot write says so rather than reporting success. A path
@@ -6131,6 +9258,29 @@ static void testMidiSequence() {
     checkNear(sequence.noteLength(0), 0.5, 1e-9, "channel 16 pairs like any other");
   }
 
+  // An edit after pairing. A pair is an index, and the sort that an earlier
+  // event forces moves everything after it: the note-on's pair then named
+  // the note-on itself, and a one-second note was 0 long.
+  {
+    MidiSequence sequence;
+    sequence.addEvent(MidiMessage::noteOn(0, 60, 100), 1.0);
+    sequence.addEvent(MidiMessage::noteOff(0, 60), 2.0);
+    sequence.addEvent(MidiMessage::noteOn(0, 64, 100), 1.5);
+    sequence.addEvent(MidiMessage::noteOff(0, 64), 3.0);
+    sequence.updateMatchedPairs();
+    sequence.addEvent(MidiMessage::controlChange(0, 1, 64), 0.5); // before them all
+    sequence.addEvent(MidiMessage::controlChange(0, 1, 32), 1.75); // between them
+    sequence.sort();
+    check(sequence[1].message.getNoteNumber() == 60 && sequence[2].message.getNoteNumber() == 64,
+          "an edit sorts the new events in");
+    checkNear(sequence.noteLength(1), 1.0, 1e-9, "...and a paired note keeps its length");
+    checkNear(sequence.noteLength(2), 1.5, 1e-9, "...as does the one that overlaps it");
+    const int off60 = sequence[1].pairedWith, off64 = sequence[2].pairedWith;
+    check(off60 >= 0 && off64 >= 0 && sequence[(size_t) off60].message.isNoteOff() &&
+              sequence[(size_t) off64].message.isNoteOff(),
+          "...and each still names its own note-off");
+  }
+
   // ── Timeline to blocks, and back ───────────────────────────
   //
   // The bridge a player crosses every block. The strong claim is not that
@@ -6202,6 +9352,52 @@ static void testMidiSequence() {
           "an event on a block boundary belongs to the block that starts there");
   }
 
+  // fillBuffer is the audio thread's half -- the standalone plays a MIDI file
+  // through it in process(). It sorted first, and stable_sort allocates its
+  // scratch whenever the timeline was edited since the last sort. An
+  // unsorted timeline must come out exactly as a sorted one would, with
+  // nothing allocated.
+  {
+    constexpr double kRate = 48000.0;
+    MidiSequence unsorted, sorted;
+    for (int i = 0; i < 1000; ++i) {
+      // Out of order, with ties: same-instant events must keep the order
+      // they were added in, as the sorted copy's stable sort keeps them.
+      const double t = (double) ((i * 37) % 250) * (64.0 / kRate);
+      const MidiMessage m = (i % 2) ? MidiMessage::noteOff(0, i % 128) : MidiMessage::noteOn(0, i % 128, 100);
+      unsorted.addEvent(m, t);
+      sorted.addEvent(m, t);
+    }
+    sorted.sort();
+    bool same = true;
+    const long before = allocationCount();
+    long allocations = 0;
+    for (int b = 0; b < 130 && same; ++b) {
+      MidiBuffer a, c;
+      armAllocationCounter(true);
+      unsorted.fillBuffer(a, b * 128.0 / kRate, 128, kRate);
+      armAllocationCounter(false);
+      sorted.fillBuffer(c, b * 128.0 / kRate, 128, kRate);
+      const auto* x = a.begin();
+      const auto* y = c.begin();
+      if ((a.end() - x) != (c.end() - y)) same = false;
+      for (; same && x != a.end(); ++x, ++y)
+        if (x->samplePosition != y->samplePosition ||
+            x->message.getRawStatus() != y->message.getRawStatus() ||
+            x->message.getNoteNumber() != y->message.getNoteNumber())
+          same = false;
+    }
+    allocations = allocationCount() - before;
+    check(same, "an unsorted timeline fills each block exactly as a sorted one does");
+#if SONORE_TESTS_HAVE_ALLOC_COUNTER
+    char msg[120];
+    std::snprintf(msg, sizeof(msg), "…and filling blocks from it allocated %ld times", allocations);
+    check(allocations == 0, msg);
+#else
+    (void) allocations;
+#endif
+  }
+
   // ── A file becomes a timeline, tempo map and all ───────────────
   {
     MidiFileData file;
@@ -6252,6 +9448,27 @@ static void testMidiSequence() {
       if (e.message.isController() && e.message.getControllerValue() == 64) controlIntact = true;
     check(controlIntact, "…and a controller is left exactly as it was");
     checkNear(sequence.noteLength(0), 1.0, 1e-9, "…with the pairs rebuilt afterwards");
+  }
+
+  // Poly pressure names its note, so it moves with it. Left behind, the
+  // pressure on 60 went to whatever note was moved onto 60: here 58, now 60.
+  {
+    MidiSequence sequence;
+    sequence.addEvent(MidiMessage::noteOn(0, 58, 100), 0.0);
+    sequence.addEvent(MidiMessage::noteOn(0, 60, 100), 0.0);
+    sequence.addEvent(MidiMessage::polyPressure(0, 60, 90), 0.5);
+    sequence.addEvent(MidiMessage::polyPressure(0, 126, 10), 0.5); // its note leaves the range
+    sequence.addEvent(MidiMessage::noteOff(0, 58), 1.0);
+    sequence.addEvent(MidiMessage::noteOff(0, 60), 1.0);
+    sequence.transpose(2);
+    int pressed = -1, pressures = 0;
+    for (const auto& e : sequence.events())
+      if (e.message.isPolyPressure()) {
+        pressed = e.message.getNoteNumber();
+        ++pressures;
+      }
+    check(pressures == 1 && pressed == 62,
+          "poly pressure moves with its note, and goes where its note goes out of range");
   }
 }
 
@@ -6376,6 +9593,49 @@ static void testMidiFile() {
       check(parsed.events[1].message.getNoteNumber() == 64 && parsed.events[1].tick == 96,
             "...the second one reusing the status and landing at its own tick");
     }
+  }
+
+  // A tempo map spread over tracks. Format 1 puts tempo in the first track
+  // by convention, not by rule, and tempo events were collected in TRACK
+  // order: a change at tick 1920 in track 1 landed before one at tick 0 in
+  // track 2, and tickToSeconds walked the map backwards -- an unsigned
+  // 0 - 1920 -- into nonsense. 240 BPM from the start, 60 from bar 2:
+  // four beats at a quarter of a second, then four at a second.
+  {
+    auto u32 = [](std::vector<uint8_t>& out, uint32_t v) {
+      for (int s = 24; s >= 0; s -= 8) out.push_back((uint8_t) (v >> s));
+    };
+    auto tempoTrack = [&](uint32_t delta, uint32_t microseconds) {
+      std::vector<uint8_t> body;
+      midifile::writeVarLen(body, delta);
+      body.insert(body.end(), {0xff, 0x51, 0x03, (uint8_t) (microseconds >> 16),
+                               (uint8_t) (microseconds >> 8), (uint8_t) microseconds});
+      midifile::writeVarLen(body, 0);
+      body.insert(body.end(), {0xff, 0x2f, 0x00});
+      std::vector<uint8_t> chunk = {'M', 'T', 'r', 'k'};
+      u32(chunk, (uint32_t) body.size());
+      chunk.insert(chunk.end(), body.begin(), body.end());
+      return chunk;
+    };
+    std::vector<uint8_t> file = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 1, 0, 2, 0x01, 0xE0};
+    const std::vector<uint8_t> first = tempoTrack(1920, 1000000), second = tempoTrack(0, 250000);
+    file.insert(file.end(), first.begin(), first.end());
+    file.insert(file.end(), second.begin(), second.end());
+    const std::string tempoPath = dir + "/tempo_in_two_tracks.mid";
+    std::FILE* f = std::fopen(tempoPath.c_str(), "wb");
+    if (f) {
+      std::fwrite(file.data(), 1, file.size(), f);
+      std::fclose(f);
+    }
+    MidiFileData spread;
+    const bool loaded = readMidiFile(tempoPath.c_str(), &spread);
+    const double atBar2 = loaded ? spread.tickToSeconds(1920) : -1.0;
+    const double atBar3 = loaded ? spread.tickToSeconds(3840) : -1.0;
+    char line[200];
+    std::snprintf(line, sizeof(line), "a tempo map spread over two tracks is followed in time order "
+                  "(bar 2 at %.4f s, bar 3 at %.4f s; want 1 and 5)", atBar2, atBar3);
+    check(loaded && std::fabs(atBar2 - 1.0) < 1e-9 && std::fabs(atBar3 - 5.0) < 1e-9, line);
+    std::remove(tempoPath.c_str());
   }
 
   // Garbage is refused, not half-parsed.
@@ -6538,6 +9798,48 @@ static void testImpulseResponse() {
     check(std::fabs(ir.sampleRate() - 48000.0) < 1e-6, "...and it reports the rate it now is");
   }
 
+  // The same response sounds the same at every session rate. Resampling kept
+  // the values, so a response at twice the rate had twice the samples and was
+  // 6 dB louder convolved; energy measured at the running rate added 3 dB a
+  // doubling, and a unit peak 6.
+  {
+    std::vector<float> room(4800, 0.0f);
+    sonore::WhiteNoise grain(57);
+    for (size_t i = 0; i < room.size(); ++i)
+      room[i] = 0.2f * grain.next() * (float) std::exp(-(double) i / 800.0);
+    room[480] += 1.0f;
+    double worst = 0.0;
+    char spread[160] = "";
+    for (ImpulseNormalise mode : {ImpulseNormalise::None, ImpulseNormalise::Peak, ImpulseNormalise::Energy}) {
+      double at48 = 0.0, lo = 1e9, hi = -1e9;
+      for (double rate : {48000.0, 44100.0, 96000.0, 192000.0}) {
+        ImpulseResponse r;
+        r.loadFromSamples(room.data(), room.size(), 1, 48000.0, rate, mode);
+        double re = 0.0, im = 0.0;
+        const float* h = r.channel(0);
+        for (size_t i = 0; i < r.length(); ++i) {
+          const double w = 2.0 * kTestPi * 1000.0 * (double) i / rate;
+          re += h[i] * std::cos(w);
+          im -= h[i] * std::sin(w);
+        }
+        const double db = 20.0 * std::log10(std::sqrt(re * re + im * im));
+        if (rate == 48000.0) at48 = db;
+        lo = std::min(lo, db - at48);
+        hi = std::max(hi, db - at48);
+      }
+      const double off = std::max(std::fabs(lo), std::fabs(hi));
+      if (off > worst) {
+        worst = off;
+        std::snprintf(spread, sizeof(spread), "mode %d, %+.2f to %+.2f dB", (int) mode, lo, hi);
+      }
+    }
+    char line[220];
+    std::snprintf(line, sizeof(line),
+                  "a 48 kHz response loaded at 44.1 to 192 kHz is as loud at 1 kHz in every normalisation "
+                  "(worst %s)", spread);
+    check(worst < 0.25, line);
+  }
+
   // Energy normalisation is what keeps two responses equally LOUD. Build a
   // second IR with the same peak but far less energy, and check that peak
   // normalisation leaves them unequal while energy normalisation does not.
@@ -6559,9 +9861,26 @@ static void testImpulseResponse() {
                           ImpulseNormalise::Energy);
     thin.loadFromSamples(sparse.data(), sourceLength, 1, 44100.0, 44100.0,
                          ImpulseNormalise::Energy);
-    check(std::fabs(dense.energy() - 1.0) < 1e-4 && std::fabs(thin.energy() - 1.0) < 1e-4,
+    // Unit energy as measured at 48 kHz, which at 44.1 kHz is 48/44.1: the
+    // same loudness, counted in more samples per second.
+    const double unit = 48000.0 / 44100.0;
+    check(std::fabs(dense.energy() - unit) < 1e-4 && std::fabs(thin.energy() - unit) < 1e-4,
           "...where energy normalisation makes them equally loud, which is what a "
           "preset switch should preserve");
+
+    // Per CHANNEL. A stereo response is two responses, each heard on its own
+    // side; normalised over both together, each side came out at half the
+    // energy -- 3 dB quieter than the same response loaded as mono.
+    std::vector<float> twin(sourceLength * 2);
+    for (size_t i = 0; i < sourceLength; ++i) twin[i * 2] = twin[i * 2 + 1] = mono[i];
+    ImpulseResponse both;
+    both.loadFromSamples(twin.data(), sourceLength, 2, 44100.0, 44100.0, ImpulseNormalise::Energy);
+    double side = 0.0;
+    for (size_t i = 0; i < both.length(); ++i) side += (double) both.channel(0)[i] * both.channel(0)[i];
+    char line[200];
+    std::snprintf(line, sizeof(line), "a stereo response plays each side as loud as the same "
+                  "response loaded mono (%.2f dB apart)", 10.0 * std::log10(side / dense.energy()));
+    check(std::fabs(side - dense.energy()) < 1e-3, line);
   }
 
   // Trimming removes leading silence and SAYS how much, so a plugin can offer
@@ -6584,6 +9903,29 @@ static void testImpulseResponse() {
                           ImpulseNormalise::None);
     check(quiet.trimSilence(-60.0f) == 0 && quiet.length() == 1000,
           "a wholly silent response is left alone rather than trimmed away");
+  }
+
+  // A reverb, normalised the default way, keeps its decay down to 60 dB below
+  // its peak and ends in a fade. The threshold was in dBFS, and Energy
+  // normalisation leaves a reverb's peak far under full scale: a 3-second
+  // decay was cut 27 dB down, at 1.3 s, on a step.
+  {
+    const double sr = 48000.0, rt60 = 3.0;
+    std::vector<float> hall((size_t) (4.0 * sr));
+    sonore::WhiteNoise hallNoise(17);
+    for (size_t i = 0; i < hall.size(); ++i)
+      hall[i] = hallNoise.next() * (float) std::pow(10.0, -3.0 * ((double) i / sr) / rt60);
+    ImpulseResponse ir;
+    ir.loadFromSamples(hall.data(), hall.size(), 1, sr, sr, ImpulseNormalise::Energy);
+    const float peak = ir.magnitude();
+    ir.trimSilence();
+    const double seconds = (double) ir.length() / sr;
+    const float tail = std::fabs(ir.channel(0)[ir.length() - 1]);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "trimming a normalised 3 s reverb keeps its decay (%.2f s), and ends it in a fade (%.1f dB under the peak)",
+                  seconds, 20.0 * std::log10(std::max(tail, 1e-12f) / peak));
+    check(seconds > 2.7 && tail < peak * 1e-4f, line);
   }
 
   // Stereo stays two responses; a mono file answers for every channel, which
@@ -6640,7 +9982,8 @@ static void testImpulseResponse() {
     check(ir.loadFromFile((dir + "/ref16.wav").c_str(), 48000.0, ImpulseNormalise::Energy),
           "an impulse response loads from a file");
     check(ir.numChannels() == 2 && ir.length() > 0, "...with its channels and length");
-    check(std::fabs(ir.energy() - 1.0) < 1e-3, "...normalised to unit energy");
+    check(std::fabs(ir.energy() / ir.numChannels() - 1.0) < 1e-3,
+          "...normalised to unit energy per channel");
     check(!ir.loadFromFile("nowhere.wav", 48000.0), "a missing file is refused");
   }
 #endif
@@ -6686,6 +10029,18 @@ static void testChannelMatrix() {
     check(std::fabs(m.getGain(0, 0) - 0.70794578f) < 1e-5f &&
               std::fabs(m.getGain(1, 0) - 0.70794578f) < 1e-5f,
           "a mono source spreads to both sides at -3 dB, not at unity into each");
+  }
+
+  // Mono -> 5.1: the output HAS a centre, and mono content belongs in it. It
+  // went there at unity AND to front left and right at -3 dB, which is +3 dB
+  // and a centre image smeared across the whole front.
+  {
+    ChannelMatrix m;
+    m.buildFromRoles(oneRole, one, sixRoles, six);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a mono source into 5.1 goes to the centre alone "
+                  "(C %.3f, L %.3f, R %.3f)", m.getGain(2, 0), m.getGain(0, 0), m.getGain(1, 0));
+    check(m.getGain(2, 0) == 1.0f && m.getGain(0, 0) == 0.0f && m.getGain(1, 0) == 0.0f, line);
   }
 
   // Stereo -> mono: both sides fold in, and neither is lost.
@@ -6919,6 +10274,39 @@ static void testSampler() {
     check(empty.renderChannel(0) == 0.0f && !empty.isActive(),
           "a voice with no sample is silent rather than dereferencing nothing");
   }
+
+  // A pitch offset that is not a number, or is past any pitch, neither
+  // crashes nor hangs the audio thread. NaN made the position NaN, and the
+  // band-limited read indexed its kernel table at (int) NaN: an access
+  // violation. Infinity made the position infinite, and the loop's wrap --
+  // a length at a time -- never ended; 400 semitones took 8 ms a frame.
+  {
+    SampleData looped = data;
+    looped.looping = true;
+    looped.loopStart = 1000;
+    looped.loopEnd = 1100;
+    const float inf = std::numeric_limits<float>::infinity();
+    const float offsets[] = {std::numeric_limits<float>::quiet_NaN(), inf, -inf, 1.0e6f, 400.0f};
+    bool sane = true;
+    for (float offset : offsets) {
+      SampleVoice voice;
+      voice.setSampleRate(44100.0);
+      voice.setSample(&looped);
+      voice.noteOn(69);
+      for (int i = 0; i < 100; ++i) {
+        voice.renderChannel(0);
+        voice.advance();
+      }
+      voice.setPitchOffset(offset);
+      for (int i = 0; i < 256; ++i) {
+        sane = sane && std::isfinite(voice.renderChannel(0));
+        voice.advance();
+      }
+      sane = sane && voice.isActive() && voice.position() >= 0.0 && voice.position() < 1100.0;
+    }
+    check(sane, "a NaN, infinite or absurd pitch offset leaves a looping voice finite and inside its "
+                "loop, without crashing or hanging");
+  }
 }
 
 // ── FLAC encoding ────────────────────────────────────────────────────────────
@@ -7046,14 +10434,175 @@ static void testFlacEncode() {
           "...back to exactly the silence it was, at full length");
   }
 
+  // The frame number, against UTF-8 itself. FLAC borrows the original
+  // (up-to-six-byte) UTF-8 coding for it, so the expected bytes are the
+  // standard's, not ours. Every file above is shorter than 128 frames, which
+  // is why the multi-byte forms went wrong for as long as they did: a lead
+  // byte carrying the whole value's width as well as the continuation bytes.
+  {
+    struct Case { uint64_t value; std::vector<uint8_t> bytes; };
+    const Case cases[] = {
+        {0x7F, {0x7F}},
+        {0x80, {0xC2, 0x80}},
+        {0x7FF, {0xDF, 0xBF}},
+        {0x800, {0xE0, 0xA0, 0x80}},
+        {0xFFFF, {0xEF, 0xBF, 0xBF}},
+        {0x10000, {0xF0, 0x90, 0x80, 0x80}},
+        {0x7FFFFFFF, {0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF}},
+    };
+    bool allMatch = true;
+    for (const Case& c : cases) {
+      flacenc::BitWriter w;
+      flacenc::writeUtf8(w, c.value);
+      w.alignToByte();
+      if (w.bytes() != c.bytes) {
+        allMatch = false;
+        std::printf("  ---- coded number 0x%llX: %zu bytes, expected %zu ----\n",
+                    (unsigned long long) c.value, w.bytes().size(), c.bytes.size());
+      }
+    }
+    check(allMatch, "FLAC frame numbers are coded exactly as UTF-8 codes them, 1 to 6 bytes");
+  }
+
+  // And a file long enough to need them: past frame 128 (sample 524288 at
+  // 4096 per frame, 10.9 s at 48 kHz), with a short final block. Kept under
+  // half scale so the 16-bit round trip is exact by construction.
+  {
+    const size_t frames = 4096 * 130 + 1000;
+    std::vector<float> longSignal(frames * 2);
+    uint32_t seed = 12345u;
+    for (size_t i = 0; i < frames; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      const int noise = (int) (seed >> 24) - 128;
+      const int tone = (int) std::lround(12000.0 * std::sin((double) i * 0.0123));
+      longSignal[i * 2] = (float) (tone + noise) / 32768.0f;
+      longSignal[i * 2 + 1] = (float) (noise * 40) / 32768.0f;
+    }
+    const std::string path = dir + "/encodedlong.flac";
+    check(writeFlac(path.c_str(), longSignal.data(), frames, 2, 48000, 16),
+          "an 11-second FLAC encodes");
+    WavData back;
+    const bool read = readFlac(path.c_str(), &back);
+    check(read && back.numFrames() == frames,
+          "...and decodes to its full length, past frame 128");
+    bool exact = back.samples.size() == longSignal.size();
+    for (size_t i = 0; exact && i < longSignal.size(); ++i)
+      if (back.samples[i] != longSignal[i]) exact = false;
+    check(exact, "...losslessly, every frame after the 128th included");
+  }
+
   // Refusals rather than half-written files.
   {
     std::vector<float> tiny(100, 0.1f);
     check(!writeFlac(nullptr, tiny.data(), 50, 2, 48000, 16), "a null path is refused");
     check(!writeFlac((dir + "/bad.flac").c_str(), tiny.data(), 50, 2, 48000, 8),
           "an unsupported bit depth is refused rather than approximated");
+    // STREAMINFO's rate is twenty bits and zero is invalid. Both were written
+    // and reported as success: a zero-rate file no decoder opens, readFlac
+    // included, and 1,096,576 Hz cut to its low twenty bits -- 48000.
+    const char* ratePath = tempPath("sonore-flac-rate.flac");
+    WavData back;
+    const bool zero = writeFlac(ratePath, tiny.data(), 50, 2, 0, 16);
+    const bool wide = writeFlac(ratePath, tiny.data(), 50, 2, (1u << 20) + 48000u, 16);
+    const bool widest = writeFlac(ratePath, tiny.data(), 50, 2, (1u << 20) - 1u, 16) &&
+                        readFlac(ratePath, &back) && back.sampleRate == (1u << 20) - 1u;
+    std::remove(ratePath);
+    check(!zero && !wide, "a rate STREAMINFO cannot hold -- zero, or past twenty bits -- is refused");
+    check(widest, "…and the widest it can hold is written and read back");
   }
 #endif
+
+  // Every channel count the encoder writes, the decoder reads. It stopped at
+  // two: a 5.1 or 7.1 FLAC written by writeFlac could not be read back.
+  {
+    bool all = true;
+    char counts[64] = "";
+    for (uint16_t channels : {(uint16_t) 3, (uint16_t) 6, (uint16_t) 8}) {
+      const size_t frames = 6000;
+      std::vector<float> wide(frames * channels);
+      for (size_t i = 0; i < frames; ++i)
+        for (uint16_t c = 0; c < channels; ++c)
+          wide[i * channels + c] =
+              0.4f * (float) std::sin(2.0 * kTestPi * (110.0 * (c + 1)) * (double) i / 48000.0);
+      const std::string path = dir + "/wide.flac";
+      WavData back;
+      const bool ok = writeFlac(path.c_str(), wide.data(), frames, channels, 48000, 24) &&
+                      readFlac(path.c_str(), &back) && back.numChannels == channels &&
+                      back.samples.size() == wide.size();
+      double worst = 0.0;
+      for (size_t k = 0; ok && k < wide.size(); ++k)
+        worst = std::max(worst, (double) std::fabs(back.samples[k] - wide[k]));
+      std::remove(path.c_str());
+      all = all && ok && worst < 2.0 / 8388608.0;
+      std::snprintf(counts + std::strlen(counts), sizeof(counts) - std::strlen(counts), "%s%u:%s",
+                    channels == 3 ? "" : ", ", (unsigned) channels, ok ? "read" : "REFUSED");
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "3-, 6- and 8-channel FLACs read back, every channel in place (%s)", counts);
+    check(all, l);
+  }
+
+  // Integer audio read and written again comes back bit for bit. The readers
+  // divide by 2^(N-1); the writers multiplied by 2^(N-1) - 1, so every
+  // sample above half scale came back one step smaller.
+  {
+    bool exact = true;
+    int changed = 0, tried = 0;
+    for (int bits : {16, 24}) {
+      const double full = bits == 16 ? 32768.0 : 8388608.0;
+      std::vector<float> codes;
+      for (double q = -full; q < full; q += full / 4096.0 + 1.0) codes.push_back((float) (q / full));
+      codes.push_back((float) ((full - 1.0) / full));
+      for (int format = 0; format < 2; ++format) {
+        const std::string path = dir + (format == 0 ? "/codes.aiff" : "/codes.flac");
+        const bool written =
+            format == 0 ? sonore::writeAiff(path.c_str(), codes.data(), codes.size(), 1, 48000, bits)
+                        : writeFlac(path.c_str(), codes.data(), codes.size(), 1, 48000, bits);
+        WavData back;
+        const bool read = written && sonore::readAudioFile(path.c_str(), &back) &&
+                          back.samples.size() == codes.size();
+        exact = exact && read;
+        for (size_t k = 0; read && k < codes.size(); ++k)
+          if (back.samples[k] != codes[k]) ++changed;
+        tried += (int) codes.size();
+        std::remove(path.c_str());
+      }
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "16- and 24-bit codes written as AIFF and FLAC read back unchanged (%d of %d changed)",
+                  changed, tried);
+    check(exact && changed == 0, l);
+  }
+
+  // 24-bit material that needs a Rice parameter past 14. Capped there, every
+  // residual spilled into its unary part: -6 dBFS noise came out 12.8 times
+  // the size of the PCM, and ffmpeg could not decode the file at all.
+  {
+    const size_t frames = 48000;
+    std::vector<float> noise(frames * 2);
+    sonore::Random rng;
+    rng.setSeed(99);
+    for (float& v : noise) v = 0.5f * (rng.nextFloat() * 2.0f - 1.0f);
+    const std::string path = dir + "/noise24.flac";
+    check(writeFlac(path.c_str(), noise.data(), frames, 2, 48000, 24), "a 24-bit noise FLAC encodes");
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    long size = 0;
+    if (f) {
+      std::fseek(f, 0, SEEK_END);
+      size = std::ftell(f);
+      std::fclose(f);
+    }
+    const double ratio = (double) size / (double) (frames * 2 * 3);
+    WavData decoded;
+    const bool read = readFlac(path.c_str(), &decoded);
+    double worst = 0.0;
+    for (size_t k = 0; read && k < decoded.samples.size() && k < noise.size(); ++k)
+      worst = std::max(worst, (double) std::fabs(decoded.samples[k] - noise[k]));
+    char l[200];
+    std::snprintf(l, sizeof(l), "...no bigger than the PCM it holds (%.2fx) and read back to within 2 LSB (%.2g)", ratio, worst);
+    check(read && ratio < 1.1 && worst < 2.5 / 8388608.0, l);
+    std::remove(path.c_str());
+  }
 }
 
 // ── State beyond parameters ──────────────────────────────────────────────────
@@ -7122,6 +10671,36 @@ static void testStateBag() {
           "a corrupt count is refused rather than allocated");
   }
 
+  // A double saved is the double restored, to the last bit. The parser
+  // summed powers of a tenth by hand, which rounds on every digit: 0.3 came
+  // back 0.30000000000000010, and most values a few units in the last place.
+  {
+    StateBag bag;
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    int wrong = 0;
+    double firstWrong = 0.0;
+    const double samples[] = {0.3, 0.1, 2.0 / 3.0, 1.0e-300, 123456.789, -0.0001};
+    for (int i = 0; i < 2000; ++i) {
+      double v;
+      if (i < 6) {
+        v = samples[i];
+      } else {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        v = (double) (seed >> 11) / 9007199254740992.0; // [0,1), every bit used
+      }
+      bag.setDouble("v", v);
+      std::vector<uint8_t> bytes;
+      bag.serialise(bytes);
+      StateBag back;
+      back.deserialise(bytes.data(), bytes.size());
+      if (back.getDouble("v") != v && wrong++ == 0) firstWrong = v;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "2000 doubles round-trip through a state bag bit for bit "
+                  "(%d did not; the first was %.17g)", wrong, firstWrong);
+    check(wrong == 0, line);
+  }
+
   // Locale immunity, the trap the parameter bridge already learned.
   {
     const char* previous = std::setlocale(LC_NUMERIC, nullptr);
@@ -7188,8 +10767,11 @@ static void testMidiCi() {
     check(parsed.identity.family == 0x1234 && parsed.identity.model == 0x3FFF,
           "...and 14-bit fields that survive the split, including the widest one");
     check(parsed.identity.maxSysExSize == 4096, "...and the 28-bit size field");
-    check(parsed.identity.categories == 0x02,
-          "...declaring property exchange, which is what earns a knob its mapping");
+    // Bit 3 (0x08), as MIDI-CI numbers it. 0x02 is protocol negotiation, and
+    // a controller reading it never asks for the parameter list.
+    check(parsed.identity.categories == kCategoryPropertyExchange &&
+              parsed.identity.categories == 0x08,
+          "...declaring property exchange (0x08), which is what earns a knob its mapping");
   }
 
   // The MUID is the field most likely to be got wrong: 28 bits little-endian
@@ -7283,7 +10865,7 @@ static int settlingAfterInputStops(Tick tick, int limit, float floor) {
 // statistical: send a single impulse, let the wet path be nothing but a pure
 // delay, and count how many samples come out non-zero.
 //
-// Uncompensated, the impulse arrives twice, once dry at 0 and once wet at L,
+// Uncompensated, the impulse arrives twice (once dry at 0 and once wet at L),
 // which is a comb filter, worst at the 50% mix where most users leave the
 // control. Compensated, there is exactly ONE impulse and it sits at L.
 // RPN and NRPN: four control changes that mean one thing.
@@ -7388,6 +10970,71 @@ static void testMpeZones() {
     check(whichKey == 60, "…the one sounding on that channel");
   }
 
+  // The two bends ADD. A finger slid up twelve semitones and the zone's
+  // wheel up one is thirteen; the zone's bend was sent as the note's whole
+  // tuning, so the note fell to one, then jumped back to twelve at the
+  // finger's next move.
+  {
+    sonore::MpeDecoder mpe;
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    configure(midi, 0, 5, 0);
+    midi.addEvent(sonore::MidiMessage::noteOn(1, 60, 100), 1);
+    midi.addEvent(sonore::MidiMessage::pitchBend(1, 8192 + 2048), 2); // +12 of 48
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 8192 + 4096), 3); // the zone's +1 of 2
+    mpe.process(midi, out);
+    float tuning = -100.0f;
+    for (const auto* e = out.begin(); e != out.end(); ++e)
+      if (e->expression == sonore::kExprTuning && e->key == 60) tuning = e->value;
+    checkNear(tuning, 13.0f, 0.01f, "a zone bend of +1 on a note bent +12 tunes it to +13");
+
+    midi.clear();
+    out.clear();
+    midi.addEvent(sonore::MidiMessage::pitchBend(1, 8192 + 2219), 0); // the finger: +13 of 48
+    mpe.process(midi, out);
+    tuning = -100.0f;
+    for (const auto* e = out.begin(); e != out.end(); ++e)
+      if (e->expression == sonore::kExprTuning && e->key == 60) tuning = e->value;
+    checkNear(tuning, 14.0f, 0.01f, "...and the finger moving on keeps the zone's +1 under it");
+  }
+
+  // What a channel is given BEFORE its note-on is the note's: MPE has a
+  // controller send the bend, pressure and CC 74 first -- as this SDK's own
+  // MPE keyboard does -- and with no note on the channel yet all three were
+  // dropped, so the note started at the DSP's defaults.
+  {
+    sonore::MpeDecoder mpe;
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    configure(midi, 0, 5, 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(2, 8192 + 1024), 5); // +6 of 48
+    midi.addEvent(cc(2, 74, 100), 5);
+    midi.addEvent(sonore::MidiMessage::channelPressure(2, 30), 5);
+    midi.addEvent(sonore::MidiMessage::noteOn(2, 64, 100), 5);
+    midi.addEvent(sonore::MidiMessage::noteOn(3, 67, 100), 6); // a channel given nothing
+    mpe.process(midi, out);
+    float tuning = -1.0f, timbre = -1.0f, pressure = -1.0f;
+    int forOther = 0;
+    bool atTheNote = true;
+    for (const auto* e = out.begin(); e != out.end(); ++e) {
+      if (e->key == 67) ++forOther;
+      if (e->key != 64 || e->channel != 2) continue;
+      if (e->samplePosition != 5) atTheNote = false;
+      if (e->expression == sonore::kExprTuning) tuning = e->value;
+      if (e->expression == sonore::kExprBrightness) timbre = e->value;
+      if (e->expression == sonore::kExprPressure) pressure = e->value;
+    }
+    char msg[200];
+    std::snprintf(msg, sizeof(msg),
+                  "a note starts with the bend, CC 74 and pressure sent before it (%.2f, %.3f, %.3f)",
+                  tuning, timbre, pressure);
+    check(std::fabs(tuning - 6.0f) < 0.01f && std::fabs(timbre - 100.0f / 127.0f) < 1e-6f &&
+              std::fabs(pressure - 30.0f / 127.0f) < 1e-6f,
+          msg);
+    check(atTheNote, "...at the frame of its note-on");
+    check(forOther == 0, "...and a note on a channel given nothing starts with nothing");
+  }
+
   // With no zone configured nothing changes: every channel independent, which
   // is what a plain MIDI keyboard needs and what this did before zones.
   {
@@ -7401,6 +11048,49 @@ static void testMpeZones() {
     for (const auto* e = out.begin(); e != out.end(); ++e)
       if (e->expression == sonore::kExprTuning) ++bent;
     check(bent == 1, "without a zone, channel 1 is an ordinary channel with its own note");
+  }
+
+  // A plain keyboard plays CHORDS on one channel, and its wheel bends them
+  // all. One note per channel was kept -- the last note-on -- so the wheel
+  // bent one note of three, and once that key was let go it bent nothing
+  // while the other two still sounded.
+  {
+    sonore::MpeDecoder mpe;
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 64, 100), 0);
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 67, 100), 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 8192 + 2048), 10);
+    mpe.process(midi, out);
+    int bent = 0;
+    for (const auto* e = out.begin(); e != out.end(); ++e)
+      if (e->expression == sonore::kExprTuning) ++bent;
+    check(bent == 3, "the wheel bends all three notes of a chord on one channel");
+
+    midi.clear();
+    out.clear();
+    midi.addEvent(sonore::MidiMessage::noteOff(0, 67), 0); // the last one pressed
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 8192), 10);
+    midi.addEvent(sonore::MidiMessage::channelPressure(0, 64), 11);
+    mpe.process(midi, out);
+    int tuned = 0, pressed = 0;
+    bool onlyHeld = true;
+    for (const auto* e = out.begin(); e != out.end(); ++e) {
+      if (e->key != 60 && e->key != 64) onlyHeld = false;
+      if (e->expression == sonore::kExprTuning) ++tuned;
+      if (e->expression == sonore::kExprPressure) ++pressed;
+    }
+    check(tuned == 2 && pressed == 2 && onlyHeld,
+          "...and with the last key let go, the two still held still follow the wheel and pressure");
+
+    // A host stopping sends All Notes Off rather than a note-off per key.
+    midi.clear();
+    out.clear();
+    midi.addEvent(cc(0, 123, 0), 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 16383), 1);
+    mpe.process(midi, out);
+    check(out.getNumEvents() == 0, "...and after All Notes Off the wheel has no notes to bend");
   }
 }
 
@@ -7561,6 +11251,27 @@ static void testTurtle() {
           "…and resolves against the directory the file came from");
   }
 
+  // ── \u and \U are code points, written as UTF-8 ──────────────────────────
+  //
+  // A tool writing ASCII-only Turtle escapes every other character, and the
+  // escape names a code point. It was cast to one char: "Caf\u00e9" came out
+  // as the Latin-1 byte E9, a plugin name that is not UTF-8, and \U (eight
+  // digits) was not known, read as a U and its digits.
+  {
+    Document doc;
+    const std::string src =
+        "<urn:caf\\u00e9> <http://e/name> \"Caf\\u00e9 \\U0001F600 \\uD800\" .\n";
+    check(parse(src, "", &doc), "a document with \\u and \\U escapes parses");
+    check(doc.object("urn:caf\xC3\xA9", "http://e/name") ==
+              "Caf\xC3\xA9 \xF0\x9F\x98\x80 \xEF\xBF\xBD",
+          "...each escape its code point in UTF-8, in a literal and in a URI, and a lone "
+          "surrogate U+FFFD");
+    check(!parse("<urn:a> <http://e/name> \"\\uZZZZ\" .", "", &doc) &&
+              !parse("<urn:a> <http://e/name> \"\\U0001F6\" .", "", &doc) &&
+              !parse("<urn:a\\u12> <http://e/name> 1 .", "", &doc),
+          "...and an escape that is short or not hexadecimal is refused, not read as a NUL");
+  }
+
   // ── What must be REFUSED ──────────────────────────────────────────────────
   //
   // A parser that skips what it does not understand hands its caller a plugin
@@ -7585,6 +11296,30 @@ static void testTurtle() {
     check(parse("", "", &doc) && doc.triples.empty(), "an empty document parses to nothing");
     check(parse("# just a comment\n", "", &doc) && doc.triples.empty(),
           "…and so does one that is only a comment");
+  }
+
+  // ── Nesting is bounded ────────────────────────────────────────────────────
+  //
+  // Collections and blank nodes recurse, one C++ frame per level, and the
+  // parser runs inside a HOST scanning plugin bundles it did not write. A few
+  // kilobytes of "((((" in someone's plugin.ttl used to take the scanning
+  // process down with a stack overflow -- the plugin cache only blacklists a
+  // bundle after the crash. Real TTL nests three or four deep.
+  {
+    Document doc;
+    const std::string deep = "<http://e/a> <http://e/b> " + std::string(100000, '(') +
+                             std::string(100000, ')') + " .";
+    check(!parse(deep, "", &doc), "100000 nested collections are refused, not recursed into");
+    const std::string deepBlank =
+        "<http://e/a> " + std::string() + [] {
+          std::string s;
+          for (int i = 0; i < 50000; ++i) s += "<http://e/p> [ ";
+          return s;
+        }() + "<http://e/p> 1 " + std::string(50000, ']') + " .";
+    check(!parse(deepBlank, "", &doc), "…and so are 50000 nested blank nodes");
+    const std::string ten = "<http://e/a> <http://e/b> " + std::string(10, '(') + "1" +
+                            std::string(10, ')') + " .";
+    check(parse(ten, "", &doc), "…while ten levels, deeper than any real bundle, still parse");
   }
 }
 
@@ -7820,6 +11555,51 @@ static void testCompensatedDryWetMixer() {
     check(std::fabs(right[(size_t) kLatency + 1] - 1.0f) < 1e-6f,
           "...and so is channel 1's");
   }
+
+  // ...and its own mix glide. One glide served every channel and stepped on
+  // every call, so a stereo pair moved the mix twice per frame: twice as fast
+  // as the same mixer running one channel.
+  {
+    sonore::CompensatedDryWetMixer<2, 128> stereo;
+    sonore::CompensatedDryWetMixer<1, 128> mono;
+    stereo.setWetLatency(kLatency);
+    mono.setWetLatency(kLatency);
+    stereo.setMix(0.0f);
+    mono.setMix(0.0f);
+    for (int i = 0; i < 64; ++i) { // running, so the next setMix glides
+      stereo.process(0, 0.0f, 1.0f);
+      stereo.process(1, 0.0f, 1.0f);
+      mono.process(0, 0.0f, 1.0f);
+    }
+    stereo.setMix(1.0f);
+    mono.setMix(1.0f);
+    float left = 0.0f, right = 0.0f, alone = 0.0f;
+    for (int i = 0; i < 480; ++i) { // the wet gain, 10 ms into the glide
+      left = stereo.process(0, 0.0f, 1.0f);
+      right = stereo.process(1, 0.0f, 1.0f);
+      alone = mono.process(0, 0.0f, 1.0f);
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a stereo mixer's channels glide as fast as a mono one (10 ms into a 0 -> 1 "
+                  "move: %.4f and %.4f, mono %.4f)",
+                  left, right, alone);
+    check(left == alone && right == alone, line);
+
+    // And the glide is a TIME: 20 ms at the rate it is given.
+    sonore::CompensatedDryWetMixer<1, 128> fast;
+    fast.setSampleRate(96000.0f);
+    fast.setMix(0.0f);
+    fast.process(0, 0.0f, 1.0f);
+    fast.setMix(1.0f);
+    float wet = 0.0f;
+    for (int i = 0; i < 1920; ++i) wet = fast.process(0, 0.0f, 1.0f); // 20 ms at 96 kHz
+    std::snprintf(line, sizeof(line),
+                  "setSampleRate(96000): one 20 ms time constant takes the wet gain %.3f of the "
+                  "way (1 - 1/e = 0.632)",
+                  wet);
+    check(std::fabs(wet - 0.632f) < 0.01f, line);
+  }
 }
 
 static void testFilterSettlingTimes() {
@@ -7934,6 +11714,16 @@ static void testAsioFormats() {
     std::snprintf(msg, sizeof(msg), "%s clamps -4.0 rather than wrapping (got %.4f)", names[f],
                   (double) under);
     check(under < -0.9f && under >= -1.0001f, msg);
+
+    // A NaN is not a sample. It slipped through the clamp -- every comparison
+    // with it is false -- and an integer format cast it to the most negative
+    // value there is: a full-scale click from a DSP that went unstable for one
+    // sample. Silence is the only safe thing to send the hardware.
+    writeSample(buffer, 0, fmt, std::nanf(""));
+    const float fromNan = readSample(buffer, 0, fmt);
+    std::snprintf(msg, sizeof(msg), "%s writes a NaN as silence (got %.4f)", names[f],
+                  (double) fromNan);
+    check(fromNan == 0.0f, msg);
   }
 
   // The formats deliberately NOT converted. Refusing them by name is the
@@ -7977,7 +11767,203 @@ static void testAsioFormats() {
   // A null destination is a channel the driver did not give us, and must be
   // survivable: createBuffers can hand back fewer buffers than were asked for.
   check(readSample(buffer, 0, 999) == 0.0f, "an unknown format reads as silence, not garbage");
+
+  // A run is what the buffer switch converts: one side of interleaved stereo,
+  // every other float. writeSamples and readSamples over a run must give, at
+  // every frame, exactly the bytes and the floats a sample at a time gives --
+  // NaN, infinities, out-of-range and negative zero included -- and touch
+  // nothing past the run nor the other side's floats.
+  {
+    const float specials[] = {0.0f, -0.0f, 1.0f, -1.0f, 4.0f, -4.0f, 0.5f, -0.999f,
+                              1e-30f, -3.0e38f, std::nanf(""), INFINITY, -INFINITY};
+    constexpr size_t kFrames = 64;
+    float interleaved[kFrames * 2];
+    for (size_t i = 0; i < kFrames; ++i) {
+      interleaved[i * 2] = 99.0f; // the other side, which the run must not read as its own
+      interleaved[i * 2 + 1] = i < sizeof(specials) / sizeof(specials[0])
+                                   ? specials[i]
+                                   : std::sin((float) i * 0.37f) * 1.3f;
+    }
+    bool writesAgree = true, readsAgree = true;
+    for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+      const long fmt = formats[f];
+      uint8_t run[kFrames * 4 + 8], one[kFrames * 4 + 8];
+      std::memset(run, 0xA5, sizeof(run));
+      std::memset(one, 0xA5, sizeof(one));
+      writeSamples(run, fmt, interleaved + 1, 2, kFrames);
+      for (size_t i = 0; i < kFrames; ++i) writeSample(one, i, fmt, interleaved[i * 2 + 1]);
+      if (std::memcmp(run, one, sizeof(run)) != 0) writesAgree = false;
+
+      float back[kFrames * 2 + 2];
+      for (float& v : back) v = 7.0f;
+      readSamples(run, fmt, back + 1, 2, kFrames);
+      for (size_t i = 0; i < kFrames; ++i) {
+        const float single = readSample(run, i, fmt);
+        if (std::memcmp(&back[i * 2 + 1], &single, sizeof(float)) != 0) readsAgree = false;
+        if (back[i * 2] != 7.0f) readsAgree = false;
+      }
+      if (back[kFrames * 2] != 7.0f || back[kFrames * 2 + 1] != 7.0f) readsAgree = false;
+    }
+    check(writesAgree, "writeSamples over a strided run writes what writeSample writes, frame "
+                       "for frame, in every format, and nothing past the run");
+    check(readsAgree, "readSamples over a strided run reads what readSample reads, into its "
+                      "own side only, in every format");
+  }
+
+  // The host's answers to asioMessage, by the published selector numbers.
+  // The first version used its own numbering and answered "supported" to
+  // every query, which is how a buffer-size change got accepted and ignored.
+  {
+    bool reset = false;
+    check(hostMessageReply(kAsioSelectorSupported, kAsioResetRequest, &reset) == 1 &&
+              hostMessageReply(kAsioSelectorSupported, kAsioEngineVersion, &reset) == 1,
+          "asioMessage: the selectors we handle are reported as supported");
+    check(hostMessageReply(kAsioSelectorSupported, kAsioBufferSizeChange, &reset) == 0 &&
+              hostMessageReply(kAsioSelectorSupported, kAsioSupportsTimeInfo, &reset) == 0 &&
+              hostMessageReply(kAsioSelectorSupported, 999, &reset) == 0,
+          "...and the ones we do not, are not -- including selectors nobody has heard of");
+    check(hostMessageReply(kAsioEngineVersion, 0, &reset) == 2, "...the engine version is 2");
+    check(!reset, "...and none of those queries asks for a reset");
+    check(hostMessageReply(kAsioBufferSizeChange, 128, &reset) == 0 && !reset,
+          "...a live buffer-size change is REFUSED, so the driver falls back to a reset");
+    check(hostMessageReply(kAsioResetRequest, 0, &reset) == 1 && reset,
+          "...and a reset request is accepted and handed to the owner to carry out");
+  }
 }
+
+#if defined(_WIN32)
+namespace sonore {
+namespace asio {
+/** A driver with nothing behind it: buffers of its own, every call succeeds. */
+struct FakeAsio : IAsio {
+  float buffers[2][2][64] = {};
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override {
+    *out = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  AsioBool init(void*) override { return 1; }
+  void getDriverName(char* name) override { std::strcpy(name, "fake"); }
+  long getDriverVersion() override { return 1; }
+  void getErrorMessage(char* text) override { text[0] = 0; }
+  AsioError start() override { return kAsioOk; }
+  AsioError stop() override { return kAsioOk; }
+  AsioError getChannels(long* in, long* out) override {
+    *in = 0;
+    *out = 2;
+    return kAsioOk;
+  }
+  AsioError getLatencies(long* in, long* out) override {
+    *in = *out = 64;
+    return kAsioOk;
+  }
+  AsioError getBufferSize(long* lo, long* hi, long* preferred, long* granularity) override {
+    *lo = *hi = *preferred = 64;
+    *granularity = 0;
+    return kAsioOk;
+  }
+  AsioError canSampleRate(AsioSampleRate) override { return kAsioOk; }
+  AsioError getSampleRate(AsioSampleRate* rate) override {
+    *rate = 48000.0;
+    return kAsioOk;
+  }
+  AsioError setSampleRate(AsioSampleRate) override { return kAsioOk; }
+  AsioError getClockSources(AsioClockSource*, long* n) override {
+    *n = 0;
+    return kAsioOk;
+  }
+  AsioError setClockSource(long) override { return kAsioOk; }
+  AsioError getSamplePosition(AsioSamples*, AsioTimeStamp*) override { return kAsioOk; }
+  AsioError getChannelInfo(AsioChannelInfo* info) override {
+    info->type = kAsioFloat32Lsb;
+    return kAsioOk;
+  }
+  AsioError createBuffers(AsioBufferInfo* infos, long n, long, AsioCallbacks*) override {
+    for (long i = 0; i < n && i < 2; ++i) {
+      infos[i].buffers[0] = buffers[i][0];
+      infos[i].buffers[1] = buffers[i][1];
+    }
+    return kAsioOk;
+  }
+  AsioError disposeBuffers() override { return kAsioOk; }
+  AsioError controlPanel() override { return kAsioOk; }
+  AsioError future(long, void*) override { return kAsioOk; }
+  AsioError outputReady() override { return kAsioOk; }
+};
+
+/** Puts a fake driver where open() would have put a real one, opened and
+ *  running (no ASIO driver need be installed), and plays the driver's side
+ *  of the callback. */
+struct AsioOutputTest {
+  static void attach(AsioOutput& out, FakeAsio& driver, AsioOutput::RenderFn render) {
+    out.driver_ = &driver;
+    out.render_ = std::move(render);
+    out.bufferFrames_ = 64;
+    out.format_ = out.inputFormat_ = kAsioFloat32Lsb;
+    out.inputChannels_ = 0;
+    out.haveInput_ = false;
+    out.scratch_.assign(128, 0.0f);
+    out.inputScratch_.assign(128, 0.0f);
+    for (int i = 0; i < 2; ++i) {
+      out.buffers_[i].isInput = 0;
+      out.buffers_[i].channelNum = i;
+    }
+    driver.createBuffers(out.buffers_, 2, 64, &out.callbacks_);
+    out.buffersMade_ = true;
+    out.running_ = true;
+    AsioOutput::instance_ = &out;
+  }
+  static void bufferSwitch(long index) { AsioOutput::onBufferSwitch(index, 1); }
+};
+} // namespace asio
+} // namespace sonore
+
+// ---------------------------------------------------------------------------
+// ASIO, one object playing and another coming and going
+//
+// The callbacks carry no user data, so they reach the one object registered
+// for them. stop() cleared that registration whoever held it, so a second
+// AsioOutput -- one whose open() was refused, or one merely destroyed --
+// cut off the one playing: its callback returned without writing and the
+// driver repeated its last two blocks. A fake driver stands in, so this runs
+// with no interface installed.
+// ---------------------------------------------------------------------------
+static void testAsioSecondOutput() {
+  using namespace sonore::asio;
+  std::printf("\n[asio, a second output]\n");
+  FakeAsio driver;
+  AsioOutput playing;
+  auto quarter = [](const float*, float* out, uint32_t frames, uint32_t channels) {
+    for (uint32_t i = 0; i < frames * channels; ++i) out[i] = 0.25f;
+  };
+  AsioOutputTest::attach(playing, driver, quarter);
+  // One callback into a buffer half that still holds older samples (0.9):
+  // rendered, both channels hold the DSP's 0.25 from first to last frame.
+  auto renders = [&](long half) {
+    for (int c = 0; c < 2; ++c)
+      for (int i = 0; i < 64; ++i) driver.buffers[c][half][i] = 0.9f;
+    AsioOutputTest::bufferSwitch(half);
+    return driver.buffers[0][half][0] == 0.25f && driver.buffers[1][half][63] == 0.25f;
+  };
+  check(renders(0), "the playing output renders into the driver's buffer");
+  {
+    AsioOutput other;
+    const bool opened = other.open("No such driver", [](const float*, float*, uint32_t, uint32_t) {});
+    char line[300];
+    std::snprintf(line, sizeof(line), "a second output's open() is refused (%s)", other.error().c_str());
+    check(!opened && other.error().find("another AsioOutput") != std::string::npos, line);
+    check(renders(1), "...and the playing one still renders, rather than repeating its last blocks");
+  }
+  { AsioOutput never; }
+  check(renders(0), "an output that was never opened, destroyed, leaves the playing one rendering");
+  playing.stop();
+  AsioOutput next;
+  next.open("No such driver", [](const float*, float*, uint32_t, uint32_t) {});
+  check(next.error().find("No such driver") != std::string::npos,
+        "once the playing one stops, another may open (here, refused only for want of the driver)");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // The device-picker bridge
@@ -7990,6 +11976,34 @@ static void testAsioFormats() {
 // here rather than through a webview: parseBridgeMessage is pure, and a test
 // that needed a window would not run on the Linux leg at all.
 // ---------------------------------------------------------------------------
+// ── Where a webview editor may go ────────────────────────────────────────────
+//
+// Every backend asks webviewMayNavigate before its page or a frame in it goes
+// anywhere. A page that followed a link to a remote site handed that site
+// window.sonore, and its sonore.set() moved the plugin's parameters.
+static void testWebviewNavigation() {
+  std::printf("\n[webview navigation]\n");
+  using sonore::webviewMayNavigate;
+  check(webviewMayNavigate("about:blank") && webviewMayNavigate("about:srcdoc") &&
+            webviewMayNavigate("ABOUT:blank") &&
+            webviewMayNavigate("data:text/html;charset=utf-8;base64,PGh0bWw+") &&
+            webviewMayNavigate("blob:null/7d3e5c1a-0000-4000-8000-000000000000"),
+        "a webview may show its own document, a srcdoc frame, data: and blob:");
+  check(!webviewMayNavigate("http://127.0.0.1:8765/remote.html") &&
+            !webviewMayNavigate("https://example.com/") &&
+            !webviewMayNavigate("HTTPS://example.com/") &&
+            !webviewMayNavigate("file:///C:/Users/me/preset.fxp") &&
+            !webviewMayNavigate("javascript:alert(1)") && !webviewMayNavigate("") &&
+            !webviewMayNavigate("about") && !webviewMayNavigate("aboutx:blank") &&
+            !webviewMayNavigate("ws://127.0.0.1/"),
+        "and nothing else: no remote site, no file, no script URL");
+  sonore::PluginDescriptor desc;
+  desc.name = "Frame Probe";
+  const std::string js = sonore::bridgeScript(desc);
+  check(js.find("if(window.top!==window)return;") < 40,
+        "the bridge sets itself up in the page's own document, not in its frames");
+}
+
 static void testDeviceBridge() {
   using sonore::BridgeMessage;
   using sonore::parseBridgeMessage;
@@ -8045,8 +12059,50 @@ static void testDeviceBridge() {
   desc.name = "Bridge Probe";
   const std::string js = sonore::bridgeScript(desc);
   check(js.find("selectAudioDevice") != std::string::npos, "the shim offers selectAudioDevice");
+
+  // A right-click on a control the bridge cannot name asks for no menu,
+  // rather than the first parameter's.
+  check(js.find("type:'menu',index:p?p.__i:-1,") != std::string::npos,
+        "a context menu for an unknown control is no menu, not parameter 0's");
+  const sonore::BridgeMessage unnamed =
+      sonore::parseBridgeMessage("{\"type\":\"menu\",\"index\":-1,\"x\":3,\"y\":4}");
+  check(unnamed.kind == sonore::BridgeMessage::Kind::ContextMenu && unnamed.index == -1,
+        "...and it reaches the wrapper as -1, which shows nothing");
   check(js.find("onAudioDevices") != std::string::npos, "the shim offers onAudioDevices");
+  // sonore.on hands (values, index, value). The fallback page read it as
+  // (index, value) and its sliders never followed the host.
+  const std::string fallback = sonore::fallbackHtml(desc);
+  check(fallback.find("sonore.on(function(_,j,v){if(j===i)") != std::string::npos &&
+            js.find("changeCbs[i](v,p?p.__i:-1,p?p.value:0)") != std::string::npos,
+        "the fallback page reads sonore.on's callback in the order the bridge calls it");
   check(js.find("api.__devices") != std::string::npos, "the host can push a device list in");
+  // A read-only parameter is marked, and the page does not write it. The
+  // bridges drop such a write (uiMayWrite), and with nothing on the page
+  // saying so a slider dragged over a meter showed the dragged value until
+  // the plugin next changed it.
+  {
+    static sonore::ParamInfo meter[2];
+    meter[0].id = "drive";
+    meter[0].label = "Drive";
+    meter[1].id = "gr";
+    meter[1].label = "Gain reduction";
+    meter[1].readOnly = true;
+    sonore::PluginDescriptor metered;
+    metered.name = "Meter Probe";
+    metered.params = meter;
+    metered.numParams = 2;
+    const std::string mjs = sonore::bridgeScript(metered);
+    const size_t drive = mjs.find("id:'drive'"), gr = mjs.find("id:'gr'");
+    check(drive != std::string::npos && gr != std::string::npos &&
+              mjs.find("readOnly:false", drive) < gr && mjs.find("readOnly:true", gr) != std::string::npos,
+          "sonore.params says which parameter is read-only");
+    check(mjs.find("set:function(r,v){var p=P(r);if(!p||p.readOnly)return;") != std::string::npos &&
+              mjs.find("begin:function(r){var p=P(r);if(p&&!p.readOnly)") != std::string::npos &&
+              mjs.find("end:function(r){var p=P(r);if(p&&!p.readOnly)") != std::string::npos,
+          "and set, begin and end leave one alone");
+    check(sonore::fallbackHtml(metered).find("s.disabled=!!p.readOnly;") != std::string::npos,
+          "the fallback page shows its slider disabled");
+  }
   check(js.find("type:'devices'") != std::string::npos,
         "the shim asks for the list itself rather than waiting to be told");
   // The default is an EMPTY list, not a missing property: a plugin page reading
@@ -8501,6 +12557,26 @@ static void testMidiClassification() {
   // something it then rejects.
   check((0xF8 & 0xF0) == 0xF0 && deliverableToDsp(0xF8) && !deliverableToDsp(0xF0),
         "masking to the high nibble first is exactly the bug: 0xF8 becomes 0xF0");
+
+  // How many bytes go on the wire. The ALSA and CoreMIDI outputs sent three
+  // for everything but program change and channel pressure -- so a clock
+  // byte, 0xF8, went out as F8 00 00, and a receiver using running status
+  // read the two zeros as one more event.
+  check(shortMessageLength(0x90) == 3 && shortMessageLength(0x8F) == 3 &&
+            shortMessageLength(0xB0) == 3 && shortMessageLength(0xE5) == 3,
+        "note, controller and pitch bend messages are three bytes");
+  check(shortMessageLength(0xC3) == 2 && shortMessageLength(0xD0) == 2,
+        "program change and channel pressure are two");
+  check(shortMessageLength(0xF8) == 1 && shortMessageLength(0xFA) == 1 &&
+            shortMessageLength(0xFC) == 1 && shortMessageLength(0xFE) == 1 &&
+            shortMessageLength(0xFF) == 1,
+        "every realtime byte is ONE byte: clock, start, stop, active sensing, reset");
+  check(shortMessageLength(0xF1) == 2 && shortMessageLength(0xF2) == 3 &&
+            shortMessageLength(0xF3) == 2 && shortMessageLength(0xF6) == 1,
+        "system common: quarter frame 2, song position 3, song select 2, tune request 1");
+  check(shortMessageLength(0xF0) == 0 && shortMessageLength(0xF7) == 0 &&
+            shortMessageLength(0x40) == 0 && shortMessageLength(0xF4) == 0,
+        "SysEx, a data byte and an undefined status are not short messages at all");
 }
 
 static void testMidiClock() {
@@ -8605,6 +12681,142 @@ static void testMidiClock() {
   std::snprintf(msg, sizeof(msg), "an absurd interval is refused (%.1f, was %.1f)",
                 glitchy.bpm(), steady);
   check(std::fabs(glitchy.bpm() - steady) < 0.01, msg);
+
+  // The glitches that matter are the ordinary ones, which the 20..400 BPM
+  // window cannot see: at 120 a dropped byte reads 60 and a duplicate
+  // halfway through an interval reads 240, both inside it. Each moved the
+  // estimate by several BPM, and the position with it.
+  auto clockAt = [&](sonore::MidiClock& c, double frames) {
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xF8, 0, 0), 0);
+    c.process(block, (uint32_t) frames);
+  };
+  auto settled120 = [&](sonore::MidiClock& c) {
+    c.prepare(48000.0);
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xFA, 0, 0), 0);
+    c.process(block, 1);
+    for (int i = 0; i < 100; ++i) clockAt(c, framesPerClock);
+  };
+  {
+    sonore::MidiClock dropped;
+    settled120(dropped);
+    double worst = 0.0;
+    clockAt(dropped, 2.0 * framesPerClock); // one byte lost
+    for (int i = 0; i < 48; ++i) {
+      worst = std::max(worst, std::fabs(dropped.bpm() - 120.0));
+      clockAt(dropped, framesPerClock);
+    }
+    std::snprintf(msg, sizeof(msg), "a dropped clock byte does not move the tempo (worst %.2f BPM off)", worst);
+    check(worst < 0.5, msg);
+
+    sonore::MidiClock doubled;
+    settled120(doubled);
+    worst = 0.0;
+    clockAt(doubled, 0.5 * framesPerClock); // a byte sent twice, half an interval apart
+    clockAt(doubled, 0.5 * framesPerClock);
+    for (int i = 0; i < 48; ++i) {
+      worst = std::max(worst, std::fabs(doubled.bpm() - 120.0));
+      clockAt(doubled, framesPerClock);
+    }
+    std::snprintf(msg, sizeof(msg), "a duplicated clock byte does not move the tempo (worst %.2f BPM off)", worst);
+    check(worst < 0.5, msg);
+
+    // But a real change of that size repeats, and is followed at once.
+    sonore::MidiClock halved;
+    settled120(halved);
+    const double slowFrames = 60.0 * 48000.0 / (80.0 * 24.0);
+    for (int i = 0; i < 8; ++i) clockAt(halved, slowFrames);
+    std::snprintf(msg, sizeof(msg), "a real jump from 120 to 80 BPM is followed within 8 clocks (reads %.2f)", halved.bpm());
+    check(std::fabs(halved.bpm() - 80.0) < 0.5, msg);
+
+    // The position is the clocks counted, whatever the tempo did between
+    // them. It was the tempo estimate integrated over time, so the four
+    // clocks the jump was held back as a possible glitch ran at 120 while
+    // the music ran at 80: two clocks ahead for good, and each change after
+    // added its own. 100 clocks at 120 and 96 at 80, each followed by its
+    // full interval, is 196 clocks: 8.1667 quarters.
+    sonore::MidiClock moved;
+    settled120(moved);
+    for (int i = 0; i < 96; ++i) clockAt(moved, slowFrames);
+    std::snprintf(msg, sizeof(msg),
+                  "after 120 then 80 BPM the position is the clocks counted (%.4f, expected %.4f)",
+                  moved.ppqPosition(), 196.0 / 24.0);
+    check(std::fabs(moved.ppqPosition() - 196.0 / 24.0) < 0.005, msg);
+    const double fastFrames = 60.0 * 48000.0 / (150.0 * 24.0);
+    for (int i = 0; i < 96; ++i) clockAt(moved, fastFrames);
+    std::snprintf(msg, sizeof(msg), "...and after 150 BPM too (%.4f, expected %.4f)",
+                  moved.ppqPosition(), 292.0 / 24.0);
+    check(std::fabs(moved.ppqPosition() - 292.0 / 24.0) < 0.005, msg);
+
+    // Play from bar 3: a sequencer sends Stop, a Song Position Pointer and
+    // Continue. The pointer is in sixteenths -- 32 is 8 quarters -- and the
+    // next clock plays there. The position went on from where Stop left it.
+    sonore::MidiClock located;
+    settled120(located);
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xFC, 0, 0), 0);
+    located.process(block, 64);
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xF2, 32, 0), 0);
+    located.process(block, 64);
+    std::snprintf(msg, sizeof(msg), "a Song Position Pointer of 32 sixteenths is 8 quarters (%.4f)",
+                  located.ppqPosition());
+    check(located.ppqPosition() == 8.0, msg);
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xFB, 0, 0), 0);
+    located.process(block, 64);
+    for (int i = 0; i < 24; ++i) clockAt(located, framesPerClock);
+    std::snprintf(msg, sizeof(msg), "...and Continue plays on from there (%.4f after a beat, expected 9)",
+                  located.ppqPosition());
+    check(std::fabs(located.ppqPosition() - 9.0) < 0.005, msg);
+    // 14 bits, low byte first: 0x7F 0x7F is the last sixteenth there is.
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xF2, 0x7F, 0x7F), 0);
+    located.process(block, 64);
+    check(located.ppqPosition() == 16383.0 / 4.0, "the pointer's 14 bits are read low byte first");
+
+    // A host preparing the plugin again -- here at a new rate -- has not
+    // stopped the sequencer. prepare() reset everything, and a playing
+    // sequencer read as stopped at position 0 from then on.
+    sonore::MidiClock reprepared;
+    settled120(reprepared);
+    reprepared.prepare(96000.0);
+    for (int i = 0; i < 24; ++i) clockAt(reprepared, 2.0 * framesPerClock); // 120 BPM at 96 kHz
+    std::snprintf(msg, sizeof(msg),
+                  "prepared again at 96 kHz mid-song it still plays (running %d, %.2f BPM, at %.4f of %.4f)",
+                  (int) reprepared.isRunning(), reprepared.bpm(), reprepared.ppqPosition(),
+                  124.0 / 24.0);
+    check(reprepared.isRunning() && std::fabs(reprepared.bpm() - 120.0) < 0.5 &&
+              std::fabs(reprepared.ppqPosition() - 124.0 / 24.0) < 0.005,
+          msg);
+    reprepared.reset();
+    check(!reprepared.isRunning() && !reprepared.hasTempo() && reprepared.ppqPosition() == 0.0,
+          "...and reset() is what forgets it");
+  }
+  {
+    // The first interval is between two CLOCKS. Measured from prepare() or
+    // from Start, it was whatever time had passed since -- here 15 ms into a
+    // 120 BPM stream, 167 BPM, taken whole as the tempo.
+    sonore::MidiClock late;
+    late.prepare(48000.0);
+    block.clear();
+    late.process(block, 720); // 15 ms of nothing
+    clockAt(late, framesPerClock);
+    clockAt(late, framesPerClock);
+    std::snprintf(msg, sizeof(msg), "the first tempo comes from two clocks, not from prepare() (reads %.2f)", late.bpm());
+    check(late.hasTempo() && std::fabs(late.bpm() - 120.0) < 0.5, msg);
+
+    sonore::MidiClock started;
+    started.prepare(48000.0);
+    block.clear();
+    block.addEvent(sonore::MidiMessage(0xFA, 0, 0), 0);
+    started.process(block, 720); // the first clock 15 ms after Start
+    clockAt(started, framesPerClock);
+    clockAt(started, framesPerClock);
+    std::snprintf(msg, sizeof(msg), "...nor from Start (reads %.2f)", started.bpm());
+    check(started.hasTempo() && std::fabs(started.bpm() - 120.0) < 0.5, msg);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -8858,6 +13070,28 @@ static void testLoadMeasurer() {
   check(afterOneSpike > settled + 0.3f, msg);
   meter.record(budget * 0.1, frames);
   check(meter.load() > afterOneSpike * 0.8f, "and it does not vanish on the very next block");
+
+  // The SAME load reads the same at every block size. The smoothing was a
+  // fixed amount per call, so its time constants scaled with the block: after
+  // a heavy second, half a second of light load read about four times lower
+  // at 32 frames than at 512.
+  {
+    auto afterFall = [](uint32_t blockFrames) {
+      sonore::LoadMeasurer m;
+      m.reset(48000.0);
+      const double block = (double) blockFrames / 48000.0;
+      const int perSecond = (int) (48000 / blockFrames);
+      for (int i = 0; i < perSecond; ++i) m.record(block * 0.8, blockFrames);     // a heavy second
+      for (int i = 0; i < perSecond / 2; ++i) m.record(block * 0.2, blockFrames); // half a light one
+      return m.load();
+    };
+    const float at32 = afterFall(32), at512 = afterFall(512);
+    std::snprintf(msg, sizeof(msg),
+                  "half a second after a heavy second the meter reads the same at 32 and 512 "
+                  "frames (%.3f, %.3f)",
+                  (double) at32, (double) at512);
+    check(std::fabs(at32 - at512) < 0.03f, msg);
+  }
 
   // The rate matters: the same wall-clock time is a different load at a
   // different block size, and a measurer that ignored that would report a
@@ -9184,6 +13418,21 @@ static void testUmp() {
   std::snprintf(msg, sizeof(msg), "velocity 0xC800 of 16 bits becomes %d of 7",
                 back.getVelocity());
   check(back.getVelocity() == 100, msg);
+  // The SOFTEST MIDI 2.0 note-on: velocity 300 of 65535 shifts to 0, and a
+  // MIDI 1.0 note-on at 0 is a note-OFF. It must stay a note-on, at 1.
+  m2[1] = 300u << 16;
+  check(toMidi1Narrowing(m2, 2, &back) && back.isNoteOn() && back.getVelocity() == 1,
+        "a MIDI 2.0 note-on too soft for 7 bits stays a note-on, at velocity 1");
+  // And the two voice messages MIDI 1.0 does have, which were refused.
+  m2[0] = (0x4u << 28) | (0xAu << 20) | (3u << 16) | (64u << 8);
+  m2[1] = 0xFE000000u;
+  check(toMidi1Narrowing(m2, 2, &back) && back.getRawStatus() == 0xA3 &&
+            back.getRawData1() == 64 && back.getRawData2() == 127,
+        "MIDI 2.0 poly pressure narrows to MIDI 1.0 poly pressure");
+  m2[0] = (0x4u << 28) | (0xCu << 20) | (1u << 16);
+  m2[1] = 42u << 24;
+  check(toMidi1Narrowing(m2, 2, &back) && back.getRawStatus() == 0xC1 && back.getRawData1() == 42,
+        "...and a program change to a program change");
 
   // Pitch bend: 32 bits down to 14, centre staying centre. A centre that
   // drifted would detune every held note the moment a controller sent its
@@ -9339,6 +13588,21 @@ static void testGfxGeometry() {
   std::snprintf(msg, sizeof(msg), "10.3..15.4 encloses pixels %d..%d", px.x, px.right());
   check(px.x == 10 && px.right() == 16, msg);
   check(px.y == 20 && px.bottom() == 26, "and 20.7..25.8 encloses 20..26");
+
+  // What paint code computes when it goes wrong. A float past INT_MAX
+  // converted to int is undefined behaviour, so the edges are clamped first --
+  // far past any canvas -- and a NaN edge encloses no pixels at all.
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const PixelRect huge = PixelRect::enclosing(Rect(-1e30f, -1e30f, 2e30f, 2e30f));
+  check(huge.x < -100000 && huge.y < -100000 && huge.right() > 100000 && huge.bottom() > 100000,
+        "a rectangle 1e30 across encloses all of any canvas");
+  check(PixelRect::enclosing(Rect(5.0f, 5.0f, inf, 10.0f)).w > 100000,
+        "and one infinitely wide reaches past its right edge");
+  check(PixelRect::enclosing(Rect(nan, 0.0f, 10.0f, 10.0f)).isEmpty(), "a NaN edge encloses nothing");
+  check(PixelRect::enclosing(Rect(0.0f, 0.0f, nan, 10.0f)).isEmpty(), "nor does a NaN width");
+  check(PixelRect::enclosing(Rect(-inf, 0.0f, inf, 10.0f)).isEmpty(),
+        "nor a rectangle from -inf whose right edge is therefore NaN");
 }
 
 static void testGfxTransform() {
@@ -9411,6 +13675,19 @@ static void testGfxColour() {
   check(std::abs((int) back.r - 200) <= 2 && std::abs((int) back.g - 100) <= 2,
         "and recovers to within rounding");
 
+  // A fade, a mix or a shade computed from 0/0 is a NaN, and a NaN failed
+  // both of the clamps' tests and was converted to uint8_t -- undefined. It
+  // counts as zero now.
+  {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const Colour base(10, 20, 30, 200);
+    check(base.withMultipliedAlpha(nan).a == 0, "a NaN fade fades to nothing");
+    check(base.withMultipliedAlpha(0.5f).a == 100 && base.withMultipliedAlpha(7.0f).a == 200,
+          "and ordinary ones are what they were");
+    check(base.interpolatedTo(Colour(250, 250, 250, 255), nan) == base, "a NaN mix stays where it starts");
+    check(base.brightened(nan) == base && base.darkened(nan) == base, "and a NaN shade changes nothing");
+  }
+
   // Zero alpha has NO defined colour. Straight-alpha compositing has to
   // divide to recover one, and there is nothing to recover -- which is the
   // whole reason the rasteriser works premultiplied.
@@ -9452,6 +13729,76 @@ static void testGfxColour() {
   check(Colour(100, 100, 100).brightened(0.2f).r > 100, "brightening brightens");
   check(Colour(10, 10, 10).brightened(-0.5f).r == 0, "and darkening clamps at black");
   check(Colour(250, 250, 250).brightened(0.5f).r == 255, "brightening clamps at white");
+}
+
+// The rasteriser blends runs of pixels under one colour, and edge pixels in
+// place, with `over` written out rather than called (bitmap.h says why). A
+// copy of the compositing arithmetic is a copy that can drift, so it is held
+// to `over` here: every alpha, every source channel up to it, every
+// destination byte, at full coverage and at three partial ones.
+static void testGfxBlendRuns() {
+  using namespace sonore::gfx;
+  std::printf("\n[gfx blend runs]\n");
+  long wrongRun = 0, wrongPixel = 0;
+  const uint8_t coverages[3] = {1, 128, 254};
+  // 259 pixels: every destination byte, and a run that is not a whole
+  // number of the four pixels the SSE2 path blends at once.
+  const int n = 259;
+  std::vector<uint8_t> dst((size_t) n * 4u), row((size_t) n * 4u);
+  for (int d = 0; d < n; ++d) {
+    // Not a valid premultiplied colour in general, deliberately: whatever is
+    // in the bitmap, the run and `over` must agree on it.
+    dst[(size_t) d * 4u + 0u] = (uint8_t) d;
+    dst[(size_t) d * 4u + 1u] = (uint8_t) (255 - d);
+    dst[(size_t) d * 4u + 2u] = (uint8_t) (d * 7);
+    dst[(size_t) d * 4u + 3u] = (uint8_t) d;
+  }
+  for (int a = 0; a < 256; ++a)
+    for (int v = 0; v <= a; ++v) {
+      const PremulColour src((uint8_t) v, (uint8_t) (a - v), (uint8_t) (v / 2), (uint8_t) a);
+      row = dst;
+      detail::blendRun(row.data(), n, src);
+      for (int d = 0; d < n; ++d) {
+        const uint8_t* was = &dst[(size_t) d * 4u];
+        const uint8_t* got = &row[(size_t) d * 4u];
+        const PremulColour want = over(src, PremulColour(was[0], was[1], was[2], was[3]));
+        if (got[0] != want.r || got[1] != want.g || got[2] != want.b || got[3] != want.a) ++wrongRun;
+        for (uint8_t cov : coverages) {
+          uint8_t px[4] = {was[0], was[1], was[2], was[3]};
+          detail::blendPixel(px, src, cov);
+          const PremulColour w = over(src, PremulColour(was[0], was[1], was[2], was[3]), cov);
+          if (px[0] != w.r || px[1] != w.g || px[2] != w.b || px[3] != w.a) ++wrongPixel;
+        }
+      }
+    }
+  char msg[160];
+  std::snprintf(msg, sizeof(msg), "a run blended at full coverage is `over`, pixel for pixel (%ld differ)", wrongRun);
+  check(wrongRun == 0, msg);
+  std::snprintf(msg, sizeof(msg), "and a pixel blended in place at partial coverage (%ld differ)", wrongPixel);
+  check(wrongPixel == 0, msg);
+
+  // A row at a coverage per pixel -- a glyph's, a shape's edge -- with runs
+  // of full coverage among the partial ones and the empty ones.
+  long wrongRow = 0;
+  std::vector<uint8_t> cover((size_t) n);
+  for (int d = 0; d < n; ++d) {
+    const int k = d % 23;
+    cover[(size_t) d] = k < 4 ? (uint8_t) 0 : k < 13 ? (uint8_t) 255 : (uint8_t) (d * 37);
+  }
+  for (int a = 0; a < 256; a += 5)
+    for (int v = 0; v <= a; v += 3) {
+      const PremulColour src((uint8_t) v, (uint8_t) (a - v), (uint8_t) (v / 2), (uint8_t) a);
+      row = dst;
+      detail::blendCoverage(row.data(), cover.data(), n, src);
+      for (int d = 0; d < n; ++d) {
+        const uint8_t* was = &dst[(size_t) d * 4u];
+        const uint8_t* got = &row[(size_t) d * 4u];
+        const PremulColour want = over(src, PremulColour(was[0], was[1], was[2], was[3]), cover[(size_t) d]);
+        if (got[0] != want.r || got[1] != want.g || got[2] != want.b || got[3] != want.a) ++wrongRow;
+      }
+    }
+  std::snprintf(msg, sizeof(msg), "and a row at a coverage per pixel, runs and edges (%ld differ)", wrongRow);
+  check(wrongRow == 0, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -9656,6 +14003,47 @@ static void testGfxRaster() {
   bmp.clear(Colour(0, 0, 0, 255));
   r.fill(bmp, line, Transform(), white);
   check(bmp.pixelAt(10, 1).r == 0, "a contour with no area fills nothing");
+
+  // ── Shapes bigger than the canvas ──
+  //
+  // An edge wholly left or right of the region is counted per sub-row, not
+  // walked: from the left it adds its winding, or for EvenOdd its parity, and
+  // from the right it only ends the last span. All four edges of a square
+  // around the canvas are outside it.
+  {
+    auto lit = [&](int x0, int x1) {
+      int n = 0;
+      for (int y = 0; y < 32; ++y)
+        for (int x = x0; x < x1; ++x)
+          if (bmp.pixelAt(x, y).r == 255) ++n;
+      return n;
+    };
+    Path nested;
+    nested.addRect(Rect(-1000.0f, -1000.0f, 3000.0f, 3000.0f));
+    nested.addRect(Rect(-500.0f, -500.0f, 2000.0f, 2000.0f));
+    bmp.clear(Colour(0, 0, 0, 255));
+    r.fill(bmp, nested, Transform(), white, FillRule::NonZero);
+    std::snprintf(msg, sizeof(msg), "two squares around the canvas fill all of it under NonZero (%d of 1024)", lit(0, 32));
+    check(lit(0, 32) == 1024, msg);
+    bmp.clear(Colour(0, 0, 0, 255));
+    r.fill(bmp, nested, Transform(), white, FillRule::EvenOdd);
+    std::snprintf(msg, sizeof(msg), "and none of it under EvenOdd, inside both (%d lit)", lit(0, 32));
+    check(lit(0, 32) == 0, msg);
+    // A left edge outside, a right edge inside: half the canvas.
+    Path half;
+    half.addRect(Rect(-1000.0f, -50.0f, 1016.0f, 200.0f));
+    bmp.clear(Colour(0, 0, 0, 255));
+    r.fill(bmp, half, Transform(), white);
+    std::snprintf(msg, sizeof(msg), "a rectangle from x = -1000 to 16 fills the left half (%d and %d lit)",
+                  lit(0, 16), lit(16, 32));
+    check(lit(0, 16) == 512 && lit(16, 32) == 0, msg);
+    // And the mirror image, ended by an edge on the right.
+    Path otherHalf;
+    otherHalf.addRect(Rect(16.0f, -50.0f, 1000.0f, 200.0f));
+    bmp.clear(Colour(0, 0, 0, 255));
+    r.fill(bmp, otherHalf, Transform(), white);
+    check(lit(0, 16) == 0 && lit(16, 32) == 512, "and one from 16 to 1016 the right half");
+  }
 }
 
 static void testGfxPath() {
@@ -9703,6 +14091,43 @@ static void testGfxPath() {
   std::snprintf(msg, sizeof(msg), "a circle flattens to %zu points at 1x and %zu at 8x",
                 at1[0].points.size(), at8[0].points.size());
   check(at8[0].points.size() > at1[0].points.size(), msg);
+
+  // And follows the direction the transform stretches MOST. The square root
+  // of the determinant averages an uneven scale or a skew with its short
+  // side, and the curve strayed 0.48 px (1:16) and 0.53 px (a skew of 8)
+  // from where it should be, against the 0.2 asked for.
+  {
+    auto worstStray = [](const Transform& t, float radius) {
+      Path round;
+      round.addEllipse(Rect(-radius, -radius, 2.0f * radius, 2.0f * radius));
+      std::vector<Contour> flat;
+      round.flatten(t, flat);
+      double worst = 0.0;
+      for (const Contour& c : flat)
+        for (int i = 0; i < 2048; ++i) {
+          const double th = 2.0 * kTestPi * i / 2048.0;
+          const double ux = radius * std::cos(th), uy = radius * std::sin(th);
+          const double x = t.a * ux + t.c * uy + t.e, y = t.b * ux + t.d * uy + t.f;
+          double nearest = 1e30;
+          for (size_t k = 0; k < c.points.size(); ++k) {
+            const Point a = c.points[k], e = c.points[(k + 1) % c.points.size()];
+            const double dx = e.x - a.x, dy = e.y - a.y, l2 = dx * dx + dy * dy;
+            double u = l2 > 0.0 ? ((x - a.x) * dx + (y - a.y) * dy) / l2 : 0.0;
+            u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+            const double qx = a.x + u * dx - x, qy = a.y + u * dy - y;
+            nearest = std::min(nearest, std::sqrt(qx * qx + qy * qy));
+          }
+          worst = std::max(worst, nearest);
+        }
+      return worst;
+    };
+    const double tall = worstStray(Transform::scaling(1.0f, 16.0f), 30.0f);
+    const double skewed = worstStray(Transform(1.0f, 0.0f, 8.0f, 1.0f, 0.0f, 0.0f), 20.0f);
+    const double even = worstStray(Transform::scaling(8.0f, 8.0f), 8.0f);
+    std::snprintf(msg, sizeof(msg), "a circle strays %.3f px from its curve under 1:16, %.3f under a skew of 8, "
+                  "%.3f under 8x", tall, skewed, even);
+    check(tall < 0.25 && skewed < 0.25 && even < 0.25, msg);
+  }
 
   // Every contour comes back closed: an unclosed one has no inside, and a
   // caller filling it means the shape they drew.
@@ -9809,6 +14234,146 @@ static void testGfxStroke() {
   // decided at centres.
   check(bmp.pixelAt(6, 16).r < 128, "and is round rather than square at the corner");
 
+  // ...and is SOLID where it overlaps the line. The pieces of a stroke are
+  // unioned under the non-zero rule, which only works if they all wind the
+  // same way: the segment quads wound against the cap and join circles, so
+  // where they overlapped the windings cancelled and the stroke had holes --
+  // 44 pixels of this line, the middle of every knob pointer and tick.
+  {
+    // Every pixel whose centre is within 3 px of the spine, caps included.
+    int holes = 0;
+    for (int y = 0; y < 40; ++y)
+      for (int x = 0; x < 40; ++x) {
+        const float cx = x + 0.5f, cy = y + 0.5f;
+        const float along = cx < 10.0f ? 10.0f : (cx > 30.0f ? 30.0f : cx);
+        if (std::hypot(cx - along, cy - 20.0f) <= 3.0f && bmp.pixelAt(x, y).r < 250) ++holes;
+      }
+    std::snprintf(msg, sizeof(msg), "a round-capped line is solid inside, caps included (%d pixels "
+                  "short)", holes);
+    check(holes == 0, msg);
+  }
+  {
+    Bitmap chevron(40, 40);
+    chevron.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(chevron);
+      g.setColour(white);
+      Path p;
+      p.moveTo(5.0f, 30.0f);
+      p.lineTo(20.0f, 10.0f);
+      p.lineTo(35.0f, 30.0f);
+      StrokeStyle rd;
+      rd.width = 8.0f;
+      rd.join = LineJoin::Round;
+      rd.cap = LineCap::Round;
+      g.strokePath(p, rd);
+    }
+    // Every pixel whose centre is within 3 px of the spine is inside a
+    // width-8 stroke whatever its edges do.
+    auto spineDistance = [](float px, float py) {
+      auto toSegment = [&](float ax, float ay, float bx, float by) {
+        const float dx = bx - ax, dy = by - ay;
+        float t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        const float ex = ax + t * dx - px, ey = ay + t * dy - py;
+        return std::sqrt(ex * ex + ey * ey);
+      };
+      return std::min(toSegment(5.0f, 30.0f, 20.0f, 10.0f), toSegment(20.0f, 10.0f, 35.0f, 30.0f));
+    };
+    int holes = 0;
+    for (int y = 0; y < 40; ++y)
+      for (int x = 0; x < 40; ++x)
+        if (spineDistance(x + 0.5f, y + 0.5f) <= 3.0f && chevron.pixelAt(x, y).r < 250) ++holes;
+    std::snprintf(msg, sizeof(msg), "a round-joined chevron is solid along its spine (%d pixels "
+                  "short)", holes);
+    check(holes == 0, msg);
+  }
+  {
+    // A square cap meets its line on a pixel's interior here, and a cap
+    // wound against the line cancels it along the seam.
+    Bitmap seam(40, 40);
+    seam.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(seam);
+      g.setColour(white);
+      Path line;
+      line.moveTo(10.5f, 20.0f);
+      line.lineTo(30.5f, 20.0f);
+      StrokeStyle sq;
+      sq.width = 4.0f;
+      sq.cap = LineCap::Square;
+      g.strokePath(line, sq);
+    }
+    std::snprintf(msg, sizeof(msg), "a square cap meets its line without a seam (%d, %d at the two "
+                  "joints)", seam.pixelAt(10, 20).r, seam.pixelAt(30, 20).r);
+    check(seam.pixelAt(10, 20).r == 255 && seam.pixelAt(30, 20).r == 255, msg);
+  }
+
+  // Curves flatten to as many segments as the tolerance needs. Measuring a
+  // cubic's control points against its chord's MIDPOINT never passed for a
+  // curve whose controls sit near the thirds -- every circle and every
+  // straight cubic -- so they split down to 1.2 px pieces: a 1000 px straight
+  // cubic became 1025 points, a radius-36 circle 257.
+  {
+    std::vector<Contour> flat;
+    Path circle;
+    circle.addEllipse(Rect(0.0f, 0.0f, 72.0f, 72.0f));
+    circle.flatten(Transform(), flat);
+    size_t points = 0;
+    float worstSag = 0.0f;
+    for (const Contour& c : flat) {
+      points += c.points.size();
+      for (size_t i = 0; i < c.points.size(); ++i) {
+        const Point a = c.points[i], b = c.points[(i + 1) % c.points.size()];
+        const float mx = (a.x + b.x) * 0.5f - 36.0f, my = (a.y + b.y) * 0.5f - 36.0f;
+        worstSag = std::max(worstSag, 36.0f - std::sqrt(mx * mx + my * my));
+      }
+    }
+    std::snprintf(msg, sizeof(msg), "a radius-36 circle flattens to %zu points, within %.3f px of "
+                  "the curve", points, worstSag);
+    check(points <= 40 && worstSag <= 0.2f, msg);
+
+    flat.clear();
+    Path straight;
+    straight.moveTo(0.0f, 0.0f);
+    straight.cubicTo(1000.0f / 3.0f, 0.0f, 2000.0f / 3.0f, 0.0f, 1000.0f, 0.0f);
+    straight.flatten(Transform(), flat);
+    const size_t straightPoints = flat.empty() ? 0 : flat.front().points.size();
+    std::snprintf(msg, sizeof(msg), "a straight 1000 px cubic flattens to %zu points", straightPoints);
+    check(straightPoints == 2, msg);
+  }
+
+  // Drawing on after close() starts from the closed contour's START -- what
+  // SVG's Z then L means, and PostScript's closepath before it. The next
+  // contour began at its first lineTo instead, missing its first corner, so
+  // a triangle drawn that way had two points and filled nothing.
+  {
+    Path twin;
+    twin.moveTo(10.0f, 10.0f);
+    twin.lineTo(30.0f, 10.0f);
+    twin.lineTo(30.0f, 30.0f);
+    twin.close();
+    twin.lineTo(10.0f, 30.0f); // from (10,10), where the first triangle began
+    twin.lineTo(30.0f, 30.0f);
+    twin.close();
+    std::vector<Contour> flat;
+    twin.flatten(Transform(), flat);
+    std::snprintf(msg, sizeof(msg), "a contour drawn on after close() starts at the closed one's "
+                  "start (%zu contours, the second with %zu points)", flat.size(),
+                  flat.size() > 1 ? flat[1].points.size() : (size_t) 0);
+    check(flat.size() == 2 && flat[1].points.size() == 3 && flat[1].points[0].x == 10.0f &&
+              flat[1].points[0].y == 10.0f,
+          msg);
+    Bitmap tri(40, 40);
+    tri.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(tri);
+      g.setColour(white);
+      g.fillPath(twin);
+    }
+    check(tri.pixelAt(13, 25).r == 255, "...so the second triangle fills");
+  }
+
   // ── The case the textbook method gets wrong ──
   //
   // A hairpin: two segments doubling back. A single-outline stroker
@@ -9902,6 +14467,70 @@ static void testGfxStroke() {
     check(true, "stroking a single point does not crash");
     g.drawLine(1.0f, 1.0f, 5.0f, 5.0f, 0.0f);
     check(true, "and a zero-width pen draws nothing rather than dividing by zero");
+  }
+
+  // A pen wider than the canvas. Past the distance to the clip's far side a
+  // wider one covers the same pixels, but at 1e29 adding half the width to
+  // a point swallowed the point -- every segment's end ran through the
+  // origin rather than its vertex -- and a round join flattened at that
+  // radius was thousands of points. Cut to a width that still reaches, with
+  // its round pieces drawn as the squares around them, it draws what the
+  // geometry says.
+  {
+    Bitmap wide(32, 32);
+    auto lit = [&](int x0, int x1) {
+      int n = 0;
+      for (int y = 0; y < 32; ++y)
+        for (int x = x0; x < x1; ++x)
+          if (wide.pixelAt(x, y).r == 255) ++n;
+      return n;
+    };
+    for (const float width : {1.0e4f, 1.0e29f, std::numeric_limits<float>::infinity()}) {
+      // Butt caps: the band between the ends, every row of it.
+      wide.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(wide);
+        g.setColour(white);
+        Path across;
+        across.moveTo(8.0f, 16.0f);
+        across.lineTo(24.0f, 16.0f);
+        g.strokePath(across, StrokeStyle{width, LineJoin::Miter, LineCap::Butt});
+      }
+      std::snprintf(msg, sizeof(msg), "a line from x = 8 to 24 stroked %g wide with butt caps lights "
+                    "%d of the 512 pixels between its ends and %d outside", (double) width,
+                    lit(8, 24), lit(0, 8) + lit(24, 32));
+      check(lit(8, 24) == 512 && lit(0, 8) + lit(24, 32) == 0, msg);
+      // Round caps and joins: everything.
+      wide.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(wide);
+        g.setColour(white);
+        Path bent;
+        bent.moveTo(8.0f, 8.0f);
+        bent.lineTo(24.0f, 8.0f);
+        bent.lineTo(16.0f, 24.0f);
+        g.strokePath(bent, StrokeStyle{width, LineJoin::Round, LineCap::Round});
+      }
+      std::snprintf(msg, sizeof(msg), "and a bent line %g wide with round joins and caps covers "
+                    "%d of 1024", (double) width, lit(0, 32));
+      check(lit(0, 32) == 1024, msg);
+    }
+    // Far from the origin and slanted, so that the offset lands on both
+    // coordinates: at 1e29 this drew nothing at all where the line is.
+    Bitmap distant(1100, 32);
+    distant.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(distant);
+      g.setColour(white);
+      Path slant;
+      slant.moveTo(1008.0f, 0.0f);
+      slant.lineTo(1024.0f, 32.0f);
+      g.strokePath(slant, StrokeStyle{1.0e29f, LineJoin::Miter, LineCap::Butt});
+    }
+    std::snprintf(msg, sizeof(msg), "a slanted line at x = 1008..1024 stroked 1e29 wide lights its "
+                  "middle (%d) and not x = 900 or 1090 (%d, %d)", distant.pixelAt(1016, 16).r,
+                  distant.pixelAt(900, 16).r, distant.pixelAt(1090, 16).r);
+    check(distant.pixelAt(1016, 16).r == 255 && distant.pixelAt(900, 16).r == 0 && distant.pixelAt(1090, 16).r == 0, msg);
   }
 }
 
@@ -10131,6 +14760,130 @@ static void testGfxTrueType() {
   std::printf("\n[gfx truetype]\n");
   char msg[260];
 
+  // ── A composite glyph's expansion is bounded in WIDTH, not just depth ──
+  //
+  // Built here, table by table, because no system font is hostile. Glyph 1 is
+  // an empty leaf; each glyph above it is a composite of `fanOut` copies of
+  // the one below. The depth cap (5) let `levels` = 5 through, and with it
+  // fanOut^5 leaf visits: 3.2 million at 20 components, 10^15 at the thousand
+  // a hostile file can hold -- a UI thread that never comes back. Before any
+  // system font is needed, so it runs on every machine.
+  {
+    auto build = [](int fanOut, int levels) {
+      auto be16 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back((uint8_t) (x >> 8));
+        v.push_back((uint8_t) x);
+      };
+      auto be32 = [&](std::vector<uint8_t>& v, uint32_t x) {
+        be16(v, x >> 16);
+        be16(v, x & 0xFFFF);
+      };
+      const int numGlyphs = 2 + levels;
+      std::vector<uint8_t> glyf, loca;
+      be32(loca, 0); // glyph 0: empty
+      be32(loca, 0); // glyph 1: empty, the leaf
+      be32(loca, 0);
+      for (int g = 2; g < numGlyphs; ++g) {
+        be16(glyf, 0xFFFF); // numberOfContours -1: a composite
+        for (int k = 0; k < 4; ++k) be16(glyf, 0);
+        for (int c = 0; c < fanOut; ++c) {
+          be16(glyf, c + 1 < fanOut ? 0x0020 : 0x0000); // MORE_COMPONENTS
+          be16(glyf, (uint32_t) (g - 1));
+          glyf.push_back(0); // dx, dy as bytes
+          glyf.push_back(0);
+        }
+        be32(loca, (uint32_t) glyf.size());
+      }
+      std::vector<uint8_t> head(54, 0), hhea(36, 0), maxp(6, 0);
+      head[18] = 0x03; head[19] = 0xE8; // unitsPerEm 1000
+      head[51] = 1;                     // indexToLocFormat: long offsets
+      maxp[4] = (uint8_t) (numGlyphs >> 8);
+      maxp[5] = (uint8_t) numGlyphs;
+      struct Table { const char* tag; const std::vector<uint8_t>* body; };
+      const Table tables[] = {{"head", &head}, {"hhea", &hhea}, {"maxp", &maxp},
+                              {"loca", &loca}, {"glyf", &glyf}};
+      std::vector<uint8_t> font;
+      be32(font, 0x00010000u);
+      be16(font, 5);
+      for (int k = 0; k < 3; ++k) be16(font, 0);
+      uint32_t offset = 12 + 16 * 5;
+      for (const Table& t : tables) {
+        font.insert(font.end(), t.tag, t.tag + 4);
+        be32(font, 0); // checksum, unchecked
+        be32(font, offset);
+        be32(font, (uint32_t) t.body->size());
+        offset += (uint32_t) ((t.body->size() + 3) & ~(size_t) 3);
+      }
+      for (const Table& t : tables) {
+        font.insert(font.end(), t.body->begin(), t.body->end());
+        while (font.size() % 4) font.push_back(0);
+      }
+      return font;
+    };
+
+    Typeface wide;
+    check(wide.load(build(20, 5)), "a hand-built font of nested composite glyphs loads");
+    Path p;
+    check(!wide.appendGlyph((uint16_t) (2 + 5 - 1), p),
+          "a composite expanding to 20^5 parts is refused rather than walked");
+    Typeface plain;
+    plain.load(build(20, 1));
+    Path q;
+    check(plain.appendGlyph(2, q), "…while one of twenty plain components still draws");
+  }
+
+  // ── A load that fails part-way leaves nothing behind ──
+  //
+  // A CFF font whose head, maxp and hhea are read before its CFF table is
+  // refused (version 2). The metrics read before the failure stayed: an
+  // invalid typeface answering unitsPerEm 1000 and an ascent of 800.
+  {
+    auto be16 = [](std::vector<uint8_t>& v, uint32_t x) {
+      v.push_back((uint8_t) (x >> 8));
+      v.push_back((uint8_t) x);
+    };
+    auto be32 = [&](std::vector<uint8_t>& v, uint32_t x) {
+      be16(v, x >> 16);
+      be16(v, x & 0xFFFF);
+    };
+    std::vector<uint8_t> head(54, 0), hhea(36, 0), maxp(6, 0);
+    const std::vector<uint8_t> cff = {2, 0, 4, 1}; // CFF2: refused
+    head[18] = 0x03; head[19] = 0xE8;              // unitsPerEm 1000
+    maxp[5] = 3;                                   // three glyphs
+    hhea[4] = 0x03; hhea[5] = 0x20;                // ascender 800
+    hhea[6] = 0xFF; hhea[7] = 0x38;                // descender -200
+    hhea[9] = 90;                                  // line gap 90
+    struct Table { const char* tag; const std::vector<uint8_t>* body; };
+    const Table tables[] = {{"CFF ", &cff}, {"head", &head}, {"hhea", &hhea}, {"maxp", &maxp}};
+    std::vector<uint8_t> font;
+    be32(font, 0x4F54544Fu); // 'OTTO'
+    be16(font, 4);
+    for (int k = 0; k < 3; ++k) be16(font, 0);
+    uint32_t offset = 12 + 16 * 4;
+    for (const Table& t : tables) {
+      font.insert(font.end(), t.tag, t.tag + 4);
+      be32(font, 0);
+      be32(font, offset);
+      be32(font, (uint32_t) t.body->size());
+      offset += (uint32_t) ((t.body->size() + 3) & ~(size_t) 3);
+    }
+    for (const Table& t : tables) {
+      font.insert(font.end(), t.body->begin(), t.body->end());
+      while (font.size() % 4) font.push_back(0);
+    }
+    Typeface partial;
+    const bool loaded = partial.load(font);
+    std::snprintf(msg, sizeof(msg),
+                  "a font refused after its metrics were read keeps none of them (\"%s\"; unitsPerEm %d, "
+                  "ascender %d, descender %d, line gap %d, %d glyphs)",
+                  partial.error().c_str(), partial.unitsPerEm(), partial.ascender(), partial.descender(),
+                  partial.lineGap(), partial.numGlyphs());
+    check(!loaded && !partial.isValid() && partial.error().find("CFF") != std::string::npos &&
+              partial.unitsPerEm() == 0 && partial.ascender() == 0 && partial.descender() == 0 &&
+              partial.lineGap() == 0 && partial.numGlyphs() == 0,
+          msg);
+  }
+
   std::string which;
   auto face = loadTestTypeface(&which);
   if (!face) {
@@ -10183,6 +14936,1224 @@ static void testGfxTrueType() {
                 box.bottom());
   check(box.bottom() <= 1.0f && box.y < 0.0f,
         "a glyph sits ABOVE its baseline -- the y flip happened at the parser");
+}
+
+// ---------------------------------------------------------------------------
+// OpenType with CFF outlines
+//
+// Most fonts a designer hands over for a plugin's brand are .otf, and most of
+// those are CFF: outlines as Type 2 charstrings -- small programs of cubic
+// curves with shared pieces in subroutines -- where a .ttf has quadratic glyf
+// points. CJK fonts are CID-keyed on top: glyphs split among Font DICTs, each
+// with its own subroutines, chosen per glyph by FDSelect. Typeface refused all
+// of it. The fixtures in tests/data/cff are built from nothing by
+// make_fixtures.py, each operator glyph beside a twin drawn with the plainest
+// operators; a twin drawing the same pixels is the check.
+// ---------------------------------------------------------------------------
+static void testGfxCff() {
+  using namespace sonore::gfx;
+  std::printf("\n[gfx cff]\n");
+  char msg[300];
+#if !defined(SONORE_TEST_DATA_DIR)
+  check(true, "SONORE_TEST_DATA_DIR not defined -- CFF tests SKIPPED, not passed");
+#else
+  auto read = [](const std::string& path) {
+    std::vector<uint8_t> bytes;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return bytes;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size > 0) {
+      bytes.resize((size_t) size);
+      if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
+    }
+    std::fclose(f);
+    return bytes;
+  };
+  const std::string dir = std::string(SONORE_TEST_DATA_DIR) + "/cff/";
+  std::vector<uint64_t> plainHashes;
+  // The third splits its FontMatrix as Adobe's CJK fonts do: the identity in
+  // the Top DICT, 0.001 in each Font DICT. Reading only the Top refused it.
+  for (const char* file : {"tiny.otf", "tiny_cid.otf", "tiny_cid_fdmatrix.otf"}) {
+    Typeface face;
+    const std::vector<uint8_t> bytes = read(dir + file);
+    std::snprintf(msg, sizeof(msg), "%s loads (%s)", file,
+                  bytes.empty() ? "the fixture is missing" : (face.load(bytes) ? "ok" : face.error().c_str()));
+    if (!face.isValid()) {
+      check(false, msg);
+      continue;
+    }
+    check(true, msg);
+    // A glyph at `scale` into a canvas, as coverage, and a hash of it.
+    auto ink = [&](char c, float scale, std::vector<uint8_t>* out) {
+      Path p;
+      face.appendGlyph(face.glyphForChar((uint32_t) c), p, 10.0f, 90.0f, scale);
+      Bitmap bmp(100, 100);
+      bmp.clear(Colour(0, 0, 0, 255));
+      Graphics g(bmp);
+      g.setColour(Colour(255, 255, 255, 255));
+      g.fillPath(p);
+      uint64_t hash = 1469598103934665603ull;
+      for (int y = 0; y < 100; ++y)
+        for (int x = 0; x < 100; ++x) {
+          const uint8_t v = bmp.pixelAt(x, y).r;
+          if (out) out->push_back(v);
+          hash = (hash ^ v) * 1099511628211ull;
+        }
+      return hash;
+    };
+    std::vector<uint8_t> square;
+    const uint64_t b = ink('B', 0.1f, &square);
+    int solid = 0;
+    for (uint8_t v : square)
+      if (v == 255) ++solid;
+    std::snprintf(msg, sizeof(msg), "%s: B is a 400 x 700 unit square, %d solid pixels at 0.1 (40 x 70 = 2800)",
+                  file, solid);
+    check(solid == 2800, msg);
+    check(ink('A', 0.1f, nullptr) == b,
+          "hstemhm, an implied vstem, two hintmasks and a width ahead of the stems draw the unhinted square");
+    check(ink('G', 0.1f, nullptr) == b, "a local subroutine calling a global one draws it too");
+    check(ink('C', 0.1f, nullptr) == ink('D', 0.1f, nullptr),
+          "flex, hflex, hflex1 and flex1 draw what their rrcurveto twins draw");
+    check(ink('E', 0.1f, nullptr) == ink('F', 0.1f, nullptr),
+          "hv/vh/hh/vvcurveto with their odd arguments, rcurveline and rlinecurve draw their twins");
+    check(ink('H', 0.25f, nullptr) == ink('I', 0.125f, nullptr),
+          "16.16 fixed operands land at the half units they say");
+    check(ink('J', 0.1f, nullptr) == b,
+          "a dotsection, deprecated, is ignored: the glyph is drawn whole, not refused half way");
+    // GPOS kerning, which the fixture has instead of a kern table.
+    auto kern = [&](char l, char r) {
+      return face.kerning(face.glyphForChar((uint32_t) l), face.glyphForChar((uint32_t) r));
+    };
+    std::snprintf(msg, sizeof(msg), "%s kerns through GPOS: A B %d (a listed pair, -80), C E %d "
+                  "and D F %d (a class matrix, -40), G H %d (behind an Extension, +25), B A %d (0)",
+                  file, kern('A', 'B'), kern('C', 'E'), kern('D', 'F'), kern('G', 'H'), kern('B', 'A'));
+    check(kern('A', 'B') == -80 && kern('C', 'E') == -40 && kern('D', 'F') == -40 &&
+              kern('G', 'H') == 25 && kern('B', 'A') == 0 && kern('E', 'C') == 0,
+          msg);
+    const uint64_t all[] = {b, ink('C', 0.1f, nullptr), ink('E', 0.1f, nullptr)};
+    if (plainHashes.empty()) {
+      plainHashes.assign(all, all + 3);
+    } else {
+      check(std::equal(plainHashes.begin(), plainHashes.end(), all),
+            "the CID-keyed font, glyphs split between two Font DICTs, draws what the plain one does");
+    }
+    // One Typeface loading a TrueType font and then this one draws this one.
+    // It kept the TrueType's glyf and loca, and drew the CFF font from them.
+    {
+      Typeface reused;
+      reused.load(read(dir + "tiny.ttf"));
+      const bool loaded = reused.load(bytes);
+      Path p;
+      reused.appendGlyph(reused.glyphForChar((uint32_t) 'B'), p, 10.0f, 90.0f, 0.1f);
+      Path q;
+      face.appendGlyph(face.glyphForChar((uint32_t) 'B'), q, 10.0f, 90.0f, 0.1f);
+      std::vector<Contour> pc, qc;
+      p.flatten(Transform(), pc);
+      q.flatten(Transform(), qc);
+      bool same = loaded && pc.size() == qc.size() && !pc.empty();
+      for (size_t k = 0; same && k < pc.size(); ++k) same = pc[k].points.size() == qc[k].points.size();
+      std::snprintf(msg, sizeof(msg), "%s into a Typeface that held tiny.ttf draws its own outline", file);
+      check(same, msg);
+    }
+    // Damaged: the CFF table cut short. Refused, not half-drawn and not a crash.
+    std::vector<uint8_t> cut = bytes;
+    cut.resize(cut.size() * 3 / 5);
+    Typeface broken;
+    std::snprintf(msg, sizeof(msg), "%s cut at 60%%: %s", file,
+                  broken.load(cut) ? "loaded" : broken.error().c_str());
+    Path scratch;
+    if (broken.isValid())
+      for (int g = 0; g < broken.numGlyphs(); ++g) broken.appendGlyph((uint16_t) g, scratch);
+    check(true, msg);
+  }
+  // A font that kerns through the old kern table only. Its pairs start
+  // after the subtable's binary-search header; read from four bytes early,
+  // every pair was invented -- Tahoma, Microsoft YaHei, Malgun Gothic.
+  {
+    Typeface kerned;
+    if (!kerned.load(read(dir + "tiny_kern.otf"))) {
+      check(false, "tiny_kern.otf loads");
+    } else {
+      auto k = [&](char l, char r) {
+        return kerned.kerning(kerned.glyphForChar((uint32_t) l), kerned.glyphForChar((uint32_t) r));
+      };
+      std::snprintf(msg, sizeof(msg), "a kern table's pairs are its own: A B %d (-50), C E %d (30), "
+                    "J A %d (-20), B A %d (0)", k('A', 'B'), k('C', 'E'), k('J', 'A'), k('B', 'A'));
+      check(k('A', 'B') == -50 && k('C', 'E') == 30 && k('J', 'A') == -20 && k('B', 'A') == 0 &&
+                k('A', 'C') == 0,
+            msg);
+    }
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Variable fonts
+//
+// tests/data/variable/tiny_var.ttf is built by make_variable.py with
+// fontTools' varLib, and tiny_var_expected.txt beside it is what fontTools
+// draws from it at six weights: the oracle. Every glyph at every weight has
+// to land on fontTools' points -- deltas listed, deltas inferred, components
+// moved and scaled -- and on its advances.
+// ---------------------------------------------------------------------------
+static void testGfxVariableFont() {
+  using namespace sonore::gfx;
+  #if defined(__APPLE__)
+  using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
+  #endif
+  std::printf("\n[gfx variable fonts]\n");
+  char msg[300];
+#if !defined(SONORE_TEST_DATA_DIR)
+  check(true, "SONORE_TEST_DATA_DIR not defined -- variable font tests SKIPPED, not passed");
+#else
+  auto read = [](const std::string& path) {
+    std::vector<uint8_t> bytes;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return bytes;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size > 0) {
+      bytes.resize((size_t) size);
+      if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
+    }
+    std::fclose(f);
+    return bytes;
+  };
+  const std::string dir = std::string(SONORE_TEST_DATA_DIR) + "/variable/";
+  const std::vector<uint8_t> bytes = read(dir + "tiny_var.ttf");
+  auto face = std::make_shared<Typeface>();
+  const bool loaded = !bytes.empty() && face->load(bytes);
+  check(loaded, bytes.empty() ? "tiny_var.ttf loads (the fixture is missing)" : "tiny_var.ttf loads");
+  if (!loaded) return;
+  const uint32_t wght = Typeface::tagOf("wght");
+  const bool axis = face->isVariable() && face->variationAxes().size() == 1 &&
+                    face->variationAxes()[0].tag == wght &&
+                    face->variationAxes()[0].minimum == 100.0f &&
+                    face->variationAxes()[0].defaultValue == 400.0f &&
+                    face->variationAxes()[0].maximum == 900.0f;
+  check(axis, "it is variable, along one axis: wght from 100 to 900, 400 by default");
+
+  // -- Against fontTools --
+  const std::vector<uint8_t> expectedBytes = read(dir + "tiny_var_expected.txt");
+  const std::string expected(expectedBytes.begin(), expectedBytes.end());
+  std::vector<int16_t> location;
+  bool locationsAgree = true;
+  int glyphs = 0, worstAt = 0, worstGlyph = -1;
+  double worstPoint = 0.0, worstAdvance = 0.0;
+  size_t at = 0;
+  int user = 0;
+  while (at < expected.size()) {
+    size_t end = expected.find('\n', at);
+    if (end == std::string::npos) end = expected.size();
+    const std::string line = expected.substr(at, end - at);
+    at = end + 1;
+    std::istringstream in(line);
+    std::string kind;
+    in >> kind;
+    if (kind == "loc") {
+      int q = 0;
+      in >> user >> q;
+      const std::vector<int16_t> ours = face->locationFor({{wght, (float) user}});
+      const int got = ours.empty() ? 0 : ours[0];
+      if (std::abs(got - q) > 1) locationsAgree = false;
+      // Drawn at fontTools' own location from here, so the outlines are
+      // compared exactly rather than through two roundings.
+      location = q ? std::vector<int16_t>{(int16_t) q} : std::vector<int16_t>{};
+    } else if (kind == "glyph") {
+      int gid = 0, count = 0;
+      double advance = 0.0;
+      in >> gid >> advance >> count;
+      std::vector<Point> want((size_t) count);
+      for (Point& p : want) in >> p.x >> p.y;
+      Path path;
+      if (location.empty()) face->appendGlyph((uint16_t) gid, path);
+      else face->appendGlyph((uint16_t) gid, path, location);
+      const double ours = location.empty() ? (double) face->advanceWidth((uint16_t) gid)
+                                           : (double) face->advanceWidth((uint16_t) gid, location);
+      // Every point near one of the other's, both ways. Not the same count:
+      // a Path closes a contour by returning to its start, a pen does not.
+      std::vector<Point> got = path.points();
+      for (Point& p : got) p.y = -p.y; // y down here, up in the font
+      double apart = got.empty() != want.empty() ? 1e9 : 0.0;
+      auto nearest = [](const Point& p, const std::vector<Point>& set) {
+        double best = 1e18;
+        for (const Point& q : set)
+          best = (std::min)(best, (double) std::hypot(p.x - q.x, p.y - q.y));
+        return best;
+      };
+      for (const Point& p : got) apart = (std::max)(apart, nearest(p, want));
+      for (const Point& p : want) apart = (std::max)(apart, nearest(p, got));
+      if (apart > worstPoint) {
+        worstPoint = apart;
+        worstGlyph = gid;
+        worstAt = user;
+      }
+      worstAdvance = (std::max)(worstAdvance, std::fabs(ours - advance));
+      ++glyphs;
+    }
+  }
+  check(locationsAgree, "locationFor lands where fontTools does, avar's bend included "
+                        "(600 is at 0.6 of the way to 900)");
+  std::snprintf(msg, sizeof(msg), "%d glyphs at six weights match fontTools: worst point %.4f "
+                "units (glyph %d at %d), worst advance %.4f", glyphs, worstPoint, worstGlyph,
+                worstAt, worstAdvance);
+  check(glyphs == 48 && worstPoint < 0.01 && worstAdvance < 0.01, msg);
+
+  // -- Through Font --
+  const Font regular(face, 40.0f);
+  const Font black = regular.withVariation("wght", 900.0f);
+  const std::string text = "AIA";
+  // At 900: A advances 840 units and I 320; at 400, 730 and 210.
+  std::snprintf(msg, sizeof(msg), "\"AIA\" is %.2f px at 400 and %.2f px at 900 (want 66.80, "
+                "80.00)", regular.stringWidth(text), black.stringWidth(text));
+  check(std::fabs(regular.stringWidth(text) - 66.8f) < 0.01f &&
+            std::fabs(black.stringWidth(text) - 80.0f) < 0.01f,
+        msg);
+  check(regular.withVariation("wght", 400.0f).stringWidth(text) == regular.stringWidth(text) &&
+            regular.withVariation("wdth", 50.0f).stringWidth(text) == regular.stringWidth(text),
+        "the default weight, and an axis the font lacks, change nothing");
+  check(regular.withVariation("wght", 5000.0f).stringWidth(text) == black.stringWidth(text) &&
+            regular.withVariation("wght", std::nanf("")).stringWidth(text) ==
+                regular.stringWidth(text),
+        "a weight past the axis is held at its end, and one that is not a number is ignored");
+  check(black.withHeight(20.0f).stringWidth(text) == black.stringWidth(text) * 0.5f &&
+            black.withoutFallback().stringWidth(text) == black.stringWidth(text),
+        "another size of the same font keeps its weight");
+
+  auto ink = [](const Font& font) {
+    Bitmap bmp(60, 60);
+    {
+      Graphics g(bmp);
+      g.setColour(Colour(255, 255, 255, 255));
+      font.draw(g, "I", 5.0f, 45.0f);
+    }
+    int covered = 0;
+    for (int y = 0; y < 60; ++y)
+      for (int x = 0; x < 60; ++x) covered += bmp.pixelAt(x, y).a;
+    return covered / 255;
+  };
+  const int thin = ink(regular), heavy = ink(black);
+  // The stem is 90 units wide at 400 and 200 at 900.
+  std::snprintf(msg, sizeof(msg), "an I drawn at 900 has %d px of ink, at 400 %d (about 200:90)",
+                heavy, thin);
+  check(heavy > thin * 2 && heavy < thin * 5 / 2, msg);
+
+  // -- A static font, and a broken variable one --
+  const std::vector<uint8_t> staticBytes = read(std::string(SONORE_TEST_DATA_DIR) + "/cff/tiny.ttf");
+  auto plain = std::make_shared<Typeface>();
+  if (plain->load(staticBytes)) {
+    const Font f(plain, 30.0f);
+    check(!plain->isVariable() && f.withVariation("wght", 900.0f).stringWidth("BB") == f.stringWidth("BB"),
+          "a font that is not variable ignores a variation");
+  }
+  // gvar's axis count no longer fvar's: the deltas cannot be read against
+  // the axes, so the font is its default design -- and still a font.
+  std::vector<uint8_t> broken = bytes;
+  const uint16_t tables = (uint16_t) ((broken[4] << 8) | broken[5]);
+  for (uint16_t i = 0; i < tables; ++i) {
+    const size_t rec = 12u + (size_t) i * 16u;
+    if (std::memcmp(&broken[rec], "gvar", 4) != 0) continue;
+    const size_t off = ((size_t) broken[rec + 8] << 24) | ((size_t) broken[rec + 9] << 16) |
+                       ((size_t) broken[rec + 10] << 8) | broken[rec + 11];
+    broken[off + 5] = 2;
+  }
+  Typeface wrong;
+  check(wrong.load(broken) && !wrong.isVariable() && wrong.variationAxes().size() == 1,
+        "a gvar whose axes are not fvar's leaves the font static, not refused");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Bidirectional text and shaping
+//
+// bidi.h is checked against a sample of Unicode's own conformance file --
+// the whole file passes, and is too large to carry. text_shaper.h is
+// checked against HarfBuzz: tests/data/shaping/make_shaping.py builds a
+// font with every kind of lookup a real Arabic, Hebrew or Latin font uses
+// and writes beside it what HarfBuzz makes of a list of strings, and every
+// glyph, cluster, advance and offset here has to be the same.
+// ---------------------------------------------------------------------------
+static void testGfxBidiAndShaping() {
+  using namespace sonore::gfx;
+  #if defined(__APPLE__)
+  using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
+  #endif
+  std::printf("\n[gfx bidi and shaping]\n");
+  char msg[300];
+
+  // -- By hand, the cases people meet --
+  {
+    auto order = [](std::vector<uint32_t> text, BidiDirection d) {
+      BidiParagraph p(text.data(), text.size(), d);
+      return p.visualOrder(0, text.size());
+    };
+    // "abc" stays; three Hebrew letters reverse; a number inside Arabic
+    // keeps its own order, left to right, inside the right-to-left run.
+    check(order({'a', 'b', 'c'}, BidiDirection::Auto) == std::vector<int>({0, 1, 2}),
+          "left-to-right text keeps its order");
+    check(order({0x5D0, 0x5D1, 0x5D2}, BidiDirection::Auto) == std::vector<int>({2, 1, 0}),
+          "right-to-left letters are shown last first");
+    check(order({0x628, ' ', '1', '2', ' ', 0x645}, BidiDirection::Auto) ==
+              std::vector<int>({5, 4, 2, 3, 1, 0}),
+          "a number inside Arabic reads left to right, where it stands in the run");
+    BidiParagraph auto1(std::vector<uint32_t>({' ', 0x5D0, 'a'}).data(), 3, BidiDirection::Auto);
+    check(auto1.baseLevel() == 1, "an Auto paragraph takes its first strong letter's direction");
+    check(BidiParagraph::mirrored('(') == ')' && BidiParagraph::mirrored(0x2264) == 0x2265,
+          "brackets and inequalities mirror");
+  }
+
+#if !defined(SONORE_TEST_DATA_DIR)
+  check(true, "SONORE_TEST_DATA_DIR not defined -- conformance and shaping tests SKIPPED, not passed");
+#else
+  auto read = [](const std::string& path) {
+    std::string bytes;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return bytes;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size > 0) {
+      bytes.resize((size_t) size);
+      if (std::fread(&bytes[0], 1, bytes.size(), f) != bytes.size()) bytes.clear();
+    }
+    std::fclose(f);
+    return bytes;
+  };
+  const std::string data = SONORE_TEST_DATA_DIR;
+
+  // -- Unicode's conformance file, sampled --
+  {
+    const std::string file = read(data + "/bidi/BidiCharacterTest-15.0.0-sample.txt");
+    std::istringstream in(file);
+    std::string line;
+    int lines = 0, failed = 0;
+    std::string firstFailure;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      std::vector<std::string> field;
+      std::stringstream ss(line);
+      std::string part;
+      while (std::getline(ss, part, ';')) field.push_back(part);
+      if (field.size() < 5) continue;
+      std::vector<uint32_t> cps;
+      {
+        std::istringstream c(field[0]);
+        std::string h;
+        while (c >> h) cps.push_back((uint32_t) std::strtoul(h.c_str(), nullptr, 16));
+      }
+      const int dir = std::atoi(field[1].c_str());
+      std::vector<std::string> want;
+      {
+        std::istringstream c(field[3]);
+        std::string h;
+        while (c >> h) want.push_back(h);
+      }
+      std::vector<int> wantOrder;
+      {
+        std::istringstream c(field[4]);
+        std::string h;
+        while (c >> h) wantOrder.push_back(std::atoi(h.c_str()));
+      }
+      ++lines;
+      const BidiParagraph p(cps.data(), cps.size(),
+                            dir == 0   ? BidiDirection::LeftToRight
+                            : dir == 1 ? BidiDirection::RightToLeft
+                                       : BidiDirection::Auto);
+      bool ok = p.baseLevel() == std::atoi(field[2].c_str()) && want.size() == cps.size();
+      const std::vector<uint8_t> levels = p.lineLevels(0, cps.size());
+      for (size_t i = 0; ok && i < cps.size(); ++i) {
+        if (want[i] == "x") ok = p.isRemoved(i);
+        else ok = !p.isRemoved(i) && levels[i] == std::atoi(want[i].c_str());
+      }
+      if (ok) ok = p.visualOrder(0, cps.size()) == wantOrder;
+      if (!ok && failed++ == 0) firstFailure = line;
+    }
+    std::snprintf(msg, sizeof(msg), "Unicode's bidi conformance sample: %d of %d paragraphs right%s%s",
+                  lines - failed, lines, failed ? " -- first wrong: " : "",
+                  failed ? firstFailure.substr(0, 120).c_str() : "");
+    check(lines > 900 && failed == 0, msg);
+  }
+
+  // -- Line breaking, against Unicode's own test --
+  {
+    const std::string file = read(data + "/linebreak/LineBreakTest-15.0.0-sample.txt");
+    std::istringstream in(file);
+    std::string line, firstFailure;
+    int cases = 0, failed = 0;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      std::istringstream ss(line.substr(0, line.find('#')));
+      std::string token;
+      std::vector<uint32_t> cps;
+      std::vector<bool> want; // a break at each boundary
+      while (ss >> token) {
+        if (token == "\xC3\x97") want.push_back(false);
+        else if (token == "\xC3\xB7") want.push_back(true);
+        else cps.push_back((uint32_t) std::strtoul(token.c_str(), nullptr, 16));
+      }
+      if (cps.empty()) continue;
+      ++cases;
+      const std::vector<LineBreak> got = findLineBreaks(cps.data(), cps.size());
+      bool ok = got.size() == want.size();
+      for (size_t i = 0; ok && i < got.size(); ++i) ok = (got[i] != LineBreak::None) == want[i];
+      if (!ok && failed++ == 0) firstFailure = line;
+    }
+    std::snprintf(msg, sizeof(msg), "Unicode's line breaking sample: %d of %d right%s%s", cases - failed, cases,
+                  failed ? " -- first wrong: " : "", failed ? firstFailure.substr(0, 100).c_str() : "");
+    check(cases > 900 && failed == 0, msg);
+  }
+
+  // -- Shaping, against HarfBuzz --
+  const std::string fontBytes = read(data + "/shaping/tiny_shaping.ttf");
+  auto face = std::make_shared<Typeface>();
+  const bool loaded = !fontBytes.empty() &&
+                      face->load(std::vector<uint8_t>(fontBytes.begin(), fontBytes.end()));
+  check(loaded, "tiny_shaping.ttf loads");
+  if (!loaded) return;
+  // Each font against what HarfBuzz made of the same strings with it.
+  struct Fixture {
+    const char* name;
+    const char* what;
+  };
+  const Fixture fixtures[] = {
+      {"tiny_shaping", "forms, lam-alef, ligatures, contexts, marks on bases and ligatures, stacked "
+                       "marks, kerning, Thai SARA AM, Hangul composed and decomposed"},
+      {"tiny_shaping_plain", "no GDEF, GSUB or GPOS: classes guessed from the characters, marks "
+                             "placed by class on the boxes, the kern table, Thai's private-use marks"},
+      {"tiny_shaping_latn", "GPOS for Latin alone: Arabic takes it, Hebrew places its marks by class"},
+      {"tiny_indic2", "Devanagari, current specification: reph, half forms, below-base Ra, conjuncts, "
+                      "a left matra moved past half forms, init, joiners"},
+      {"tiny_indic", "Devanagari, old specification: the halant moved after the last consonant"},
+      {"tiny_khmer", "Khmer: Coeng Ro before the base, subscripts, split and left vowels"},
+      {"tiny_myanmar", "Myanmar: kinzi, medial Ra and the left vowel before the base"},
+      {"tiny_use", "Javanese, by the Universal Shaping Engine: subscripts, the taling moved before "
+                   "its syllable"},
+  };
+  for (const Fixture& fixture : fixtures) {
+    const std::string bytes = read(data + "/shaping/" + fixture.name + ".ttf");
+    Typeface fixtureFace;
+    if (bytes.empty() || !fixtureFace.load(std::vector<uint8_t>(bytes.begin(), bytes.end()))) {
+      std::snprintf(msg, sizeof(msg), "%s.ttf loads", fixture.name);
+      check(false, msg);
+      continue;
+    }
+    const std::string expected = read(data + "/shaping/" + fixture.name + "_expected.txt");
+    std::istringstream in(expected);
+    std::string line;
+    int runs = 0, wrong = 0;
+    std::string firstWrong;
+    while (std::getline(in, line)) {
+      const size_t bar = line.find('|');
+      if (bar == std::string::npos) continue;
+      std::istringstream head(line.substr(0, bar));
+      int rtl = 0;
+      head >> rtl;
+      std::vector<uint32_t> text;
+      std::string h;
+      while (head >> h) text.push_back((uint32_t) std::strtoul(h.c_str(), nullptr, 16));
+      std::string got;
+      char buf[80];
+      for (const ShapedGlyph& g : shapeRun(fixtureFace, text.data(), text.size(), rtl != 0)) {
+        if (!got.empty()) got += ';';
+        std::snprintf(buf, sizeof(buf), "%u,%u,%d,%d,%d", g.glyph, g.cluster, g.xAdvance,
+                      g.xOffset, g.yOffset);
+        got += buf;
+      }
+      std::string want = line.substr(bar + 1);
+      while (!want.empty() && (want[0] == ' ')) want.erase(0, 1);
+      while (!want.empty() && (want.back() == '\r' || want.back() == ' ')) want.pop_back();
+      ++runs;
+      if (got != want && wrong++ == 0) firstWrong = line.substr(0, bar) + "-> " + got;
+    }
+    std::snprintf(msg, sizeof(msg), "%s: %d of %d runs shape exactly as HarfBuzz shapes them -- "
+                  "%s%s%s", fixture.name, runs - wrong, runs, fixture.what,
+                  wrong ? "; first wrong: " : "", wrong ? firstWrong.substr(0, 80).c_str() : "");
+    check(runs >= 14 && wrong == 0, msg);
+  }
+
+  // -- Through Font: bidi, runs, the same measure as the drawing --
+  {
+    const Font font(face, 100.0f); // 100 px on a 1000-unit em: a unit is 0.1 px
+    const std::string arabic = u8"بمب";  // beh meem beh: init, medi, fina
+    // HarfBuzz: 555 + 474 + 473 units.
+    std::snprintf(msg, sizeof(msg), "a shaped Arabic word measures its forms' advances: %.2f px "
+                  "(want 150.20)", font.stringWidth(arabic));
+    check(std::fabs(font.stringWidth(arabic) - 150.2f) < 0.01f, msg);
+    // Lam and alef are one glyph: narrower than the two letters were.
+    const std::string lamAlef = u8"لا";
+    check(std::fabs(font.stringWidth(lamAlef) - 51.6f) < 0.01f, "lam and alef measure as one ligature");
+    // Mixed: the Latin and the Arabic each shaped, the whole the sum. Latin
+    // this font neither ligates nor kerns, as the Latin measured alone is
+    // drawn a glyph per character -- inside shaped text "fi" ligates.
+    const std::string mixed = "iV " + arabic;
+    const float sum = font.stringWidth("iV ") + font.stringWidth(arabic);
+    std::snprintf(msg, sizeof(msg), "Latin then Arabic measures as the two runs do: %.2f against %.2f",
+                  font.stringWidth(mixed), sum);
+    check(std::fabs(font.stringWidth(mixed) - sum) < 0.01f, msg);
+    // Drawn: ink lands, and lands where it was measured.
+    Bitmap bmp(400, 120);
+    {
+      Graphics g(bmp);
+      g.setColour(Colour(255, 255, 255, 255));
+      font.draw(g, mixed, 10.0f, 90.0f);
+    }
+    int right = 0, inked = 0;
+    for (int y = 0; y < 120; ++y)
+      for (int x = 0; x < 400; ++x)
+        if (bmp.pixelAt(x, y).a > 0) {
+          ++inked;
+          right = std::max(right, x);
+        }
+    std::snprintf(msg, sizeof(msg), "drawn, %d px of ink, the last at x = %d (the string ends at "
+                  "%.1f)", inked, right, 10.0f + font.stringWidth(mixed));
+    check(inked > 500 && right < 10.0f + font.stringWidth(mixed) + 1.0f, msg);
+    // A string with nothing to shape takes the old path, untouched.
+    check(!Font::needsShaping("Gain -6.0 dB") && !Font::needsShaping(u8"Café über") &&
+              Font::needsShaping(arabic) && Font::needsShaping(u8"กำ") &&
+              Font::needsShaping(u8"\u1100\u1161") && !Font::needsShaping(u8"한국어") && Font::needsShaping(u8"é"),
+          "only text that needs it is shaped: Latin, accented or not, is drawn as before");
+  }
+
+  // -- Wrapping where a line may end, never inside a cluster --
+  {
+    const std::string bytes = read(data + "/shaping/tiny_indic2.ttf");
+    auto indic = std::make_shared<Typeface>();
+    if (!bytes.empty() && indic->load(std::vector<uint8_t>(bytes.begin(), bytes.end()))) {
+      const Font font(indic, 100.0f);
+      // Two conjuncts with their matras and nothing to break at: too wide for
+      // one line, broken between the clusters and nowhere inside one.
+      const std::string word = u8"क्षिक्षि";
+      const std::vector<std::string> lines = font.wrapText(word, font.stringWidth(u8"क्षि") + 1.0f);
+      std::snprintf(msg, sizeof(msg), "a word of two conjuncts wraps into %d lines, each a whole cluster",
+                    (int) lines.size());
+      check(lines.size() == 2 && lines[0] == u8"क्षि" && lines[1] == u8"क्षि", msg);
+    }
+  }
+  {
+    // Hyphens and numbers: a break after the hyphen, none inside the price.
+    const std::vector<uint32_t> text = {'w', 'e', 'l', 'l', '-', 'k', 'n', 'o', 'w', 'n', ' ', '$', '1', '2', '.', '5', '0'};
+    const std::vector<LineBreak> b = findLineBreaks(text.data(), text.size());
+    check(b[5] == LineBreak::Allowed && b[4] == LineBreak::None && b[11] == LineBreak::Allowed &&
+              b[12] == LineBreak::None && b[14] == LineBreak::None && b[15] == LineBreak::None,
+          "a line may end after a hyphen and before a price, not inside either");
+    // Ideographs break between each other, not before a closing bracket.
+    const std::vector<uint32_t> cjk = {0x65E5, 0x672C, 0x8A9E, 0x3002, 0x300C, 0x65E5, 0x300D};
+    const std::vector<LineBreak> c = findLineBreaks(cjk.data(), cjk.size());
+    check(c[1] == LineBreak::Allowed && c[2] == LineBreak::Allowed && c[3] == LineBreak::None &&
+              c[5] == LineBreak::None && c[6] == LineBreak::None,
+          "Japanese breaks between ideographs, not before a full stop or a closing bracket, not after an opening one");
+  }
+
+  // -- Colour glyphs: COLR's layers, sbix's and CBDT's pictures --
+  {
+    const std::shared_ptr<Typeface> colr = loadTypefaceFile((data + "/colour/tiny_colr.ttf").c_str());
+    const std::shared_ptr<Typeface> sbix = loadTypefaceFile((data + "/colour/tiny_sbix.ttf").c_str());
+    const std::shared_ptr<Typeface> cbdt = loadTypefaceFile((data + "/colour/tiny_cbdt.ttf").c_str());
+    check(colr && sbix && cbdt && colr->hasColourGlyphs() && sbix->hasColourGlyphs() && cbdt->hasColourGlyphs(),
+          "the colour fixtures load -- sbix and CBDT with no outlines at all");
+    if (colr && sbix && cbdt) {
+      const uint16_t a = colr->glyphForChar('A');
+      const std::vector<ColourLayer> layers = colr->colourLayers(a), second = colr->colourLayers(a, 1);
+      std::snprintf(msg, sizeof(msg), "COLR: A is %zu layers -- %d,%d,%d,%d; %s; %d,%d,%d,%d -- and %zu in the "
+                    "second palette; B none; %d palettes", layers.size(),
+                    layers.size() > 0 ? layers[0].red : -1, layers.size() > 0 ? layers[0].green : -1,
+                    layers.size() > 0 ? layers[0].blue : -1, layers.size() > 0 ? layers[0].alpha : -1,
+                    layers.size() > 1 && layers[1].foreground ? "the text's colour" : "not the text's colour",
+                    layers.size() > 2 ? layers[2].red : -1, layers.size() > 2 ? layers[2].green : -1,
+                    layers.size() > 2 ? layers[2].blue : -1, layers.size() > 2 ? layers[2].alpha : -1, second.size(),
+                    colr->numPalettes());
+      check(layers.size() == 3 && layers[0].red == 255 && layers[0].green == 0 && layers[0].alpha == 255 &&
+                !layers[0].foreground && layers[1].foreground && layers[2].blue == 255 && layers[2].alpha == 128 &&
+                second.size() == 3 && second[0].green == 255 && second[0].red == 0 && second[2].red == 255 &&
+                second[2].green == 255 && colr->colourLayers(colr->glyphForChar('B')).empty() &&
+                colr->numPalettes() == 2,
+            msg);
+
+      // Where HarfBuzz puts each picture (hb_font_get_glyph_extents): sbix's
+      // from the 40 ppem strike, 2 pixels right of the pen and its top 13
+      // above the baseline; CBDT's 1 right and 12 above.
+      ImageLayer large, small, beyond, blue;
+      const bool found = sbix->colourImage(2, 40.0f, &large) && sbix->colourImage(2, 15.0f, &small) &&
+                         sbix->colourImage(2, 200.0f, &beyond) && cbdt->colourImage(2, 32.0f, &blue);
+      std::snprintf(msg, sizeof(msg), "pictures from the strike HarfBuzz takes: sbix at 40 px %d ppem (%d,%d), at "
+                    "15 px %d, at 200 px %d; CBDT %d ppem (%d,%d)", large.ppem, large.left, large.top, small.ppem,
+                    beyond.ppem, blue.ppem, blue.left, blue.top);
+      ImageLayer subPixel;
+      check(sbix->colourImage(2, 0.4f, &subPixel) && subPixel.ppem == 20,
+            "text under a pixel to the em takes the smallest strike, not the largest");
+      check(found && large.ppem == 40 && large.left == 2 && large.top == -13 && small.ppem == 20 &&
+                beyond.ppem == 40 && blue.ppem == 32 && blue.left == 1 && blue.top == -12 &&
+                !sbix->colourImage(3, 40.0f, &blue),
+            msg);
+
+      // Drawn: A's layers in their colours, none of its black silhouette;
+      // B in the text's colour.
+      Bitmap canvas(200, 100);
+      canvas.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(canvas);
+        g.setColour(Colour(0, 255, 0, 255));
+        Font(colr, 80.0f).draw(g, "AB", 10.0f, 80.0f);
+      }
+      const PremulColour red = canvas.pixelAt(30, 50), ink = canvas.pixelAt(70, 70), over = canvas.pixelAt(70, 30),
+                         plain = canvas.pixelAt(130, 60);
+      std::snprintf(msg, sizeof(msg), "COLR drawn: red %d,%d,%d; the text's green %d,%d,%d; half blue over black "
+                    "%d,%d,%d; B %d,%d,%d", red.r, red.g, red.b, ink.r, ink.g, ink.b, over.r, over.g, over.b,
+                    plain.r, plain.g, plain.b);
+      check(red.r == 255 && red.g == 0 && red.b == 0 && ink.g == 255 && ink.r == 0 && over.b >= 120 &&
+                over.b <= 136 && over.r == 0 && over.g == 0 && plain.g == 255 && plain.r == 0,
+            msg);
+
+      // Pictures drawn where HarfBuzz puts them, from the strike the size on
+      // the SCREEN wants: 20 px under a 2x transform is the 40 ppem strike.
+      Bitmap pictures(120, 60);
+      pictures.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(pictures);
+        Font(sbix, 40.0f).draw(g, "A", 10.0f, 50.0f);
+        Font(sbix, 15.0f).draw(g, "A", 40.0f, 50.0f);
+        Font(cbdt, 32.0f).draw(g, "A", 60.0f, 50.0f);
+        g.save();
+        g.addTransform(Transform::scaling(2.0f, 2.0f));
+        Font(sbix, 20.0f).draw(g, "A", 40.0f, 25.0f);
+        g.restore();
+      }
+      const PremulColour green = pictures.pixelAt(20, 45), reduced = pictures.pixelAt(44, 49),
+                         cbdtBlue = pictures.pixelAt(66, 46), sharp = pictures.pixelAt(90, 45),
+                         outside = pictures.pixelAt(20, 30);
+      std::snprintf(msg, sizeof(msg), "pictures drawn: sbix at 40 px %d,%d,%d; at 15 px %d,%d,%d; CBDT %d,%d,%d; "
+                    "20 px at 2x %d,%d,%d; above the picture %d,%d,%d", green.r, green.g, green.b, reduced.r,
+                    reduced.g, reduced.b, cbdtBlue.r, cbdtBlue.g, cbdtBlue.b, sharp.r, sharp.g, sharp.b, outside.r,
+                    outside.g, outside.b);
+      check(green.g == 255 && green.r == 0 && reduced.r == 255 && reduced.g == 0 && cbdtBlue.b == 255 &&
+                cbdtBlue.r == 0 && sharp.g == 255 && sharp.r == 0 && outside.r == 0 && outside.g == 0 &&
+                outside.b == 0,
+            msg);
+    }
+  }
+
+  // -- An emoji from the system's colour emoji face --
+  if (const std::shared_ptr<Typeface> emoji = emojiTypeface()) {
+    // Green text on black: an emoji drawn in colour has pixels that are not
+    // green; one asked for as text (VS15), or a heart without VS16, has none.
+    auto colourful = [&](const std::string& text) {
+      Bitmap canvas(80, 60);
+      canvas.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(canvas);
+        g.setColour(Colour(0, 255, 0, 255));
+        Font(face, 40.0f).draw(g, text, 10.0f, 45.0f);
+      }
+      int count = 0;
+      for (int y = 0; y < canvas.height(); ++y)
+        for (int x = 0; x < canvas.width(); ++x) count += canvas.pixelAt(x, y).r > 100 ? 1 : 0;
+      return count;
+    };
+    const int smile = colourful(u8"\U0001F600"), asText = colourful(u8"\U0001F600\uFE0E");
+    const int heart = colourful(u8"\u2764"), redHeart = colourful(u8"\u2764\uFE0F");
+    std::snprintf(msg, sizeof(msg), "emoji come from the colour face: U+1F600 %d coloured pixels, with VS15 %d; "
+                  "U+2764 %d, with VS16 %d", smile, asText, heart, redHeart);
+    check(smile > 50 && asText == 0 && heart == 0 && redHeart > 50, msg);
+  } else {
+    std::printf("  SKIPPED the colour emoji face: this system has none\n");
+  }
+
+  // -- Text drawn from cached glyph coverage --
+  {
+    // As filling the outline draws it: the same ink, each glyph within a
+    // quarter pixel of where the outline puts it.
+    const Font font(face, 24.0f);
+    const std::string text = "Mix 50 dB";
+    auto render = [&](bool outline, float x, float y, int scale) {
+      Bitmap canvas(220 * scale, 60 * scale);
+      canvas.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(canvas);
+        if (scale != 1) g.addTransform(Transform::scaling((float) scale, (float) scale));
+        g.setColour(Colour(255, 255, 255, 255));
+        if (outline) {
+          Path path;
+          font.appendString(path, text, x, y);
+          g.fillPath(path, FillRule::NonZero);
+        } else {
+          font.draw(g, text, x, y);
+        }
+      }
+      return canvas;
+    };
+    const Bitmap cached = render(false, 10.3f, 40.6f, 1), filled = render(true, 10.3f, 40.6f, 1);
+    long inkCached = 0, inkFilled = 0;
+    int worst = 0;
+    for (int y = 0; y < cached.height(); ++y)
+      for (int x = 0; x < cached.width(); ++x) {
+        const int a = cached.pixelAt(x, y).r, b = filled.pixelAt(x, y).r;
+        inkCached += a;
+        inkFilled += b;
+        worst = (std::max)(worst, std::abs(a - b));
+      }
+    const Bitmap again = render(false, 10.3f, 40.6f, 1);
+    const bool same = std::memcmp(again.data(), cached.data(), cached.sizeInBytes()) == 0;
+    std::snprintf(msg, sizeof(msg), "text from cached glyph coverage: ink %ld against the outline's %ld, worst pixel "
+                  "%d apart; drawn again from the cache, %s", inkCached, inkFilled, worst,
+                  same ? "the same pixels" : "different pixels");
+    check(inkFilled > 0 && std::labs(inkCached - inkFilled) * 50 < inkFilled && worst <= 160 && same, msg);
+    // At 2x it is rasterised at the size it lands at, not scaled up.
+    const Bitmap twice = render(false, 10.3f, 40.6f, 2), twiceFilled = render(true, 10.3f, 40.6f, 2);
+    long inkTwice = 0, inkTwiceFilled = 0;
+    for (int y = 0; y < twice.height(); ++y)
+      for (int x = 0; x < twice.width(); ++x) {
+        inkTwice += twice.pixelAt(x, y).r;
+        inkTwiceFilled += twiceFilled.pixelAt(x, y).r;
+      }
+    std::snprintf(msg, sizeof(msg), "at 2x: ink %ld against the outline's %ld", inkTwice, inkTwiceFilled);
+    check(inkTwiceFilled > 0 && std::labs(inkTwice - inkTwiceFilled) * 50 < inkTwiceFilled, msg);
+    // A gradient paints cached coverage as it paints an outline.
+    Bitmap ramp(220, 60);
+    ramp.clear(Colour(0, 0, 0, 255));
+    const float wide = font.stringWidth(text);
+    {
+      Graphics g(ramp);
+      g.setGradient(ColourGradient(Colour(255, 0, 0, 255), Point(10.0f, 0.0f), Colour(0, 0, 255, 255),
+                                   Point(10.0f + wide, 0.0f), false));
+      font.draw(g, text, 10.3f, 40.6f);
+    }
+    int reddest = 0, bluest = 0;
+    for (int y = 0; y < ramp.height(); ++y)
+      for (int x = 0; x < ramp.width(); ++x) {
+        const PremulColour c = ramp.pixelAt(x, y);
+        if ((float) x < 10.0f + wide * 0.25f) reddest = (std::max)(reddest, (int) c.r - (int) c.b);
+        if ((float) x > 10.0f + wide * 0.75f) bluest = (std::max)(bluest, (int) c.b - (int) c.r);
+      }
+    check(reddest > 100 && bluest > 100, "a gradient paints text drawn from cached coverage, red to blue");
+    // Big on the device -- a zoom, a giant readout -- the outline is
+    // filled, and only what the clip shows: the same ink either way.
+    const Font big(face, 120.0f);
+    Bitmap bigCanvas(160, 160), bigOutline(160, 160);
+    bigCanvas.clear(Colour(0, 0, 0, 255));
+    bigOutline.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(bigCanvas);
+      g.addTransform(Transform::scaling(4.0f, 4.0f));
+      g.setColour(Colour(255, 255, 255, 255));
+      big.draw(g, "H", -20.0f, 60.0f);
+    }
+    {
+      Graphics g(bigOutline);
+      g.addTransform(Transform::scaling(4.0f, 4.0f));
+      g.setColour(Colour(255, 255, 255, 255));
+      Path path;
+      big.appendString(path, "H", -20.0f, 60.0f);
+      g.fillPath(path, FillRule::NonZero);
+    }
+    check(std::memcmp(bigCanvas.data(), bigOutline.data(), bigCanvas.sizeInBytes()) == 0,
+          "text 480 pixels to the em on the device is its outline filled, not cached coverage");
+  }
+
+  // -- A font file mapped, and a font read where its bytes are --
+  {
+    const std::string path = data + "/shaping/tiny_shaping.ttf";
+    std::shared_ptr<Typeface> mapped = loadTypefaceFile(path.c_str());
+    const std::string bytes = read(path);
+    Typeface inPlace;
+    const bool viewed = inPlace.load((const uint8_t*) bytes.data(), bytes.size());
+    const bool same = mapped && viewed && mapped->numGlyphs() == inPlace.numGlyphs() &&
+                      mapped->glyphForChar(0x628) != 0 && mapped->glyphForChar(0x628) == inPlace.glyphForChar(0x628);
+    check(same, "loadTypefaceFile maps a font file, and Typeface::load reads bytes in place: the same font as read");
+    check(!loadTypefaceFile((data + "/shaping/no_such_font.ttf").c_str()), "a missing file is no typeface");
+    if (mapped) {
+      const Typeface copy = *mapped;
+      const uint16_t beh = mapped->glyphForChar(0x628);
+      mapped.reset();
+      Path outline;
+      copy.appendGlyph(beh, outline, 0.0f, 0.0f, 1.0f);
+      check(copy.glyphForChar(0x628) == beh && !outline.isEmpty(), "a copy of a mapped typeface keeps the file mapped");
+    }
+  }
+
+  // -- OpenType features the caller chooses, against HarfBuzz --
+  {
+    // Shapes each line of an expected file as it asks, and counts the runs
+    // that come out otherwise than HarfBuzz's.
+    auto shapesAsHarfBuzz = [&](const Typeface& face, const std::string& expected, int* runs,
+                                std::string* firstWrong) {
+      std::istringstream in(expected);
+      std::string line;
+      int wrong = 0;
+      while (std::getline(in, line)) {
+        const size_t bar = line.find('|');
+        if (bar == std::string::npos) continue;
+        std::istringstream head(line.substr(0, bar));
+        std::string given;
+        int rtl = 0;
+        head >> given >> rtl;
+        std::vector<std::pair<uint32_t, uint32_t>> features;
+        std::istringstream list(given == "-" ? std::string() : given);
+        std::string item;
+        while (std::getline(list, item, ',')) {
+          const size_t eq = item.find('=');
+          features.push_back({Typeface::tagOf(item.substr(0, eq).c_str()),
+                              (uint32_t) std::strtoul(item.substr(eq + 1).c_str(), nullptr, 10)});
+        }
+        std::vector<uint32_t> text;
+        std::string h;
+        while (head >> h) text.push_back((uint32_t) std::strtoul(h.c_str(), nullptr, 16));
+        std::string got;
+        char buf[80];
+        for (const ShapedGlyph& g : shapeRun(face, text.data(), text.size(), rtl != 0, nullptr, &features)) {
+          if (!got.empty()) got += ';';
+          std::snprintf(buf, sizeof(buf), "%u,%u,%d,%d,%d", g.glyph, g.cluster, g.xAdvance, g.xOffset, g.yOffset);
+          got += buf;
+        }
+        std::string want = line.substr(bar + 1);
+        while (!want.empty() && want[0] == ' ') want.erase(0, 1);
+        while (!want.empty() && (want.back() == '\r' || want.back() == ' ')) want.pop_back();
+        ++*runs;
+        if (got != want && wrong++ == 0) *firstWrong = line.substr(0, bar) + "-> " + got;
+      }
+      return wrong;
+    };
+    const std::string bytes = read(data + "/shaping/tiny_features.ttf");
+    auto featured = std::make_shared<Typeface>();
+    const bool loadedFeatures = !bytes.empty() && featured->load(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+    check(loadedFeatures, "tiny_features.ttf loads");
+    if (loadedFeatures) {
+      std::string firstWrong;
+      int runs = 0;
+      const int wrong =
+          shapesAsHarfBuzz(*featured, read(data + "/shaping/tiny_features_expected.txt"), &runs, &firstWrong);
+      std::snprintf(msg, sizeof(msg), "tiny_features: %d of %d runs as HarfBuzz shapes them -- tabular figures, "
+                    "automatic fractions, ligatures off, alternates by value%s%s", runs - wrong, runs,
+                    wrong ? "; first wrong: " : "", wrong ? firstWrong.substr(0, 80).c_str() : "");
+      check(runs >= 16 && wrong == 0, msg);
+      // Through Font: tabular figures are one width each -- 600 units, 60 px
+      // here -- where the plain ones are 669, 310, 351 and 392.
+      const Font plain(featured, 100.0f);
+      const Font tabular = plain.withFeature("tnum");
+      std::snprintf(msg, sizeof(msg), "withFeature(\"tnum\") makes \"0123\" %.1f px wide, from %.1f; "
+                    "turned off again, %.1f", tabular.stringWidth("0123"), plain.stringWidth("0123"),
+                    tabular.withFeature("tnum", 0).stringWidth("0123"));
+      check(std::fabs(tabular.stringWidth("0123") - 240.0f) < 0.01f &&
+                std::fabs(plain.stringWidth("0123") - 172.2f) < 0.01f &&
+                std::fabs(tabular.withFeature("tnum", 0).stringWidth("0123") - 172.2f) < 0.01f &&
+                tabular.features().size() == 1,
+            msg);
+    }
+    // A font that lists things more than once: of two liga features only
+    // the first counts, a required feature applies though nobody asked for
+    // its tag, and a calt of 4,000 lookups listed 4,000 times is planned in
+    // linear time -- merging them pairwise took minutes.
+    const std::string repeated = read(data + "/shaping/tiny_repeats.ttf");
+    Typeface repeats;
+    const bool loadedRepeats = !repeated.empty() && repeats.load(std::vector<uint8_t>(repeated.begin(), repeated.end()));
+    check(loadedRepeats, "tiny_repeats.ttf loads");
+    if (loadedRepeats) {
+      std::string firstWrong;
+      int runs = 0;
+      const auto started = std::chrono::steady_clock::now();
+      const int wrong =
+          shapesAsHarfBuzz(repeats, read(data + "/shaping/tiny_repeats_expected.txt"), &runs, &firstWrong);
+      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      std::snprintf(msg, sizeof(msg), "tiny_repeats: %d of %d runs as HarfBuzz shapes them, in %.3f s -- "
+                    "the first of two ligas, an unasked required feature, a calt of 4,000 lookups 4,000 times%s%s",
+                    runs - wrong, runs, seconds, wrong ? "; first wrong: " : "",
+                    wrong ? firstWrong.substr(0, 80).c_str() : "");
+      check(runs >= 6 && wrong == 0 && seconds < 5.0, msg);
+    }
+    // Variation sequences, from the cmap's format 14: a character and its
+    // selector become the glyph the font lists for the pair, its own where
+    // the pair is a default one; a selector the font lists nothing for is
+    // hidden.
+    const std::string varied = read(data + "/shaping/tiny_variants.ttf");
+    Typeface variants;
+    const bool loadedVariants = !varied.empty() && variants.load(std::vector<uint8_t>(varied.begin(), varied.end()));
+    check(loadedVariants, "tiny_variants.ttf loads");
+    if (loadedVariants) {
+      std::string firstWrong;
+      int runs = 0;
+      const int wrong =
+          shapesAsHarfBuzz(variants, read(data + "/shaping/tiny_variants_expected.txt"), &runs, &firstWrong);
+      std::snprintf(msg, sizeof(msg), "tiny_variants: %d of %d runs as HarfBuzz shapes them -- a selector's own "
+                    "glyph, a default one, none, two in a row, a ligature and a fraction about them%s%s",
+                    runs - wrong, runs, wrong ? "; first wrong: " : "", wrong ? firstWrong.substr(0, 80).c_str() : "");
+      check(runs >= 11 && wrong == 0, msg);
+      std::snprintf(msg, sizeof(msg), "variationGlyph: a+VS1 %u, a+VS2 %u, a+VS15 %u, 0+VS1 %u (its own, %u)",
+                    variants.variationGlyph(0x61, 0xFE00), variants.variationGlyph(0x61, 0xFE01),
+                    variants.variationGlyph(0x61, 0xFE0E), variants.variationGlyph(0x30, 0xFE00),
+                    variants.glyphForChar(0x30));
+      check(variants.variationGlyph(0x61, 0xFE00) == 7 && variants.variationGlyph(0x61, 0xFE01) == 8 &&
+                variants.variationGlyph(0x61, 0xFE0E) == 0 &&
+                variants.variationGlyph(0x30, 0xFE00) == variants.glyphForChar(0x30) &&
+                variants.variationGlyph(0x32, 0xFE00) == 0,
+            msg);
+    }
+  }
+
+  // -- Joiners in a Font's text: shaped, not dropped --
+  {
+    const Font font(face, 100.0f);
+    const float scale = 100.0f / (float) face->unitsPerEm();
+    auto shapedWidth = [&](std::vector<uint32_t> text) {
+      float width = 0.0f;
+      for (const ShapedGlyph& g : shapeRun(*face, text.data(), text.size(), true)) width += (float) g.xAdvance * scale;
+      return width;
+    };
+    // Lam then ZWJ takes its initial form; ZWJ then lam its final one;
+    // ZWNJ between two behs keeps both alone.
+    const float lamZwj = font.stringWidth(u8"\u0644\u200D"), zwjLam = font.stringWidth(u8"\u200D\u0644");
+    const float parted = font.stringWidth(u8"\u0628\u200C\u0628");
+    std::snprintf(msg, sizeof(msg), "a Font shapes ZWJ and ZWNJ with the letters about them: lam+ZWJ %.1f (shaped "
+                  "%.1f, alone %.1f), ZWJ+lam %.1f (%.1f), beh+ZWNJ+beh %.1f (%.1f)", lamZwj,
+                  shapedWidth({0x644, 0x200D}), shapedWidth({0x644}), zwjLam, shapedWidth({0x200D, 0x644}), parted,
+                  shapedWidth({0x628, 0x200C, 0x628}));
+    check(std::fabs(lamZwj - shapedWidth({0x644, 0x200D})) < 0.01f &&
+              std::fabs(lamZwj - shapedWidth({0x644})) > 1.0f &&
+              std::fabs(zwjLam - shapedWidth({0x200D, 0x644})) < 0.01f &&
+              std::fabs(parted - shapedWidth({0x628, 0x200C, 0x628})) < 0.01f,
+          msg);
+    const CharacterLayout l = font.layoutCharacters(u8"\u0628\u200C\u0628");
+    check(l.size() == 3 && l.stop[0] && !l.stop[1] && l.stop[2], "ZWNJ is no place for a caret of its own");
+  }
+
+  // -- Emoji sequences: one cluster, one place for a caret --
+  {
+    const Font font(face, 100.0f);
+    // a, thumbs up with a skin tone, b, the flags of Spain and France, c, a
+    // family of three joined by ZWJs, d, the flag of England as tags, e.
+    const std::string text = u8"a\U0001F44D\U0001F3FDb\U0001F1EA\U0001F1F8\U0001F1EB\U0001F1F7c"
+                             u8"\U0001F468\u200D\U0001F469\u200D\U0001F467d"
+                             u8"\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007Fe";
+    const CharacterLayout l = font.layoutCharacters(text);
+    std::string stops;
+    for (size_t i = 0; i < l.size(); ++i) stops += l.stop[i] ? '|' : '.';
+    std::snprintf(msg, sizeof(msg), "emoji sequences are one place for a caret each: %s", stops.c_str());
+    check(stops == "||.||.|.||....||......|", msg);
+    TextEditor field;
+    field.setFont(font);
+    field.setBounds({0.0f, 0.0f, 2000.0f, 120.0f});
+    field.setText(u8"a\U0001F44D\U0001F3FD\U0001F1EA\U0001F1F8\U0001F468\u200D\U0001F469\u200D\U0001F467"
+                  u8"e\u0301");
+    KeyPress end, back, home, del;
+    end.keyCode = KeyPress::End;
+    back.keyCode = KeyPress::Backspace;
+    home.keyCode = KeyPress::Home;
+    del.keyCode = KeyPress::Delete;
+    field.keyPressed(end);
+    field.keyPressed(back);
+    const bool markAlone = field.getText() == u8"a\U0001F44D\U0001F3FD\U0001F1EA\U0001F1F8"
+                                              u8"\U0001F468\u200D\U0001F469\u200D\U0001F467e";
+    field.keyPressed(back);
+    field.keyPressed(back);
+    const bool familyWhole = field.getText() == u8"a\U0001F44D\U0001F3FD\U0001F1EA\U0001F1F8";
+    field.keyPressed(back);
+    const bool flagWhole = field.getText() == u8"a\U0001F44D\U0001F3FD";
+    field.keyPressed(home);
+    field.keyPressed(del);
+    field.keyPressed(del);
+    std::snprintf(msg, sizeof(msg), "Backspace takes an accent alone (%d) but a family (%d) and a flag (%d) whole; "
+                  "Delete takes a skin-toned thumb whole (%d)", markAlone, familyWhole, flagWhole,
+                  field.getText().empty());
+    check(markAlone && familyWhole && flagWhole && field.getText().empty(), msg);
+  }
+
+  // -- TextArea: a text field of several lines --
+  {
+    const Font font(face, 20.0f);
+    const float space = font.stringWidth(" ");
+    TextArea notes;
+    notes.setFont(font);
+    // Room for "one two" and not "one two three" on a line.
+    const float room = font.stringWidth("one two") + space * 0.5f + TextArea::kPadding * 2.0f;
+    notes.setBounds({0.0f, 0.0f, room, 300.0f});
+    notes.setText("one two three four\r\nfive\rsix");
+    KeyPress key;
+    auto press = [&](int code, bool shift = false, bool ctrl = false) {
+      key = KeyPress();
+      key.keyCode = code;
+      key.shiftDown = shift;
+      key.ctrlDown = ctrl;
+      notes.keyPressed(key);
+    };
+    std::snprintf(msg, sizeof(msg), "TextArea: %d lines -- wrapped where UAX #14 allows, and at CR LF and CR, "
+                  "which are stored as LF", notes.numLines());
+    check(notes.numLines() == 5 && notes.getText() == "one two three four\nfive\nsix", msg);
+    // Down through a short line keeps to the x the caret began at.
+    notes.setBounds({0.0f, 0.0f, 400.0f, 300.0f});
+    notes.setText("abcdef\nab\nabcdef");
+    press(KeyPress::Home, false, true);
+    press(KeyPress::End);
+    press(KeyPress::Down);
+    const int shortLine = notes.caretPosition();
+    press(KeyPress::Down);
+    const int below = notes.caretPosition();
+    press(KeyPress::Up);
+    press(KeyPress::Up);
+    std::snprintf(msg, sizeof(msg), "End, then down through a short line and on: %d, %d; and back up: %d", shortLine,
+                  below, notes.caretPosition());
+    check(shortLine == 9 && below == 16 && notes.caretPosition() == 6, msg);
+    press(KeyPress::Down);
+    press(KeyPress::Down);
+    press(KeyPress::Home);
+    check(notes.caretPosition() == 10 && notes.caretLine() == 2, "Home goes to the start of the line");
+    press(KeyPress::Backspace);
+    check(notes.getText() == "abcdef\nababcdef" && notes.caretPosition() == 9,
+          "Backspace at a line's start joins it to the one above");
+    press(KeyPress::Return);
+    check(notes.getText() == "abcdef\nab\nabcdef" && notes.caretPosition() == 10, "Return makes a line break");
+    press(KeyPress::End, false, true);
+    press(KeyPress::Home, true, true);
+    check(notes.selectionStart() == 0 && notes.selectionEnd() == 16 && notes.selectedText() == notes.getText(),
+          "Ctrl+End, then Shift+Ctrl+Home, selects across every line");
+    press(KeyPress::Delete);
+    check(notes.isEmpty() && notes.numLines() == 1, "Delete takes a selection of several lines");
+    // A text ending with a line break has an empty last line, where the
+    // caret is.
+    notes.setText("ab\n");
+    check(notes.numLines() == 2 && notes.caretLine() == 1, "after a final line break, the caret is on a line of its own");
+    // A click on the second line puts the caret there.
+    notes.setText("first\nsecond");
+    MouseEvent click;
+    click.position = {TextArea::kPadding + 1.0f, 4.0f + font.lineHeight() * 1.5f};
+    notes.mouseDown(click);
+    check(notes.caretPosition() == 6, "a click at the start of the second line puts the caret there");
+    click.clickCount = 2;
+    click.position.x = TextArea::kPadding + font.stringWidth("sec");
+    notes.mouseDown(click);
+    check(notes.selectedText() == "second", "a double click selects the word");
+    // A long text scrolls to keep the caret in view.
+    std::string many;
+    for (int i = 0; i < 40; ++i) many += "line\n";
+    notes.setText(many);
+    const float scrolled = notes.scrollOffset();
+    press(KeyPress::Home, false, true);
+    std::snprintf(msg, sizeof(msg), "forty lines scroll to the caret at the end (%.1f px) and back to the top (%.1f)",
+                  scrolled, notes.scrollOffset());
+    check(scrolled > 0.0f && notes.scrollOffset() == 0.0f, msg);
+    notes.setMaxLength(5);
+    notes.setText("");
+    for (uint32_t c : {(uint32_t) 'a', (uint32_t) 'b', (uint32_t) 'c'}) {
+      key = KeyPress();
+      key.character = c;
+      notes.keyPressed(key);
+    }
+    press(KeyPress::Return);
+    press(KeyPress::Return);
+    press(KeyPress::Return);
+    check(notes.getText() == "abc\n\n", "the length limit counts a line break as a character");
+    // The CR that Windows sends as a character after Return is no second
+    // line break.
+    key = KeyPress();
+    key.character = '\r';
+    check(!notes.keyPressed(key) && notes.getText() == "abc\n\n", "a CR typed as a character is refused");
+    // Nor is what is no character: past U+10FFFF, or a surrogate.
+    key = KeyPress();
+    key.character = 0x300000;
+    const bool past = notes.keyPressed(key);
+    key.character = 0xD800;
+    check(!past && !notes.keyPressed(key) && notes.getText() == "abc\n\n",
+          "a code point past U+10FFFF, or a surrogate, is refused");
+    // Every mandatory break is stored as LF, and a text ending with one has
+    // a line after it.
+    notes.setMaxLength(0);
+    notes.setText(u8"ab cd\u0085ef\u000Bgh ");
+    check(notes.getText() == "ab\ncd\nef\ngh\n" && notes.numLines() == 5 && notes.caretLine() == 4,
+          "VT, NEL and the line and paragraph separators are stored as LF");
+    // A word too long for its line wraps with nothing hanging: the end of one
+    // line is the index the next begins at, and the caret keeps to the line
+    // that End, a click or up and down put it on.
+    const float tenM = font.stringWidth("mmmmmmmmmm");
+    notes.setBounds({0.0f, 0.0f, tenM + font.stringWidth("m") * 0.5f + TextArea::kPadding * 2.0f, 300.0f});
+    notes.setText(std::string(30, 'm'));
+    const int wrappedLines = notes.numLines();
+    press(KeyPress::Up);
+    const int upPosition = notes.caretPosition(), upLine = notes.caretLine();
+    press(KeyPress::Up);
+    const int topLine = notes.caretLine();
+    press(KeyPress::Home);
+    press(KeyPress::End);
+    std::snprintf(msg, sizeof(msg), "thirty m's in %d lines of ten: up from the end is %d on line %d, up again line "
+                  "%d; End stays on line %d at %d", wrappedLines, upPosition, upLine, topLine, notes.caretLine(),
+                  notes.caretPosition());
+    check(wrappedLines == 3 && upPosition == 20 && upLine == 1 && topLine == 0 && notes.caretLine() == 0 &&
+              notes.caretPosition() == 10,
+          msg);
+    press(KeyPress::Right);
+    check(notes.caretPosition() == 11 && notes.caretLine() == 1, "and Right from there goes on into the next line");
+    // Hanging spaces are places for the caret: each one moves it.
+    notes.setBounds({0.0f, 0.0f, 400.0f, 300.0f});
+    notes.setText("abc    ");
+    Rect end, before;
+    notes.caretBounds(&end);
+    press(KeyPress::Left);
+    notes.caretBounds(&before);
+    std::snprintf(msg, sizeof(msg), "the caret moves through spaces at a line's end: %.1f, then %.1f", end.x, before.x);
+    check(end.x > before.x + 1.0f && before.x > TextArea::kPadding + font.stringWidth("abc"), msg);
+    press(KeyPress::Home);
+    press(KeyPress::End);
+    check(notes.caretPosition() == 7, "End on the last line goes past its spaces, to the text's end");
+
+  }
+
+  // -- A caret in shaped text: where each character is drawn --
+  {
+    const Font font(face, 100.0f);
+    const std::string word = u8"بلا"; // beh, then lam and alef as one ligature
+    const CharacterLayout l = font.layoutCharacters(word);
+    std::snprintf(msg, sizeof(msg), "an Arabic word's carets run right to left: %.1f %.1f %.1f %.1f (width %.1f), "
+                  "and alef, inside the lam-alef ligature, is no place for one", l.caretX(0), l.caretX(1),
+                  l.caretX(2), l.caretX(3), l.width);
+    check(l.size() == 3 && std::fabs(l.width - font.stringWidth(word)) < 0.001f &&
+              std::fabs(l.caretX(0) - l.width) < 0.001f && l.caretX(1) < l.caretX(0) && l.caretX(3) == 0.0f &&
+              l.stop[0] && l.stop[1] && !l.stop[2],
+          msg);
+    TextEditor field;
+    field.setFont(font);
+    field.setBounds({0.0f, 0.0f, 400.0f, 120.0f});
+    field.setText(word);
+    KeyPress home, right;
+    home.keyCode = KeyPress::Home;
+    right.keyCode = KeyPress::Right;
+    field.keyPressed(home);
+    field.keyPressed(right);
+    const int afterBeh = field.caretPosition();
+    field.keyPressed(right);
+    std::snprintf(msg, sizeof(msg), "the arrows step over the lam-alef ligature as one place (%d, then %d)",
+                  afterBeh, field.caretPosition());
+    check(afterBeh == 1 && field.caretPosition() == 3, msg);
+    MouseEvent click;
+    click.position = {TextEditor::kPadding + 1.0f, 60.0f};
+    field.mouseDown(click);
+    check(field.caretPosition() == 3, "a click at the left of a right-to-left word puts the caret after it");
+  }
+  {
+    const std::string bytes = read(data + "/shaping/tiny_indic2.ttf");
+    auto indic = std::make_shared<Typeface>();
+    const bool loadedIndic = !bytes.empty() && indic->load(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+    check(loadedIndic, "tiny_indic2.ttf loads");
+    if (loadedIndic) {
+      const Font font(indic, 100.0f);
+      const std::string conjunct = u8"क्षि"; // ka, virama, ssa, and the i-matra drawn before them
+      const CharacterLayout l = font.layoutCharacters(conjunct);
+      check(l.size() == 4 && l.stop[0] && !l.stop[1] && !l.stop[2] && !l.stop[3] &&
+                std::fabs(l.width - font.stringWidth(conjunct)) < 0.001f,
+            "a conjunct and its matra are one place for a caret");
+      TextEditor field;
+      field.setFont(font);
+      field.setBounds({0.0f, 0.0f, 400.0f, 120.0f});
+      field.setText(conjunct + u8"क");
+      KeyPress home, del;
+      home.keyCode = KeyPress::Home;
+      del.keyCode = KeyPress::Delete;
+      field.keyPressed(home);
+      field.keyPressed(del);
+      check(field.getText() == u8"क", "delete takes the whole conjunct, not its first letter");
+    }
+  }
+#endif
 }
 
 static void testGfxText() {
@@ -10306,6 +16277,179 @@ static void testGfxText() {
     empty.draw(g, "x", 0.0f, 0.0f);
     check(true, "and drawing with it is a no-op rather than a crash");
   }
+
+  // ── Characters the face does not have ──
+  //
+  // Invisible marks -- a zero-width joiner, a soft hyphen, a variation
+  // selector -- take no room and draw nothing; looked up, they drew a .notdef
+  // box mid-word.
+  {
+    const float plain = font.stringWidth("ab");
+    std::snprintf(msg, sizeof(msg), "a zero-width joiner and a variation selector take no room "
+                  "(%.2f against %.2f)", font.stringWidth("a\xE2\x80\x8D" "b\xEF\xB8\x8F"), plain);
+    check(font.stringWidth("a\xE2\x80\x8D" "b\xEF\xB8\x8F") == plain, msg);
+    check(font.stringWidth("\xC2\xAD") == 0.0f, "nor does a soft hyphen");
+  }
+  // A Japanese name -- a preset a user typed, a sample folder -- comes from
+  // the system's fallback faces where the face lacks it, not as a row of
+  // boxes; measured and drawn by the same walk, so the ink ends where the
+  // measurement says.
+  {
+    const std::string name = "\xE6\x97\xA5\xE6\x9C\xAC"; // the two characters of "Japan"
+    if (face->glyphForChar(0x65E5) != 0) {
+      check(true, "this face has U+65E5 itself -- fallback not exercised here");
+    } else if (!fallbackTypeface(0x65E5)) {
+      check(true, "no face on this machine has U+65E5 -- fallback SKIPPED, not passed");
+    } else {
+      auto ink = [&](const Font& f, int& rightmost) {
+        Bitmap canvas(120, 48);
+        canvas.clear(Colour(0, 0, 0, 255));
+        Graphics g(canvas);
+        g.setColour(Colour(255, 255, 255, 255));
+        f.draw(g, name, 4.0f, 36.0f);
+        int lit = 0;
+        rightmost = -1;
+        uint64_t hash = 1469598103934665603ull;
+        for (int y = 0; y < 48; ++y)
+          for (int x = 0; x < 120; ++x) {
+            const uint8_t v = canvas.pixelAt(x, y).r;
+            if (v > 0) {
+              ++lit;
+              if (x > rightmost) rightmost = x;
+            }
+            hash = (hash ^ v) * 1099511628211ull;
+          }
+        return std::make_pair(lit, hash);
+      };
+      int rightFound = 0, rightBox = 0;
+      const auto found = ink(font, rightFound);
+      const auto boxes = ink(font.withoutFallback(), rightBox);
+      std::snprintf(msg, sizeof(msg), "a Japanese name draws from a fallback face (%d pixels lit, "
+                    "and not the .notdef boxes' %d)", found.first, boxes.first);
+      check(found.first > 0 && found.second != boxes.second, msg);
+      const float width = font.stringWidth(name);
+      std::snprintf(msg, sizeof(msg), "and its ink ends where it measures: x = %d against 4 + %.1f",
+                    rightFound, width);
+      check(rightFound >= 4 && (float) rightFound <= 4.0f + width + 1.0f && width > 20.0f, msg);
+      check(font.withHeight(20.0f).fallsBack() && !font.withoutFallback().withHeight(20.0f).fallsBack(),
+            "withHeight keeps whether a font falls back");
+    }
+  }
+  // A character costs the faces for its own script, not every face on the
+  // list: one Thai letter in a preset name read every CJK face on the way
+  // past, 47 to 87 MB kept for good in every plugin. The small faces listed
+  // for any character, and Thai's own, are the most it may read.
+  {
+    const size_t before = fallbackFacesRead();
+    const std::shared_ptr<Typeface> thai = fallbackTypeface(0x0E01);
+    (void) fallbackTypeface(0x10FFFF); // nothing has it: a miss, remembered
+    (void) fallbackTypeface(0xDC00);   // a lone surrogate: not a character
+    const size_t read = fallbackFacesRead() - before;
+    std::snprintf(msg, sizeof(msg), "a Thai letter and two characters nothing covers read %zu "
+                  "more face file(s)%s", read, thai ? ", and the letter was found" : "");
+    check(read <= 4, msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One Font, drawn with on several threads at once
+//
+// A Graphics draws on whatever thread paints, a host may run two editors on
+// two threads, and an image may be rendered on a worker -- with copies of one
+// Font, which share its caches. Those are filled as text is drawn and emptied
+// when full, and nothing locked them: four threads drawing with copies of one
+// Font corrupted the heap of a release build within seconds, and under ASan
+// this case reported a use-after-free in the shaped-string cache. Here four
+// threads draw, measure and lay out lines with copies of one cold Font --
+// more shaped strings than it keeps, so that cache empties while they read
+// it -- and every frame must come out as a Font of its own drew it alone.
+// ---------------------------------------------------------------------------
+static void testGfxFontThreads() {
+  using namespace sonore::gfx;
+  std::printf("\n[gfx text on several threads]\n");
+  char msg[260];
+
+  auto face = loadTestTypeface(nullptr);
+  if (!face) {
+    check(true, "no font on this machine -- the threaded text test SKIPPED, not passed");
+    return;
+  }
+
+  // An eighth Latin, drawn a glyph per character; the rest with Hebrew in
+  // them, which is shaped: 525 shaped strings, past the 512 a Font keeps.
+  struct Line {
+    std::string text;
+    float scale;
+    uint64_t hash;
+    float width, laidOut;
+  };
+  std::vector<Line> lines;
+  for (int i = 0; i < 600; ++i) {
+    Line line;
+    for (int k = 0; k < 3; ++k) line.text += (char) ('a' + (i + k * 7) % 26);
+    if (i % 8 != 0)
+      for (int k = 0; k < 2; ++k) {
+        line.text += '\xD7'; // U+05D0 to U+05EA
+        line.text += (char) (0x90 + (i + k * 5) % 27);
+      }
+    line.text += std::to_string(i);
+    line.scale = 0.6f + (float) (i % 100) * 0.008f; // a flattening and coverage each
+    lines.push_back(line);
+  }
+  auto frame = [](const Font& f, const Line& line, Bitmap& canvas) {
+    canvas.clear(Colour(0, 0, 0, 255));
+    {
+      Graphics g(canvas);
+      g.addTransform(Transform::scaling(line.scale, line.scale));
+      g.setColour(Colour(255, 255, 255, 255));
+      f.draw(g, line.text, 2.0f, 15.0f);
+    }
+    uint64_t hash = 1469598103934665603ull;
+    const uint8_t* p = canvas.data();
+    for (size_t i = 0; i + 4 <= canvas.sizeInBytes(); i += 4) {
+      uint32_t pixel;
+      std::memcpy(&pixel, p + i, 4);
+      hash = (hash ^ pixel) * 1099511628211ull;
+    }
+    return hash;
+  };
+
+  const Font shared(face, 14.0f);
+  {
+    // The answers, from a Font with caches of its own, on this thread alone.
+    const Font alone = shared.withHeight(shared.height());
+    Bitmap canvas(128, 36);
+    for (Line& line : lines) {
+      line.hash = frame(alone, line, canvas);
+      line.width = alone.stringWidth(line.text);
+      line.laidOut = alone.layoutCharacters(line.text).width;
+    }
+  }
+
+  // Each thread half the lines, from its own place in them: every line is
+  // drawn by two of the four, which start together -- the caches are cold,
+  // and filled fastest, at the start.
+  const size_t each = lines.size() / 2;
+  std::atomic<int> wrong{0}, drawn{0}, ready{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 4; ++t)
+    threads.emplace_back([&, t]() {
+      const Font mine = shared; // a copy: the same caches as the others'
+      Bitmap canvas(128, 36);
+      ++ready;
+      while (ready.load() < 4) std::this_thread::yield();
+      for (size_t k = 0; k < each; ++k) {
+        const Line& line = lines[(k + (size_t) t * lines.size() / 4) % lines.size()];
+        if (frame(mine, line, canvas) != line.hash || mine.stringWidth(line.text) != line.width ||
+            mine.layoutCharacters(line.text).width != line.laidOut)
+          ++wrong;
+        ++drawn;
+      }
+    });
+  for (std::thread& thread : threads) thread.join();
+  std::snprintf(msg, sizeof(msg), "four threads drew %d lines with copies of one Font, and %d came out "
+                "other than a Font of its own drew them alone", drawn.load(), wrong.load());
+  check(drawn.load() == 4 * (int) each && wrong.load() == 0, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -10363,6 +16507,27 @@ static void testGfxComponent() {
   std::printf("\n[gfx component]\n");
   char msg[220];
 
+  // -- Bounds a layout computed wrong --
+  //
+  // NaN from a ratio of two empty sizes, 1e30 or infinity from a division by
+  // a zero count. A widget turns its size into a row count and a pixel index,
+  // and converting either to an int is undefined; setBounds makes them sane
+  // once. Ordinary values pass through untouched.
+  {
+    Component c;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    c.setBounds(Rect(nan, 1e30f, inf, -inf));
+    const Rect b = c.bounds();
+    std::snprintf(msg, sizeof(msg), "NaN, 1e30, inf and -inf bounds become %g, %g, %g, %g",
+                  (double) b.x, (double) b.y, (double) b.w, (double) b.h);
+    check(b.x == 0.0f && b.y == 16777216.0f && b.w == 16777216.0f && b.h == -16777216.0f, msg);
+    c.setBounds(Rect(-12.5f, 3.25f, 640.0f, 480.75f));
+    check(c.bounds().x == -12.5f && c.bounds().y == 3.25f && c.bounds().w == 640.0f &&
+              c.bounds().h == 480.75f,
+          "and ordinary bounds are kept exactly");
+  }
+
   // -- Re-entrancy: the router must not deref a component freed by a callback --
   //
   // The router dispatches through user callbacks and holds raw LOCALS across
@@ -10395,6 +16560,47 @@ static void testGfxComponent() {
     rerouter.mouseDown({150.0f, 50.0f});  // focus hb -> ha.focusLost deletes hb mid-delivery
     check(true, "clicking a control that another control's focus-loss handler destroys does not "
                 "use freed memory");
+  }
+
+  // The same trap in the release. After a mouse-up the router works out the
+  // hover again -- exit the old, enter the new -- and assigned the new one
+  // only AFTER the exit ran. An exit handler that destroys the control under
+  // the pointer left that assignment holding a freed component, and the
+  // enter went to it. mouseMove had been fixed for exactly this; mouseUp
+  // had the copy that was not.
+  {
+    static bool s_gone = false;
+    static int s_enteredAfterDeath = 0;
+    struct Leaving : public Component {
+      std::function<void()> onExit;
+      void mouseExit(const MouseEvent&) override { if (onExit) onExit(); }
+    };
+    struct Doomed : public Component {
+      ~Doomed() override { s_gone = true; }
+      void mouseEnter(const MouseEvent&) override { if (s_gone) ++s_enteredAfterDeath; }
+    };
+    Component stage;
+    stage.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    Leaving left;
+    left.setBounds({0.0f, 0.0f, 100.0f, 100.0f});
+    Doomed* right = new Doomed();
+    right->setBounds({100.0f, 0.0f, 100.0f, 100.0f});
+    stage.addChild(&left);
+    stage.addChild(right);
+    left.onExit = [&]() {
+      if (!right) return;
+      stage.removeChild(right);
+      delete right;
+      right = nullptr;
+    };
+    MouseRouter router(stage);
+    router.mouseMove({50.0f, 50.0f});  // hovering the left control
+    router.mouseDown({50.0f, 50.0f});
+    router.mouseUp({150.0f, 50.0f});   // released over the right one; leaving left deletes it
+    std::snprintf(msg, sizeof(msg), "a release whose hover change destroys the control under the "
+                  "pointer does not deliver to it (%d call(s) into the freed control)",
+                  s_enteredAfterDeath);
+    check(s_enteredAfterDeath == 0 && router.hovered() == nullptr, msg);
   }
 
   // ── The tree ──
@@ -11124,6 +17330,62 @@ static void testGfxGenericEditor() {
   }
   check(true, "sync() pulls host values back into the controls");
 
+  // A READ-ONLY parameter -- a meter, a gain reduction the plugin reports --
+  // is shown and never set. The editor dragged one like any other row, and
+  // every wrapper passed the write on to the host as an edit (found by
+  // fuzz_ui). uiMayWrite is the rule the wrappers' editor and page paths
+  // share; the row itself must not ask in the first place.
+  {
+    sonore::ParamInfo pair[2];
+    pair[0].id = "drive";
+    pair[0].label = "Drive";
+    pair[0].minValue = 0.0f;
+    pair[0].maxValue = 1.0f;
+    pair[1].id = "reduction";
+    pair[1].label = "Reduction";
+    pair[1].unit = "dB";
+    pair[1].minValue = -30.0f;
+    pair[1].maxValue = 0.0f;
+    pair[1].readOnly = true;
+    sonore::PluginDescriptor d;
+    d.params = pair;
+    d.numParams = 2;
+    check(sonore::uiMayWrite(d, 0) && !sonore::uiMayWrite(d, 1) && !sonore::uiMayWrite(d, 2) &&
+              !sonore::uiMayWrite(d, -1),
+          "an interface may write an ordinary parameter, and not a read-only one or one out of range");
+
+    float shown[2] = {0.5f, -12.0f};
+    int writes[2] = {0, 0}, gestures[2] = {0, 0};
+    EditorHost ro;
+    ro.getParameter = [&](int i) { return shown[i]; };
+    ro.setParameter = [&](int i, float v) {
+      ++writes[i];
+      shown[i] = v;
+    };
+    ro.beginGesture = [&](int i) { ++gestures[i]; };
+    ro.endGesture = [&](int) {};
+    GenericEditor meterEditor(pair, 2, ro, font);
+    meterEditor.setSize(360.0f, meterEditor.preferredHeight());
+    Component stage;
+    stage.setBounds({0.0f, 0.0f, 360.0f, meterEditor.preferredHeight()});
+    stage.addChild(&meterEditor);
+    MouseRouter hands(stage);
+    const float y0 = GenericEditor::kPadding + GenericEditor::kRowHeight * 0.5f;
+    const float y1 = y0 + GenericEditor::kRowHeight;
+    for (const float y : {y0, y1}) {
+      hands.mouseDown({160.0f, y});
+      hands.mouseMove({280.0f, y});
+      hands.mouseUp({280.0f, y});
+    }
+    std::snprintf(msg, sizeof(msg), "dragging both rows moves the ordinary one (%d write(s)) and not "
+                  "the read-only one (%d write(s), %d gesture(s))", writes[0], writes[1], gestures[1]);
+    check(writes[0] > 0 && writes[1] == 0 && gestures[1] == 0, msg);
+    shown[1] = -3.0f;
+    meterEditor.sync();
+    check(writes[1] == 0, "...and following the plugin's own value writes nothing back");
+    stage.removeChild(&meterEditor);
+  }
+
   // Degenerate: a plugin with NO parameters must still produce an editor
   // rather than a zero-height window a host cannot place.
   GenericEditor empty(nullptr, 0, host, font);
@@ -11256,6 +17518,42 @@ static void testGfxGradient() {
   check(g.lookup(0.5f).r == 128, msg);
   check(g.lookup(-3.0f).r == 0 && g.lookup(9.0f).r == 255,
         "past either end it clamps rather than repeating or wrapping");
+  // A stop at NaN counts as 0. It was stored as NaN, and a NaN among the keys
+  // breaks the ordering std::sort requires -- undefined behaviour.
+  {
+    ColourGradient stops(Colour(0, 0, 0, 255), Point(0.0f, 0.0f), Colour(255, 255, 255, 255),
+                         Point(0.0f, 100.0f));
+    stops.addStop(0.75f, Colour(10, 10, 10, 255));
+    stops.addStop(std::numeric_limits<float>::quiet_NaN(), Colour(20, 20, 20, 255));
+    stops.addStop(0.25f, Colour(30, 30, 30, 255));
+    bool ordered = true;
+    for (int i = 0; i < stops.numStops(); ++i) {
+      const float at = stops.stopAt(i).position;
+      if (!(at >= 0.0f && at <= 1.0f)) ordered = false;
+      if (i > 0 && !(stops.stopAt(i - 1).position <= at)) ordered = false;
+    }
+    check(ordered, "a stop at NaN lands at 0, and the stops stay in order");
+  }
+  // Built a stop at a time, as an SVG builds its gradients, the cost is the
+  // number of stops: each was appended and the whole list sorted again, so n
+  // stops cost n sorts -- an SVG gradient of 20,000 stops took 1.3 s to read.
+  {
+    auto build = [](int n) {
+      ColourGradient ramp;
+      for (int i = 0; i < n; ++i) ramp.addStop((float) i / (float) n, Colour((uint8_t) i, 0, 0, 255));
+      return ramp;
+    };
+    int sink = 0;
+    const ColourGradient big = build(20000);
+    bool inOrder = big.numStops() == 20000;
+    for (int i = 1; i < big.numStops() && inOrder; ++i)
+      inOrder = big.stopAt(i - 1).position <= big.stopAt(i).position && big.stopAt(i).colour.r == (uint8_t) i;
+    const double ratio = relativeCost([&] { sink += build(20000).numStops(); },
+                                      [&] { for (int k = 0; k < 10; ++k) sink += build(2000).numStops(); }, 3.0);
+    std::snprintf(msg, sizeof(msg), "20,000 stops added in order are in order, and cost %.2fx ten "
+                  "gradients of 2,000 (%d)", ratio, sink > 0 ? 1 : 0);
+    check(inOrder && ratio < 3.0, msg);
+  }
 
   // -- Where a point falls --
   checkNear(g.positionOf(Point(0.0f, 50.0f)), 0.5f, 1e-5f, "the midpoint of the axis is 0.5");
@@ -11390,6 +17688,82 @@ static void testGfxGradient() {
     gr.fillRect(Rect(0.0f, 0.0f, 8.0f, 8.0f));
     check(bmp.pixelAt(4, 1).r == 90 && bmp.pixelAt(4, 6).r == 90,
           "so a flat fill after a gradient is really flat");
+  }
+
+  // -- A ramp along an axis, against the per-pixel rule --
+  //
+  // A left-to-right or top-to-bottom ramp is filled with one colour worked
+  // out per column or per row (ColourGradient::varyingAxis), and a row's
+  // colour blended as a run. Held here to the rule it replaced, computed
+  // independently: each pixel's coverage, from the same shape filled in
+  // white, times the clip path's, and `over` with colourAt at the pixel's
+  // centre. Stops that are transparent and translucent, every spread, ramps
+  // shorter than the shape, shapes off whole pixels, under a 2x transform,
+  // with and without a path clip.
+  {
+    const int w = 96, h = 72;
+    Bitmap ground(w, h);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        ground.setPixel(x, y, PremulColour((uint8_t) (x * 5), (uint8_t) (y * 3), (uint8_t) ((x ^ y) * 7), 255));
+    const Transform toDevice = Transform::scaling(2.0f, 2.0f).then(Transform::translation(0.5f, -1.0f));
+    // A shape's coverage, as its alpha filled in white; a clip path's, as the
+    // clip it makes lets white through.
+    auto coverageOf = [&](const Path& p, bool asClip) {
+      Bitmap ink(w, h);
+      Graphics gi(ink);
+      gi.addTransform(toDevice);
+      if (asClip) {
+        gi.clipToPath(p);
+        gi.fillAll(Colour(255, 255, 255, 255));
+      } else {
+        gi.setColour(Colour(255, 255, 255, 255));
+        gi.fillPath(p);
+      }
+      return ink;
+    };
+    int cases = 0, wrong = 0;
+    for (int axis = 0; axis < 2; ++axis)
+      for (int spread = 0; spread < 3; ++spread)
+        for (int shape = 0; shape < 3; ++shape)
+          for (int clipped = 0; clipped < 2; ++clipped) {
+            ColourGradient ramp = axis == 0
+                                      ? ColourGradient::horizontal(Colour(250, 20, 40, 255), 6.3f, Colour(0, 0, 0, 0), 30.6f)
+                                      : ColourGradient::vertical(Colour(250, 20, 40, 255), 4.2f, Colour(0, 0, 0, 0), 22.7f);
+            ramp.addStop(0.4f, Colour(20, 200, 90, 120));
+            ramp.addStop(0.7f, Colour(0, 0, 255, 0));
+            ramp.setSpread(spread == 0 ? GradientSpread::Pad : spread == 1 ? GradientSpread::Repeat : GradientSpread::Reflect);
+            Path p;
+            if (shape == 0) p.addRect(Rect(1.75f, 1.5f, 40.0f, 32.0f)); // on whole device pixels
+            else if (shape == 1) p.addRoundedRect(Rect(3.3f, 2.7f, 37.9f, 29.1f), 6.0f);
+            else p.addEllipse(Rect(1.1f, 0.9f, 43.0f, 33.0f));
+            Path clip;
+            clip.addEllipse(Rect(6.0f, 4.0f, 30.0f, 26.0f));
+            Bitmap got = ground;
+            {
+              Graphics gg(got);
+              gg.addTransform(toDevice);
+              if (clipped) gg.clipToPath(clip);
+              gg.setGradient(ramp);
+              gg.fillPath(p);
+            }
+            const Bitmap shapeInk = coverageOf(p, false), clipInk = coverageOf(clip, true);
+            const ColourGradient device = ramp.transformed(toDevice);
+            for (int y = 0; y < h; ++y)
+              for (int x = 0; x < w; ++x) {
+                uint8_t cov = shapeInk.pixelAt(x, y).a;
+                if (clipped) cov = detail::multiplyCoverage(cov, clipInk.pixelAt(x, y).a);
+                PremulColour want = ground.pixelAt(x, y);
+                const Colour c = device.colourAt(Point((float) x + 0.5f, (float) y + 0.5f));
+                if (cov != 0 && !c.isTransparent()) want = over(PremulColour::from(c), want, cov);
+                const PremulColour g2 = got.pixelAt(x, y);
+                if (g2.r != want.r || g2.g != want.g || g2.b != want.b || g2.a != want.a) ++wrong;
+              }
+            ++cases;
+          }
+    std::snprintf(msg, sizeof(msg), "%d fills of a ramp along an axis are the per-pixel rule exactly (%d pixels differ)",
+                  cases, wrong);
+    check(wrong == 0, msg);
   }
 }
 
@@ -11710,6 +18084,19 @@ static void testGfxKeyboard() {
   check(router.focused() == &knob, "and wraps round to the knob, which is now in the cycle");
   router.focusNext(/*backwards=*/true);
   check(router.focused() == &second, "shift-tab goes the other way");
+
+  // And the KEY does it. Every field declines Tab, saying traversal is the
+  // router's job -- and nothing in the router ever did it, so pressing Tab
+  // moved focus nowhere and the keyboard could not leave the first field.
+  {
+    KeyPress tab;
+    tab.keyCode = KeyPress::Tab;
+    check(router.keyPressed(tab) && router.focused() == &knob,
+          "pressing Tab moves the focus on, through the router");
+    tab.shiftDown = true;
+    check(router.keyPressed(tab) && router.focused() == &second,
+          "...and Shift+Tab moves it back");
+  }
   router.setFocus(&field);
 
   // -- Typing --
@@ -11862,7 +18249,41 @@ static void testGfxKeyboard() {
     check(utf.getText() == "\xe2\x99\xaa \xf0\x9f\x8e\xb9",
           "a three-byte and a four-byte character both round-trip");
     check(utf.caretPosition() == 3, "and count as one character each");
+
+    // Bytes that are not UTF-8 become U+FFFD, the replacement character. A
+    // lead byte with its sequence cut off was kept with its length bits
+    // masked away -- "abc\xC3" read back as "abc" plus U+0003, a control
+    // character -- and a stray continuation byte became a C1 control.
+    utf.setText("abc\xc3");
+    check(utf.getText() == "abc\xef\xbf\xbd", "a truncated sequence reads back as U+FFFD");
+    utf.setText("a\x80" "b\xc3" "c");
+    check(utf.getText() == "a\xef\xbf\xbd" "b\xef\xbf\xbd" "c",
+          "and so do a stray continuation byte and a lead byte whose next byte is not one");
     holder.removeChild(&utf);
+  }
+
+  // -- A new text starts in view --
+  //
+  // Typing past the right edge scrolls the text left, and setText kept that
+  // scroll: a preset name typed long and then replaced by "Init" sat 128 px
+  // left of the field, and the field looked empty.
+  {
+    TextEditor name;
+    name.setFont(font);
+    name.setBounds({0.0f, 0.0f, 100.0f, 24.0f});
+    Component holder;
+    holder.setBounds({0.0f, 0.0f, 100.0f, 24.0f});
+    holder.addChild(&name);
+    MouseRouter r4(holder);
+    r4.setFocus(&name);
+    for (char c : std::string("A preset name typed much longer than the field"))
+      r4.keyPressed(typed((uint32_t) c));
+    const float typedScroll = name.scrollOffset();
+    name.setText("Init");
+    std::snprintf(msg, sizeof(msg), "a short text set after typing a long one is scrolled back into "
+                  "view (offset %.1f, was %.1f)", name.scrollOffset(), typedScroll);
+    check(typedScroll > 0.0f && name.scrollOffset() == 0.0f, msg);
+    holder.removeChild(&name);
   }
 
   // -- Drawn --
@@ -11980,6 +18401,32 @@ static void testGfxViewport() {
   std::snprintf(msg, sizeof(msg), "and it stops at %.0f rather than running off the end",
                 vp.viewPositionY());
   check(std::fabs(vp.viewPositionY() - maxY) < 0.01f, msg);
+
+  // -- Switching pages starts each at its top --
+  //
+  // A tabbed editor hands one viewport a different page per tab. The scroll
+  // position was reset to zero but the page kept the negative position it
+  // was scrolled to, and setting the position to zero then did nothing,
+  // because it already WAS zero: a page shown again sat 300 px up, with its
+  // top out of reach.
+  {
+    Component pageA, pageB;
+    pageA.setBounds({0.0f, 0.0f, 180.0f, 600.0f});
+    pageB.setBounds({0.0f, 0.0f, 180.0f, 600.0f});
+    Viewport tabs;
+    tabs.setBounds({0.0f, 0.0f, 200.0f, 150.0f});
+    tabs.setViewedComponent(&pageA);
+    tabs.setViewPosition(0.0f, 300.0f);
+    tabs.setViewedComponent(&pageB);
+    std::snprintf(msg, sizeof(msg), "the page left behind is back at its own origin (y=%.0f)",
+                  pageA.bounds().y);
+    check(pageA.bounds().y == 0.0f, msg);
+    tabs.setViewedComponent(&pageA);
+    std::snprintf(msg, sizeof(msg), "a page shown again starts at its top (y=%.0f, view at %.0f)",
+                  pageA.bounds().y, tabs.viewPositionY());
+    check(pageA.bounds().y == 0.0f && tabs.viewPositionY() == 0.0f, msg);
+    tabs.setViewedComponent(nullptr);
+  }
 
   // -- The interaction between the two bars --
   //
@@ -12232,6 +18679,39 @@ static void testGfxMidiKeyboard() {
     check(offs.size() == 1 && !kb.isNoteHeld(60), "leaving the keyboard mid-press ends the note");
     router.mouseUp({15.0f, 70.0f});
 
+    // Hovering highlights a key, and the pointer LEAVING takes the highlight
+    // with it. It stayed: the last key the mouse crossed on its way out sat
+    // highlighted until the mouse came back.
+    router.mouseMove({45.0f, 70.0f});
+    const int hovered = kb.hoveredNote();
+    kb.mouseExit(MouseEvent{});
+    std::snprintf(msg, sizeof(msg), "the hover highlight goes when the pointer leaves (was %d, "
+                  "now %d)", hovered, kb.hoveredNote());
+    check(hovered == 62 && kb.hoveredNote() == -1, msg);
+
+    // A key the HOST is holding stays lit through a mouse press and release
+    // on it. Both lights were one flag, so releasing the mouse put out the
+    // host's note too while the DSP was still sounding it.
+    kb.setNoteHeld(60, true);
+    router.mouseDown({15.0f, 70.0f});
+    router.mouseUp({15.0f, 70.0f});
+    check(kb.isNoteHeld(60), "a mouse release leaves a key the host is holding lit");
+    kb.allNotesOff();
+
+    // All-notes-off while the mouse holds a key ends that note for the owner
+    // too. It dropped the mouse's note without onNoteOff, and the release
+    // then had nothing to release: the synth kept the note sounding.
+    ons.clear();
+    offs.clear();
+    router.mouseDown({45.0f, 70.0f}); // D
+    kb.allNotesOff();
+    const size_t offsAtReset = offs.size();
+    router.mouseUp({45.0f, 70.0f});
+    std::snprintf(msg, sizeof(msg), "all-notes-off under a held mouse sends its note-off (%d at "
+                  "the reset, %d after the release)", (int) offsAtReset, (int) offs.size());
+    check(ons.size() == 1 && offsAtReset == 1 && offs.size() == 1 && offs[0] == 62 &&
+              !kb.isNoteHeld(62), msg);
+
     root.removeChild(&kb);
   }
 
@@ -12326,6 +18806,27 @@ static void testGfxAudioDisplay() {
     scopeBuffer.columnAt(0, &low, &high);
     check(std::fabs(high) < 1e-5f && std::fabs(low) < 1e-5f,
           "hard left against hard right sums to silence, as a mono sum must");
+  }
+
+  // A clear() in the middle of a column empties the display at once, and the
+  // half-built column it interrupted does not leak into the next one. The
+  // audio thread now does that half of the reset itself, at its next push.
+  {
+    const float loud[2] = {-0.9f, 0.9f};
+    const float* loudCh[1] = {loud};
+    scopeBuffer.push(loudCh, 1, 2); // half of a 4-sample column
+    scopeBuffer.clear();
+    float low = 1.0f, high = 1.0f;
+    scopeBuffer.columnAt(0, &low, &high);
+    check(low == 0.0f && high == 0.0f, "clear() empties the columns straight away");
+    const float quiet[4] = {0.1f, 0.2f, 0.1f, 0.2f};
+    const float* quietCh[1] = {quiet};
+    scopeBuffer.push(quietCh, 1, 4);
+    scopeBuffer.columnAt(0, &low, &high);
+    std::snprintf(msg, sizeof(msg),
+                  "and the next column holds only what came after it (low %.2f high %.2f)", low,
+                  high);
+    check(std::fabs(low - 0.1f) < 1e-5f && std::fabs(high - 0.2f) < 1e-5f, msg);
   }
 
   // A null block is SILENCE, not a freeze. A bypassed plugin still has to keep
@@ -12478,6 +18979,37 @@ static void testGfxAudioDisplay() {
                   middleInk, edgeInk);
     check(middleInk > edgeInk * 4, msg);
     check(edgeInk > 0, "and silence still draws a line, so the file does not look truncated");
+
+    // More buckets than pixels, which is the ordinary case for a long file in
+    // a narrow view: every bucket under a pixel is drawn, not one of them. A
+    // click in a bucket the per-pixel pick skipped (bucket 15 of 2000, under
+    // pixel 1 of 200) used to vanish, and a sound on the right channel alone
+    // was never drawn at all.
+    {
+      std::vector<float> left(20000, 0.0f), right(20000, 0.0f);
+      left[155] = 0.9f;                                     // bucket 15: under pixel 1
+      for (size_t i = 12000; i < 14000; ++i) right[i] = (i % 2 == 0 ? 0.7f : -0.7f); // pixels 120..139
+      const float* both[2] = {left.data(), right.data()};
+      sonore::AudioThumbnail dense;
+      dense.build(both, 2, left.size(), 2000);
+      WaveformView narrow;
+      narrow.setThumbnail(&dense);
+      narrow.setBounds({0.0f, 0.0f, 200.0f, 60.0f});
+      bmp.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(bmp);
+        narrow.paintTree(g);
+      }
+      int clickInk = 0, rightInk = 0;
+      for (int y = 0; y < 24; ++y) {
+        if (bmp.pixelAt(1, y).b > 90) ++clickInk;
+        for (int x = 125; x < 135; ++x)
+          if (bmp.pixelAt(x, y).b > 90) ++rightInk;
+      }
+      std::snprintf(msg, sizeof(msg), "a click between the pixels' buckets drew %d pixels above the line, "
+                    "a right-channel-only sound %d", clickInk, rightInk);
+      check(clickInk > 10 && rightInk > 100, msg);
+    }
 
     // An empty thumbnail is silence, not a broken control.
     WaveformView empty;
@@ -12893,6 +19425,39 @@ static void testGfxLayout() {
     check(a.bounds().w >= 179.9f, msg);
   }
 
+  // -- The limits apply to the starting size too --
+  //
+  // The base size went into the layout unclamped, and only items that took
+  // part in distributing space were ever held to their limits. An item with
+  // nothing to flex, or a row that happened to fit exactly, kept a width its
+  // own maximum forbade.
+  {
+    FlexBox flex;
+    flex.add(FlexItem(&a).withWidth(400.0f).withMaxWidth(100.0f).withShrink(0.0f));
+    flex.add(FlexItem(&b).withGrow(1.0f));
+    flex.performLayout(Rect(0.0f, 0.0f, 300.0f, 20.0f));
+    std::snprintf(msg, sizeof(msg), "an inflexible item 400 wide with a maximum of 100 is %.0f, "
+                  "and the other takes %.0f", a.bounds().w, b.bounds().w);
+    check(std::fabs(a.bounds().w - 100.0f) < 0.01f && std::fabs(b.bounds().w - 200.0f) < 0.01f,
+          msg);
+  }
+  {
+    FlexBox flex;
+    flex.add(FlexItem(&a).withWidth(300.0f).withMaxWidth(100.0f));
+    flex.performLayout(Rect(0.0f, 0.0f, 300.0f, 20.0f));
+    std::snprintf(msg, sizeof(msg), "and one that fits its row exactly is still held to its "
+                  "maximum (%.0f)", a.bounds().w);
+    check(std::fabs(a.bounds().w - 100.0f) < 0.01f, msg);
+  }
+  {
+    FlexBox flex;
+    flex.add(FlexItem(&a).withBasis(20.0f).withMinWidth(60.0f).withShrink(0.0f));
+    flex.performLayout(Rect(0.0f, 0.0f, 300.0f, 20.0f));
+    std::snprintf(msg, sizeof(msg), "a basis under its minimum starts at the minimum (%.0f)",
+                  a.bounds().w);
+    check(std::fabs(a.bounds().w - 60.0f) < 0.01f, msg);
+  }
+
   // -- Nothing is ever given a negative size --
   //
   // An inverted rectangle hit-tests as nothing and paints as nothing, so it
@@ -12990,6 +19555,12 @@ static void testGfxLayout() {
     std::snprintf(msg, sizeof(msg), "row-reverse puts the first item at %.0f, after the second "
                   "at %.0f", a.bounds().x, b.bounds().x);
     check(b.bounds().x < a.bounds().x, msg);
+    // MIRRORED, free space included: packed against the END, where a reversed
+    // row starts. The order was reversed but the packing still began at the
+    // left, so the row was neither a mirror nor what CSS lays out.
+    std::snprintf(msg, sizeof(msg), "and packs against the far edge, as its mirror does "
+                  "(%.0f and %.0f in 300)", a.bounds().x, b.bounds().x);
+    check(a.bounds().x == 200.0f && b.bounds().x == 100.0f, msg);
   }
 
   // -- Wrapping --
@@ -13076,6 +19647,121 @@ static void testGfxLayout() {
     check(std::fabs(a.bounds().w - 110.0f) < 0.01f, msg);
   }
 
+  // An auto track is as big as the width (or height) given to an item in it
+  // alone, margin included, and the fractions share the rest: the
+  // reference's rule. Beside fractions it used to get half an even share
+  // whatever was in it -- 100 of these 400, leaving the 1fr and 2fr 100 and
+  // 200.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::automatic(), TrackSize::fr(1.0f), TrackSize::fr(2.0f)};
+    grid.templateRows = {TrackSize::fr(1.0f)};
+    grid.add(GridItem(&a, 0, 0).withWidth(40.0f));
+    grid.add(GridItem(&c, 0, 0).withWidth(60.0f).withMargin(Margin(0.0f, 5.0f)));
+    grid.add(GridItem(&b, 1, 0));
+    const std::vector<float> cols = grid.columnSizes(400.0f);
+    std::snprintf(msg, sizeof(msg), "an auto column beside 1fr and 2fr in 400 is its widest item, "
+                  "60 with 5 either side: %.1f, %.1f, %.1f", cols[0], cols[1], cols[2]);
+    check(cols.size() == 3 && std::fabs(cols[0] - 70.0f) < 0.01f &&
+              std::fabs(cols[1] - 110.0f) < 0.01f && std::fabs(cols[2] - 220.0f) < 0.01f, msg);
+    grid.performLayout(Rect(0.0f, 0.0f, 400.0f, 50.0f));
+    std::snprintf(msg, sizeof(msg), "and the 1fr item starts where it ends (%.1f), %.1f wide",
+                  b.bounds().x, b.bounds().w);
+    check(std::fabs(b.bounds().x - 70.0f) < 0.01f && std::fabs(b.bounds().w - 110.0f) < 0.01f, msg);
+    std::snprintf(msg, sizeof(msg), "the width sizes the track, not the item: the 40-wide one fills "
+                  "the 70 (%.1f), the margined one 60 of it (%.1f)", a.bounds().w, c.bounds().w);
+    check(std::fabs(a.bounds().w - 70.0f) < 0.01f && std::fabs(c.bounds().w - 60.0f) < 0.01f, msg);
+  }
+
+  // The same for a row, from a height and the top and bottom margin.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::fr(1.0f)};
+    grid.templateRows = {TrackSize::px(30.0f), TrackSize::automatic(), TrackSize::fr(1.0f)};
+    grid.add(GridItem(&a, 0, 1).withHeight(24.0f).withMargin(Margin(3.0f, 0.0f)));
+    const std::vector<float> rows = grid.rowSizes(200.0f);
+    std::snprintf(msg, sizeof(msg), "an auto row holding a 24-high item with 3 above and below is "
+                  "%.1f, leaving the 1fr %.1f", rows[1], rows[2]);
+    check(rows.size() == 3 && std::fabs(rows[1] - 30.0f) < 0.01f &&
+              std::fabs(rows[2] - 140.0f) < 0.01f, msg);
+  }
+
+  // No item with a size, no size: the fraction takes everything. Before,
+  // this auto column was 75 of 300.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::automatic(), TrackSize::fr(1.0f)};
+    grid.templateRows = {TrackSize::fr(1.0f)};
+    grid.add(GridItem(&a, 0, 0));
+    grid.add(GridItem(&b, 1, 0));
+    grid.add(GridItem(nullptr, 0, 0).withWidth(50.0f));
+    grid.performLayout(Rect(0.0f, 0.0f, 300.0f, 50.0f));
+    std::snprintf(msg, sizeof(msg), "an auto column with no sized item is %.1f, the 1fr beside it "
+                  "%.1f from %.1f", a.bounds().w, b.bounds().w, b.bounds().x);
+    check(a.bounds().w == 0.0f && b.bounds().x == 0.0f && b.bounds().w == 300.0f, msg);
+  }
+
+  // An item spanning several tracks sizes none of them, as in the reference:
+  // it fits whatever its tracks come to.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::automatic(), TrackSize::automatic(), TrackSize::fr(1.0f)};
+    grid.templateRows = {TrackSize::fr(1.0f)};
+    grid.add(GridItem(&a, 0, 0).withSpan(2, 1).withWidth(300.0f));
+    grid.add(GridItem(&b, 1, 0).withWidth(50.0f));
+    const std::vector<float> cols = grid.columnSizes(400.0f);
+    std::snprintf(msg, sizeof(msg), "a 300-wide item spanning two auto columns sizes neither: "
+                  "%.1f, %.1f, %.1f", cols[0], cols[1], cols[2]);
+    check(cols.size() == 3 && cols[0] == 0.0f && std::fabs(cols[1] - 50.0f) < 0.01f &&
+              std::fabs(cols[2] - 350.0f) < 0.01f, msg);
+    grid.performLayout(Rect(0.0f, 0.0f, 400.0f, 50.0f));
+    std::snprintf(msg, sizeof(msg), "and is as wide as the two came to, %.1f", a.bounds().w);
+    check(std::fabs(a.bounds().w - 50.0f) < 0.01f, msg);
+  }
+
+  // With no fractions the auto tracks also share what is left, so unsized
+  // ones divide the room evenly exactly as before, and a sized one keeps
+  // its size on top of its share.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::automatic(), TrackSize::automatic(), TrackSize::px(50.0f)};
+    grid.templateRows = {TrackSize::fr(1.0f)};
+    const std::vector<float> even = grid.columnSizes(350.0f);
+    std::snprintf(msg, sizeof(msg), "two unsized auto columns and 50px in 350 give %.1f, %.1f, %.1f",
+                  even[0], even[1], even[2]);
+    check(even.size() == 3 && even[0] == 150.0f && even[1] == 150.0f && even[2] == 50.0f, msg);
+    grid.add(GridItem(&a, 0, 0).withWidth(100.0f));
+    const std::vector<float> cols = grid.columnSizes(350.0f);
+    std::snprintf(msg, sizeof(msg), "and with a 100-wide item in the first, %.1f and %.1f",
+                  cols[0], cols[1]);
+    check(cols[0] == 200.0f && cols[1] == 100.0f && cols[2] == 50.0f, msg);
+  }
+
+  // A grid with no auto track is untouched, sizes on its items or not: the
+  // numbers below are the ones the half-share version gave.
+  {
+    Grid grid;
+    grid.templateColumns = {TrackSize::px(60.0f), TrackSize::fr(1.0f), TrackSize::fr(3.0f),
+                            TrackSize::px(40.0f)};
+    grid.templateRows = {TrackSize::px(20.0f), TrackSize::fr(1.0f)};
+    grid.columnGap = 10.0f;
+    grid.rowGap = 4.0f;
+    grid.add(GridItem(&a, 1, 1).withWidth(999.0f).withHeight(999.0f));
+    grid.add(GridItem(&b, 2, 0).withWidth(5.0f));
+    const std::vector<float> cols = grid.columnSizes(530.0f);
+    const std::vector<float> rows = grid.rowSizes(124.0f);
+    std::snprintf(msg, sizeof(msg), "60px, 1fr, 3fr and 40px with 10 gaps in 530 still give "
+                  "%.1f, %.1f, %.1f, %.1f", cols[0], cols[1], cols[2], cols[3]);
+    check(cols.size() == 4 && cols[0] == 60.0f && cols[1] == 100.0f && cols[2] == 300.0f &&
+              cols[3] == 40.0f && rows.size() == 2 && rows[0] == 20.0f && rows[1] == 100.0f, msg);
+    grid.performLayout(Rect(0.0f, 0.0f, 530.0f, 124.0f));
+    const Rect ra = a.bounds(), rb = b.bounds();
+    std::snprintf(msg, sizeof(msg), "and place the items where they were: %.0f,%.0f %.0fx%.0f and "
+                  "%.0f,%.0f %.0fx%.0f", ra.x, ra.y, ra.w, ra.h, rb.x, rb.y, rb.w, rb.h);
+    check(ra.x == 70.0f && ra.y == 24.0f && ra.w == 100.0f && ra.h == 100.0f && rb.x == 180.0f &&
+              rb.y == 0.0f && rb.w == 300.0f && rb.h == 20.0f, msg);
+  }
+
   // Out-of-range placement is ignored rather than writing somewhere wrong.
   {
     Grid grid;
@@ -13144,6 +19830,23 @@ static void testGfxTooltip() {
   check(tips.update(&knob, over, 0.8 + TooltipManager::kHoldSeconds + 0.1),
         "and disappears after the hold");
   check(!tips.isVisible(), "leaving nothing on screen");
+  // ...and STAYS gone while the pointer rests where it was. The clock that
+  // timed the delay was never restarted, so the next tick found the delay
+  // long past and showed it again: up for six seconds, down for one frame,
+  // up again, for as long as the mouse sat there.
+  {
+    const double after = 0.8 + TooltipManager::kHoldSeconds + 0.1;
+    bool reappeared = false;
+    for (double t = after + 0.033; t < after + 20.0; t += 0.033)
+      if (tips.update(&knob, over, t) || tips.isVisible()) reappeared = true;
+    check(!reappeared, "and does not come back while the pointer stays put");
+    // A move is a new rest, and earns a new tooltip.
+    const Point nudged{over.x + 5.0f, over.y};
+    tips.update(&knob, nudged, after + 20.0);
+    check(tips.update(&knob, nudged, after + 20.0 + TooltipManager::kDelaySeconds + 0.01),
+          "...until it moves, which starts the delay over");
+    tips.clear();
+  }
 
   // -- Moving resets the clock --
   //
@@ -13411,6 +20114,18 @@ static void testGfxPng() {
 
     check(Inflater::adler32((const uint8_t*) "hello", 5) == 0x062c0215u,
           "the Adler-32 matches the value zlib computes for the same bytes");
+
+    // HuffmanTable is public, and build() was given lengths it trusted: a
+    // stream never yields one above 15, but a direct call can, and it was
+    // counted into counts_[16], one past the end of the table.
+    HuffmanTable table;
+    const uint8_t canonical[] = {1, 2, 3, 3};
+    const uint8_t tooLong[] = {1, 16, 2};
+    check(table.build(canonical, 4) && table.counts().size() == 16 && table.counts()[3] == 2 &&
+              table.symbols()[0] == 0 && table.symbols()[3] == 3,
+          "HuffmanTable builds from code lengths of 1 to 15");
+    check(!table.build(tooLong, 3) && !table.build(canonical, -1),
+          "...and refuses a length above 15, or a negative count, rather than writing past its tables");
   }
 
   // -- A plain RGBA image --
@@ -13545,6 +20260,9 @@ static void testGfxPng() {
 
     image = PngDecoder::decode(nullptr, 0);
     check(!image.ok(), "an empty buffer does not crash");
+    // Null with a size: the signature check read eight bytes through it.
+    image = PngDecoder::decode(nullptr, 64);
+    check(!image.ok() && image.bitmap.isEmpty(), "nor does a null one with a size");
 
     // A header claiming an enormous image is refused BEFORE anything is
     // allocated. 60000x60000 is 14 GB of RGBA and both numbers fit in the
@@ -13557,6 +20275,138 @@ static void testGfxPng() {
       std::snprintf(msg, sizeof(msg), "a header claiming 60000x60000 is refused: \"%s\"",
                     big.error.c_str());
       check(!big.ok(), msg);
+    }
+
+    // A bit depth and a colour type each legal ALONE, illegal TOGETHER. The
+    // header check tested the two fields separately, so a 16-bit PALETTE image
+    // got through: one channel, two bytes a pixel, and the 16-bit expansion
+    // fell through to its RGBA case and read p[6] -- five bytes past the end of
+    // a 1x1 image's data, into whatever followed it on the heap, and out into
+    // the picture. Built here byte by byte, CRCs and all, so the only thing
+    // wrong with each file is the combination.
+    {
+      auto makePng = [](uint8_t depth, uint8_t colourType, const std::vector<uint8_t>& scanlines) {
+        std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+          for (int s = 24; s >= 0; s -= 8) v.push_back((uint8_t) (x >> s));
+        };
+        auto chunk = [&](const char* type, const std::vector<uint8_t>& body) {
+          be32(png, (uint32_t) body.size());
+          std::vector<uint8_t> typed(type, type + 4);
+          typed.insert(typed.end(), body.begin(), body.end());
+          png.insert(png.end(), typed.begin(), typed.end());
+          be32(png, sonore::ZipFile::crc32(typed.data(), typed.size()));
+        };
+        std::vector<uint8_t> ihdr;
+        be32(ihdr, 1);
+        be32(ihdr, 1);
+        ihdr.insert(ihdr.end(), {depth, colourType, 0, 0, 0});
+        chunk("IHDR", ihdr);
+        if (colourType == 3) chunk("PLTE", {10, 20, 30, 40, 50, 60});
+        // zlib, one STORED block, then the Adler-32 of what it stored.
+        std::vector<uint8_t> z = {0x78, 0x01, 0x01, (uint8_t) scanlines.size(), 0,
+                                  (uint8_t) ~scanlines.size(), 0xFF};
+        z.insert(z.end(), scanlines.begin(), scanlines.end());
+        uint32_t a = 1, b = 0;
+        for (uint8_t v : scanlines) {
+          a = (a + v) % 65521u;
+          b = (b + a) % 65521u;
+        }
+        be32(z, (b << 16) | a);
+        chunk("IDAT", z);
+        chunk("IEND", {});
+        return png;
+      };
+      // The builder itself first, or every refusal below could be a broken file.
+      const PngImage sane = PngDecoder::decode(makePng(8, 3, {0, 1}));
+      check(sane.ok() && sane.bitmap.pixelAt(0, 0).r == 40,
+            "a hand-built 1x1 8-bit palette PNG decodes, to palette entry 1");
+      // An index past the two-entry palette is refused, with an EMPTY bitmap
+      // like every other failure: the picture had been sized before the bad
+      // index stopped its expansion, and came back that way.
+      const PngImage badIndex = PngDecoder::decode(makePng(8, 3, {0, 2}));
+      check(!badIndex.ok() && badIndex.bitmap.isEmpty(),
+            "a palette index past the palette is refused, and the bitmap is empty");
+      // Each with EXACTLY the data its header implies -- a filter byte and
+      // ceil(channels * depth / 8) bytes -- so nothing but the pairing is wrong.
+      struct Combo { uint8_t depth, type; int channels; const char* what; };
+      const Combo illegal[] = {{16, 3, 1, "16-bit palette"}, {4, 2, 3, "4-bit RGB"},
+                               {1, 6, 4, "1-bit RGBA"}, {2, 4, 2, "2-bit grey+alpha"}};
+      bool allRefused = true;
+      for (const Combo& c : illegal) {
+        std::vector<uint8_t> scan(1 + (size_t) ((c.channels * c.depth + 7) / 8), 0);
+        const PngImage img = PngDecoder::decode(makePng(c.depth, c.type, scan));
+        if (img.ok()) {
+          allRefused = false;
+          std::printf("  ---- a %s PNG was accepted ----\n", c.what);
+        }
+      }
+      check(allRefused, "a depth and colour type the PNG spec does not pair are refused together "
+                        "(16-bit palette, 4-bit RGB, 1-bit RGBA, 2-bit grey+alpha)");
+    }
+
+    // A grey or RGB image's tRNS chunk is one colour, the transparent one --
+    // what oxipng and OptiPNG write for an RGBA icon whose only transparency
+    // is a clear background. It was read as a palette's alphas and never
+    // looked at, so the background came out opaque.
+    {
+      auto keyed = [](uint32_t w, uint8_t depth, uint8_t colourType, const std::vector<uint8_t>& key,
+                      const std::vector<uint8_t>& scanline) {
+        std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+          for (int s = 24; s >= 0; s -= 8) v.push_back((uint8_t) (x >> s));
+        };
+        auto chunk = [&](const char* type, const std::vector<uint8_t>& body) {
+          be32(png, (uint32_t) body.size());
+          std::vector<uint8_t> typed(type, type + 4);
+          typed.insert(typed.end(), body.begin(), body.end());
+          png.insert(png.end(), typed.begin(), typed.end());
+          be32(png, sonore::ZipFile::crc32(typed.data(), typed.size()));
+        };
+        std::vector<uint8_t> ihdr;
+        be32(ihdr, w);
+        be32(ihdr, 1);
+        ihdr.insert(ihdr.end(), {depth, colourType, 0, 0, 0});
+        chunk("IHDR", ihdr);
+        chunk("tRNS", key);
+        std::vector<uint8_t> z = {0x78, 0x01, 0x01, (uint8_t) scanline.size(), 0,
+                                  (uint8_t) ~scanline.size(), 0xFF};
+        z.insert(z.end(), scanline.begin(), scanline.end());
+        uint32_t a = 1, b = 0;
+        for (uint8_t v : scanline) {
+          a = (a + v) % 65521u;
+          b = (b + a) % 65521u;
+        }
+        be32(z, (b << 16) | a);
+        chunk("IDAT", z);
+        chunk("IEND", {});
+        return png;
+      };
+      // 8-bit RGB: the key (255, 0, 255), then (10, 20, 30).
+      const PngImage rgb = PngDecoder::decode(keyed(2, 8, 2, {0, 255, 0, 0, 0, 255}, {0, 255, 0, 255, 10, 20, 30}));
+      // 8-bit grey: the key 7, then 8.
+      const PngImage grey = PngDecoder::decode(keyed(2, 8, 0, {0, 7}, {0, 7, 8}));
+      // 2-bit grey, four pixels 0 1 2 3: the key 2.
+      const PngImage grey2 = PngDecoder::decode(keyed(4, 2, 0, {0, 2}, {0, 0x1B}));
+      // 16-bit RGB: the key exactly, then a colour one step off it in a LOW
+      // byte, which keeps the same 8-bit picture and is not the key.
+      const PngImage rgb16 = PngDecoder::decode(
+          keyed(2, 16, 2, {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC},
+                {0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0x12, 0x34, 0x56, 0x79, 0x9A, 0xBC}));
+      std::snprintf(msg, sizeof(msg),
+                    "tRNS keys: RGB %d/%d, grey %d/%d, 2-bit grey %d %d %d %d, 16-bit RGB %d/%d "
+                    "(alpha of the key, then of the colour beside it)",
+                    rgb.bitmap.pixelAt(0, 0).a, rgb.bitmap.pixelAt(1, 0).a, grey.bitmap.pixelAt(0, 0).a,
+                    grey.bitmap.pixelAt(1, 0).a, grey2.bitmap.pixelAt(0, 0).a, grey2.bitmap.pixelAt(1, 0).a,
+                    grey2.bitmap.pixelAt(2, 0).a, grey2.bitmap.pixelAt(3, 0).a, rgb16.bitmap.pixelAt(0, 0).a,
+                    rgb16.bitmap.pixelAt(1, 0).a);
+      check(rgb.ok() && grey.ok() && grey2.ok() && rgb16.ok() && rgb.bitmap.pixelAt(0, 0).a == 0 &&
+                rgb.bitmap.pixelAt(1, 0).a == 255 && rgb.bitmap.pixelAt(1, 0).r == 10 &&
+                grey.bitmap.pixelAt(0, 0).a == 0 && grey.bitmap.pixelAt(1, 0).a == 255 &&
+                grey2.bitmap.pixelAt(2, 0).a == 0 && grey2.bitmap.pixelAt(0, 0).a == 255 &&
+                grey2.bitmap.pixelAt(3, 0).a == 255 && rgb16.bitmap.pixelAt(0, 0).a == 0 &&
+                rgb16.bitmap.pixelAt(1, 0).a == 255,
+            msg);
     }
 
     // Every byte of a valid PNG, corrupted one at a time. None of it may crash,
@@ -13696,6 +20546,108 @@ static void testGfxSvg() {
     check(d.numShapes() <= 1, "malformed path data ends the path, not the process");
     Drawable e = Drawable::parse("<svg viewBox=\"0 0 4 4\"><path d=\"M1 1 2 2 3\"/></svg>");
     check(e.numShapes() <= 1, "and a trailing half-coordinate does too");
+  }
+
+  // -- A curve flung past what a float can resolve --
+  //
+  // The deep fuzz pass hung on this: a smooth curve's control point at 3e11,
+  // stroked with round joins. Each join is a small circle, and where a float
+  // is spaced about as far apart as the circle is wide, rounding kept its
+  // curves from ever meeting the flatness test, and each split to the full
+  // depth -- 262,145 points for one 3 px circle, billions for the icon. The
+  // flatness test is never asked for finer than a float shows at the
+  // coordinates now. The bytes are the fuzzer's, the geometry kept to what
+  // matters.
+  {
+    sonore::gfx::Path distant;
+    distant.addEllipse(Rect(0.0f, 23173946.0f, 3.0f, 3.0f));
+    std::vector<sonore::gfx::Contour> flat;
+    distant.flatten(sonore::gfx::Transform(), flat);
+    size_t points = 0;
+    for (const auto& c : flat) points += c.points.size();
+    std::snprintf(msg, sizeof(msg), "a 3 px circle at y = 23,173,946, where a float steps by 2 px, "
+                  "flattens to its chords (%zu points; it was 262,145)", points);
+    check(points > 0 && points <= 16, msg);
+
+    // The same circle brought on screen by the transform, and a small one
+    // magnified to sit three million pixels out: the coordinates the test
+    // runs in are the user's, and they were just as unresolvable.
+    distant.flatten(sonore::gfx::Transform::translation(40.0f, -23173906.0f), flat);
+    points = 0;
+    for (const auto& c : flat) points += c.points.size();
+    std::snprintf(msg, sizeof(msg), "…and the same when a translation brings it on screen "
+                  "(%zu points; it was 262,145)", points);
+    check(points > 0 && points <= 16, msg);
+    sonore::gfx::Path tiny;
+    tiny.addEllipse(Rect(1500.0f, 1500.0f, 1.5e-3f, 1.5e-3f));
+    tiny.flatten(sonore::gfx::Transform::scaling(2000.0f, 2000.0f), flat);
+    points = 0;
+    for (const auto& c : flat) points += c.points.size();
+    std::snprintf(msg, sizeof(msg), "…and a 3 px circle magnified to three million px out "
+                  "(%zu points; it was 21,869)", points);
+    check(points > 0 && points <= 64, msg);
+
+    // But a huge shape whose near edge IS on screen keeps its curve there. A
+    // circle five million pixels across with its top at y = 40, as a zoomed
+    // envelope or a large rounded panel puts one: every row from 40 down is
+    // inside it. Cut to chords past 4e6 px, it filled 3120 of the 5376.
+    for (const float scale : {1.0f, 1.0e5f}) {
+      sonore::gfx::Path huge;
+      if (scale == 1.0f) huge.addEllipse(Rect(48.0f - 5.0e6f, 40.0f, 1.0e7f, 1.0e7f));
+      else huge.addEllipse(Rect(-50.0f, 0.0f, 100.0f, 100.0f));
+      sonore::gfx::Bitmap big(96, 96);
+      sonore::gfx::Graphics hg(big);
+      if (scale != 1.0f)
+        hg.addTransform(sonore::gfx::Transform::scaling(scale, scale)
+                            .then(sonore::gfx::Transform::translation(48.0f, 40.0f)));
+      hg.setColour(Colour(255, 255, 255, 255));
+      hg.fillPath(huge);
+      int filled = 0;
+      for (int y = 0; y < 96; ++y)
+        for (int x = 0; x < 96; ++x)
+          if (big.pixelAt(x, y).a > 0) ++filled;
+      std::snprintf(msg, sizeof(msg), "a circle 1e7 px across with its top on screen fills every "
+                    "row under the top (%d of 5376 px, %s)", filled,
+                    scale == 1.0f ? "in device space" : "a radius-50 circle at scale 1e5");
+      check(filled == 5376, msg);
+    }
+
+    // An arc's sweep becomes a count of cubics: inf or NaN made that cast
+    // undefined, and a billion turns asked for four billion curves.
+    {
+      sonore::gfx::Path arcs;
+      arcs.addArc(Rect(0.0f, 0.0f, 10.0f, 10.0f), 0.0f, HUGE_VALF);
+      arcs.addArc(Rect(0.0f, 0.0f, 10.0f, 10.0f), std::nanf(""), 1.0f);
+      check(arcs.isEmpty(), "an arc to an angle that is not a number adds nothing");
+      arcs.addArc(Rect(0.0f, 0.0f, 10.0f, 10.0f), 0.0f, 6.0e9f);
+      arcs.flatten(sonore::gfx::Transform(), flat);
+      points = 0;
+      for (const auto& c : flat) points += c.points.size();
+      std::snprintf(msg, sizeof(msg), "and a billion turns draw at most 64 of them (%zu points)",
+                    points);
+      check(points > 0 && points <= 64 * 4 * 64, msg);
+      // ...and still ends at the angle it was asked to: the turns are cut
+      // whole, so a path continued from its end continues from the right place.
+      sonore::gfx::Path lapped;
+      const float to = 1000.0f * 6.28318531f + 1.0f;
+      lapped.addArc(Rect(0.0f, 0.0f, 10.0f, 10.0f), 0.0f, to);
+      lapped.flatten(sonore::gfx::Transform(), flat);
+      const Point end = flat.empty() || flat[0].points.empty() ? Point{} : flat[0].points.back();
+      const Point want{5.0f + 5.0f * std::sin(to), 5.0f - 5.0f * std::cos(to)};
+      std::snprintf(msg, sizeof(msg), "a thousand-turn arc ends where its angle says "
+                    "(%.3f, %.3f), not where 64 turns would (want %.3f, %.3f)",
+                    (double) end.x, (double) end.y, (double) want.x, (double) want.y);
+      check(std::fabs(end.x - want.x) < 0.05f && std::fabs(end.y - want.y) < 0.05f, msg);
+    }
+
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 64 64\"><g transform=\"translate(8 8) scale(0.75) rotate(15)\">"
+        "<path d=\"M10 10 L50 10 Q60 30 50 50 C40 60 20 60 10 50 S0 30e10 10 Z\" fill=\"#fff\" "
+        "stroke=\"#000\" stroke-width=\"2\"/></g></svg>");
+    sonore::gfx::Bitmap bmp(96, 96);
+    sonore::gfx::Graphics g(bmp);
+    d.draw(g, Rect(0.0f, 0.0f, 96.0f, 96.0f)); // returning is the test
+    check(d.numShapes() == 1, "and the fuzzed icon it came from draws, rather than hanging");
   }
 
   // -- Every shape element --
@@ -13946,6 +20898,647 @@ static void testGfxSvg() {
 }
 
 // ---------------------------------------------------------------------------
+// Clipping to a path, layers, masks, dashes, and gradients that do more
+//
+// What an SVG's clip paths, masks and group opacity are drawn with -- and what
+// a hand-written paint() wants as often: a rounded panel clipping an image, a
+// group faded as one, a dashed grid line.
+// ---------------------------------------------------------------------------
+static void testGfxClipLayersMasks() {
+  using namespace sonore::gfx;
+  #if defined(__APPLE__)
+  // See testGfxSvg: MacTypes.h has a Rect and a Point of its own.
+  using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
+  #endif
+  std::printf("\n[gfx clip to a path, layers, masks, dashes]\n");
+  char msg[240];
+  const Colour red(255, 0, 0, 255), blue(0, 0, 255, 255), white(255, 255, 255, 255);
+
+  // -- Clipping to a path --
+  {
+    Bitmap bmp(40, 40);
+    Graphics g(bmp);
+    g.save();
+    Path circle;
+    circle.addEllipse(Rect(0.0f, 0.0f, 40.0f, 40.0f));
+    g.clipToPath(circle);
+    g.fillAll(red);
+    g.restore();
+    const PremulColour corner = bmp.pixelAt(1, 1), centre = bmp.pixelAt(20, 20);
+    // The circle crosses pixel (34,34) at 45 degrees: partly in, partly out.
+    const PremulColour edge = bmp.pixelAt(34, 34);
+    std::snprintf(msg, sizeof(msg), "a fill clipped to a circle: corner alpha %d, centre %d, the "
+                  "pixel the edge crosses %d", corner.a, centre.a, edge.a);
+    check(corner.a == 0 && centre.a == 255 && edge.a > 0 && edge.a < 255, msg);
+
+    g.setColour(blue);
+    g.fillRect(Rect(0.0f, 0.0f, 40.0f, 40.0f));
+    check(bmp.pixelAt(1, 1).b == 255, "and restore() takes the path clip away");
+
+    // Two path clips are their intersection, and an image is clipped too.
+    Bitmap image(40, 40);
+    image.clear(Colour(0, 255, 0, 255));
+    Bitmap out(40, 40);
+    Graphics h(out);
+    Path left;
+    left.addRect(Rect(0.0f, 0.0f, 20.0f, 40.0f));
+    h.clipToPath(left);
+    h.clipToPath(circle);
+    h.drawImage(image, Rect(0.0f, 0.0f, 40.0f, 40.0f));
+    std::snprintf(msg, sizeof(msg), "two clips intersect, and an image obeys them: (10,20) %d, "
+                  "(30,20) %d, (1,1) %d", out.pixelAt(10, 20).a, out.pixelAt(30, 20).a,
+                  out.pixelAt(1, 1).a);
+    check(out.pixelAt(10, 20).g == 255 && out.pixelAt(30, 20).a == 0 && out.pixelAt(1, 1).a == 0,
+          msg);
+
+    // A path with no area clips everything away.
+    Bitmap none(8, 8);
+    Graphics n(none);
+    n.clipToPath(Path());
+    n.fillAll(red);
+    check(none.pixelAt(4, 4).a == 0 && n.isClippedOut(), "and an empty path clips everything");
+  }
+
+  // -- Layers --
+  //
+  // Half-transparent shapes drawn one by one show their overlap darker. In a
+  // layer they are one picture, faded as one: where blue covers red, the
+  // result is half blue and no red at all.
+  {
+    Bitmap bmp(30, 10);
+    {
+      Graphics g(bmp);
+      g.beginLayer(0.5f);
+      g.setColour(red);
+      g.fillRect(Rect(0.0f, 0.0f, 20.0f, 10.0f));
+      g.setColour(blue);
+      g.fillRect(Rect(10.0f, 0.0f, 20.0f, 10.0f));
+      g.endLayer();
+    }
+    const PremulColour only = bmp.pixelAt(5, 5), overlap = bmp.pixelAt(15, 5);
+    std::snprintf(msg, sizeof(msg), "a layer at 50%%: red alone (%d,%d,%d,%d), red under blue "
+                  "(%d,%d,%d,%d)", only.r, only.g, only.b, only.a, overlap.r, overlap.g,
+                  overlap.b, overlap.a);
+    check(only.r >= 127 && only.r <= 128 && only.a >= 127 && only.a <= 128 && overlap.r == 0 &&
+              overlap.b >= 127 && overlap.b <= 128,
+          msg);
+
+    // A layer is as big as the clip, and is put down through it.
+    Bitmap clipped(30, 10);
+    {
+      Graphics g(clipped);
+      g.clipTo(Rect(0.0f, 0.0f, 10.0f, 10.0f));
+      g.beginLayer(1.0f);
+      g.fillAll(red);
+      g.endLayer();
+    }
+    check(clipped.pixelAt(5, 5).r == 255 && clipped.pixelAt(20, 5).a == 0,
+          "a layer stays inside the clip it began in");
+
+    // restore() cannot reach past the state a layer began with, and endLayer
+    // puts back everything: here, a translation made inside it.
+    Bitmap b2(10, 10);
+    {
+      Graphics g(b2);
+      g.beginLayer(1.0f);
+      g.translate(3.0f, 3.0f);
+      g.restore();
+      g.restore();
+      g.endLayer();
+      check(g.state().transform.isIdentity(),
+            "a restore() too many inside a layer does not unbalance it");
+    }
+
+    // A layer left open is put down by the Graphics going away, not lost.
+    Bitmap b3(10, 10);
+    {
+      Graphics g(b3);
+      g.beginLayer(1.0f);
+      g.fillAll(blue);
+    }
+    check(b3.pixelAt(5, 5).b == 255, "and a layer nobody ended still arrives");
+  }
+
+  // -- Masks --
+  {
+    Bitmap bmp(20, 10);
+    {
+      Graphics g(bmp);
+      g.save();
+      g.beginMask();
+      g.setColour(white);
+      g.fillRect(Rect(0.0f, 0.0f, 10.0f, 10.0f));
+      g.endMask();
+      g.fillAll(Colour(0, 255, 0, 255));
+      g.restore();
+    }
+    check(bmp.pixelAt(5, 5).g == 255 && bmp.pixelAt(15, 5).a == 0,
+          "what a mask draws is what shows through it");
+
+    Bitmap lum(10, 10);
+    {
+      Graphics g(lum);
+      g.beginMask();
+      g.fillAll(Colour(128, 128, 128, 255));
+      g.endMask(Graphics::MaskFrom::Luminance);
+      g.fillAll(white);
+    }
+    std::snprintf(msg, sizeof(msg), "a mid-grey luminance mask lets half through: alpha %d",
+                  lum.pixelAt(5, 5).a);
+    check(lum.pixelAt(5, 5).a >= 126 && lum.pixelAt(5, 5).a <= 130, msg);
+  }
+
+  // -- Dashes --
+  {
+    auto dashed = [&](std::vector<float> pattern, float offset) {
+      Bitmap bmp(100, 10);
+      Graphics g(bmp);
+      g.setColour(Colour(0, 0, 0, 255));
+      StrokeStyle style;
+      style.width = 4.0f;
+      style.dashes = std::move(pattern);
+      style.dashOffset = offset;
+      Path line;
+      line.moveTo(0.0f, 5.0f);
+      line.lineTo(100.0f, 5.0f);
+      g.strokePath(line, style);
+      std::string row;
+      for (int x = 0; x < 100; x += 5) row += bmp.pixelAt(x, 5).a == 255 ? '#' : '.';
+      return row;
+    };
+    const std::string plain = dashed({10.0f, 10.0f}, 0.0f);
+    std::snprintf(msg, sizeof(msg), "10 on, 10 off, every 5 px: %s", plain.c_str());
+    check(plain == "##..##..##..##..##..", msg);
+    const std::string shifted = dashed({10.0f, 10.0f}, 5.0f);
+    std::snprintf(msg, sizeof(msg), "and five into the pattern: %s", shifted.c_str());
+    check(shifted == "#..##..##..##..##..#", msg);
+    check(dashed({10.0f}, 0.0f) == plain, "an odd count repeats itself: {10} is {10, 10}");
+    check(dashed({0.0f, 0.0f}, 0.0f) == std::string(20, '#'), "an all-zero pattern is solid");
+    check(dashed({5.0f, -1.0f}, 0.0f) == std::string(20, '#'), "and so is a negative one");
+    // A pattern finer than anything can show, along the line: two hundred
+    // million pieces asked for, and a solid line drawn instead.
+    check(dashed({1e-6f, 1e-6f}, 0.0f) == std::string(20, '#'),
+          "a pattern of a millionth of a pixel draws solid rather than cutting 1e8 dashes");
+
+    // A closed outline has no ends: the dash still on at its close runs on
+    // into the one that began it, round the first corner, and that corner
+    // is mitred like the others -- as resvg and the browsers draw it. Cut
+    // in two there, each half was capped and a square was missing from the
+    // corner. 100 on, 20 off round a 160-long square: on from 120 to 160
+    // and on again from 0, through the top-left corner.
+    auto corner = [&](std::vector<float> pattern) {
+      Bitmap bmp(64, 64);
+      Graphics g(bmp);
+      g.setColour(Colour(0, 0, 0, 255));
+      StrokeStyle style;
+      style.width = 6.0f;
+      style.dashes = std::move(pattern);
+      Path square;
+      square.addRect(Rect(10.0f, 10.0f, 40.0f, 40.0f));
+      g.strokePath(square, style);
+      return std::make_pair(bmp.pixelAt(8, 8).a, bmp.pixelAt(51, 8).a);
+    };
+    const auto through = corner({100.0f, 20.0f});
+    const auto solid = corner({});
+    std::snprintf(msg, sizeof(msg), "a dash through a square's first corner fills its miter: %d (solid %d, the "
+                  "next corner %d)", through.first, solid.first, through.second);
+    check(through.first == 255 && solid.first == 255 && through.second == 255, msg);
+  }
+
+  // -- Gradients: spread, a focal point, any affine map --
+  {
+    ColourGradient ramp(Colour(0, 0, 0, 255), Point(0.0f, 0.0f), Colour(255, 255, 255, 255),
+                        Point(10.0f, 0.0f));
+    ramp.setSpread(GradientSpread::Repeat);
+    check(ramp.colourAt(Point(15.0f, 0.0f)).r == ramp.colourAt(Point(5.0f, 0.0f)).r &&
+              ramp.colourAt(Point(5.0f, 0.0f)).r > 100,
+          "a repeating ramp starts again at its end");
+    ramp.setSpread(GradientSpread::Reflect);
+    check(ramp.colourAt(Point(12.0f, 0.0f)).r == ramp.colourAt(Point(8.0f, 0.0f)).r,
+          "and a reflecting one comes back");
+
+    ColourGradient focal = ColourGradient::radial(Colour(255, 255, 255, 255), Point(50.0f, 50.0f),
+                                                  40.0f, Colour(0, 0, 0, 255));
+    focal.setFocalPoint(Point(30.0f, 50.0f));
+    std::snprintf(msg, sizeof(msg), "a focal gradient starts at its focal point (%d) and ends on "
+                  "the circle either side of it (%d, %d)", focal.colourAt(Point(30.0f, 50.0f)).r,
+                  focal.colourAt(Point(90.0f, 50.0f)).r, focal.colourAt(Point(10.0f, 50.0f)).r);
+    check(focal.colourAt(Point(30.0f, 50.0f)).r == 255 &&
+              focal.colourAt(Point(90.0f, 50.0f)).r == 0 &&
+              focal.colourAt(Point(10.0f, 50.0f)).r == 0,
+          msg);
+    // Outside the circle the circles sweep a cone, and beside it is nothing.
+    focal.setFocalPoint(Point(100.0f, 50.0f));
+    check(focal.colourAt(Point(100.0f, 0.0f)).a == 0 && focal.colourAt(Point(60.0f, 50.0f)).a > 0,
+          "a focal point outside the circle paints a cone, and nothing beside it");
+
+    // Squashed, a radial gradient is an ellipse: halfway out along the long
+    // axis and halfway out along the short one are the same colour. Moving
+    // two points kept it a circle.
+    const ColourGradient round = ColourGradient::radial(
+        Colour(0, 0, 0, 255), Point(0.0f, 0.0f), 10.0f, Colour(255, 255, 255, 255));
+    const ColourGradient squashed = round.transformed(Transform::scaling(2.0f, 1.0f));
+    const int along = squashed.colourAt(Point(10.0f, 0.0f)).r;
+    const int across = squashed.colourAt(Point(0.0f, 5.0f)).r;
+    std::snprintf(msg, sizeof(msg), "a radial gradient scaled 2:1 is an ellipse: %d along, %d "
+                  "across", along, across);
+    check(std::abs(along - across) <= 1 && along > 100 && along < 155, msg);
+
+    // Two stops at one place are a hard edge, in the order they were added.
+    ColourGradient edge(red, Point(0.0f, 0.0f), blue, Point(1.0f, 0.0f));
+    edge.clearStops();
+    edge.addStop(0.0f, red);
+    edge.addStop(0.5f, red);
+    edge.addStop(0.5f, blue);
+    edge.addStop(1.0f, blue);
+    check(edge.lookup(0.49f).r == 255 && edge.lookup(0.51f).b == 255,
+          "two stops at 0.5 make red then blue, not blue then red");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SVG as the tools write it
+//
+// Figma, Illustrator, Inkscape and the icon sets: clip paths and gradients in
+// <defs> at the END of the file, styles in <style> blocks, shapes reused with
+// <use>, icons drawn in currentColor. Each check names what an earlier parser
+// did with the same file.
+// ---------------------------------------------------------------------------
+static void testGfxSvgDocuments() {
+  using namespace sonore::gfx;
+  #if defined(__APPLE__)
+  using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
+  #endif
+  std::printf("\n[gfx svg documents]\n");
+  char msg[240];
+
+  auto render = [](const Drawable& d, int w, int h) {
+    Bitmap bmp(w, h);
+    Graphics g(bmp);
+    d.draw(g, Rect(0.0f, 0.0f, (float) w, (float) h));
+    return bmp;
+  };
+
+  // -- A path goes on after its first Z --
+  //
+  // The guard against a Z that consumed nothing took the Z's own letter for
+  // nothing, and every path ended at its first Z: the hole in an O, the
+  // second shape of an icon, gone.
+  {
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><path fill-rule=\"evenodd\" "
+        "d=\"M0 0h10v10h-10z M3 3h4v4h-4z\"/></svg>");
+    const Bitmap bmp = render(d, 40, 40);
+    std::snprintf(msg, sizeof(msg), "a square with a square hole: frame alpha %d, hole alpha %d",
+                  bmp.pixelAt(4, 4).a, bmp.pixelAt(20, 20).a);
+    check(bmp.pixelAt(4, 4).a == 255 && bmp.pixelAt(20, 20).a == 0, msg);
+    Drawable ring = Drawable::parse(
+        "<svg viewBox=\"0 0 24 24\"><path d=\"M12,21a9,9,0,1,1,9-9A9,9,0,0,1,12,21Z"
+        "M12,4.5A7.5,7.5,0,1,0,19.5,12,7.5,7.5,0,0,0,12,4.5Z\"/></svg>");
+    check(render(ring, 48, 48).pixelAt(24, 24).a == 0,
+          "and a ring drawn as two arcs has its middle (an icon set's radio button)");
+  }
+
+  // -- Figma's export --
+  //
+  // A frame is a group clipped to a white rectangle declared in <defs>, after
+  // everything it clips; fills name gradients declared there too. Drawn as a
+  // shape, the white rectangle covered the icon, and every url(#) fill came
+  // out black.
+  {
+    Drawable d = Drawable::parse(
+        "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" "
+        "xmlns=\"http://www.w3.org/2000/svg\">\n"
+        "<g clip-path=\"url(#clip0_12_34)\">\n"
+        "<path d=\"M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 "
+        "17.52 2 12 2Z\" fill=\"url(#paint0_linear_12_34)\"/>\n"
+        "<rect x=\"8\" y=\"8\" width=\"8\" height=\"8\" rx=\"2\" fill=\"#1E1E1E\"/>\n"
+        "</g>\n<defs>\n"
+        "<linearGradient id=\"paint0_linear_12_34\" x1=\"2\" y1=\"2\" x2=\"22\" y2=\"22\" "
+        "gradientUnits=\"userSpaceOnUse\">\n<stop stop-color=\"#FF0000\"/>\n"
+        "<stop offset=\"1\" stop-color=\"#0000FF\"/>\n</linearGradient>\n"
+        "<clipPath id=\"clip0_12_34\">\n<rect width=\"24\" height=\"24\" fill=\"white\"/>\n"
+        "</clipPath>\n</defs>\n</svg>");
+    std::snprintf(msg, sizeof(msg), "two shapes are drawn, not the clip's rectangle as well: %d",
+                  d.numShapes());
+    check(d.numShapes() == 2, msg);
+    check(d.numShapes() >= 1 && d.shapeAt(0).fillIsGradient, "and the circle has its gradient");
+    const Bitmap bmp = render(d, 96, 96);
+    const PremulColour corner = bmp.pixelAt(2, 2), upper = bmp.pixelAt(28, 28),
+                       lower = bmp.pixelAt(68, 68), middle = bmp.pixelAt(48, 48);
+    std::snprintf(msg, sizeof(msg), "corner alpha %d, upper left (%d,%d,%d), lower right "
+                  "(%d,%d,%d), middle (%d,%d,%d)", corner.a, upper.r, upper.g, upper.b, lower.r,
+                  lower.g, lower.b, middle.r, middle.g, middle.b);
+    check(corner.a == 0 && upper.r > upper.b + 60 && lower.b > lower.r + 60 && middle.r == 0x1E &&
+              middle.a == 255,
+          msg);
+  }
+
+  // -- Styles --
+  //
+  // Illustrator's default export puts every colour in a <style> block and
+  // gives each shape a class. Read as attributes only, all of it was black.
+  {
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 100 10\"><style type=\"text/css\"><![CDATA[\n"
+        "  /* Illustrator */ rect { fill: #ff0000 } .a { fill: #00ff00 } #b { fill: #0000ff }\n"
+        "  .a.c { fill: #ffff00 } .x, .y { fill: #00ffff } .imp { fill: #ff00ff !important }\n"
+        "  .k > x { fill: #ff0000 }\n"
+        "]]></style>"
+        "<rect width=\"1\" height=\"1\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"a\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"a\" id=\"b\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"c a\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"y\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"a\" style=\"fill:#808080\"/>"
+        "<rect width=\"1\" height=\"1\" class=\"imp\" style=\"fill:#808080\"/>"
+        "<rect width=\"1\" height=\"1\" fill=\"#123456\" data-note=\"a > b\"/>"
+        "</svg>");
+    check(d.numShapes() == 8, "eight rects, every one styled by the sheet");
+    if (d.numShapes() == 8) {
+      auto rgb = [&](int i) {
+        const Colour c = d.shapeAt(i).fill;
+        return ((unsigned) c.r << 16) | ((unsigned) c.g << 8) | c.b;
+      };
+      std::snprintf(msg, sizeof(msg), "type %06x, class %06x, id %06x, two classes %06x, a list "
+                    "%06x, style= %06x, !important %06x, the sheet over an attribute %06x", rgb(0),
+                    rgb(1), rgb(2), rgb(3), rgb(4), rgb(5), rgb(6), rgb(7));
+      check(rgb(0) == 0xff0000 && rgb(1) == 0x00ff00 && rgb(2) == 0x0000ff && rgb(3) == 0xffff00 &&
+                rgb(4) == 0x00ffff && rgb(5) == 0x808080 && rgb(6) == 0xff00ff &&
+                rgb(7) == 0xff0000,
+            msg);
+    }
+  }
+
+  // -- currentColor, which is how an icon asks to be tinted --
+  {
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\">"
+        "<path d=\"M12 2v20\"/></svg>");
+    Bitmap plain(48, 48), tinted(48, 48);
+    {
+      Graphics g(plain);
+      d.draw(g, Rect(0.0f, 0.0f, 48.0f, 48.0f));
+      Graphics h(tinted);
+      d.draw(h, Rect(0.0f, 0.0f, 48.0f, 48.0f), Colour(0, 200, 0, 255));
+    }
+    const PremulColour a = plain.pixelAt(24, 24), b = tinted.pixelAt(24, 24);
+    std::snprintf(msg, sizeof(msg), "drawn plain (%d,%d,%d,%d), drawn in green (%d,%d,%d,%d)", a.r,
+                  a.g, a.b, a.a, b.r, b.g, b.b, b.a);
+    check(a.a == 255 && a.g == 0 && b.a == 255 && b.g == 200 && b.r == 0, msg);
+  }
+
+  // -- Strokes as the file says, at the scale the editor is drawn at --
+  {
+    // At 200% the stroke was the width times the viewBox's scale alone --
+    // half the weight of the fills around it.
+    Drawable line = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><line x1=\"0\" y1=\"5\" x2=\"10\" y2=\"5\" stroke=\"#000\" "
+        "stroke-width=\"2\"/></svg>");
+    Bitmap bmp(20, 20);
+    {
+      Graphics g(bmp);
+      g.addTransform(Transform::scaling(2.0f, 2.0f));
+      line.draw(g, Rect(0.0f, 0.0f, 10.0f, 10.0f));
+    }
+    std::snprintf(msg, sizeof(msg), "a 2-unit line at 200%% covers device rows 8 to 11: %d %d %d "
+                  "%d, and not 7 or 12: %d %d", bmp.pixelAt(10, 8).a, bmp.pixelAt(10, 9).a,
+                  bmp.pixelAt(10, 10).a, bmp.pixelAt(10, 11).a, bmp.pixelAt(10, 7).a,
+                  bmp.pixelAt(10, 12).a);
+    check(bmp.pixelAt(10, 8).a == 255 && bmp.pixelAt(10, 11).a == 255 &&
+              bmp.pixelAt(10, 7).a == 0 && bmp.pixelAt(10, 12).a == 0,
+          msg);
+
+    // SVG's caps and joins are butt and miter unless it says otherwise; they
+    // were always round.
+    Drawable butt = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><line x1=\"2\" y1=\"5\" x2=\"8\" y2=\"5\" stroke=\"#000\" "
+        "stroke-width=\"2\"/></svg>");
+    Drawable round = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><line x1=\"2\" y1=\"5\" x2=\"8\" y2=\"5\" stroke=\"#000\" "
+        "stroke-width=\"2\" stroke-linecap=\"round\"/></svg>");
+    check(render(butt, 10, 10).pixelAt(1, 5).a == 0 && render(round, 10, 10).pixelAt(1, 5).a > 0,
+          "a butt cap stops at the end; a round one goes past it");
+
+    // The transform scales the pen with the path, dashes included.
+    Drawable scaled = Drawable::parse(
+        "<svg viewBox=\"0 0 40 40\"><g transform=\"scale(2)\"><line x1=\"0\" y1=\"5\" x2=\"10\" "
+        "y2=\"5\" stroke=\"#000\" stroke-width=\"1.5\" stroke-dasharray=\"1 2\"/></g></svg>");
+    check(scaled.numShapes() == 1 && scaled.shapeAt(0).strokeWidth == 3.0f &&
+              scaled.shapeAt(0).dashes.size() == 2 && scaled.shapeAt(0).dashes[1] == 4.0f,
+          "a group's scale(2) doubles the stroke width and the dashes");
+
+    // An arc's two flags can be written with nothing between them.
+    Drawable spaced = Drawable::parse(
+        "<svg viewBox=\"0 0 20 20\"><path d=\"M5 10 a5 5 0 1 0 5 5\"/></svg>");
+    Drawable packed = Drawable::parse(
+        "<svg viewBox=\"0 0 20 20\"><path d=\"M5 10a5 5 0 105 5\"/></svg>");
+    bool same = spaced.numShapes() == 1 && packed.numShapes() == 1 &&
+                spaced.shapeAt(0).path.points().size() == packed.shapeAt(0).path.points().size();
+    for (size_t i = 0; same && i < spaced.shapeAt(0).path.points().size(); ++i)
+      same = spaced.shapeAt(0).path.points()[i].x == packed.shapeAt(0).path.points()[i].x &&
+             spaced.shapeAt(0).path.points()[i].y == packed.shapeAt(0).path.points()[i].y;
+    check(same, "an arc's flags packed as \"105 5\" read as 1, 0, then 5 5");
+  }
+
+  // -- <use>, <symbol>, gradients in a box, group opacity, masks --
+  {
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 20 20\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"><defs>"
+        "<symbol id=\"s\" viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"red\"/>"
+        "</symbol></defs><use xlink:href=\"#s\" x=\"10\" y=\"0\" width=\"5\" height=\"5\"/></svg>");
+    float x0 = 1e9f, x1 = -1e9f;
+    if (d.numShapes() == 1)
+      for (const Point& p : d.shapeAt(0).path.points()) {
+        x0 = (std::min)(x0, p.x);
+        x1 = (std::max)(x1, p.x);
+      }
+    std::snprintf(msg, sizeof(msg), "a symbol used at x=10, 5 wide: %d shape from %.1f to %.1f",
+                  d.numShapes(), (double) x0, (double) x1);
+    check(d.numShapes() == 1 && x0 == 10.0f && x1 == 15.0f, msg);
+
+    Drawable box = Drawable::parse(
+        "<svg viewBox=\"0 0 100 10\"><linearGradient id=\"g\"><stop offset=\"0\" "
+        "stop-color=\"red\"/><stop offset=\"1\" stop-color=\"blue\"/></linearGradient>"
+        "<rect x=\"50\" width=\"50\" height=\"10\" fill=\"url(#g)\"/></svg>");
+    const Bitmap boxed = render(box, 100, 10);
+    check(boxed.pixelAt(52, 5).r > 200 && boxed.pixelAt(97, 5).b > 200,
+          "a gradient in objectBoundingBox units runs across its own shape, not the document");
+
+    Drawable group = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><g opacity=\"0.5\"><rect width=\"6\" height=\"10\" "
+        "fill=\"red\"/><rect x=\"4\" width=\"6\" height=\"10\" fill=\"blue\"/></g></svg>");
+    const PremulColour overlap = render(group, 10, 10).pixelAt(5, 5);
+    std::snprintf(msg, sizeof(msg), "a half-transparent group's overlap is half blue, no red: "
+                  "(%d,%d,%d,%d)", overlap.r, overlap.g, overlap.b, overlap.a);
+    check(overlap.r == 0 && overlap.b >= 126 && overlap.b <= 129, msg);
+
+    Drawable masked = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><mask id=\"m\"><rect width=\"5\" height=\"10\" "
+        "fill=\"white\"/></mask><rect width=\"10\" height=\"10\" fill=\"lime\" "
+        "mask=\"url(#m)\"/></svg>");
+    const Bitmap m = render(masked, 10, 10);
+    check(m.pixelAt(2, 5).g == 255 && m.pixelAt(7, 5).a == 0, "a mask shows what it covers");
+  }
+
+  // -- Colours as CSS spells them --
+  {
+    Drawable d = Drawable::parse(
+        "<svg viewBox=\"0 0 1 1\"><rect width=\"1\" height=\"1\" fill=\"#0f08\"/>"
+        "<rect width=\"1\" height=\"1\" fill=\"rgba(0, 0, 255, 0.5)\"/>"
+        "<rect width=\"1\" height=\"1\" fill=\"hsl(120, 100%, 25%)\"/>"
+        "<rect width=\"1\" height=\"1\" fill=\"SteelBlue\"/>"
+        "<rect width=\"1\" height=\"1\" fill=\"rgb(100%, 50%, 0%)\"/></svg>");
+    check(d.numShapes() == 5, "five colour spellings, five shapes");
+    if (d.numShapes() == 5) {
+      const Colour a = d.shapeAt(0).fill, b = d.shapeAt(1).fill, c = d.shapeAt(2).fill,
+                   e = d.shapeAt(3).fill, f = d.shapeAt(4).fill;
+      std::snprintf(msg, sizeof(msg), "#0f08 (%d,%d,%d,%d) rgba() alpha %d, hsl() (%d,%d,%d), "
+                    "SteelBlue (%d,%d,%d), rgb(%%) (%d,%d,%d)", a.r, a.g, a.b, a.a, b.a, c.r, c.g,
+                    c.b, e.r, e.g, e.b, f.r, f.g, f.b);
+      check(a.g == 255 && a.a == 0x88 && b.b == 255 && b.a == 128 && c.r == 0 && c.g == 128 &&
+                e.r == 70 && e.g == 130 && e.b == 180 && f.r == 255 && f.g == 128 && f.b == 0,
+            msg);
+    }
+  }
+
+  // -- What a hostile document cannot do --
+  {
+    // A <use> of a group of two uses of a group of two uses... thirty deep is
+    // a billion rectangles. It stops at the limit and says so.
+    std::string bomb = "<svg viewBox=\"0 0 10 10\"><defs><rect id=\"a0\" width=\"1\" height=\"1\"/>";
+    for (int i = 1; i <= 30; ++i)
+      bomb += "<g id=\"a" + std::to_string(i) + "\"><use href=\"#a" + std::to_string(i - 1) +
+              "\"/><use href=\"#a" + std::to_string(i - 1) + "\"/></g>";
+    bomb += "</defs><use href=\"#a30\"/></svg>";
+    Drawable d = Drawable::parse(bomb);
+    std::snprintf(msg, sizeof(msg), "a billion-rectangle <use> chain stops at %d shapes: \"%s\"",
+                  d.numShapes(), d.error().c_str());
+    check(d.numShapes() > 0 && d.numShapes() <= 100000 && !d.error().empty(), msg);
+
+    Drawable self = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><use id=\"u\" href=\"#u\"/><g id=\"p\"><use href=\"#q\"/></g>"
+        "<g id=\"q\"><use href=\"#p\"/><rect width=\"1\" height=\"1\"/></g></svg>");
+    check(self.numShapes() >= 1 && self.numShapes() <= 4,
+          "a <use> of itself, and two that use each other, end");
+
+    std::string deep = "<svg viewBox=\"0 0 10 10\">";
+    for (int i = 0; i < 100000; ++i) deep += "<g>";
+    deep += "<rect width=\"1\" height=\"1\"/></svg>";
+    check(Drawable::parse(deep).numShapes() <= 1, "and a hundred thousand nested groups do not "
+                                                   "overflow the stack");
+
+    // A '>' inside a quoted attribute is not the end of the tag; entities
+    // decode.
+    Drawable quoted = Drawable::parse(
+        "<svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" data-x=\"a > b\" "
+        "fill=\"&#x23;00ff00\"/></svg>");
+    check(quoted.numShapes() == 1 && quoted.shapeAt(0).fill.g == 255,
+          "a '>' inside quotes and a character reference both read");
+  }
+
+  // -- What a hostile document cannot cost --
+  //
+  // Each of these read a megabyte in seconds to minutes, on the thread that
+  // opens the editor, or asked for gigabytes. Checked by how the cost GROWS
+  // -- a document eight times longer against eight short ones -- so a busy
+  // machine cannot decide them.
+  auto repeated = [](const std::string& s, size_t n) {
+    std::string out;
+    out.reserve(s.size() * n);
+    for (size_t i = 0; i < n; ++i) out += s;
+    return out;
+  };
+  size_t svgSink = 0;
+  {
+    // A '&' that starts no reference: each one looked for its ';' to the end
+    // of the text. A megabyte of them took 15 s.
+    const std::string longer = "<svg viewBox=\"0 0 10 10\">" + std::string(262144, '&') + "</svg>";
+    const std::string shorter = "<svg viewBox=\"0 0 10 10\">" + std::string(32768, '&') + "</svg>";
+    const double ratio = relativeCost([&] { svgSink += Drawable::parse(longer).numShapes(); },
+                                      [&] { for (int k = 0; k < 8; ++k) svgSink += Drawable::parse(shorter).numShapes(); },
+                                      3.0);
+    std::snprintf(msg, sizeof(msg), "256 KB of '&' costs %.2fx eight documents of 32 KB", ratio);
+    check(ratio < 3.0, msg);
+  }
+  {
+    // At-rule statements: each looked for a '{' to the end of the sheet. A
+    // megabyte of "@a;" took 4 s.
+    const std::string longer = "<svg viewBox=\"0 0 10 10\"><style>" + repeated("@a;", 87381) + "</style></svg>";
+    const std::string shorter = "<svg viewBox=\"0 0 10 10\"><style>" + repeated("@a;", 10922) + "</style></svg>";
+    const double ratio = relativeCost([&] { svgSink += Drawable::parse(longer).numShapes(); },
+                                      [&] { for (int k = 0; k < 8; ++k) svgSink += Drawable::parse(shorter).numShapes(); },
+                                      3.0);
+    std::snprintf(msg, sizeof(msg), "256 KB of @-statements costs %.2fx eight sheets of 32 KB", ratio);
+    check(ratio < 3.0, msg);
+  }
+  {
+    // One block under a list of 4,000 selectors was copied into each: an
+    // 18 KB sheet came to 700 MB.
+    const std::string block = "{" + repeated("b:c;", 2500) + "}";
+    const std::string listed = "<svg viewBox=\"0 0 10 10\"><style>" + repeated("a,", 3999) + "a" + block +
+                               "</style><rect width=\"5\" height=\"5\"/></svg>";
+    const std::string single = "<svg viewBox=\"0 0 10 10\"><style>a" + block + repeated(" ", 7998) +
+                               "</style><rect width=\"5\" height=\"5\"/></svg>";
+    const double ratio = relativeCost([&] { svgSink += Drawable::parse(listed).numShapes(); },
+                                      [&] { svgSink += Drawable::parse(single).numShapes(); }, 4.0);
+    std::snprintf(msg, sizeof(msg), "4,000 selectors over one block of 2,500 declarations cost %.2fx one", ratio);
+    check(ratio < 4.0, msg);
+  }
+  {
+    // A long class list under 4,000 class rules: each rule read the list
+    // again. A megabyte took 16 s.
+    const std::string rules = "<style>" + repeated(".b{}", 4000) + "</style>";
+    const std::string list = "<rect width=\"5\" height=\"5\" class=\"" + repeated("a ", 131072) + "\"/>";
+    const std::string styled = "<svg viewBox=\"0 0 10 10\">" + rules + list + "</svg>";
+    const std::string one = "<svg viewBox=\"0 0 10 10\"><style>.b{}" + std::string(rules.size() - 19, ' ') +
+                            "</style>" + list + "</svg>";
+    const double ratio = relativeCost([&] { svgSink += Drawable::parse(styled).numShapes(); },
+                                      [&] { svgSink += Drawable::parse(one).numShapes(); }, 4.0);
+    std::snprintf(msg, sizeof(msg), "a 256 KB class list under 4,000 class rules costs %.2fx the same list "
+                  "under one", ratio);
+    check(ratio < 4.0, msg);
+  }
+  {
+    // Every element kept a copy of every declaration of every rule it
+    // matched, unbounded: 4,000 "*{fill:red}" over 2,000 elements, a 54 KB
+    // file, was 600 MB, and a hundred thousand elements tens of gigabytes.
+    // Now paid for from a style budget, which this exhausts -- and says so.
+    const std::string doc = "<svg viewBox=\"0 0 10 10\"><style>" + repeated("*{fill:red}", 4000) + "</style>" +
+                            repeated("<rect width=\"5\" height=\"5\"/>", 2000) + "</svg>";
+    const Drawable d = Drawable::parse(doc);
+    std::snprintf(msg, sizeof(msg), "4,000 universal rules over 2,000 elements stop at %d shapes: \"%s\"",
+                  d.numShapes(), d.error().c_str());
+    check(d.numShapes() > 0 && d.numShapes() < 2000 && !d.error().empty(), msg);
+  }
+  {
+    // Every shape a gradient fills gets its own copy of the stops: 60,000
+    // stops filling 8,000 shapes, a 760 KB file, took 78 s and 3.7 GB.
+    const std::string doc = "<svg viewBox=\"0 0 10 10\"><linearGradient id=\"g\">" + repeated("<stop/>", 5000) +
+                            "</linearGradient>" +
+                            repeated("<rect width=\"5\" height=\"5\" fill=\"url(#g)\"/>", 1000) + "</svg>";
+    const Drawable d = Drawable::parse(doc);
+    std::snprintf(msg, sizeof(msg), "5,000 stops filling 1,000 shapes stop at %d shapes: \"%s\"", d.numShapes(),
+                  d.error().c_str());
+    check(d.numShapes() > 0 && d.numShapes() < 1000 && !d.error().empty(), msg);
+  }
+  {
+    // An element is read again each time a <use> draws it, and each copy
+    // kept its own path: one path of 200,000 closes used 5,000 times, a
+    // 480 KB file, took 7.5 s and 960 MB.
+    const std::string doc = "<svg viewBox=\"0 0 10 10\"><defs><path id=\"p\" d=\"M0 0" + repeated(" Z", 100000) +
+                            "\"/></defs>" + repeated("<use href=\"#p\"/>", 1000) + "</svg>";
+    const Drawable d = Drawable::parse(doc);
+    std::snprintf(msg, sizeof(msg), "a 200 KB path used 1,000 times stops at %d copies: \"%s\"", d.numShapes(),
+                  d.error().c_str());
+    check(d.numShapes() > 0 && d.numShapes() < 1000 && !d.error().empty(), msg);
+  }
+  check(svgSink > 0, "the hostile documents still drew what they could");
+}
+
+// ---------------------------------------------------------------------------
 // Random, noise, JSON and Base64
 //
 // Three things the map never listed until a second audit went looking. The RNG
@@ -14115,6 +21708,86 @@ static void testRandom() {
     std::snprintf(msg, sizeof(msg), "pink noise has %.1fx the low-frequency energy ratio of "
                   "white (%.4f against %.4f)", pinkRatio / whiteRatio, pinkRatio, whiteRatio);
     check(pinkRatio > whiteRatio * 3.0, msg);
+
+    // Equal energy per octave across the audible range, which is the claim.
+    // Seven Voss rows are pink only above fs/128 -- 375 Hz at 48 kHz -- and
+    // white below, so the 20-40 Hz octave sat 8 dB under the midrange.
+    // Welch-averaged, Hann-windowed spectrum, summed into the ten octaves
+    // from 20 Hz to 20.48 kHz.
+    {
+      constexpr size_t N = 16384;
+      const double fs = 48000.0;
+      auto fft = std::make_unique<sonore::Fft<N>>();
+      sonore::PinkNoise octavePink(11);
+      const size_t total = (size_t) 1 << 21;
+      std::vector<float> x(total);
+      for (auto& v : x) v = octavePink.next();
+      std::vector<double> power(N / 2 + 1, 0.0);
+      std::vector<float> re(N), im(N);
+      for (size_t start = 0; start + N <= total; start += N / 2) {
+        for (size_t i = 0; i < N; ++i) {
+          const double w = 0.5 - 0.5 * std::cos(2.0 * kTestPi * (double) i / (double) N);
+          re[i] = (float) (w * x[start + i]);
+          im[i] = 0.0f;
+        }
+        fft->transform(re.data(), im.data());
+        for (size_t k = 0; k <= N / 2; ++k) power[k] += (double) re[k] * re[k] + (double) im[k] * im[k];
+      }
+      double octaveDb[10], mean = 0.0;
+      for (int o = 0; o < 10; ++o) {
+        const double lo = 20.0 * std::pow(2.0, o), hi = 2.0 * lo;
+        double e = 0.0;
+        for (size_t k = 1; k <= N / 2; ++k) {
+          const double f = (double) k * fs / (double) N;
+          if (f >= lo && f < hi) e += power[k];
+        }
+        octaveDb[o] = 10.0 * std::log10(e);
+        mean += octaveDb[o] / 10.0;
+      }
+      double worst = 0.0;
+      for (double d : octaveDb) worst = std::max(worst, std::fabs(d - mean));
+      std::printf("  ---- pink octaves 20 Hz..20 kHz, dB from their mean:");
+      for (double d : octaveDb) std::printf(" %+.1f", d - mean);
+      std::printf(" ----\n");
+      std::snprintf(msg, sizeof(msg), "pink noise has equal energy in every octave from 20 Hz to "
+                    "20 kHz, to within 1 dB (worst %.2f dB)", worst);
+      check(worst < 1.0, msg);
+    }
+
+    // So the level in a fixed low band does not depend on the sample rate --
+    // what the tape model's flutter noise is: pink, smoothed at 15 Hz. White
+    // down there, it lost 5.8 dB of flutter between 48 and 192 kHz.
+    {
+      auto lowBandRms = [](double fs) {
+        sonore::PinkNoise p(3);
+        const double c = 1.0 - std::exp(-2.0 * kTestPi * 15.0 / fs);
+        double z = 0.0, sum = 0.0;
+        const int settle = (int) fs, count = (int) (fs * 40.0);
+        for (int i = 0; i < settle + count; ++i) {
+          z += ((double) p.next() - z) * c;
+          if (i >= settle) sum += z * z;
+        }
+        return std::sqrt(sum / count);
+      };
+      const double at48 = lowBandRms(48000.0), at192 = lowBandRms(192000.0);
+      const double drift = 20.0 * std::log10(at192 / at48);
+      std::snprintf(msg, sizeof(msg), "pink noise below 15 Hz is as loud at 192 kHz as at 48 kHz "
+                    "(%.4f against %.4f, %+.1f dB)", at192, at48, drift);
+      check(std::fabs(drift) < 2.0, msg);
+
+      // setSeed starts the SAME sequence a fresh generator gives. It reseeded
+      // the random source and kept the rows, the running sum and the
+      // counter, so "bounce twice and compare" compared two noises.
+      sonore::PinkNoise used(42), fresh(42);
+      for (int i = 0; i < 10000; ++i) used.next();
+      used.setSeed(42);
+      int differ = 0;
+      for (int i = 0; i < 48000; ++i)
+        if (used.next() != fresh.next()) ++differ;
+      std::snprintf(msg, sizeof(msg),
+                    "a reseeded pink noise repeats a fresh one exactly (%d of 48000 differ)", differ);
+      check(differ == 0, msg);
+    }
   }
 
   // -- Dither --
@@ -14209,6 +21882,30 @@ static void testJson() {
     check(!state.has("cutoff") && state.has("gain"), "has() reports which is which");
     check(state["missing"]["deeper"].asInt(7) == 7,
           "and reading THROUGH a missing key still gives the fallback");
+
+    // A settings file is user-editable, and a number too big for an int is
+    // still valid JSON. Converting it was undefined behaviour; the answer
+    // that means something is the nearest int, and a non-number has none.
+    JsonValue big = JsonValue::parse("{\"n\":1e300,\"m\":-1e300,\"f\":2.9}");
+    char line[200];
+    std::snprintf(line, sizeof(line), "an out-of-range number reads as the nearest int "
+                  "(%d and %d, want %d and %d)", big["n"].asInt(), big["m"].asInt(), INT_MAX,
+                  INT_MIN);
+    check(big["n"].asInt() == INT_MAX && big["m"].asInt() == INT_MIN, line);
+    check(big["f"].asInt() == 2, "...and an in-range one still truncates as before");
+    check(JsonValue(std::nan("")).asInt(5) == 5, "...and NaN, which is no int, gives the fallback");
+    // asFloat() the same way: narrowing a double beyond float's range is
+    // undefined behaviour too, and MSVC made 1e300 an infinity.
+    const float flMax = (std::numeric_limits<float>::max)();
+    std::snprintf(line, sizeof(line),
+                  "an out-of-float-range number reads as the largest float (%g and %g, want %g and %g)",
+                  (double) big["n"].asFloat(), (double) big["m"].asFloat(), (double) flMax, (double) -flMax);
+    check(big["n"].asFloat() == flMax && big["m"].asFloat() == -flMax, line);
+    check(big["f"].asFloat() == 2.9f && JsonValue(1e30).asFloat() == (float) 1e30,
+          "...and an in-range one narrows as before");
+    check(std::isinf(JsonValue(std::numeric_limits<double>::infinity()).asFloat()) &&
+              std::isnan(JsonValue(std::nan("")).asFloat()),
+          "...while an infinity or a NaN, which float has, is kept");
   }
 
   // -- Escapes --
@@ -14252,6 +21949,59 @@ static void testJson() {
     for (int i = 0; i < 500; ++i) deep += ']';
     check(JsonValue::parse(deep, &error).isNull() && !error.empty(),
           "500 levels of nesting is refused rather than overflowing the stack");
+
+    // A number is all of its span or it is not a number: the parser kept the
+    // prefix the conversion used and dropped the rest without a word.
+    check(JsonValue::parse("[1-2]", &error).isNull() &&
+              JsonValue::parse("{\"gain\":0.5.7}", &error).isNull() &&
+              JsonValue::parse("12-3", &error).isNull(),
+          "1-2, 0.5.7 and 12-3 are refused, not read as 1, 0.5 and 12");
+    check(JsonValue::parse("{\"n\":1e999}", &error).isNull(),
+          "and 1e999 is refused rather than read as infinity");
+
+    // \u takes exactly four hex digits; half a surrogate pair is no character.
+    check(JsonValue::parse("\"\\u0x41\"", &error).isNull() &&
+              JsonValue::parse("\"\\u 041\"", &error).isNull() &&
+              JsonValue::parse("\"\\u12zz\"", &error).isNull() &&
+              JsonValue::parse("\"\\u-001\"", &error).isNull(),
+          "\\u0x41, \\u 041, \\u12zz and \\u-001 are refused");
+    check(JsonValue::parse("\"\\ud800\"").asString() == "\xef\xbf\xbd",
+          "a lone surrogate becomes U+FFFD, not the invalid bytes ED A0 80");
+  }
+
+  // -- Walking down a tree: node = node[key] --
+  //
+  // The child being assigned is part of the value it is assigned to. The
+  // memberwise assignment cleared the parent's map, and with it the child,
+  // while it was still copying from it: the walk ended at null, or at
+  // garbage (a use after free under ASan).
+  {
+    JsonValue node = JsonValue::parse(
+        "{\"a\":{\"b\":{\"c\":[1,2,{\"d\":\"a value long enough for the heap\"}]}}}");
+    for (const char* key : {"a", "b"}) node = node[key];
+    check(node.toString() == "{\"c\":[1,2,{\"d\":\"a value long enough for the heap\"}]}",
+          "node = node[key] walks down an object");
+    JsonValue list = JsonValue::parse("[[[[\"x\",\"a value long enough for the heap\"],2],3],4]");
+    for (int i = 0; i < 3; ++i) list = list.at(0);
+    check(list.toString() == "[\"x\",\"a value long enough for the heap\"]",
+          "and node = node.at(0) down an array");
+  }
+
+  // -- Base64, all or nothing --
+  {
+    std::vector<uint8_t> bytes;
+    check(!sonore::Base64::decode("AAECA", bytes) && bytes.empty(),
+          "a truncated quad is refused, with nothing decoded");
+    check(!sonore::Base64::decode("QQ==QUJD", bytes) && bytes.empty(), "and so is data after the padding");
+    check(!sonore::Base64::decode("QR==", bytes), "and leftover bits that are not the encoder's zeros");
+    check(sonore::Base64::decode("QUJD", bytes) && bytes.size() == 3 && bytes[0] == 'A',
+          "while a whole quad decodes");
+    check(sonore::Base64::decode("QQ==", bytes) && bytes.size() == 1 && bytes[0] == 'A',
+          "a padded one too");
+    check(sonore::Base64::decode("QQ", bytes) && bytes.size() == 1, "and an unpadded tail of two");
+    const std::vector<uint8_t> blob = {0, 1, 2, 250, 251, 252, 253};
+    check(sonore::Base64::decode(sonore::Base64::encode(blob), bytes) && bytes == blob,
+          "and everything the encoder writes reads back");
   }
 
   // -- Deterministic output --
@@ -14541,6 +22291,33 @@ static void testGfxContainers() {
     std::snprintf(msg, sizeof(msg), "painting it drew %d rows, not %d", drawn, list.numRows());
     check(drawn > 0 && drawn < 12, msg);
 
+    // A list driven by its own model can shrink without the list being told.
+    // Scrolled to the bottom of 400 and shrunk to 5, it kept a scroll position
+    // past the end of the rows and drew none of them -- and setItems, the one
+    // call that re-clamped, is not a call such a list ever makes.
+    {
+      ListBox model;
+      model.setBounds({0.0f, 0.0f, 160.0f, 100.0f});
+      int rows = 400;
+      model.getNumRows = [&]() { return rows; };
+      int painted = 0;
+      model.drawRow = [&](Graphics&, int, const Rect&, bool) { ++painted; };
+      model.setSelectedRow(399, false); // scrolls to the bottom
+      rows = 5;
+      Bitmap shot(160, 100);
+      {
+        Graphics g(shot);
+        model.paintTree(g);
+      }
+      std::snprintf(msg, sizeof(msg), "a model that shrinks under a scrolled list still has its "
+                    "rows drawn (%d drawn of 5)", painted);
+      check(painted == 5, msg);
+      model.updateContent();
+      std::snprintf(msg, sizeof(msg), "and updateContent() brings the selection back inside "
+                    "(row %d)", model.selectedRow());
+      check(model.selectedRow() == 4, msg);
+    }
+
     // -- Selection --
     list.setItems(presets); // restores the default drawRow
     Component root;
@@ -14663,6 +22440,11 @@ static void testGfxContainers() {
     check(changes == 1, "and setting the tab it is already on reports nothing");
     tabs.setCurrentTab(99);
     check(tabs.currentTab() == 1, "an out-of-range tab is ignored");
+    // And its name is empty, as its bounds are. tabName indexed the vector
+    // unchecked: -1 or 3 read outside it.
+    check(tabs.tabName(1) == "Filter" && tabs.tabName(3).empty() && tabs.tabName(-1).empty() &&
+              tabs.tabBounds(3).isEmpty(),
+          "an out-of-range tab has no name, as it has no bounds");
     root.removeChild(&tabs);
   }
 
@@ -14709,6 +22491,29 @@ static void testGfxContainers() {
     std::snprintf(msg, sizeof(msg), "at half, the left is filled (%d) and the right is not (%d)",
                   leftInk, rightInk);
     check(leftInk > 200 && rightInk == 0, msg);
+
+    // A job on ANOTHER thread hands over a std::atomic<double>. The only
+    // source there was is a plain double, read here while a loader wrote it
+    // there: a data race, which no test can make fail on x64 but a thread
+    // sanitizer reports, and which the class comment invited.
+    std::atomic<double> shared{0.0};
+    ProgressBar fed;
+    fed.setSource(shared);
+    check(!fed.isIndeterminate() && fed.progress() == 0.0, "a bar on an atomic source starts at it");
+    int changed = 0;
+    std::thread loader([&shared]() {
+      for (int i = 1; i <= 2000; ++i) shared.store((double) i / 2000.0);
+    });
+    while (fed.progress() < 1.0)
+      if (fed.tick()) ++changed;
+    loader.join();
+    std::snprintf(msg, sizeof(msg), "and follows a writer on another thread to the end (%.2f, %d "
+                  "ticks that moved)", fed.progress(), changed);
+    check(fed.progress() == 1.0 && changed >= 1, msg);
+    fed.setSource(nullptr);
+    check(fed.isIndeterminate(), "setSource(nullptr) is still the indeterminate bar");
+    fed.setSource(&loaded);
+    check(!fed.isIndeterminate() && fed.progress() == 0.5, "and a plain double replaces the atomic");
   }
 }
 
@@ -14786,6 +22591,57 @@ static void testGfxCursor() {
     check(field.cursor() == MouseCursor::Text, "a text field asks for an I-beam");
     ResizableCorner grip;
     check(grip.cursor() == MouseCursor::ResizeCorner, "and the resize grip for a diagonal");
+  }
+
+  // A horizontal BAR is dragged left and right like the fader, and its cursor
+  // says so. Only LinearHorizontal was tested for, so it got up-and-down.
+  {
+    Slider bar(Slider::Style::LinearBar);
+    Slider upright(Slider::Style::LinearBarVertical);
+    std::snprintf(msg, sizeof(msg), "a horizontal bar asks for left-right (%d), a vertical one "
+                  "for up-down (%d)", (int) bar.cursor(), (int) upright.cursor());
+    check(bar.cursor() == MouseCursor::DragHorizontal &&
+              upright.cursor() == MouseCursor::DragVertical, msg);
+    Slider restyled(Slider::Style::Rotary);
+    restyled.setStyle(Slider::Style::LinearBar);
+    check(restyled.cursor() == MouseCursor::DragHorizontal, "and so does one setStyle made a bar");
+    restyled.setStyle(Slider::Style::Rotary);
+    check(restyled.cursor() == MouseCursor::DragVertical, "and back to up-down as a rotary");
+  }
+
+  // A rotary dragged left and right says so too -- but only while its
+  // cursor is still the one the slider gave itself. A cursor the plugin set
+  // is never replaced, by setRotaryDrag or by setStyle.
+  {
+    Slider turned(Slider::Style::Rotary);
+    turned.setRotaryDrag(Slider::RotaryDrag::Horizontal);
+    std::snprintf(msg, sizeof(msg), "a rotary dragged left and right asks for left-right (%d)",
+                  (int) turned.cursor());
+    check(turned.cursor() == MouseCursor::DragHorizontal, msg);
+    turned.setRotaryDrag(Slider::RotaryDrag::Both);
+    check(turned.cursor() == MouseCursor::DragVertical, "and for up-down again when both axes count");
+    turned.setRotaryDrag(Slider::RotaryDrag::Horizontal);
+    turned.setStyle(Slider::Style::LinearVertical);
+    check(turned.cursor() == MouseCursor::DragVertical,
+          "made a vertical fader, a left-right rotary asks for up-down");
+    turned.setStyle(Slider::Style::Rotary);
+    std::snprintf(msg, sizeof(msg), "and made a rotary again, left-right, its drag kept (%d)",
+                  (int) turned.cursor());
+    check(turned.cursor() == MouseCursor::DragHorizontal, msg);
+
+    Slider chosen(Slider::Style::Rotary);
+    chosen.setCursor(MouseCursor::Pointing);
+    chosen.setRotaryDrag(Slider::RotaryDrag::Horizontal);
+    check(chosen.cursor() == MouseCursor::Pointing,
+          "a cursor the plugin set is kept when the rotary's drag changes");
+    chosen.setStyle(Slider::Style::LinearHorizontal);
+    std::snprintf(msg, sizeof(msg), "and when its style changes (%d)", (int) chosen.cursor());
+    check(chosen.cursor() == MouseCursor::Pointing, msg);
+    chosen.setCursor(MouseCursor::Default);
+    chosen.setStyle(Slider::Style::Rotary);
+    std::snprintf(msg, sizeof(msg), "even Default, which shows the parent's cursor (%d)",
+                  (int) chosen.cursor());
+    check(chosen.cursor() == MouseCursor::Default, msg);
   }
 
   root.removeChild(&knob);
@@ -14934,6 +22790,64 @@ static void testGfxAnimator() {
     check(animator.count() == 1, "and the finished one is forgotten");
     animator.cancelAll(true);
     check(animator.count() == 0 && b.bounds().y == 200.0f, "cancelAll lands whatever is left");
+  }
+
+  // cancelAll(true) lands each component with setBounds, which runs
+  // resized() -- user layout code, free to start animations of its own.
+  // Walking the list in place, the first such start reallocated it under the
+  // loop, and whatever the callbacks started was then cleared with the rest.
+  {
+    struct Relayout : Component {
+      Animator* animator = nullptr;
+      std::vector<std::unique_ptr<Component>>* spawned = nullptr;
+      void resized() override {
+        if (!animator || !spawned) return;
+        for (int i = 0; i < 16; ++i) {
+          spawned->push_back(std::make_unique<Component>());
+          animator->animateBounds(spawned->back().get(), Rect(0.0f, 50.0f, 10.0f, 10.0f), 1.0, 0.0,
+                                  Easing::Linear);
+        }
+      }
+    };
+    std::vector<std::unique_ptr<Component>> spawned;
+    Relayout a, b;
+    a.setBounds({0.0f, 0.0f, 10.0f, 10.0f});
+    b.setBounds({0.0f, 0.0f, 10.0f, 10.0f});
+    // Sizes change, not just positions: resized() runs only for those.
+    animator.animateBounds(&a, Rect(100.0f, 0.0f, 20.0f, 10.0f), 1.0, 0.0, Easing::Linear);
+    animator.animateBounds(&b, Rect(0.0f, 100.0f, 10.0f, 20.0f), 1.0, 0.0, Easing::Linear);
+    a.animator = b.animator = &animator;
+    a.spawned = b.spawned = &spawned;
+    animator.cancelAll(true);
+    a.animator = b.animator = nullptr;
+    std::snprintf(msg, sizeof(msg), "cancelAll lands both even when their layout starts 32 "
+                  "animations, and keeps those (%d running)", animator.count());
+    check(a.bounds().w == 20.0f && b.bounds().h == 20.0f && animator.count() == 32, msg);
+    animator.cancelAll(false);
+  }
+
+  // -- Every curve, by name, in both animators --
+  //
+  // The bounds animator had its own copy of the curves that knew Linear, In,
+  // Out and InOut and ran Back, Elastic and Bounce as a straight line; and
+  // Elastic's sine took its phase from t - 1, so it leapt to 1.5 in its first
+  // instant.
+  {
+    panel.setBounds({0.0f, 0.0f, 10.0f, 10.0f});
+    animator.animateBounds(&panel, Rect(100.0f, 0.0f, 10.0f, 10.0f), 1.0, 0.0, Easing::Back);
+    animator.tick(0.8);
+    std::snprintf(msg, sizeof(msg), "a Back animation of bounds overshoots on the way in (x=%.1f "
+                  "at 80%%)", panel.bounds().x);
+    check(panel.bounds().x > 100.0f, msg);
+    animator.cancelAll(false);
+    const double early = ValueAnimator::ease(0.01, Easing::Elastic);
+    std::snprintf(msg, sizeof(msg), "Elastic starts from where it starts (%.3f at t=0.01)", early);
+    check(early >= 0.0 && early < 0.2, msg);
+    bool same = true;
+    for (int e = 0; e <= (int) Easing::Bounce; ++e)
+      for (double t = 0.0; t <= 1.0; t += 0.05)
+        if (Animator::ease(t, (Easing) e) != ValueAnimator::ease(t, (Easing) e)) same = false;
+    check(same, "and the two animators follow the same curve for every name");
   }
 
   // -- Degenerate input --
@@ -15151,6 +23065,27 @@ static void testGfxRegion() {
     check(differences == 0, msg);
   }
 
+  // -- Hiding a component damages where it was --
+  //
+  // setVisible(false) dropped the flag and THEN called repaint(), which does
+  // nothing for a component that is not showing -- so hiding marked no damage
+  // and the control stayed drawn until something else covered it.
+  {
+    Component root;
+    root.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    Component bar;
+    bar.setBounds({150.0f, 10.0f, 12.0f, 80.0f});
+    root.addChild(&bar);
+    root.clearDamage();
+    bar.setVisible(false);
+    const Rect d = root.damageBounds();
+    check(root.isDirty() && d.x <= 150.0f && d.right() >= 162.0f && d.y <= 10.0f && d.bottom() >= 90.0f,
+          "hiding a component damages the area it covered, so the pixels under it are redrawn");
+    root.clearDamage();
+    bar.setVisible(true);
+    check(root.isDirty(), "...and showing it again damages it too");
+  }
+
   // -- Damage moves into a child's coordinates correctly --
   //
   // Getting the sign wrong here paints the right components with the wrong
@@ -15196,6 +23131,46 @@ static void testGfxRegion() {
 
     panel.removeChild(&inner);
     root.removeChild(&panel);
+  }
+
+  // A partial repaint of a busy editor builds nothing for what it misses.
+  // Every child was handed its own translated copy of the damage list -- a
+  // vector allocated per child per frame -- before anything asked whether
+  // the child was under the damage at all. Two hundred controls and one
+  // meter moving: two hundred allocations, thirty times a second. Measured
+  // as the same one-control repaint in a tree of 200 and in a tree of 1:
+  // what painting the control costs is the same in both, and nothing else
+  // should be.
+  {
+    auto repaintOneOf = [](int count) {
+      Component root;
+      root.setBounds({0.0f, 0.0f, 400.0f, 400.0f});
+      std::vector<std::unique_ptr<CountingBox>> boxes;
+      for (int i = 0; i < count; ++i) {
+        boxes.emplace_back(new CountingBox());
+        boxes.back()->setBounds({(float) (i % 20) * 20.0f, (float) (i / 20) * 20.0f, 18.0f, 18.0f});
+        root.addChild(boxes.back().get());
+      }
+      Bitmap bmp(400, 400);
+      RectangleList damage;
+      damage.add(Rect(2.0f, 2.0f, 6.0f, 6.0f)); // inside the first box only
+      long allocated = 0;
+      {
+        Graphics g(bmp);
+        armAllocationCounterOnThisThread(true);
+        const long before = allocationCount();
+        root.paintTree(g, damage);
+        allocated = allocationCount() - before;
+        armAllocationCounterOnThisThread(false);
+      }
+      for (auto& b : boxes) root.removeChild(b.get());
+      return allocated;
+    };
+    const long alone = repaintOneOf(1), crowded = repaintOneOf(200);
+    char line[200];
+    std::snprintf(line, sizeof(line), "repainting one control costs the same among two hundred as "
+                  "alone (%ld allocations against %ld)", crowded, alone);
+    check(crowded == alone, line);
   }
 }
 
@@ -15399,7 +23374,9 @@ static void testGfxEffects() {
     check(colours::byName("transparent", &c) && c.a == 0, "transparent has zero alpha");
     check(colours::byName("gray", &c) && colours::byName("grey", &c),
           "both spellings of grey are there, because both get written");
-    check(!colours::byName("chartreuse", &c),
+    check(colours::byName("chartreuse", &c) && c.r == 0x7f && c.g == 0xff,
+          "every CSS name is there, the unusual ones too");
+    check(!colours::byName("notacolour", &c),
           "and a name that is not in the table says so, rather than giving black");
     // The distinction matters: "not a name" and "the name for black" are
     // different answers, and a lookup returning a Colour could not tell them
@@ -15450,8 +23427,25 @@ static void testGfxClipboard() {
 
   field.selectAll();
   check(field.copyToClipboard(), "copying a selection succeeds");
+  // The REAL system clipboard, shared with everything else on the desktop. A
+  // clipboard manager, a remote-desktop session or a person copying something
+  // between the write and the read replaces it, and the same binary that
+  // passed a minute earlier fails with nothing changed. Try a few times;
+  // if the desktop keeps winning, say so and skip -- a test that cannot get a
+  // quiet clipboard has no verdict, and no verdict must not read as a defect.
   std::string got;
-  check(Clipboard::getText(&got) && got == "Warm Pad", "and the clipboard holds exactly it");
+  {
+    bool held = false;
+    for (int attempt = 0; attempt < 5 && !held; ++attempt) {
+      if (attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        field.copyToClipboard();
+      }
+      held = Clipboard::getText(&got) && got == "Warm Pad";
+    }
+    if (held) check(true, "and the clipboard holds exactly it");
+    else std::printf("  SKIPPED the clipboard round trip: another program keeps replacing the clipboard\n");
+  }
 
   // A partial selection copies the part.
   field.setText("abcdef");
@@ -15531,6 +23525,22 @@ static void testGfxClipboard() {
     std::snprintf(msg, sizeof(msg), "and a length limit stops it at \"%s\"",
                   numeric.getText().c_str());
     check(numeric.getText() == "1234", msg);
+
+    // A paste the filter refuses ENTIRELY changes nothing. The selection was
+    // deleted before the filter ran, so pasting letters over a selected
+    // number in a numeric field silently erased the number -- with no change
+    // reported and no repaint.
+    numeric.setMaxLength(0);
+    numeric.setText("42");
+    numeric.selectAll();
+    int changes = 0;
+    numeric.onTextChange = [&](const std::string&) { ++changes; };
+    Clipboard::setText("abc");
+    router.keyPressed(typed('v', true));
+    std::snprintf(msg, sizeof(msg), "a paste the filter refuses entirely leaves the selection "
+                  "alone (\"%s\")", numeric.getText().c_str());
+    check(numeric.getText() == "42" && numeric.hasSelection() && changes == 0, msg);
+    numeric.onTextChange = nullptr;
     root.removeChild(&numeric);
   }
 
@@ -15601,6 +23611,16 @@ static void testGfxRangeAndIcon() {
   std::snprintf(msg, sizeof(msg), "setting 0.8..0.2 gives %.2f..%.2f, in order",
                 range.lowValue(), range.highValue());
   check(range.lowValue() < range.highValue() && std::fabs(range.lowValue() - 0.2f) < 0.001f, msg);
+
+  // Collapsed at the TOP, the gap still holds -- the low end moves down to
+  // make it. Only the high end ever moved, and it could not pass 1, so
+  // 1..1 stayed a range of nothing: two thumbs on one spot, and no telling
+  // which a drag would take.
+  range.setRange(1.0f, 1.0f, false);
+  std::snprintf(msg, sizeof(msg), "a range collapsed at the top keeps its gap (%.4f..%.4f)",
+                range.lowValue(), range.highValue());
+  check(range.highValue() - range.lowValue() >= RangeSlider::kMinimumGap * 0.999f, msg);
+  range.setRange(0.2f, 0.8f, false);
 
   // -- The ends cannot cross, which is the whole reason this is one control --
   Component root;
@@ -15711,6 +23731,33 @@ static void testGfxRangeAndIcon() {
       }
     std::snprintf(msg, sizeof(msg), "and it draws %d pixels of the icon's own colour", accent);
     check(accent > 30, msg);
+
+    // An icon drawn in currentColor takes the theme's text colour -- and the
+    // dimmed one when the button is disabled. It was drawn black.
+    button.setToggleable(false);
+    button.setIcon("<svg viewBox='0 0 24 24' fill='currentColor'><rect x='4' y='4' width='16' "
+                   "height='16'/></svg>");
+    auto centre = [&]() {
+      Bitmap face(32, 32);
+      face.clear(Colour(0, 0, 0, 255));
+      {
+        Graphics g(face);
+        button.paintTree(g);
+      }
+      return face.pixelAt(16, 16);
+    };
+    const Colour text = button.lookAndFeel().text(), dim = button.lookAndFeel().dimText();
+    const PremulColour enabled = centre();
+    button.setEnabled(false);
+    const PremulColour disabled = centre();
+    button.setEnabled(true);
+    std::snprintf(msg, sizeof(msg), "a currentColor icon is drawn in the text colour (%d,%d,%d "
+                  "for %d,%d,%d) and dimmed when disabled (%d,%d,%d)", enabled.r, enabled.g,
+                  enabled.b, text.r, text.g, text.b, disabled.r, disabled.g, disabled.b);
+    check(std::abs(enabled.r - text.r) <= 2 && std::abs(enabled.g - text.g) <= 2 &&
+              std::abs(enabled.b - text.b) <= 2 && std::abs(disabled.r - dim.r) <= 2 &&
+              std::abs(disabled.g - dim.g) <= 2,
+          msg);
     root2.removeChild(&button);
   }
 }
@@ -16112,6 +24159,141 @@ static void testGfxBacking() {
 
   check(Backing::toDevice(621.0f, 1.5f) == 932,
         "asking the platform for a size rounds rather than truncating");
+
+  // -- After a partial render the WHOLE bitmap is right, under a root that paints --
+  //
+  // The window copies only the rectangles render() hands back -- until the OS
+  // or the host wants the whole window (uncovered, shown again, a host's own
+  // invalidation), and then it copies the bitmap as it stands. So every pixel
+  // of it must be right after a partial render, not only the damaged ones.
+  //
+  // The tree-level identity test passes with a root that paints nothing. Every
+  // real editor's root paints its background (GenericEditor, Viewport), and
+  // that fill covered the whole root, clipped to nothing but its bounds, while
+  // only the damaged children were painted back over it. A full copy after one
+  // knob moved showed one knob on an empty editor -- the synth's native editor,
+  // photographed two seconds after it opened, was a keyboard and nothing else.
+  {
+    struct Background : Component {
+      void paint(Graphics& g) override { g.fillAll(Colour(30, 30, 40, 255)); }
+    };
+    for (float scale : {1.0f, 1.5f}) {
+      Backing b;
+      Background root;
+      Filler left(Colour(255, 0, 0, 255)), right(Colour(0, 0, 255, 255));
+      root.addChild(&left);
+      root.addChild(&right);
+      b.setContent(&root);
+      b.setGround(Colour(0, 0, 0, 255));
+      b.setDeviceSize(300, 120);
+      b.setScale(scale);
+      left.setBounds({10.0f, 10.0f, 60.0f, 40.0f});
+      right.setBounds({120.0f, 10.0f, 60.0f, 40.0f});
+      b.invalidateAll();
+      b.render();
+
+      // Only `right` changes, and only `right` is damaged.
+      right.colour = Colour(0, 255, 0, 255);
+      right.repaint();
+      const bool partialChanged = !b.render().empty();
+      std::vector<PremulColour> afterPartial;
+      for (int y = 0; y < b.bitmap().height(); ++y)
+        for (int x = 0; x < b.bitmap().width(); ++x) afterPartial.push_back(b.bitmap().pixelAt(x, y));
+
+      // The same tree, rendered whole: what a full-window copy must show.
+      b.invalidateAll();
+      b.render();
+      int differences = 0;
+      size_t i = 0;
+      for (int y = 0; y < b.bitmap().height(); ++y)
+        for (int x = 0; x < b.bitmap().width(); ++x, ++i) {
+          const PremulColour f = b.bitmap().pixelAt(x, y), p = afterPartial[i];
+          if (p.r != f.r || p.g != f.g || p.b != f.b) ++differences;
+        }
+      std::snprintf(msg, sizeof(msg), "at %g%%, after a partial render the whole bitmap matches a "
+                    "full one -- the undamaged control included (%d differing pixels)",
+                    (double) scale * 100.0, differences);
+      check(partialChanged && differences == 0, msg);
+    }
+
+    // Two controls MEETING at a fractional edge, at 150%: the damaged one's
+    // device rectangle is rounded outward, so the clear takes in the pixel the
+    // two share. The neighbour must be painted back into it, or a seam of bare
+    // ground runs down its edge every time the other one moves.
+    {
+      Backing b;
+      Background root;
+      Filler moved(Colour(255, 0, 0, 255)), still(Colour(0, 0, 255, 255));
+      root.addChild(&moved);
+      root.addChild(&still);
+      b.setContent(&root);
+      b.setGround(Colour(0, 0, 0, 255));
+      b.setDeviceSize(300, 120);
+      b.setScale(1.5f);
+      moved.setBounds({10.0f, 10.0f, 60.3f, 40.0f});
+      still.setBounds({70.3f, 10.0f, 60.0f, 40.0f});
+      b.invalidateAll();
+      b.render();
+      moved.colour = Colour(0, 255, 0, 255);
+      moved.repaint();
+      b.render();
+      std::vector<PremulColour> afterPartial;
+      for (int y = 0; y < b.bitmap().height(); ++y)
+        for (int x = 0; x < b.bitmap().width(); ++x) afterPartial.push_back(b.bitmap().pixelAt(x, y));
+      b.invalidateAll();
+      b.render();
+      int differences = 0;
+      size_t i = 0;
+      for (int y = 0; y < b.bitmap().height(); ++y)
+        for (int x = 0; x < b.bitmap().width(); ++x, ++i) {
+          const PremulColour f = b.bitmap().pixelAt(x, y), p = afterPartial[i];
+          if (p.r != f.r || p.g != f.g || p.b != f.b) ++differences;
+        }
+      std::snprintf(msg, sizeof(msg), "…and a neighbour meeting it at a fractional edge keeps "
+                    "its edge pixels (%d differing)", differences);
+      check(differences == 0, msg);
+    }
+  }
+
+  // -- What the bitmap holds is what the window needs --
+  //
+  // A resized vector keeps its buffer. A window moved from a 200% monitor
+  // to a 100% one went on holding the 200% frame for as long as it stayed
+  // open; shrunk to under half of what it holds, the bitmap is made anew.
+  // A drag that changes the size a little keeps the buffer it has, so the
+  // drag allocates no more often than before. And a closed window's peer
+  // gives the pixels back, the buffer itself and not only the size.
+  {
+    Backing b;
+    Component root;
+    Filler child(Colour(255, 0, 0, 255));
+    root.addChild(&child);
+    b.setContent(&root);
+    b.setScale(2.0f);
+    b.setDeviceSize(400, 300);
+    child.setBounds({0.0f, 0.0f, 200.0f, 150.0f});
+    b.render();
+    const uint8_t* twoX = b.bitmap().data();
+    b.setDeviceSize(396, 298); // a drag, a few pixels in
+    b.render();
+    check(b.bitmap().data() == twoX && b.bitmap().width() == 396,
+          "a window a few pixels smaller keeps the buffer it has");
+    b.setScale(1.0f);
+    b.setDeviceSize(200, 150); // the same window on a 100% monitor
+    child.setBounds({0.0f, 0.0f, 200.0f, 150.0f});
+    b.render();
+    const PremulColour c = b.bitmap().pixelAt(199, 149);
+    check(b.bitmap().data() != twoX && b.bitmap().sizeInBytes() == 200u * 150u * 4u && c.r == 255 && c.g == 0,
+          "under half the size, the bitmap is made anew at it, and painted");
+    b.setContent(nullptr);
+    b.release();
+    check(b.bitmap().data() == nullptr && b.deviceWidth() == 0, "release() gives the pixels back");
+    b.setContent(&root);
+    b.setDeviceSize(200, 150);
+    b.render();
+    check(b.bitmap().width() == 200 && b.bitmap().pixelAt(100, 75).r == 255,
+          "…and the same size afterwards allocates and paints again");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -16213,6 +24395,26 @@ static void testGfxValueBox() {
     router.keyPressed(KeyPress{KeyPress::Escape});
     check(!box.isEditing(), "Escape closes it");
     check(box.text() == "0.00 dB", "leaving the readout exactly as it was");
+
+    // Refused as the focus LEAVES, it closes on the old value. The keyboard
+    // went with the click: the field stayed open without it, showing text
+    // nobody could type into, over a readout that had stopped following the
+    // parameter.
+    {
+      Widget elsewhere;
+      elsewhere.setWantsKeyboardFocus(true);
+      elsewhere.setBounds({120.0f, 0.0f, 60.0f, 20.0f});
+      root.addChild(&elsewhere);
+      router.mouseDown({10.0f, 10.0f}, 2);
+      router.keyPressed(KeyPress{KeyPress::None, (uint32_t) 'y'});
+      router.mouseDown({150.0f, 10.0f}, 1);
+      router.mouseUp({150.0f, 10.0f});
+      check(entered == "y" && router.focused() == &elsewhere,
+            "clicking away offers what was typed, and the keyboard goes with the click");
+      check(!box.isEditing() && box.text() == "0.00 dB",
+            "refused then, the field closes on the readout as it was, as Escape leaves it");
+      root.removeChild(&elsewhere);
+    }
 
     // Automation arriving mid-edit must NOT overwrite what somebody is typing.
     accept = true;
@@ -16404,6 +24606,28 @@ static void testGfxAlert() {
     check(alert.panelBounds().w == 320.0f, "and exactly as wide as before -- 80% of a 400px editor");
     alert.show("x", "y", {"OK"}, [](int) {});
     router.keyPressed(KeyPress{KeyPress::Return});
+
+    // A handler that asks a follow-up question calls show() from inside the
+    // answer, and show() replaces the handler -- which destroyed the very
+    // function still running, and everything it had captured, mid-call.
+    {
+      auto token = std::make_shared<int>(7);
+      std::weak_ptr<int> watch = token;
+      bool aliveAfterShow = false;
+      int followUp = -1;
+      alert.show("Save?", "Unsaved changes.", {"Save", "Discard"},
+                 [&, token](int) {
+                   alert.show("Really?", "This cannot be undone.", {"Yes", "No"},
+                              [&](int i) { followUp = i; });
+                   aliveAfterShow = !watch.expired();
+                 });
+      token.reset();
+      router.keyPressed(KeyPress{KeyPress::Return});
+      check(aliveAfterShow, "a handler that asks a follow-up question is still alive after show()");
+      check(alert.isShowing(), "and the follow-up is up");
+      router.keyPressed(KeyPress{KeyPress::Return});
+      check(followUp == 0 && !alert.isShowing(), "and answering it reaches the second handler");
+    }
   }
 
   // -- The call-out points at something, and stays inside the editor --
@@ -16448,6 +24672,16 @@ static void testGfxAlert() {
     router.mouseDown({5.0f, 290.0f});
     check(dismissed, "and a click outside does");
     check(!callout.isVisible(), "so it goes away");
+
+    // Shown again with OTHER content while still up: the first content was
+    // left attached under the new one, painting and taking clicks inside a
+    // bubble that no longer belonged to it.
+    Component first, second;
+    callout.show(&first, Rect(100.0f, 40.0f, 40.0f, 20.0f), 160.0f, 80.0f);
+    callout.show(&second, Rect(100.0f, 40.0f, 40.0f, 20.0f), 160.0f, 80.0f);
+    check(first.parent() == nullptr && second.parent() == &callout,
+          "showing new content in an open call-out detaches the old");
+    callout.dismiss();
   }
 
   // -- A group is a container, not a decoration --
@@ -16983,6 +25217,45 @@ static void testFiles() {
   std::printf("\n[files]\n");
   char msg[300];
 
+#if defined(_WIN32)
+  // Paths past MAX_PATH. A plugin runs inside a host with no long-path
+  // manifest, so every open, stat and mkdir under a folder this deep failed;
+  // the wide calls now get the long-path prefix when a path needs it.
+  {
+    std::string deep = tempPath("sonore-long-path");
+    sonore::pathio::makeDirectory(deep.c_str());
+    while (deep.size() < 320) {
+      deep += "/a-folder-name-long-enough-to-matter";
+      sonore::pathio::makeDirectory(deep.c_str());
+    }
+    const std::string file = deep + "/sample.bin";
+    bool wrote = false, read = false;
+    if (std::FILE* f = sonore::pathio::open(file.c_str(), "wb")) {
+      wrote = std::fputs("long", f) >= 0;
+      std::fclose(f);
+    }
+    if (std::FILE* f = sonore::pathio::open(file.c_str(), "rb")) {
+      char back[8] = {0};
+      read = std::fread(back, 1, 4, f) == 4 && std::strcmp(back, "long") == 0;
+      std::fclose(f);
+    }
+    char ll[200];
+    std::snprintf(ll, sizeof(ll),
+                  "a %zu-character path makes its folders, writes, reads back and is removed",
+                  file.size());
+    check(sonore::pathio::isDirectoryAt(deep.c_str()) && wrote && read &&
+              sonore::pathio::remove(file.c_str()) == 0,
+          ll);
+  }
+#endif
+
+  // -- A list sorts the same on every platform --
+  // Compared as UNSIGNED bytes. With plain char the order was the platform's:
+  // a UTF-8 name sorted before "Apple" where char is signed (Windows, x86
+  // Linux) and after it where it is not (Linux on ARM).
+  check(!asciiLess("Ã" "cho", "Apple") && asciiLess("Apple", "Ã" "cho"),
+        "a name starting with a UTF-8 letter sorts after plain ASCII, whatever char is");
+
   // -- Paths, which need no filesystem at all --
   check(fileName("/a/b/kick.wav") == "kick.wav", "the name is the last component");
   check(fileName("/a/b/") == "b", "and a trailing separator does not make it empty");
@@ -17270,6 +25543,38 @@ static void testGfxTreeView() {
           "and closing the folder clears it rather than leaving it pointing inside");
   }
 
+  // -- A selection callback that replaces the tree --
+  //
+  // A browser that loads a new folder when a row is selected rebuilds the
+  // tree inside onSelectionChange. The click handler kept the node it had
+  // hit and, on a double click, went on to read it and choose it -- a node
+  // that had just been destroyed.
+  {
+    TreeNode first, second;
+    first.addChild("old.wav", "/old.wav");
+    TreeView rebuilt;
+    rebuilt.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    rebuilt.setRoot(&first);
+    rebuilt.onSelectionChange = [&](TreeNode*) {
+      if (rebuilt.root() != &first) return;
+      second.addChild("new.wav", "/new.wav"); // made before the old one goes
+      rebuilt.setRoot(&second);
+      first.clearChildren();
+    };
+    int choices = 0;
+    rebuilt.onItemChosen = [&](TreeNode*) { ++choices; };
+    Component holder;
+    holder.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    holder.addChild(&rebuilt);
+    MouseRouter r(holder);
+    r.mouseDown({60.0f, 10.0f}, 2);
+    r.mouseUp({60.0f, 10.0f});
+    std::snprintf(msg, sizeof(msg), "a double click whose selection rebuilt the tree acts on no "
+                  "destroyed node (%d chosen)", choices);
+    check(choices == 0, msg);
+    holder.removeChild(&rebuilt);
+  }
+
   // -- What a reader hears --
   {
     tree.setOpen(drums, true);
@@ -17279,6 +25584,48 @@ static void testGfxTreeView() {
                   info.value.c_str(), info.currentValue, info.maxValue);
     check(info.role == AccessibleRole::List && info.value == "kick.wav" && info.hasRange, msg);
   }
+}
+
+// A tree whose root lists its children lazily. The root is never drawn, so it
+// is never opened by a click -- and onNeedChildren, called only on opening,
+// was never called for it: the tree stayed empty for good (found by
+// fuzz_widgets, which never once selected a row of its tree).
+static void testGfxTreeLazyRoot() {
+  using namespace sonore::gfx;
+  char msg[200];
+  TreeView tree;
+  TreeNode root;
+  root.text = "Library";
+  root.mightHaveChildren = true;
+  int asked = 0;
+  tree.onNeedChildren = [&](TreeNode& node) {
+    ++asked;
+    for (int i = 0; i < 3; ++i) node.addChild("child " + std::to_string(i), {}, true);
+  };
+  tree.setRoot(&root);
+  std::snprintf(msg, sizeof(msg), "a lazily listed root is asked for its children when set (%d time(s)) "
+                "and they are the top level (%d row(s))", asked, tree.numVisibleRows());
+  check(asked == 1 && tree.numVisibleRows() == 3, msg);
+  tree.setRowHeight(20.0f); // a rebuild
+  check(asked == 1, "...once, not on every rebuild");
+  tree.setOpen(tree.nodeAtRow(0), true);
+  std::snprintf(msg, sizeof(msg), "and a child opens as before (%d row(s))", tree.numVisibleRows());
+  check(tree.numVisibleRows() == 6, msg);
+
+  // A callback that fills the root and then refreshes the tree re-enters
+  // rebuild(). With the rows cleared before it was asked, the inner rebuild's
+  // rows and the outer one's were both appended: every top-level row twice.
+  TreeView refreshing;
+  TreeNode lazy;
+  lazy.mightHaveChildren = true;
+  refreshing.onNeedChildren = [&](TreeNode& node) {
+    for (int i = 0; i < 3; ++i) node.addChild("item " + std::to_string(i));
+    refreshing.rebuild();
+  };
+  refreshing.setRoot(&lazy);
+  std::snprintf(msg, sizeof(msg), "a root whose callback rebuilds the tree lists its 3 children once "
+                "(%d row(s))", refreshing.numVisibleRows());
+  check(refreshing.numVisibleRows() == 3, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -17383,6 +25730,61 @@ static void testGfxBrowsers() {
     check(nonFolders == 0, "a directories-only browser shows no files at all");
   }
 
+  // -- An empty folder is not a file, and refresh reopens what was open --
+  //
+  // Opening an empty folder takes its twisty away, and from then on the tree
+  // treats it as a leaf: choosing it reported the FOLDER to onFileChosen, so
+  // a host would try to load a directory as a sample. And refresh() reopened
+  // each open folder by walking the path to it -- opening everything above
+  // and returning the folder itself still closed.
+  {
+    namespace fs = std::filesystem;
+    const fs::path scratch = fs::temp_directory_path() / "sonore_file_browser_test";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+    fs::create_directories(scratch / "empty", ec);
+    fs::create_directories(scratch / "full" / "inner", ec);
+    if (std::FILE* f = std::fopen((scratch / "full" / "kick.wav").string().c_str(), "wb")) {
+      std::fputc('x', f);
+      std::fclose(f);
+    }
+
+    FileBrowser fb;
+    fb.setBounds({0.0f, 0.0f, 300.0f, 400.0f});
+    fb.setRootPath(scratch.string());
+    std::vector<std::string> chosen;
+    fb.onFileChosen = [&](const std::string& path) { chosen.push_back(path); };
+    auto rowNamed = [&](const std::string& name) -> TreeNode* {
+      for (int i = 0; i < fb.tree().numVisibleRows(); ++i)
+        if (fb.tree().nodeAtRow(i)->text == name) return fb.tree().nodeAtRow(i);
+      return nullptr;
+    };
+    TreeNode* empty = rowNamed("empty");
+    check(empty != nullptr, "the scratch tree has its empty folder");
+    if (empty) {
+      fb.tree().setOpen(empty, true); // finds nothing, loses its twisty
+      fb.tree().setSelectedNode(empty);
+      fb.tree().keyPressed(KeyPress{KeyPress::Return});
+      std::snprintf(msg, sizeof(msg), "Return on an opened empty folder chooses no file (%zu "
+                    "reported)", chosen.size());
+      check(chosen.empty(), msg);
+      // The same mistake through the other door: selectionIsDirectory read
+      // the twisty, and said an opened empty folder was a file.
+      check(fb.selectionIsDirectory(), "and the browser still calls it a folder");
+    }
+    if (TreeNode* full = rowNamed("full")) {
+      fb.tree().setOpen(full, true);
+      if (TreeNode* inner = rowNamed("inner")) fb.tree().setOpen(inner, true);
+      fb.tree().setSelectedNode(fb.tree().nodeAtRow(0)); // not inside what is open
+      fb.refresh();
+      TreeNode* fullAfter = rowNamed("full");
+      std::snprintf(msg, sizeof(msg), "refresh reopens a folder that was open (%s)",
+                    fullAfter && fullAfter->isOpen ? "open" : "closed");
+      check(fullAfter && fullAfter->isOpen && rowNamed("kick.wav") != nullptr, msg);
+    }
+    fs::remove_all(scratch, ec);
+  }
+
   // -- The table --
   {
     struct Preset {
@@ -17474,6 +25876,21 @@ static void testGfxBrowsers() {
     std::snprintf(msg, sizeof(msg), "and cannot go below its minimum: %.0f",
                   table.columns()[0].width);
     check(table.columns()[0].width >= 40.0f, msg);
+
+    // New columns arriving mid-drag end the drag. It kept going, resizing the
+    // column at the OLD index from the OLD width: a fresh 50-pixel column
+    // jumped to the dragged one's size, and with fewer columns the index
+    // pointed past the end of the vector it wrote to.
+    {
+      const float grab = table.columns()[0].width;
+      router.mouseDown({grab, 10.0f});
+      table.setColumns({{"Only", 50.0f}});
+      router.mouseMove({grab + 30.0f, 10.0f});
+      router.mouseUp({grab + 30.0f, 10.0f});
+      std::snprintf(msg, sizeof(msg), "columns replaced mid-drag are left as they were set "
+                    "(%.0f)", table.columns()[0].width);
+      check(table.columns().size() == 1 && table.columns()[0].width == 50.0f, msg);
+    }
 
     // Rows, selection and the keyboard.
     table.setColumns({{"Name", 200.0f}, {"Author", 120.0f}});
@@ -17655,6 +26072,54 @@ static void testGfxSplitter() {
           "and the row still ends exactly at the edge");
   }
 
+  // -- A drag of many small moves, in a row that does not start at zero --
+  //
+  // The bar measured the drag in its OWN coordinates, and it moves while it
+  // is dragged: after the first move re-laid the row, the same pointer was
+  // somewhere else relative to it, and the boundary jumped back -- 210, 151,
+  // 211, 152 on four one-pixel moves. And it took its own x in the PARENT as
+  // a position in the layout, so a row starting at x=10 moved by ten pixels
+  // on a click that did not move at all.
+  {
+    Component root;
+    root.setBounds({0.0f, 0.0f, 420.0f, 200.0f});
+    StretchableLayoutManager panes;
+    panes.setItemLayout(0, 50.0, 300.0, 150.0);
+    panes.setItemLayout(1, 6.0, 6.0, 6.0);
+    panes.setItemLayout(2, 50.0, 300.0, 244.0);
+    Component left, right;
+    StretchableLayoutResizerBar bar(&panes, 1, /*vertical=*/true);
+    root.addChild(&left);
+    root.addChild(&bar);
+    root.addChild(&right);
+    auto relayout = [&]() {
+      Component* items[3] = {&left, &bar, &right};
+      panes.layOutComponents(items, 3, 10.0f, 0.0f, 400.0f, 200.0f, false, true);
+    };
+    bar.onMoved = relayout;
+    relayout();
+    MouseRouter router(root);
+
+    const float startWidth = left.bounds().w;
+    const float grab = bar.bounds().x + 3.0f;
+    router.mouseDown({grab, 100.0f});
+    router.mouseMove({grab + 60.0f, 100.0f});
+    std::snprintf(msg, sizeof(msg), "in a row starting at x=10, a 60-pixel drag widens the pane by "
+                  "60 (%.0f, was %.0f)", left.bounds().w, startWidth);
+    check(std::fabs(left.bounds().w - (startWidth + 60.0f)) < 0.01f, msg);
+    std::string widths;
+    bool tracked = true;
+    for (int step = 1; step <= 6; ++step) {
+      router.mouseMove({grab + 60.0f + (float) step, 100.0f});
+      widths += std::to_string((int) std::lround(left.bounds().w)) + " ";
+      if (std::fabs(left.bounds().w - (startWidth + 60.0f + (float) step)) > 0.01f) tracked = false;
+    }
+    router.mouseUp({grab + 66.0f, 100.0f});
+    std::snprintf(msg, sizeof(msg), "and a drag of one-pixel moves follows the pointer pixel by "
+                  "pixel (%s)", widths.c_str());
+    check(tracked, msg);
+  }
+
   // -- A picture --
   {
     Bitmap picture(40, 20);
@@ -17767,10 +26232,21 @@ static void testCoreUtilities() {
                   formatDuration(3.7).c_str());
     check(formatDuration(3.7) == "0:04", msg);
     check(formatDuration(-65.0) == "-1:05", "and a negative length keeps its sign");
+    // Frames over a rate of 0 -- a sample not loaded yet -- is NaN or
+    // infinite. Cast to an integer that was undefined, and read "-30:-8".
+    std::snprintf(msg, sizeof(msg), "a length nobody knows reads \"%s\", \"%s\", \"%s\", not a time",
+                  formatDuration(std::nan("")).c_str(), formatDuration(HUGE_VAL).c_str(),
+                  formatDuration(1e300).c_str());
+    check(formatDuration(std::nan("")) == "--:--" && formatDuration(HUGE_VAL) == "--:--" &&
+              formatDuration(-HUGE_VAL) == "--:--" && formatDuration(1e300) == "--:--",
+          msg);
+    check(formatDuration(-0.4) == "0:00", "and one that rounds to nothing has no sign (it read -0:00)");
 
     // Short ones, where 0:00 is true of everything and useful for nothing.
     check(formatShortDuration(0.012) == "12.0 ms", "12 milliseconds reads as milliseconds");
     check(formatShortDuration(3.5) == "3.50 s", "and three and a half seconds as seconds");
+    check(formatShortDuration(0.0005) == "500 \xC2\xB5s",
+          "and half a millisecond in microseconds, the sign as UTF-8 whatever the source encoding");
   }
 
   // -- How long ago --
@@ -17912,6 +26388,57 @@ static void testCoreUtilities() {
     std::snprintf(msg, sizeof(msg), "a listener removed DURING the notify is not called (%d)",
                   victimCalls);
     check(victimCalls == 0, msg);
+  }
+
+  // -- A listener that deletes the broadcaster --
+  //
+  // A window closing its document when told it changed, a player dropping its
+  // transport when told it stopped. The loop went on to read the dead
+  // object's list: freed memory (the sanitizer leg's report), or -- here,
+  // where the replacement document is built in the same storage, as an
+  // allocator handing back the block just freed would -- the NEW document's
+  // listeners, told of a change it never made.
+  {
+    std::optional<ChangeBroadcaster> document;
+    document.emplace();
+    int windowCalls = 0;
+    LambdaChangeListener window([&]() { ++windowCalls; });
+    struct Reopener : ChangeListener {
+      std::optional<ChangeBroadcaster>* document = nullptr;
+      ChangeListener* window = nullptr;
+      void changeListenerCallback(ChangeBroadcaster*) override {
+        document->reset();
+        document->emplace();
+        (*document)->addChangeListener(window);
+      }
+    } reopener;
+    reopener.document = &document;
+    reopener.window = &window;
+    document->addChangeListener(&reopener);
+    document->addChangeListener(&window);
+    document->sendSynchronousChangeMessage();
+    std::snprintf(msg, sizeof(msg),
+                  "a broadcaster deleted by its own listener tells nobody else (%d calls)", windowCalls);
+    check(windowCalls == 0, msg);
+    document->sendSynchronousChangeMessage();
+    check(windowCalls == 1, "and the one built in its place tells its own listeners");
+
+    ChangeBroadcaster* transport = new ChangeBroadcaster();
+    int playerCalls = 0;
+    LambdaChangeListener player([&]() { ++playerCalls; });
+    struct Dropper : ChangeListener {
+      ChangeBroadcaster** transport = nullptr;
+      void changeListenerCallback(ChangeBroadcaster* source) override {
+        *transport = nullptr;
+        delete source;
+      }
+    } dropper;
+    dropper.transport = &transport;
+    transport->addChangeListener(&dropper);
+    transport->addChangeListener(&player);
+    transport->sendChangeMessage();
+    check(transport->dispatchPendingChanges() && transport == nullptr && playerCalls == 0,
+          "deleted from a coalesced dispatch, the same");
   }
 }
 
@@ -18113,6 +26640,26 @@ static void testZip() {
           "and a BACKSLASH is refused outright -- the format says forward slashes, so a "
           "backslash is somebody hoping the reader splits on only one of them");
     check(!ZipFile::isSafeEntryName(""), "an empty name is not a name");
+
+    // Overlong UTF-8: C0 AE is a '.' in two bytes. A byte-level check saw no
+    // ".." in it, and the path layer's decoder then made it one -- the slip
+    // happened at open(), after the check had said yes.
+    check(!ZipFile::isSafeEntryName("\xC0\xAE\xC0\xAE\xC0\xAF" "evil.txt"),
+          "an overlong-encoded \"../\" is refused");
+    check(!ZipFile::isSafeEntryName(std::string("run.bat\xC0\x80.wav")),
+          "and so is an overlong NUL hiding an extension");
+    check(!ZipFile::isSafeEntryName(std::string("a\0b.wav", 7)), "and a real NUL");
+    check(!ZipFile::isSafeEntryName("notes.txt:hidden"),
+          "and a colon, which on Windows names another file's data stream");
+    check(ZipFile::isSafeEntryName("presets/caf\xC3\xA9.json"), "while real UTF-8 is fine");
+#if defined(_WIN32)
+    const std::wstring wide = sonore::pathio::widen("\xC0\xAE\xC0\xAE\xC0\xAF" "evil.txt");
+    check(wide.size() >= 3 && wide[0] == 0xFFFD && wide[1] == 0xFFFD && wide[2] == 0xFFFD,
+          "and the path layer decodes overlong forms to U+FFFD, never to \"../\"");
+    const std::wstring nul = sonore::pathio::widen("run.bat\xC0\x80.wav");
+    check(nul.find(L'\0') == std::wstring::npos && nul.size() == 12,
+          "nor to a NUL inside a wide name");
+#endif
   }
 
   // -- The CRC itself, against the published check value --
@@ -18161,6 +26708,28 @@ static void testThreadPool() {
                   (int) drained);
     check(drained && howMany == 200, msg);
     check(pool.numJobsOutstanding() == 0, "and nothing is outstanding afterwards");
+  }
+
+  // -- Small jobs cost what they cost --
+  //
+  // Every job started a watcher thread to relay cancellation and joined it at
+  // the end -- and the join waited out the watcher's 5 ms sleep. A browser
+  // queueing a job per file in a folder of forty thousand spent minutes on
+  // thread creation and sleeps rather than on the files.
+  {
+    ThreadPool pool(1);
+    std::atomic<int> ran{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 2000; ++i) pool.addJob([&](const std::atomic<bool>&) { ++ran; });
+    const bool drained = pool.waitForAll(60000);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    // The bug cost 5 ms a job -- ten seconds for these. A second is far
+    // below that and far above what a loaded machine can add to 2000 empty
+    // jobs: 50 ms was within reach of the parallel suite's load.
+    std::snprintf(msg, sizeof(msg), "2000 trivial jobs on one worker take %.1f ms (%d ran)", ms,
+                  ran.load());
+    check(drained && ran.load() == 2000 && ms < 1000.0, msg);
   }
 
   // -- A long job notices it has been cancelled --
@@ -18242,6 +26811,37 @@ static void testThreadPool() {
     std::snprintf(msg, sizeof(msg), "after a job threw, the pool still ran %d more (drained=%d)",
                   after.load(), (int) drained);
     check(drained && after.load() == 1, msg);
+  }
+
+  // -- Idle means the closure is gone too --
+  //
+  // What a job captured -- a stream with its file open, the last reference to
+  // a buffer, a guard whose destructor reaches the caller's state -- was
+  // destroyed on the worker AFTER the job was counted done, so waitForAll()
+  // returned while it was still being torn down. A slow destructor makes the
+  // window wide enough to see every time.
+  {
+    struct SlowGuard {
+      std::atomic<bool>* released;
+      explicit SlowGuard(std::atomic<bool>* r) : released(r) {}
+      ~SlowGuard() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        released->store(true);
+      }
+    };
+    int early = 0;
+    for (int round = 0; round < 5; ++round) {
+      ThreadPool pool(1);
+      std::atomic<bool> released{false};
+      auto guard = std::make_shared<SlowGuard>(&released);
+      pool.addJob([guard](const std::atomic<bool>&) {});
+      guard.reset();
+      const bool drained = pool.waitForAll(5000);
+      if (!drained || !released.load() || pool.numJobsOutstanding() != 0) ++early;
+    }
+    std::snprintf(msg, sizeof(msg), "waitForAll returns only once each job's closure is destroyed "
+                  "(%d of 5 returned with it still alive)", early);
+    check(early == 0, msg);
   }
 
   // -- Closing --
@@ -18423,6 +27023,26 @@ static void testGfxImageTransform() {
     check(lit == 0, "a collapsed transform draws nothing rather than filling the clip with NaN");
   }
 
+  // A destination a hair tall scales the source by a factor past INT_MAX:
+  // the row a pixel samples was converted to int before it was clamped, which
+  // is undefined -- on x86 it came out as INT_MIN and clamped to the FIRST
+  // row. Clamped in float first, a pixel past the destination's bottom takes
+  // the LAST row, as one a whole row past it always did.
+  {
+    Bitmap twoRows(4, 2);
+    for (int x = 0; x < 4; ++x) {
+      twoRows.setPixel(x, 0, PremulColour::from(Colour(255, 0, 0, 255)));
+      twoRows.setPixel(x, 1, PremulColour::from(Colour(0, 0, 255, 255)));
+    }
+    Bitmap canvas(16, 4);
+    canvas.clear(Colour(0, 0, 0, 255));
+    Graphics g(canvas);
+    g.drawImage(twoRows, Rect(4.0f, 0.0f, 8.0f, 1e-12f));
+    const PremulColour hair = canvas.pixelAt(6, 0);
+    std::snprintf(msg, sizeof(msg), "an image 1e-12 tall samples its last row (%d,%d,%d)", hair.r, hair.g, hair.b);
+    check(hair.b == 255 && hair.r == 0, msg);
+  }
+
   // -- A texture that repeats --
   {
     Bitmap tile(4, 4);
@@ -18471,11 +27091,67 @@ static void testGfxImageTransform() {
                   "equal, because it repeats rather than mirrors", rowsLeft, rowsRight);
     check(rowsLeft == rowsRight, msg);
 
+    // A STROKE takes the texture too. strokePath knew the plain colour and
+    // the gradient and drew a tiled stroke in whatever plain colour happened
+    // to be set underneath.
+    Bitmap stroked(20, 20);
+    stroked.clear(Colour(0, 0, 0, 255));
+    Graphics g4(stroked);
+    g4.setTiledImageFill(tile, {0.0f, 0.0f});
+    Path down;
+    down.moveTo(10.0f, 0.0f);
+    down.lineTo(10.0f, 20.0f);
+    g4.strokePath(down, 6.0f);
+    int strokeGreen = 0;
+    for (int y = 0; y < 20; ++y)
+      if (stroked.pixelAt(10, y).g > 200) ++strokeGreen;
+    std::snprintf(msg, sizeof(msg), "a stroke with a tiled fill shows the tile (%d green rows of "
+                  "20, as the fill gives 5)", strokeGreen);
+    check(strokeGreen == 5, msg);
+
+    // fillAll(colour) paints that colour with a tile set, and leaves the tile
+    // set. It turned the gradient off for the fill but not the tile, so the
+    // whole clip came out as the texture.
+    {
+      Bitmap flat(20, 20);
+      flat.clear(Colour(0, 0, 0, 255));
+      Graphics gf(flat);
+      gf.setTiledImageFill(tile, {0.0f, 0.0f});
+      gf.fillAll(Colour(255, 0, 0, 255));
+      int red = 0;
+      for (int y = 0; y < 20; ++y)
+        for (int x = 0; x < 20; ++x) {
+          const PremulColour p = flat.pixelAt(x, y);
+          if (p.r == 255 && p.g == 0 && p.b == 0) ++red;
+        }
+      std::snprintf(msg, sizeof(msg), "fillAll(red) with a tile set paints red (%d of 400 pixels)",
+                    red);
+      check(red == 400, msg);
+      gf.fillRect(Rect(0.0f, 0.0f, 20.0f, 20.0f));
+      check(gf.hasTiledImage() && flat.pixelAt(5, 0).g > 200 && flat.pixelAt(5, 1).r == 0,
+            "and the tile is the brush again afterwards");
+    }
+
     // setColour turns it off. Three ways to decide a pixel's colour and only
     // two of them cleared is a fill that silently ignores the colour it was
     // given -- which is exactly the bug fillAll had with the gradient flag.
     g.setColour(Colour(255, 0, 0, 255));
     check(!g.hasTiledImage(), "and setColour turns the tile off, like it does the gradient");
+
+    // A texture scrolled by an offset gone to NaN samples nothing. The NaN
+    // was converted to int -- undefined; INT_MIN on x86, which wrapped to the
+    // tile's first row and painted it everywhere.
+    Bitmap lost(20, 20);
+    lost.clear(Colour(0, 0, 0, 255));
+    Graphics g5(lost);
+    g5.setTiledImageFill(tile, {std::numeric_limits<float>::quiet_NaN(), 0.0f});
+    g5.fillRect(Rect(0.0f, 0.0f, 20.0f, 20.0f));
+    int lostGreen = 0;
+    for (int y = 0; y < 20; ++y)
+      for (int x = 0; x < 20; ++x)
+        if (lost.pixelAt(x, y).g > 0) ++lostGreen;
+    std::snprintf(msg, sizeof(msg), "a tile at a NaN origin paints nothing (%d green pixels)", lostGreen);
+    check(lostGreen == 0, msg);
   }
 }
 
@@ -18518,6 +27194,31 @@ static void testCommands() {
 
   std::snprintf(msg, sizeof(msg), "%d commands registered", commands.numCommands());
   check(commands.numCommands() == 4, msg);
+
+  // -- A default shortcut is the first registrant's --
+  //
+  // Documented as "applied unless the key is already taken by something
+  // registered earlier", and implemented as the opposite: a later command
+  // defaulting to Ctrl+Z took it from Undo. Re-registering a command put its
+  // defaults back over whatever the user had remapped it to.
+  {
+    CommandManager clash;
+    clash.registerCommand({1, "Undo", "Edit", ""}, {Shortcut::fromCharacter('Z')});
+    clash.registerCommand({2, "Zoom", "View", ""}, {Shortcut::fromCharacter('Z')});
+    std::snprintf(msg, sizeof(msg), "a later default for a taken key leaves it with the first "
+                  "(Ctrl+Z runs command %d)", clash.commandForShortcut(Shortcut::fromCharacter('Z')));
+    check(clash.commandForShortcut(Shortcut::fromCharacter('Z')) == 1 &&
+              clash.shortcutsFor(2).empty(),
+          msg);
+    clash.clearShortcuts(1);
+    clash.addShortcut(1, Shortcut::fromCharacter('U'));
+    clash.registerCommand({1, "Undo", "Edit", "renamed"}, {Shortcut::fromCharacter('Z')});
+    check(clash.shortcutsFor(1).size() == 1 && clash.shortcutsFor(1)[0] == Shortcut::fromCharacter('U'),
+          "re-registering a command keeps what the user mapped it to");
+    clash.resetToDefaults();
+    check(clash.commandForShortcut(Shortcut::fromCharacter('Z')) == 1,
+          "and a reset to defaults gives a shared key to the first registrant again");
+  }
   check(commands.commandInfo(kUndo) != nullptr &&
             commands.commandInfo(kUndo)->name == "Undo", "and one can be looked up by id");
   check(commands.commandInfo(99) == nullptr, "where an id nobody registered gives nothing");
@@ -18812,6 +27513,97 @@ static void testLogger() {
     check(log.droppedCount() == 0, "the count resets once it has been reported");
   }
 
+  // -- Several audio threads at once --
+  //
+  // The logger is one per process and a host runs the instances of a plugin on
+  // parallel threads, so the audio-thread door has many producers. A
+  // single-producer ring gave two of them the same slot -- one line lost, the
+  // other written twice or torn -- and a producer preempted between reading
+  // the head and storing it put the head behind the tail, after which drain()
+  // looped for 2^64 lines with the lock held. A watchdog turns that hang into
+  // a failure rather than a test that never ends.
+  {
+    static constexpr int kThreads = 4;
+    static constexpr int kPerThread = 60; // 240 lines: under the ring, so nothing is dropped
+    std::atomic<bool> finished{false};
+    // A minute with no round finished is a hang; a minute for all 1500 rounds
+    // is only a busy machine -- a full run beside two builds took longer than
+    // that with nothing stuck, and was reported as the drain() loop.
+    std::atomic<int> roundsDone{0};
+    std::thread watchdog([&finished, &roundsDone] {
+      int last = -1, still = 0;
+      while (!finished.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const int now = roundsDone.load();
+        still = now == last ? still + 1 : 0;
+        last = now;
+        if (still >= 600 && !finished.load()) {
+          std::printf("  FAIL concurrent audio-thread logging hung drain(): no round finished in a minute\n");
+          std::fflush(stdout);
+          std::_Exit(1);
+        }
+      }
+    });
+
+    int badRounds = 0, firstBadMoved = -1, firstBadMissing = 0, firstBadDuplicated = 0;
+    std::vector<int> seen((size_t) (kThreads * kPerThread));
+    for (int round = 0; round < 1500; ++round) {
+      log.clear();
+      std::atomic<int> ready{0};
+      std::atomic<bool> producing{true};
+      std::vector<std::thread> producers;
+      for (int t = 0; t < kThreads; ++t)
+        producers.emplace_back([&log, &ready, t] {
+          char line[32];
+          ready.fetch_add(1);
+          while (ready.load() < kThreads) {
+          }
+          for (int i = 0; i < kPerThread; ++i) {
+            std::snprintf(line, sizeof(line), "p%d-%d", t, i);
+            log.writeFromAudioThread(line);
+          }
+        });
+      // The editor's clock draining while the audio threads write.
+      int moved = 0;
+      std::thread watcher([&producing, &log, &moved] {
+        while (producing.load()) moved += log.drain();
+      });
+      for (auto& p : producers) p.join();
+      producing.store(false);
+      watcher.join();
+      moved += log.drain();
+
+      std::fill(seen.begin(), seen.end(), 0);
+      const std::string all = log.recent(kThreads * kPerThread + 10);
+      for (size_t at = all.find("[audio] p"); at != std::string::npos;
+           at = all.find("[audio] p", at + 1)) {
+        int t = -1, i = -1;
+        if (std::sscanf(all.c_str() + at, "[audio] p%d-%d", &t, &i) == 2 && t >= 0 &&
+            t < kThreads && i >= 0 && i < kPerThread)
+          ++seen[(size_t) (t * kPerThread + i)];
+      }
+      int missing = 0, duplicated = 0;
+      for (int c : seen) {
+        if (c == 0) ++missing;
+        if (c > 1) ++duplicated;
+      }
+      if (moved != kThreads * kPerThread || missing || duplicated || log.droppedCount() != 0) {
+        if (badRounds++ == 0) {
+          firstBadMoved = moved;
+          firstBadMissing = missing;
+          firstBadDuplicated = duplicated;
+        }
+      }
+      roundsDone.fetch_add(1);
+    }
+    finished.store(true);
+    watchdog.join();
+    std::snprintf(msg, sizeof(msg), "4 audio threads logging at once while the editor drains: "
+                  "%d of 1500 rounds lost or repeated a line (first: %d moved, %d missing, "
+                  "%d twice)", badRounds, firstBadMoved, firstBadMissing, firstBadDuplicated);
+    check(badRounds == 0, msg);
+  }
+
   // -- Writing to a real file --
   {
     const std::string path = joinPath(userDataRoot(), "sonore_logger_test.log");
@@ -18846,6 +27638,31 @@ static void testLogger() {
     check(contents.find("first line") != std::string::npos &&
               contents.find("third line") != std::string::npos,
           "and a later write APPENDS rather than starting again");
+
+    // A drain of a full ring is ONE trip to the file. It opened and closed
+    // the file once per line with the logger's lock held -- 256 opens on the
+    // editor's clock, each one a filesystem round trip (and a virus scanner's
+    // look) on the thread that draws the interface.
+    {
+      // The best of five, because one open can be slow for reasons that are
+      // the machine's (a scanner, a preempted thread); 256 of them are not.
+      double best = 1e9;
+      int moved = 0;
+      for (int round = 0; round < 5; ++round) {
+        for (size_t i = 0; i < Logger::kRingLines; ++i) log.writeFromAudioThread("a line from audio");
+        const auto t0 = std::chrono::steady_clock::now();
+        moved = log.drain();
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+        if (ms < best) best = ms;
+      }
+      // 20 ms in a debug build, where formatting 256 lines alone came to
+      // 5.3: still far below 256 opens of the file, which is what this guards.
+      const double bound = kOptimisedBuild ? 5.0 : 20.0;
+      std::snprintf(msg, sizeof(msg), "draining %d audio lines to the file takes %.2f ms (best "
+                    "of five, under %.0f)", moved, best, bound);
+      check(moved == (int) Logger::kRingLines && best < bound, msg);
+    }
 
     // -- It cannot fill a disk --
     log.setMaxBytes(200);
@@ -19160,6 +27977,8 @@ static void testSystemStats() {
     // bit from the wrong leaf -- which is the usual cpuid mistake.
     check(!features.avx2 || features.avx, "AVX2 implies AVX, which is not a coincidence");
     check(!features.sse41 || features.sse2, "and SSE4.1 implies SSE2");
+    check(!features.fma || features.avx,
+          "and FMA implies AVX: FMA3 uses the registers AVX's OS check is about");
 
     // On the two architectures this runs on, one of these must be true. A
     // detector returning all-false compiles and reports nothing, forever.
@@ -19235,6 +28054,24 @@ static void testSystemStats() {
                   "sixty", threes);
     check(threes == 1 && firedAfterStall >= 1, msg);
 
+    // -- At the rate it was asked for, on the clock it actually gets --
+    //
+    // The editor asks Windows for a 33 ms timer and gets the scheduler's
+    // granularity instead: ticks of 31.25 ms. A 100 ms timer on that clock
+    // used to fire every FOURTH tick -- the elapsed count was zeroed on
+    // firing, throwing away the 25 ms past the deadline -- so 125 ms apart,
+    // 24 in three seconds instead of 30.
+    {
+      MultiTimer clock;
+      int meterFires = 0;
+      clock.onTimer = [&](int) { ++meterFires; };
+      clock.startTimer(1, 100.0);
+      for (int tick = 0; tick < 96; ++tick) clock.advance(31.25);
+      std::snprintf(msg, sizeof(msg), "a 100 ms timer on a 31.25 ms clock fires %d times in three "
+                    "seconds (30 asked for)", meterFires);
+      check(meterFires >= 29 && meterFires <= 30, msg);
+    }
+
     // -- Restarting resets the phase --
     fired.clear();
     timers.stopAllTimers();
@@ -19271,6 +28108,39 @@ static void testSystemStats() {
     check(stoppedItself && !timers.isTimerRunning(6),
           "a timer can stop ITSELF from inside its own callback");
     check(timers.advance(1000.0) == 0, "and stays stopped");
+  }
+
+  // -- A callback that deletes the MultiTimer --
+  //
+  // A notice closing itself on its own timer, and the window that owns the
+  // MultiTimer going with it. advance() went on reading the dead object's
+  // timers: freed memory (the sanitizer leg's report), or -- here, where the
+  // next window's MultiTimer is built in the same storage, as an allocator
+  // handing back the block just freed would -- that one's timers, advanced
+  // and fired by a call nobody made on it.
+  {
+    std::optional<MultiTimer> clock;
+    clock.emplace();
+    int nextFired = 0;
+    clock->onTimer = [&clock, &nextFired](int) {
+      // Taken out first: the reset destroys this lambda and its captures.
+      std::optional<MultiTimer>* slot = &clock;
+      int* fired = &nextFired;
+      slot->reset();
+      slot->emplace();
+      (*slot)->onTimer = [fired](int) { ++*fired; };
+      (*slot)->startTimer(7, 100.0);
+      (*slot)->startTimer(8, 5.0);
+    };
+    clock->startTimer(1, 10.0);
+    clock->startTimer(2, 10.0);
+    const int firedNow = clock->advance(20.0);
+    std::snprintf(msg, sizeof(msg),
+                  "a MultiTimer deleted from its own callback fires nothing more (%d, %d)", firedNow,
+                  nextFired);
+    check(firedNow == 1 && nextFired == 0, msg);
+    check(clock->advance(5.0) == 1 && nextFired == 1,
+          "and the one built in its place keeps its own time");
   }
 }
 
@@ -19336,6 +28206,17 @@ static void testGfxValueAnimator() {
                            0.0, 1.0, 1.0, 0.0, Easing::Linear);
     anim3.tick(2.0);
     check(!anim3.isAnimating(), "a setter that cancels itself by id leaves a clean animator");
+
+    // The finishing tick calls the setter ONCE, with the exact target. It
+    // called it twice -- the interpolated value, then the target -- and a
+    // setter that writes a parameter sent the host two edits for one landing.
+    ValueAnimator once;
+    std::vector<double> landed;
+    once.animate([&](double v) { landed.push_back(v); }, 0.1, 0.3, 1.0, 0.0, Easing::Linear);
+    once.tick(5.0);
+    std::snprintf(msg, sizeof(msg), "finishing calls the setter once, with the target (%zu call(s), "
+                  "last %.17g)", landed.size(), landed.empty() ? 0.0 : landed.back());
+    check(landed.size() == 1 && landed.back() == 0.3, msg);
   }
 
   // -- Straight down the middle --
@@ -20029,6 +28910,22 @@ static void testGfxResizableBorder() {
     BoundsConstrainer f = constrainerFor(fixed);
     check(f.isFixedSize(), "a plugin that declares itself unresizable produces a fixed "
                            "constrainer, with no second flag to disagree with the first");
+
+    // A FIXED axis is pinned to the editor's natural size -- what the
+    // descriptor's own comment promises. It was pinned to the maximum, which
+    // by default is 8192: a rack effect resizable in width only asked for an
+    // 8192-pixel-tall window the moment its edge was dragged.
+    EditorConstraints rack; // default limits: 8192 at most
+    rack.resizableVertically = false;
+    BoundsConstrainer r = constrainerFor(rack, 600.0f, 300.0f);
+    std::snprintf(msg, sizeof(msg), "a fixed height is the natural 300, not the maximum "
+                  "(%.0f..%.0f)", r.minHeight, r.maxHeight);
+    check(r.minHeight == 300.0f && r.maxHeight == 300.0f && r.maxWidth > 600.0f, msg);
+    BoundsConstrainer unknown = constrainerFor(rack);
+    std::snprintf(msg, sizeof(msg), "and with no natural size given, the minimum rather than "
+                  "8192 (%.0f)", unknown.maxHeight);
+    check(unknown.minHeight == unknown.maxHeight && unknown.maxHeight == (float) rack.minHeight,
+          msg);
   }
 
   // -- A drag reports a size, and reports it constrained --
@@ -20368,6 +29265,22 @@ static void testGfxSwitchParameter() {
   check(values[0] == 1.0f && begins == 1 && ends == 1, msg);
   check(button.label() == "Post", "and the label follows the state");
 
+  // The editor's clock syncs every control thirty times a second. The label
+  // was set -- and the button repainted -- on every sync, changed or not, so
+  // an editor with a switch never went idle: thirty repaints and screen
+  // copies a second, for nothing, in a process also running audio.
+  {
+    Component page;
+    page.setBounds({0.0f, 0.0f, 200.0f, 60.0f});
+    button.setBounds({10.0f, 10.0f, 80.0f, 24.0f});
+    page.addChild(&button);
+    page.clearDamage();
+    attach.sync();
+    attach.sync();
+    check(!page.isDirty(), "syncing a switch whose parameter did not move marks nothing to repaint");
+    page.removeChild(&button);
+  }
+
   // ── An automation ramp ──
   //
   // A host automating this parameter sends a continuous sweep through it. A
@@ -20681,6 +29594,53 @@ static void testGfxWheelOwnership() {
     check(deaf.value() == deafBefore,
           "…and WheelMode::Never ignores it entirely, the conventional off case");
   }
+
+  // -- A ComboBox follows the same rule --
+  //
+  // It took every wheel outright and never asked wheelBelongsHere: inside a
+  // scrolling view a notch over it changed the selection (automation, on a
+  // parameter) instead of scrolling, and setWheelMode did nothing at all.
+  {
+    Component root;
+    root.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    Viewport viewport;
+    viewport.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    root.addChild(&viewport);
+    Component content;
+    content.setBounds({0.0f, 0.0f, 200.0f, 400.0f});
+    ComboBox box;
+    box.setBounds({0.0f, 0.0f, 200.0f, 24.0f});
+    box.setItems({"Sine", "Saw", "Square"});
+    content.addChild(&box);
+    viewport.setViewedComponent(&content);
+
+    MouseRouter router(root);
+    router.mouseWheel({100.0f, 12.0f}, -1.0f);
+    std::snprintf(msg, sizeof(msg), "a combo box inside a scrolling view leaves the wheel to it: "
+                  "item %d, scrolled to %.0f", box.selectedIndex(),
+                  (double) viewport.viewPositionY());
+    check(box.selectedIndex() == 0 && viewport.viewPositionY() > 0.0f, msg);
+
+    viewport.setViewPosition(0.0f, 0.0f);
+    box.setWheelMode(WheelMode::Always);
+    router.mouseWheel({100.0f, 12.0f}, -1.0f);
+    check(box.selectedIndex() == 2 && viewport.viewPositionY() == 0.0f,
+          "and with WheelMode::Always it takes the wheel there");
+
+    Component plainRoot;
+    plainRoot.setBounds({0.0f, 0.0f, 200.0f, 100.0f});
+    ComboBox fixed;
+    fixed.setBounds({0.0f, 0.0f, 200.0f, 24.0f});
+    fixed.setItems({"Sine", "Saw", "Square"});
+    plainRoot.addChild(&fixed);
+    MouseRouter plainRouter(plainRoot);
+    fixed.setWheelMode(WheelMode::Never);
+    plainRouter.mouseWheel({100.0f, 12.0f}, -1.0f);
+    check(fixed.selectedIndex() == 0, "WheelMode::Never leaves it alone even with nothing to scroll");
+    fixed.setWheelMode(WheelMode::DeferToScroll);
+    plainRouter.mouseWheel({100.0f, 12.0f}, -1.0f);
+    check(fixed.selectedIndex() == 2, "and by default, with nothing to scroll, the wheel steps it");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -20948,6 +29908,55 @@ static void testMetering() {
     std::printf("  ---- measure.ts's K-weighting reads this buffer at %.2f LUFS (the standard says -23.01) ----\n", ref);
     check(ref < -23.15, "…which the TypeScript port confirms: it reads a quarter of an LU low");
   }
+  // A channel weight the caller set survives a re-prepare. prepare() rewrote
+  // every weight to the standard's, so a channel muted with weight 0 came
+  // back at full weight the first time a host changed the rate.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = sr;
+    spec.numChannels = 2;
+    sonore::LoudnessMeter<2> meter;
+    meter.prepare(spec);
+    meter.setChannelWeight(1, 0.0f); // the right channel does not count
+    spec.sampleRate = 44100.0;       // the host changes the rate
+    meter.prepare(spec);
+    const int n = (int) (44100.0 * 3.0);
+    const float a = sonore::dbToGain(-20.0f);
+    float frame[2];
+    for (int i = 0; i < n; ++i) {
+      frame[0] = 0.0f; // only the muted channel carries signal
+      frame[1] = a * (float) std::sin(2.0 * kTestPi * 997.0 * i / 44100.0);
+      meter.process(frame);
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "a channel weighted 0 still counts for nothing after a re-prepare (%.1f LUFS)",
+                  meter.integrated());
+    check(meter.integrated() <= sonore::LoudnessMeter<2>::kSilence + 0.5f, line);
+  }
+  // The stereo convenience on a meter prepared for more channels. It built a
+  // frame of two samples and process() read as many as prepare() was given:
+  // a 5.1 meter read four samples past the array (ASan: stack-buffer-
+  // overflow), and EBU Tech 3341's first case -- a -23 dBFS 1 kHz sine on
+  // both channels, -23.0 LUFS -- measured +9.95. The rest of the frame is
+  // silence now.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = sr;
+    spec.numChannels = 6;
+    sonore::LoudnessMeter<8> meter;
+    meter.prepare(spec);
+    const float a = sonore::dbToGain(-23.0f);
+    for (int i = 0; i < (int) (sr * 4.0); ++i) {
+      const float v = a * (float) std::sin(2.0 * kTestPi * 1000.0 * i / sr);
+      meter.process(v, v);
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "a 5.1 meter fed stereo reads the stereo programme: EBU 3341 case 1 "
+                  "at %.2f LUFS (-23.0)", meter.integrated());
+    checkNear(meter.integrated(), -23.0, 0.1, line);
+  }
+
   // The rate independence the parametrised design promises: the same
   // calibration at 44.1 and 96 kHz, where a pasted 48 kHz table would be wrong.
   for (double rate : {44100.0, 96000.0}) {
@@ -21028,6 +30037,34 @@ static void testMetering() {
     checkNear(meter.range(), 10.0, 1.5, "two passages 10 LU apart give a loudness range of ~10 LU");
   }
 
+  // One infinite sample in EBU 3341's first case. Its power went into the
+  // 100 ms block whole: momentary read +inf LUFS for 400 ms and short-term
+  // for 3 s, and each of those blocks was booked into the histograms through
+  // (int) of infinity -- undefined, bin 0 on x64, the top bin (+9.95 LUFS)
+  // on ARM64, which then gates the whole programme out of the integrated
+  // reading. A sample that is not a number carries no loudness.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = sr;
+    spec.numChannels = 2;
+    sonore::LoudnessMeter<2> meter;
+    meter.prepare(spec);
+    const float a = sonore::dbToGain(-23.0f);
+    float loudest = -1000.0f;
+    bool finite = true;
+    for (int i = 0; i < (int) (sr * 10.0); ++i) {
+      const float v = a * (float) std::sin(2.0 * kTestPi * 1000.0 * i / sr);
+      const float frame[2] = {i == (int) (sr * 5.0) ? std::numeric_limits<float>::infinity() : v, v};
+      meter.process(frame);
+      if (!std::isfinite(meter.momentary()) || !std::isfinite(meter.shortTerm())) finite = false;
+      loudest = std::max(loudest, std::max(meter.momentary(), meter.shortTerm()));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "one infinite sample leaves momentary and short-term finite (loudest %.2f LUFS) "
+                  "and the integrated reading at -23 (%.2f)", loudest, meter.integrated());
+    check(finite && loudest < -22.9f && std::fabs(meter.integrated() + 23.0f) < 0.1f, line);
+  }
+
   // ── True peak: the intersample over a sample peak cannot see ──
   {
     sonore::TruePeakMeter tp;
@@ -21044,6 +30081,97 @@ static void testMetering() {
     tp.reset();
     for (int i = 0; i < 4800; ++i) tp.process(0.5f * (float) std::sin(2.0 * kTestPi * 1000.0 * i / sr));
     checkNear(tp.peakDb(), -6.02, 0.1, "a -6 dBFS 1 kHz sine reads -6 dBTP (no false overs)");
+
+    // What process() returns per sample is one instant: the interpolated
+    // points sit 7.25..7.75 samples behind the input, so the sample compared
+    // with them is the one 7 behind -- not the newest, which put every
+    // click's level out 7 samples before its waveform. The limiter built on
+    // this saw each transient that early.
+    tp.reset();
+    std::vector<float> perSample(32);
+    for (int i = 0; i < 32; ++i) perSample[(size_t) i] = tp.process(i == 4 ? 1.0f : 0.0f);
+    int loudest = 0;
+    for (int i = 1; i < 32; ++i) if (perSample[(size_t) i] > perSample[(size_t) loudest]) loudest = i;
+    char line[200];
+    std::snprintf(line, sizeof(line), "a click's true peak is reported where its waveform is, 7 samples on "
+                  "(peak at %+d, %.3f at the click's own sample)", loudest - 4, perSample[4]);
+    check(loudest == 11 && perSample[4] < 0.1f, line);
+    tp.reset();
+    for (int i = 0; i < 31; ++i) tp.process(0.0f);
+    tp.process(0.9f);
+    checkNear(tp.peakLinear(), 0.9, 1e-6, "…and the held peak still includes the newest sample, never under the sample peak");
+
+    // The three interpolating dot products, 48 multiply-adds a sample over a
+    // contiguous window, are simd::dot's whole job. Checked against the
+    // scalar loop, rebuilt here from the meter's own design, on a second of
+    // noise: the same readings (to float rounding) for less work.
+    // The window survives a visit to a high rate. A 50 ms window clamped to
+    // 42.6 ms at 192 kHz was KEPT, so back at 48 kHz the shifter ran at the
+    // clamp's latency rather than the one it was given.
+    {
+      sonore::PitchShifter<8192> visiting;
+      visiting.setSampleRate(48000.0f);
+      visiting.setWindowMs(50.0f);
+      const int before = visiting.latencySamples();
+      visiting.setSampleRate(192000.0f);
+      visiting.setSampleRate(48000.0f);
+      char pl[160];
+      std::snprintf(pl, sizeof(pl),
+                    "a 50 ms window is 50 ms again after a visit to 192 kHz (latency %d, then %d)",
+                    before, visiting.latencySamples());
+      check(visiting.latencySamples() == before, pl);
+    }
+
+    {
+      constexpr int kTaps = 16, kHalf = 8;
+      static float taps[3][kTaps];
+      for (int ph = 1; ph < 4; ++ph) {
+        const double frac = (double) ph / 4.0;
+        double sum = 0.0;
+        for (int k = 0; k < kTaps; ++k) {
+          const double t = (double) (k - kHalf) + frac;
+          const double pi = (double) sonore::kPi;
+          const double sinc = std::fabs(t) < 1e-12 ? 1.0 : std::sin(pi * t) / (pi * t);
+          const double n = (double) k, m = (double) (kTaps - 1);
+          const double w = 0.42 - 0.5 * std::cos(2.0 * pi * n / m) + 0.08 * std::cos(4.0 * pi * n / m);
+          taps[ph - 1][k] = (float) (sinc * w);
+          sum += sinc * w;
+        }
+        for (int k = 0; k < kTaps; ++k) taps[ph - 1][k] = (float) ((double) taps[ph - 1][k] / sum);
+      }
+      float hist[2 * kTaps] = {};
+      int at = 0;
+      auto scalar = [&](float x) {
+        hist[at] = x;
+        hist[at + kTaps] = x;
+        const float* window = hist + at + 1;
+        at = (at + 1) % kTaps;
+        float peak = std::fabs(window[kHalf]);
+        for (int ph = 0; ph < 3; ++ph) {
+          float v = 0.0f;
+          for (int k = 0; k < kTaps; ++k) v += window[k] * taps[ph][k];
+          if (std::fabs(v) > peak) peak = std::fabs(v);
+        }
+        return peak;
+      };
+      sonore::TruePeakMeter vec;
+      sonore::WhiteNoise noise(23);
+      double worst = 0.0;
+      for (int i = 0; i < 48000; ++i) {
+        const float x = noise.next();
+        worst = std::max(worst, (double) std::fabs(vec.process(x) - scalar(x)));
+      }
+      float sink = 0.0f;
+      auto oursBody = ([&] { for (int i = 0; i < 400000; ++i) sink += vec.process((float) (i & 63) * 0.01f); });
+      auto oldBody = ([&] { for (int i = 0; i < 400000; ++i) sink += scalar((float) (i & 63) * 0.01f); });
+      const double ratio = relativeCost(oursBody, oldBody, 0.85);
+      char line[200];
+      std::snprintf(line, sizeof(line), "the true-peak meter's vectorised taps read what the scalar "
+                    "loop did (worst %.2e) at %.2fx its cost%s", worst, ratio,
+                    kOptimisedBuild ? "" : " (cost not judged: Debug build)");
+      check(worst < 1e-6 && (ratio < 0.85 || !kOptimisedBuild), line);
+      if (sink == 12345.0f) std::printf(" ");
+    }
   }
 
   // ── Correlation ──
@@ -21073,6 +30201,79 @@ static void testDynamicsFamily() {
   std::printf("dynamics family (expander, upward, transient, de-esser)\n");
   const double sr = 48000.0;
 
+  // One NaN or Inf sample must not latch into a feedback state. flushDenormal
+  // let NaN through, so an envelope follower stuck at NaN read as -180 dB:
+  // an expander sat at its full range for good, with FINITE output that no
+  // NaN guard downstream would catch.
+  {
+    sonore::EnvFollower env;
+    env.setSampleRate((float) sr);
+    env.setTimes(1.0f, 50.0f);
+    for (int i = 0; i < 4800; ++i) env.process(0.5f);
+    env.process(std::numeric_limits<float>::quiet_NaN());
+    for (int i = 0; i < 48000; ++i) env.process(0.5f);
+    const float afterNan = env.value();
+    env.process(std::numeric_limits<float>::infinity());
+    for (int i = 0; i < 48000; ++i) env.process(0.5f);
+    const float afterInf = env.value();
+    char nl[160];
+    std::snprintf(nl, sizeof(nl),
+                  "an envelope recovers from a NaN and an Inf sample (%.3f, %.3f)", afterNan,
+                  afterInf);
+    check(std::fabs(afterNan - 0.5f) < 0.01f && std::fabs(afterInf - 0.5f) < 0.01f, nl);
+
+    sonore::Expander expander;
+    expander.setSampleRate((float) sr);
+    expander.setThreshold(-40.0f);
+    expander.setRange(40.0f);
+    const float a = sonore::dbToGain(-9.0f);
+    auto levelOut = [&](int samples) {
+      double peak = 0.0;
+      for (int i = 0; i < samples; ++i) {
+        const float x = a * (float) std::sin(2.0 * kTestPi * 440.0 * i / sr);
+        peak = std::max(peak, (double) std::fabs(expander.process(x)));
+      }
+      return 20.0 * std::log10(peak + 1e-12);
+    };
+    const double before = levelOut(48000);
+    expander.process(std::numeric_limits<float>::quiet_NaN());
+    const double after = levelOut(48000);
+    std::snprintf(nl, sizeof(nl),
+                  "and an expander too: a -9 dB sine reads %.1f dB before a NaN, %.1f dB after",
+                  before, after);
+    check(std::fabs(after - before) < 0.5, nl);
+  }
+
+  // The Gain stage ramps over a fixed 10 ms, however the host splits blocks.
+  // It ramped over exactly one block, so a 0 -> 1 move at a block of one
+  // sample was a step.
+  {
+    sonore::Gain gain;
+    gain.setGainLinear(0.0f);
+    sonore::ProcessSpec spec;
+    spec.sampleRate = 48000.0;
+    spec.maximumBlockSize = 512;
+    spec.numChannels = 1;
+    gain.prepare(spec);
+    gain.setGainLinear(1.0f);
+    float biggestJump = 0.0f, last = 0.0f, settled = 0.0f;
+    for (int i = 0; i < 960; ++i) { // one-sample blocks, as a split host sends
+      float x = 1.0f;
+      float* ch[1] = {&x};
+      sonore::AudioBlock<float> one(ch, 1, 1);
+      gain.process(one);
+      biggestJump = std::max(biggestJump, std::fabs(x - last));
+      last = x;
+      settled = x;
+    }
+    char gl[160];
+    std::snprintf(gl, sizeof(gl),
+                  "a 0 -> 1 gain move in one-sample blocks ramps (largest step %.4f), and settles "
+                  "at %.3f",
+                  biggestJump, settled);
+    check(biggestJump < 0.01f && std::fabs(settled - 1.0f) < 1e-6f, gl);
+  }
+
   // ── Expander: 2:1, ten dB under the threshold, is ten dB of reduction ──
   {
     sonore::Expander ex;
@@ -21087,7 +30288,8 @@ static void testDynamicsFamily() {
     for (int i = 0; i < 1000; ++i) ex.process(level);
     checkNear(ex.gainReduction(), -10.0, 1.0, "a 2:1 expander 10 dB under threshold reduces ~10 dB");
     ex.setRange(6.0f);
-    for (int i = 0; i < 1000; ++i) ex.process(level);
+    // 100 ms: a range moved while running glides there (10 ms time constant).
+    for (int i = 0; i < 4800; ++i) ex.process(level);
     checkNear(ex.gainReduction(), -6.0, 0.5, "…and no further than its range");
     ex.setRange(60.0f);
     for (int i = 0; i < (int) (sr * 0.5); ++i) ex.process(sonore::dbToGain(-6.0f));
@@ -21108,7 +30310,9 @@ static void testDynamicsFamily() {
     for (int i = 0; i < 1000; ++i) uc.process(level);
     checkNear(uc.gainChange(), 5.0, 0.7, "a 2:1 upward compressor 10 dB under threshold lifts ~5 dB");
     uc.setMaxGain(3.0f);
-    for (int i = 0; i < 1000; ++i) uc.process(level);
+    // 100 ms: a largest boost moved while running glides there (10 ms time
+    // constant), from the default 20 dB.
+    for (int i = 0; i < 4800; ++i) uc.process(level);
     checkNear(uc.gainChange(), 3.0, 0.3, "…capped at its maximum gain");
   }
 
@@ -21185,6 +30389,50 @@ static void testDynamicsFamily() {
     std::printf("  ---- wideband de-esser: 300 Hz %.1f dB, 7 kHz %.1f dB ----\n", w300, w7k);
     check(w7k < -4.0 && w300 < -4.0, "wideband mode ducks both");
     check(std::fabs(w300 - w7k) < 0.5, "…by the same amount, because it is one gain");
+
+    // reset() forgets everything. The crossover's filters were left out, so a
+    // de-esser reset after a loud passage rang on into the silence after it --
+    // a click at the top of every bounce that started from a reset.
+    sonore::DeEsser de;
+    de.prepare(spec);
+    de.setFrequency(7000.0f);
+    for (int i = 0; i < 4800; ++i)
+      de.process(0.8f * (float) std::sin(2.0 * kTestPi * 5000.0 * i / sr));
+    de.reset();
+    double after = 0.0;
+    for (int i = 0; i < 480; ++i) after = std::max(after, (double) std::fabs(de.process(0.0f)));
+    char line[160];
+    std::snprintf(line, sizeof(line), "a reset de-esser is silent on silence (peak %.2e)", after);
+    check(after == 0.0, line);
+
+    // A frequency the rate cannot hold is held under it there and asked for
+    // again at the next rate. The clamped value was kept: an 8 kHz band
+    // prepared at 11.025 kHz came back to 48 kHz at 4.96 kHz, and an 8 kHz
+    // "s" was ducked 4.3 dB where a fresh de-esser ducks it 14.
+    auto meanGr = [&](sonore::DeEsser& d) {
+      double sum = 0.0;
+      int count = 0;
+      for (int i = 0; i < 48000; ++i) {
+        (void) d.process(0.316f * (float) std::sin(2.0 * kTestPi * 8000.0 * i / sr));
+        if (i >= 24000) { sum += d.gainReduction(); ++count; }
+      }
+      return sum / count;
+    };
+    sonore::ProcessSpec low = spec;
+    low.sampleRate = 11025.0;
+    sonore::DeEsser fresh, visited;
+    for (sonore::DeEsser* d : {&fresh, &visited}) {
+      d->prepare(spec);
+      d->setFrequency(8000.0f);
+      d->setThreshold(-30.0f);
+      d->setRatio(4.0f);
+    }
+    visited.prepare(low);
+    visited.prepare(spec);
+    const double grFresh = meanGr(fresh), grVisited = meanGr(visited);
+    std::snprintf(line, sizeof(line), "a de-esser back from 11.025 kHz de-esses its 8 kHz band as before (%.2f dB, fresh %.2f)",
+                  grVisited, grFresh);
+    check(std::fabs(grVisited - grFresh) < 0.1, line);
   }
 }
 
@@ -21391,6 +30639,340 @@ static void testFdnReverb() {
     g_fdn.setParameters(p);
     check(g_fdn.tailSamples() > 2.0 * sr, "the reported tail covers at least the declared decay");
   }
+
+  // ── Width 0 is a mono tail, for the FDN and the Freeverb alike ──
+  //
+  // Both blended their two outputs as w and 1 - w: mono at 0.5, and at 0
+  // the two sides SWAPPED -- as wide as at 1, at the end of the control the
+  // documentation calls mono. The same signal into both inputs, fully wet,
+  // must come out the same on both sides at 0 and differ at 1.
+  {
+    auto run = [&](auto& fx, std::vector<float>& l, std::vector<float>& r) {
+      l.assign(24000, 0.0f);
+      r.assign(24000, 0.0f);
+      for (int n = 0; n < 24000; ++n) {
+        const float x = (n % 4800 == 0 ? 0.8f : 0.0f) + 0.2f * (float) std::sin(2.0 * kTestPi * 330.0 * n / sr);
+        float a = x, b = x;
+        fx.process(a, b);
+        l[(size_t) n] = a;
+        r[(size_t) n] = b;
+      }
+    };
+    auto apart = [](const std::vector<float>& l, const std::vector<float>& r) {
+      double worst = 0.0;
+      for (size_t i = 0; i < l.size(); ++i) worst = std::max(worst, (double) std::fabs(l[i] - r[i]));
+      return worst;
+    };
+    std::vector<float> l, r;
+    double fdn[2], room[2];
+    for (int k = 0; k < 2; ++k) {
+      g_fdn.prepare(spec);
+      sonore::FdnReverb<8>::Parameters p;
+      p.mix = 1.0f;
+      p.width = k == 0 ? 0.0f : 1.0f;
+      g_fdn.setParameters(p);
+      run(g_fdn, l, r);
+      fdn[k] = apart(l, r);
+      auto rev = std::make_unique<sonore::Reverb>();
+      rev->prepare(spec);
+      sonore::Reverb::Parameters rp;
+      rp.mix = 1.0f;
+      rp.width = k == 0 ? 0.0f : 1.0f;
+      rev->setParameters(rp);
+      run(*rev, l, r);
+      room[k] = apart(l, r);
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "width 0 is mono: largest left/right difference %.6f (fdn) and %.6f (freeverb), "
+                  "against %.3f and %.3f at width 1",
+                  fdn[0], room[0], fdn[1], room[1]);
+    check(fdn[0] == 0.0 && room[0] == 0.0 && fdn[1] > 0.01 && room[1] > 0.01, line);
+  }
+
+  // ── Eight lines at every rate, not one line eight times ──
+  //
+  // The lengths were clamped one by one at MaxDelay before the prime step, so
+  // the long ones piled up at the ceiling and rounded to the SAME prime: at
+  // 192 kHz and the default size, seven of the eight lines were 8171 samples,
+  // and the network was a comb fluttering every 42.6 ms. Every other check of
+  // this reverb runs at 48 kHz, where nothing reaches the ceiling.
+  {
+    static sonore::FdnReverb<8> highRate; // ~1.1 MB: static, never a local
+    struct Case { double rate; float size; };
+    const Case cases[] = {{48000.0, 0.5f}, {96000.0, 1.0f}, {192000.0, 0.5f},
+                          {192000.0, 1.0f}, {384000.0, 1.0f}};
+    for (const Case& c : cases) {
+      sonore::ProcessSpec hs;
+      hs.sampleRate = c.rate;
+      hs.numChannels = 2;
+      highRate.prepare(hs);
+      sonore::FdnReverb<8>::Parameters hp;
+      hp.size = c.size;
+      highRate.setParameters(hp);
+      bool distinct = true, increasing = true;
+      for (int i = 0; i < 8; ++i)
+        for (int j = i + 1; j < 8; ++j)
+          if (highRate.lineLength(i) == highRate.lineLength(j)) distinct = false;
+      for (int i = 1; i < 8; ++i)
+        if (highRate.lineLength(i) <= highRate.lineLength(i - 1)) increasing = false;
+      const float spread = highRate.lineLength(7) / highRate.lineLength(0);
+      char line[200];
+      std::snprintf(line, sizeof(line), "at %.0f kHz, size %.1f: eight distinct lines, %.0f to %.0f "
+                    "samples (spread %.2f)", c.rate / 1000.0, (double) c.size,
+                    (double) highRate.lineLength(0), (double) highRate.lineLength(7), (double) spread);
+      check(distinct && increasing && spread > 2.0f && highRate.lineLength(7) <= 32768.0f - 16.0f,
+            line);
+    }
+  }
+  // reset() left the drift LFOs where they were, so two renders did not null.
+  {
+    char line[160];
+    auto render = [&](std::vector<float>& out) {
+      g_fdn.prepare(spec);
+      sonore::FdnReverb<8>::Parameters q;
+      q.modulation = 1.0f;
+      q.mix = 1.0f;
+      g_fdn.setParameters(q);
+      float l = 0.0f, r = 0.0f;
+      for (int i = 0; i < 24000; ++i) { l = 0.0f; r = 0.0f; g_fdn.process(l, r); } // drift moves on
+      g_fdn.reset();
+      out.assign(48000, 0.0f);
+      for (int i = 0; i < 48000; ++i) {
+        l = i == 0 ? 1.0f : 0.0f;
+        r = l;
+        g_fdn.process(l, r);
+        out[(size_t) i] = l;
+      }
+    };
+    std::vector<float> a, b;
+    render(a);
+    // A second render that has run longer before its reset.
+    g_fdn.prepare(spec);
+    {
+      sonore::FdnReverb<8>::Parameters q;
+      q.modulation = 1.0f;
+      q.mix = 1.0f;
+      g_fdn.setParameters(q);
+      float l = 0.0f, r = 0.0f;
+      for (int i = 0; i < 37000; ++i) { l = 0.0f; r = 0.0f; g_fdn.process(l, r); }
+      g_fdn.reset();
+      b.assign(48000, 0.0f);
+      for (int i = 0; i < 48000; ++i) {
+        l = i == 0 ? 1.0f : 0.0f;
+        r = l;
+        g_fdn.process(l, r);
+        b[(size_t) i] = l;
+      }
+    }
+    double diff = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) diff = std::max(diff, (double) std::fabs(a[i] - b[i]));
+    std::snprintf(line, sizeof(line), "two renders after reset() are identical (max difference %.3g)", diff);
+    check(diff == 0.0, line);
+  }
+
+  // A mix knob turned mid-signal. DryWetMixer landed a new mix in one
+  // sample: the delay stepped 52 times its largest natural step, the plate
+  // 47 -- every reverb, the chorus and the phaser went through it.
+  {
+    auto ratioOf = [&](auto& fx, auto&& turn) {
+      double natural = 0.0, atChange = 0.0;
+      float prev = 0.0f;
+      for (int n = 0; n < 48000; ++n) {
+        if (n == 24000) turn();
+        float l = 0.5f * (float) std::sin(2.0 * kTestPi * 150.0 * n / 48000.0), r = l;
+        fx.process(l, r);
+        const double step = std::fabs(l - prev);
+        prev = l;
+        if (n > 4000 && n < 24000) natural = std::max(natural, step);
+        if (n >= 24000 && n < 24300) atChange = std::max(atChange, step);
+      }
+      return atChange / natural;
+    };
+    auto delay = std::make_unique<sonore::StereoDelay<>>();
+    delay->prepare(spec);
+    sonore::StereoDelay<>::Parameters dp;
+    dp.mix = 0.0f;
+    delay->setParameters(dp);
+    const double delayRatio = ratioOf(*delay, [&] { dp.mix = 1.0f; delay->setParameters(dp); });
+    g_fdn.prepare(spec);
+    sonore::FdnReverb<8>::Parameters fp;
+    fp.mix = 0.0f;
+    g_fdn.setParameters(fp);
+    const double fdnRatio = ratioOf(g_fdn, [&] { fp.mix = 1.0f; g_fdn.setParameters(fp); });
+    char line[200];
+    std::snprintf(line, sizeof(line), "a mix turned from dry to wet glides (largest step at the change x%.2f delay, x%.2f fdn)",
+                  delayRatio, fdnRatio);
+    check(delayRatio < 2.0 && fdnRatio < 2.0, line);
+  }
+
+  // The other knobs, turned mid-signal: a delay's modulation depth, the
+  // FDN's decay and width, the Freeverb's room size and width, the plate's
+  // decay. Each moved in one sample. Against the larger of the natural steps
+  // before and after, as for the gain controls.
+  {
+    auto ratioOf = [&](auto& fx, auto&& turn) {
+      double before = 0.0, after = 0.0, atChange = 0.0;
+      float prev = 0.0f;
+      for (int n = 0; n < 72000; ++n) {
+        if (n == 24000) turn();
+        float l = 0.3f * (float) std::sin(2.0 * kTestPi * 150.0 * n / 48000.0), r = 0.3f * (float) std::sin(2.0 * kTestPi * 211.0 * n / 48000.0);
+        fx.process(l, r);
+        const double step = std::fabs(l - prev);
+        prev = l;
+        if (n > 4000 && n < 24000) before = std::max(before, step);
+        if (n >= 24000 && n < 24300) atChange = std::max(atChange, step);
+        if (n > 60000) after = std::max(after, step);
+      }
+      return atChange / std::max(before, after);
+    };
+    auto delay = std::make_unique<sonore::StereoDelay<>>();
+    delay->prepare(spec);
+    sonore::StereoDelay<>::Parameters dp;
+    dp.mix = 1.0f;
+    delay->setParameters(dp);
+    const double depth = ratioOf(*delay, [&] { dp.modDepthMs = 2.0f; delay->setParameters(dp); });
+    g_fdn.prepare(spec);
+    sonore::FdnReverb<8>::Parameters fp;
+    fp.mix = 1.0f;
+    fp.width = 1.0f;
+    g_fdn.setParameters(fp);
+    const double fdnWidth = ratioOf(g_fdn, [&] { fp.width = 0.0f; g_fdn.setParameters(fp); });
+    auto room = std::make_unique<sonore::Reverb>();
+    room->prepare(spec);
+    sonore::Reverb::Parameters rp;
+    rp.mix = 1.0f;
+    room->setParameters(rp);
+    const double roomWidth = ratioOf(*room, [&] { rp.width = 0.0f; room->setParameters(rp); });
+    char line[200];
+    std::snprintf(line, sizeof(line), "delay depth, fdn width and room width glide when turned (x%.2f, x%.2f, x%.2f)",
+                  depth, fdnWidth, roomWidth);
+    check(depth < 1.5 && fdnWidth < 1.5 && roomWidth < 1.5, line);
+  }
+
+  // A size turned mid-signal: every line moves to new primes, so every read
+  // point jumped -- 0.5 -> 0.52 stepped the output 65 times its natural step.
+  {
+    g_fdn.prepare(spec);
+    sonore::FdnReverb<8>::Parameters q;
+    q.mix = 1.0f;
+    q.size = 0.5f;
+    g_fdn.setParameters(q);
+    double before = 0.0, after = 0.0, atChange = 0.0;
+    float prev = 0.0f;
+    std::vector<float> right(72000);
+    for (int n = 0; n < 72000; ++n) {
+      if (n == 24000) { q.size = 0.8f; g_fdn.setParameters(q); }
+      float l = 0.3f * (float) std::sin(2.0 * kTestPi * 150.0 * n / 48000.0), r = l;
+      g_fdn.process(l, r);
+      right[(size_t) n] = r;
+      const double step = std::fabs(l - prev);
+      prev = l;
+      if (n > 4000 && n < 24000) before = std::max(before, step);
+      if (n >= 24000 && n < 26400) atChange = std::max(atChange, step);
+      if (n > 60000) after = std::max(after, step);
+    }
+    const double ratio = atChange / std::max(before, after);
+    char line[160];
+    std::snprintf(line, sizeof(line), "an fdn size turned mid-signal fades to the new lines (x%.2f the natural step)", ratio);
+    check(ratio < 1.5, line);
+
+    // ...on the right too, which reads its own tap along each line. That tap
+    // jumped while the lines faded: a step 40 times the natural one. The
+    // right side's LEVEL also swells for a while as the network settles into
+    // the new lengths, so a step is measured against the tone's own step at
+    // the level it has there: per period of the 150 Hz tone, the largest step
+    // over the peak times 2 pi f / fs. A tone reads 1; a click far more.
+    double worst = 0.0;
+    const double toneStep = 2.0 * kTestPi * 150.0 / 48000.0;
+    for (int w = 24000; w + 320 <= 30000; w += 160) {
+      double step = 0.0, peak = 0.0;
+      for (int n = w; n < w + 320; ++n) {
+        step = std::max(step, (double) std::fabs(right[(size_t) n] - right[(size_t) n - 1]));
+        peak = std::max(peak, (double) std::fabs(right[(size_t) n]));
+      }
+      worst = std::max(worst, step / (peak * toneStep));
+    }
+    std::snprintf(line, sizeof(line), "...and so does its right tap (largest step x%.2f a tone's at that level)", worst);
+    check(worst < 1.3, line);
+  }
+
+  // ...and turned the way a knob or automation turns it, a new size every
+  // block. A size arriving mid-fade restarted the fade from where that one
+  // was heading and dropped the old head at whatever level it still had: a
+  // click every block, the output's curvature (its second difference, where
+  // a click is a spike) 610 times its natural value. Queued behind the
+  // running fade, as the delay queues a time, a sweep is a run of fades.
+  {
+    g_fdn.prepare(spec);
+    sonore::FdnReverb<8>::Parameters q;
+    q.mix = 1.0f;
+    q.size = 0.5f;
+    g_fdn.setParameters(q);
+    double natural = 0.0, swept = 0.0, eNatural = 0.0, eSwept = 0.0;
+    float y1 = 0.0f, y2 = 0.0f;
+    for (int n = 0; n < 144000; ++n) {
+      if (n >= 120000 && n % 256 == 0) {
+        q.size += 0.004f;
+        g_fdn.setParameters(q);
+      }
+      float wl = 0.3f * (float) std::sin(2.0 * kTestPi * 150.0 * n / 48000.0), wr = wl;
+      g_fdn.process(wl, wr);
+      const double bend = std::fabs(wl - 2.0f * y1 + y2);
+      y2 = y1;
+      y1 = wl;
+      if (n >= 96000 && n < 120000) {
+        natural = std::max(natural, bend);
+        eNatural += (double) wl * wl;
+      }
+      if (n >= 120000) {
+        swept = std::max(swept, bend);
+        eSwept += (double) wl * wl;
+      }
+    }
+    const double ratio = (swept / std::sqrt(eSwept)) / (natural / std::sqrt(eNatural));
+    char line[200];
+    std::snprintf(line, sizeof(line), "an fdn size changed every block crossfades and never drops a head "
+                  "(curvature x%.2f the natural)", ratio);
+    check(ratio < 5.0, line);
+  }
+
+  // The limits a delay clamps to, asked rather than heard: a 2000 ms delay at
+  // 192 kHz played 1000 ms, an FDN's 200 ms pre-delay 85.
+  {
+    sonore::ProcessSpec fast = spec;
+    fast.sampleRate = 192000.0;
+    auto delay = std::make_unique<sonore::StereoDelay<>>();
+    delay->prepare(fast);
+    sonore::StereoDelay<>::Parameters dp;
+    dp.timeMs = 2000.0f;
+    delay->setParameters(dp);
+    const double heldMs = 1000.0 * delay->delaySamples(0) / 192000.0;
+    g_fdn.prepare(fast);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a delay and an fdn say how long they can go at 192 kHz (%.0f ms, played %.0f; pre-delay %.1f ms)",
+                  delay->maxTimeMs(), heldMs, g_fdn.maxPreDelayMs());
+    check(std::fabs(heldMs - delay->maxTimeMs()) < 1.0 && g_fdn.maxPreDelayMs() < 200.0f && g_fdn.maxPreDelayMs() > 80.0f, line);
+  }
+
+  // The drift in time, at every rate: it was 4 samples everywhere, a quarter
+  // as deep at 192 kHz as at 48.
+  {
+    double lo = 1e9, hi = 0.0;
+    for (double rate : {44100.0, 48000.0, 96000.0, 192000.0}) {
+      sonore::ProcessSpec at = spec;
+      at.sampleRate = rate;
+      g_fdn.prepare(at);
+      sonore::FdnReverb<8>::Parameters q;
+      q.modulation = 1.0f;
+      g_fdn.setParameters(q);
+      lo = std::min(lo, (double) g_fdn.modulationDepthMs());
+      hi = std::max(hi, (double) g_fdn.modulationDepthMs());
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "the fdn's drift is as deep in time at 44.1 to 192 kHz (%.4f to %.4f ms)", lo, hi);
+    check(hi - lo < 1e-4 && lo > 0.08, line);
+  }
 }
 
 /** measure.ts's autocorrelation pitch probe, ported: the second opinion. */
@@ -21437,6 +31019,27 @@ static void testPitch() {
     checkNear(det.frequency(), 110.0, 0.7, "a 110 Hz square -- every odd harmonic -- reads 110, not 220 or 330");
   }
   {
+    // Below what the window can see at this rate, the answer is "nothing",
+    // not the floor. A 2048 window holds 1022 lags -- 94 Hz at 96 kHz -- and
+    // an 82 Hz string read 93.93 Hz there, a confident-looking wrong number.
+    sonore::PitchDetector<2048> high;
+    high.setSampleRate(96000.0f);
+    std::vector<float> saw(2048);
+    for (size_t i = 0; i < saw.size(); ++i) {
+      const double phase = std::fmod(82.41 * (double) i / 96000.0, 1.0);
+      saw[i] = (float) (2.0 * phase - 1.0);
+    }
+    high.analyse(saw.data(), saw.size());
+    char pl[200];
+    std::snprintf(pl, sizeof(pl),
+                  "an 82 Hz saw at 96 kHz, below the window's %.1f Hz floor, reads %.2f Hz (0 = "
+                  "no estimate), never the floor itself",
+                  (double) high.lowestHz(), (double) high.frequency());
+    check(high.frequency() == 0.0f || std::fabs(high.frequency() - 82.41f) < 1.0f, pl);
+    check(std::fabs(high.lowestHz() - 96000.0f / 1022.0f) < 0.5f,
+          "and lowestHz() says where that floor is");
+  }
+  {
     // A range whose ceiling is a few hertz asks for a minimum lag of tens of
     // thousands of samples in a 2048-sample window. The clamp used to bound
     // only the maximum lag and then push it one past the minimum, so the
@@ -21447,7 +31050,7 @@ static void testPitch() {
     tiny.setRange(1.0f, 2.0f);
     auto v = tone(440.0, 2048, "sine");
     tiny.analyse(v.data(), v.size());
-    check(std::isfinite(tiny.frequency()) && tiny.frequency() > 0.0f,
+    check(std::isfinite(tiny.frequency()) && tiny.frequency() >= 0.0f,
           "a degenerate frequency range is clamped into the window, not indexed past it");
     tiny.setRange(40.0f, 2000.0f);
     tiny.analyse(v.data(), v.size());
@@ -21480,6 +31083,116 @@ static void testPitch() {
     check(updates >= 1, "streaming push() produces estimates");
     checkNear(det.frequency(), 440.0, 1.0, "…that read the streamed tone");
   }
+  {
+    // push() did the whole analysis -- every lag times half a window, about
+    // a million multiply-adds at the defaults -- inside the one call that
+    // completed a hop: a spike of several hundred microseconds in one audio
+    // block out of every sixteen at 64 frames. The work is now spread over
+    // the hop, maxLag multiply-adds per sample, finishing on the same sample.
+    //
+    // Timed per call. Each hop's slowest push() against the mean push(),
+    // and the MEDIAN of those across hops, so one pre-emption somewhere
+    // cannot decide it: a hop that does all its work in one call is a
+    // thousand times its mean. And the best of three tries, under 100x: on
+    // a machine busy enough that most hops were pre-empted somewhere (the
+    // whole ctest at -j3 beside a compiler) one try read 66x.
+    using Clock = std::chrono::steady_clock;
+    sonore::PitchDetector<2048> timed;
+    timed.setSampleRate((float) sr);
+    sonore::Oscillator osc;
+    osc.setSampleRate((float) sr);
+    osc.setFreq(220.0f);
+    constexpr int kHops = 17, kHop = 1024;
+    float sink = 0.0f;
+    double meanNs = 0.0, medianWorst = 0.0, ratio = 1e30;
+    for (int attempt = 0; attempt < 3 && ratio >= 50.0; ++attempt) {
+      std::vector<double> hopWorst;
+      double totalNs = 0.0;
+      for (int h = 0; h < kHops; ++h) {
+        double worst = 0.0;
+        for (int i = 0; i < kHop; ++i) {
+          const float x = osc.sine();
+          const auto t0 = Clock::now();
+          const bool fresh = timed.push(x);
+          const double ns = std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+          if (fresh) sink += timed.frequency();
+          totalNs += ns;
+          if (ns > worst) worst = ns;
+        }
+        hopWorst.push_back(worst);
+      }
+      std::sort(hopWorst.begin(), hopWorst.end());
+      const double mean = totalNs / (kHops * kHop), median = hopWorst[kHops / 2];
+      if (median / mean < ratio) {
+        ratio = median / mean;
+        meanNs = mean;
+        medianWorst = median;
+      }
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "pitch detection is spread over the hop: a hop's slowest push() "
+                  "is %.0fx the mean (%.0f ns against %.0f ns)", ratio, medianWorst, meanNs);
+    check(ratio < 100.0, line);
+    checkNear(timed.frequency(), 220.0, 0.5, "…and the estimate it finishes reads the tone");
+
+    // The streamed estimate IS the analysis of the window it ends on.
+    sonore::PitchDetector<2048> streamed, direct;
+    streamed.setSampleRate((float) sr);
+    direct.setSampleRate((float) sr);
+    sonore::Oscillator rich;
+    rich.setSampleRate((float) sr);
+    rich.setFreq(173.0f);
+    std::vector<float> history;
+    int compared = 0;
+    double worstHz = 0.0;
+    for (int i = 0; i < 8 * 1024; ++i) {
+      const float x = 0.6f * rich.square() + 0.1f * rich.sine();
+      history.push_back(x);
+      if (streamed.push(x) && history.size() >= 2048) {
+        direct.analyse(history.data() + history.size() - 2048, 2048);
+        worstHz = std::max(worstHz, (double) std::fabs(streamed.frequency() - direct.frequency()));
+        ++compared;
+      }
+    }
+    std::snprintf(line, sizeof(line), "…and each streamed estimate matches analyse() on the window "
+                  "it ends on (%d windows, worst %.4f Hz)", compared, worstHz);
+    check(compared >= 6 && worstHz < 0.01, line);
+
+    // A range changed halfway through a hop still gives an estimate of the
+    // whole window, over the new lags.
+    streamed.reset();
+    history.clear();
+    for (int i = 0; i < 2048 + 512; ++i) {
+      const float x = 0.6f * rich.square();
+      history.push_back(x);
+      streamed.push(x);
+    }
+    streamed.setRange(60.0f, 1500.0f);
+    direct.setRange(60.0f, 1500.0f);
+    bool fresh = false;
+    while (!fresh) {
+      const float x = 0.6f * rich.square();
+      history.push_back(x);
+      fresh = streamed.push(x);
+    }
+    direct.analyse(history.data() + history.size() - 2048, 2048);
+    checkNear(streamed.frequency(), direct.frequency(), 0.01,
+              "…including the hop in which its range was changed");
+    (void) sink;
+  }
+  {
+    // Used as constructed, at the 48 kHz its members default to. Those
+    // defaults (40 Hz floor) are a 1200-sample lag, and only setRange()
+    // clamped it to the 1022 a 2048 window holds -- so a detector nobody
+    // called setSampleRate() on summed past the end of its difference buffer,
+    // into the sample rate and the lag bounds behind it.
+    sonore::PitchDetector<2048> bare;
+    sonore::Oscillator osc;
+    osc.setSampleRate(48000.0f);
+    osc.setFreq(440.0f);
+    for (int i = 0; i < 8192; ++i) bare.push(osc.sine());
+    checkNear(bare.frequency(), 440.0, 1.0, "a detector used as constructed keeps its lags inside its window");
+  }
 
   // ── Shifter, graded by the detector ──
   {
@@ -21508,10 +31221,119 @@ static void testPitch() {
     checkNear(fifth.first, 659.3, 659.3 * 0.03, "+7 reads a fifth up");
     checkNear(none.first, 440.0, 440.0 * 0.01, "0 leaves the pitch alone");
     checkNear(20.0 * std::log10(none.second / 0.7071), 0.0, 1.5, "…and the level within 1.5 dB (equal-power heads)");
-    sonore::PitchShifter<8192> ps;
-    ps.setSampleRate((float) sr);
-    ps.setWindowMs(50.0f);
-    checkNear((double) ps.latencySamples(), 0.025 * sr, 2.0, "latency is half the window, as declared");
+    // The latency a host compensates by, against where an impulse actually
+    // comes out at no shift. "Half the window" was compared with itself; the
+    // read head sits two samples further back than that, so a host aligning
+    // by the declared number left the shifted signal two samples late.
+    for (double rate : {48000.0, 44100.0})
+    for (float ms : {50.0f, 20.0f}) {
+      sonore::PitchShifter<8192> ps;
+      ps.setSampleRate((float) rate);
+      ps.setWindowMs(ms);
+      int peakAt = -1;
+      float peak = 0.0f;
+      for (int i = 0; i < 6000; ++i) {
+        const float y = ps.process(i == 0 ? 1.0f : 0.0f);
+        if (std::fabs(y) > peak) {
+          peak = std::fabs(y);
+          peakAt = i;
+        }
+      }
+      char line[160];
+      std::snprintf(line, sizeof(line), "at %.1f kHz a %.0f ms window declares %d samples of "
+                    "latency and an impulse comes out at %d", rate / 1000.0, ms,
+                    ps.latencySamples(), peakAt);
+      check(peakAt == ps.latencySamples(), line);
+    }
+
+    // The two heads' crossfade was two std::sin per sample, and each head's
+    // cubic read wrapped its neighbours with three signed modulos; sinTurns
+    // is the same curve to within 3e-7 and a compare is the same wrap. The
+    // output must match the old version, rebuilt here in full (its own ring,
+    // its own modulo read, std::sin), and cost less.
+    {
+      sonore::PitchShifter<8192> ps;
+      ps.setSampleRate((float) sr);
+      ps.setWindowMs(50.0f);
+      ps.setSemitones(7.0f);
+      constexpr int kRing = 8192;
+      std::vector<float> ring(kRing, 0.0f);
+      int writeAt = 0;
+      auto oldRead = [&](float delay) {
+        const float d = std::min(std::max(delay, 2.0f), (float) (kRing - 3));
+        // The read point in whole samples and d's own fraction, as DelayLine
+        // finds it now (one float w - d rounded the fraction to the line's
+        // size); the modulos below are the old wrap being timed.
+        const int whole = (int) d;
+        const float part = d - (float) whole;
+        int i1 = writeAt - whole;
+        float frac = 0.0f;
+        if (part > 0.0f) {
+          --i1;
+          frac = 1.0f - part;
+        }
+        i1 = (i1 + kRing) % kRing;
+        const int i0 = (i1 - 1 + kRing) % kRing, i2 = (i1 + 1) % kRing, i3 = (i1 + 2) % kRing;
+        return sonore::DelayLine<8192>::catmullRomTap(ring[(size_t) i0], ring[(size_t) i1],
+                                                        ring[(size_t) i2], ring[(size_t) i3], frac);
+      };
+      const float window = 2.0f * std::round(50.0f * 0.001f * (float) sr * 0.5f);
+      const float ratio = std::pow(2.0f, 7.0f / 12.0f);
+      float phase = 0.0f;
+      auto reference = [&](float x) {
+        phase += 1.0f - ratio;
+        while (phase < 0.0f) phase += window;
+        while (phase >= window) phase -= window;
+        const float dA = phase;
+        float dB = phase + window * 0.5f;
+        if (dB >= window) dB -= window;
+        const float a = oldRead(dA + 2.0f), b = oldRead(dB + 2.0f);
+        const float ga = std::sin((float) kTestPi * dA / window);
+        const float gb = std::sin((float) kTestPi * dB / window);
+        ring[(size_t) writeAt] = x;
+        if (++writeAt >= kRing) writeAt = 0;
+        return a * ga + b * gb;
+      };
+      double worst = 0.0;
+      for (int i = 0; i < 48000; ++i) {
+        const float x = (float) std::sin(2.0 * kTestPi * 440.0 * i / sr);
+        worst = std::max(worst, (double) std::fabs(ps.process(x) - reference(x)));
+      }
+      // Timed in alternation, best of five each, so a burst of load from the
+      // tests running beside this one lands on both: about 0.70x alone, and
+      // a regression to the old arithmetic reads 1.0x.
+      auto timeOnce = [&](auto&& body) {
+        const auto t0 = std::chrono::steady_clock::now();
+        body();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      };
+      float sink = 0.0f;
+      auto runOurs = [&] {
+        for (int i = 0; i < 400000; ++i) sink += ps.process((float) (i & 127) * 0.01f);
+      };
+      auto runOld = [&] {
+        for (int i = 0; i < 400000; ++i) sink += reference((float) (i & 127) * 0.01f);
+      };
+      // Up to three ATTEMPTS of that, passing on the first that clears the
+      // bound. A machine loaded hard enough -- two compilers beside the suite
+      // -- read 1.16x once; one clean attempt proves the arithmetic is the
+      // cheaper one, and a real regression (1.0x) almost never clears 0.92x.
+      double ours = 1e9, old = 1e9;
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        ours = 1e9;
+        old = 1e9;
+        for (int round = 0; round < 5; ++round) {
+          ours = std::min(ours, timeOnce(runOurs));
+          old = std::min(old, timeOnce(runOld));
+        }
+        if (ours < old * 0.92) break;
+      }
+      char line2[200];
+      std::snprintf(line2, sizeof(line2), "the shifter matches its old modulo-and-std::sin self "
+                    "(worst %.2e) at %.2fx its cost", worst, ours / old);
+      check(worst < 1e-5 && ours < old * 0.92, line2);
+      if (sink == 12345.0f) std::printf(" ");
+    }
   }
 }
 
@@ -21574,6 +31396,21 @@ static void testSynthesis() {
   {
     g_saw.buildAdditive([](int h) { return 1.0f / (float) h; });
     check(g_saw.isBuilt(), "a saw table builds additively");
+    // A phase a hair below zero, as phase modulation produces: it rounds to a
+    // phase of exactly 1.0, and the read indexed one past the table -- past
+    // the LAST mip, the bytes after the array. A cosine starts at 1 in every
+    // mip, so that read has to say 1 too.
+    {
+      static sonore::Wavetable<64, 2> tiny;
+      float cycle[64];
+      for (int i = 0; i < 64; ++i) cycle[i] = (float) std::cos(2.0 * kTestPi * i / 64.0);
+      tiny.build(cycle);
+      const float justBelow = tiny.read(1, -1e-9f), atZero = tiny.read(1, 0.0f);
+      char line[160];
+      std::snprintf(line, sizeof(line), "a phase of -1e-9 reads the top of the table (%.4f), not past "
+                    "its end", (double) justBelow);
+      check(std::fabs(justBelow - atZero) < 1e-3f && std::fabs(atZero - 1.0f) < 1e-3f, line);
+    }
     sonore::WavetableOscillator<sonore::Wavetable<2048, 10>> osc;
     osc.setTable(&g_saw);
     osc.setSampleRate((float) sr);
@@ -21624,6 +31461,46 @@ static void testSynthesis() {
     check(wide > tight * 3.0, "40 cents of detune puts energy beside the fundamental that 0 does not");
     check(cTight > 0.999, "with no spread the two outputs are identical");
     check(cWide < 0.95, "…and full spread makes them differ");
+
+    // Under glide or a pitch bend setFreq() runs every sample, and it
+    // recomputed every voice's detune ratio (a pow) and pan gains (a cos and
+    // a sin) though neither depends on the frequency: seven voices, 21
+    // transcendentals a sample, several times the cost of rendering them.
+    // Gliding now costs little more than holding a note: about 1.6x, against
+    // 13x before. The two are timed in alternation, best of five each, so a
+    // burst of load from tests running beside this one lands on both.
+    {
+      auto timeOnce = [&](auto&& body) {
+        const auto t0 = std::chrono::steady_clock::now();
+        body();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      };
+      float sink = 0.0f;
+      auto holdNote = [&] {
+        for (int i = 0; i < 200000; ++i) {
+          float a, b;
+          uni.render(a, b);
+          sink += a;
+        }
+      };
+      auto glide = [&] {
+        for (int i = 0; i < 200000; ++i) {
+          uni.setFreq(220.0f + (float) (i & 1023) * 0.25f);
+          float a, b;
+          uni.render(a, b);
+          sink += a;
+        }
+      };
+      double held = 1e9, gliding = 1e9;
+      for (int round = 0; round < 5; ++round) {
+        held = std::min(held, timeOnce(holdNote));
+        gliding = std::min(gliding, timeOnce(glide));
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "a gliding unison costs %.2fx a held one (seven voices)", gliding / held);
+      check(gliding < held * 3.0, line);
+      if (sink == 12345.0f) std::printf(" ");
+    }
   }
 
   // ── Hard sync ──
@@ -21666,6 +31543,34 @@ static void testSynthesis() {
     const double bAlias = between(yes), nAlias = between(no);
     std::printf("  ---- sync alias floor between harmonics: BLEP %.1f dB, naive %.1f dB ----\n", bAlias, nAlias);
     check(bAlias < nAlias - 10.0, "BLEPping the reset lowers the alias floor by at least 10 dB");
+
+    // The pitch moving between two samples, right after the slave wrapped:
+    // a legato note two octaves down, and the ratio knob at its bottom. The
+    // correction for the wrap was worked out from the increment in force on
+    // the NEXT sample, and came out at 5.7 for the first and NaN for the
+    // second. Every start point over a few master cycles, so some land just
+    // after a wrap; 1987 Hz and 1.37 so the wraps are not exact binary
+    // fractions, which hid it.
+    float worstDrop = 0.0f;
+    bool zeroFinite = true;
+    for (int k = 1; k < 200; ++k) {
+      for (int mode = 0; mode < 2; ++mode) {
+        sonore::HardSyncOscillator h;
+        h.setSampleRate((float) sr);
+        h.setRatio(1.37f);
+        h.setMasterFreq(1987.0f);
+        h.reset();
+        for (int i = 0; i < k; ++i) h.next();
+        if (mode == 0) h.setMasterFreq(1987.0f / 4.0f);
+        else h.setRatio(0.0f);
+        const float y = h.next();
+        if (!std::isfinite(y)) zeroFinite = false;
+        else if (mode == 0) worstDrop = (std::max)(worstDrop, std::fabs(y));
+      }
+    }
+    std::printf("  ---- sync: worst sample after a two-octave drop %.3f ----\n", worstDrop);
+    check(worstDrop < 1.2f, "a pitch drop just after the slave wraps stays within the waveform");
+    check(zeroFinite, "...and a ratio set to 0 just after it is not NaN");
   }
 
   // ── FM: Bessel's zero ──
@@ -21714,6 +31619,62 @@ static void testSynthesis() {
     int samples = 0;
     while (samples < (int) sr && env.getNextSample() > start * 0.001f) ++samples;
     checkNear(samples / sr, p.release, p.release * 0.2, "release reaches -60 dB in its declared time");
+
+    // A retrigger -- the same key again, or a voice stolen while it sounds --
+    // starts from where the envelope IS. noteOn forced the Delay stage, which
+    // set the level to zero: a step from sustain to silence in one sample, the
+    // click ADSR does not make and the doc says this keeps the conventions of.
+    env.reset();
+    env.noteOn();
+    for (int i = 0; i < (int) (sr * 0.2); ++i) env.getNextSample(); // into sustain
+    float last = env.getNextSample(), worstStep = 0.0f;
+    env.noteOn();
+    for (int i = 0; i < (int) (sr * 0.1); ++i) {
+      const float v = env.getNextSample();
+      worstStep = std::max(worstStep, std::fabs(v - last));
+      last = v;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "a retrigger from sustain moves at most %.3f per sample "
+                  "(the attack's own step is %.3f)", worstStep, 1.0 / (p.attack * sr));
+    check(worstStep <= 1.0f / (p.attack * (float) sr) + 1e-4f, line);
+
+    // Its curves are coefficients too, not an exp() per sample per voice.
+    {
+      sonore::Dahdsr slow;
+      slow.setSampleRate((float) sr);
+      sonore::Dahdsr::Parameters q;
+      q.delay = 0.0f; q.attack = 0.0001f; q.hold = 0.0f; q.decay = 0.0001f; q.sustain = 1.0f;
+      q.release = 60.0f;
+      slow.setParameters(q);
+      volatile float sink = 0.0f;
+      auto releaseBody = [&] {
+        // A LOCAL envelope, as a voice owns its own: reached through the
+        // lambda's reference the compiler kept its state in memory, and the
+        // loop measured the stores rather than the envelope.
+        sonore::Dahdsr env = slow;
+        env.reset();
+        env.noteOn();
+        for (int i = 0; i < 64; ++i) env.getNextSample();
+        env.noteOff();
+        float acc = 0.0f;
+        for (int i = 0; i < 2000000; ++i) acc += env.getNextSample();
+        sink = acc;
+      };
+      auto multiplyBody = [&] {
+        float level = 1.0f, acc = 0.0f;
+        for (int i = 0; i < 2000000; ++i) {
+          level *= 0.99999f;
+          acc += level;
+        }
+        sink = acc;
+      };
+      const double ratio = relativeCost(releaseBody, multiplyBody, 2.5);
+      (void) sink;
+      std::snprintf(line, sizeof(line), "two million DAHDSR release samples cost %.1fx a bare "
+                    "multiply loop", ratio);
+      check(ratio < 2.5, line);
+    }
   }
 
   // ── Karplus-Strong ──
@@ -21744,6 +31705,71 @@ static void testSynthesis() {
     std::printf("  ---- string -60 dB after %.2f s (declared 1.0) ----\n", t60);
     checkNear(t60, 1.0, 0.4, "…and dies away in about the declared second");
     check(!ks.isActive(), "…after which it reports itself spent");
+  }
+
+  // A voice reused after a note-off must decay like a fresh one. noteOn()
+  // never cleared the release flag, so every note after a voice's first
+  // note-off rang with the release damping: 78 dB/s where the decay said 37.
+  {
+    auto decayRate = [&](sonore::KarplusStrong<4096>& ks) {
+      ks.noteOn(880.0f, 1.0f);
+      std::vector<float> out((size_t) (sr * 0.8));
+      for (auto& v : out) v = ks.render();
+      std::vector<float> a(out.begin() + (size_t) (sr * 0.1), out.begin() + (size_t) (sr * 0.2));
+      std::vector<float> b(out.begin() + (size_t) (sr * 0.6), out.begin() + (size_t) (sr * 0.7));
+      return (20.0 * std::log10(rms(a) + 1e-12) - 20.0 * std::log10(rms(b) + 1e-12)) / 0.5;
+    };
+    sonore::KarplusStrong<4096> fresh, reused;
+    for (auto* k : {&fresh, &reused}) {
+      k->setSampleRate((float) sr);
+      k->setDecay(2.0f);
+      k->setDamping(0.0f);
+    }
+    reused.noteOn(880.0f, 1.0f);
+    for (int i = 0; i < 4800; ++i) reused.render();
+    reused.noteOff(); // the voice's first note ends with a release...
+    for (int i = 0; i < 48000; ++i) reused.render();
+    const double freshRate = decayRate(fresh), reusedRate = decayRate(reused);
+    char ksl[200];
+    std::snprintf(ksl, sizeof(ksl),
+                  "a voice reused after a note-off decays like a fresh one (%.1f vs %.1f dB/s)",
+                  reusedRate, freshRate);
+    check(std::fabs(reusedRate - freshRate) < 5.0, ksl);
+  }
+
+  // ── Karplus-Strong at high rates: every note down to the 20 Hz it accepts ──
+  // The string is a delay line one period long, and a 4096-sample line is
+  // 47 Hz at 192 kHz: an E1 asked for at 41 Hz sounded at 47, a bass note
+  // pinned to whatever fitted. The default line now holds 20 Hz up to
+  // 327 kHz.
+  for (const auto& probe : {std::pair<double, double>{96000.0, 21.0}, {192000.0, 30.0}, {192000.0, 41.2}}) {
+    const double rate = probe.first, want = probe.second;
+    auto string = std::make_unique<sonore::KarplusStrong<>>();
+    string->setSampleRate((float) rate);
+    string->setDecay(4.0f);
+    string->setDamping(0.0f);
+    string->noteOn((float) want, 1.0f);
+    std::vector<float> out((size_t) (rate * 1.5));
+    for (auto& v : out) v = string->render();
+    std::vector<float> body(out.begin() + (size_t) (rate * 0.25), out.end());
+    double bestHz = 0.0, bestMag = 0.0;
+    for (double hz = want * 0.75; hz <= want * 1.6; hz += want * 0.002) {
+      const double m = magnitudeAt(body, hz, rate);
+      if (m > bestMag) { bestMag = m; bestHz = hz; }
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "a string plucked at %.1f Hz at %.0f kHz sounds at it "
+                  "(reads %.2f Hz)", want, rate / 1000.0, bestHz);
+    checkNear(bestHz, want, want * 0.01, line);
+  }
+  {
+    // A shorter line says where its floor is instead of pinning in silence.
+    sonore::KarplusStrong<4096> shortLine;
+    shortLine.setSampleRate(192000.0f);
+    sonore::KarplusStrong<4096> atBase;
+    atBase.setSampleRate(48000.0f);
+    check(std::fabs(shortLine.lowestHz() - 192000.0f / 4088.0f) < 0.01f && atBase.lowestHz() == 20.0f,
+          "a string reports the lowest note its line holds: 47 Hz for 4096 samples at 192 kHz, 20 Hz at 48 kHz");
   }
 
   // ── Modal ──
@@ -21777,6 +31803,25 @@ static void testSynthesis() {
       if (i > 200 && std::fabs(v) > peak * 0.001f) samples = i;
     }
     checkNear(samples / sr, 0.5, 0.1, "a mode's -60 dB time is its declared decay");
+
+    // A mode set high at one rate stays inside the next. It was clamped once,
+    // when set, so a 30 kHz mode set at 96 kHz rang at 14.1 kHz after a move
+    // to 44.1 -- its angle past pi, folded down.
+    sonore::ModalResonator<8> high;
+    high.setSampleRate(96000.0f);
+    high.setNumModes(1);
+    high.setMode(0, 30000.0f, 0.2f, 1.0f);
+    high.setSampleRate(44100.0f);
+    std::vector<float> ring(8820);
+    for (size_t i = 0; i < ring.size(); ++i) ring[i] = high.process(i == 0 ? 1.0f : 0.0f);
+    const double atFold = magnitudeAt(ring, 14100.0, 44100.0);
+    const double atEdge = magnitudeAt(ring, 0.49 * 44100.0, 44100.0);
+    char ml[200];
+    std::snprintf(ml, sizeof(ml),
+                  "a 30 kHz mode moved from 96 to 44.1 kHz rings at the top of the band, not "
+                  "folded to 14.1 kHz (%.3g there, %.3g at the fold)",
+                  atEdge, atFold);
+    check(atEdge > atFold * 10.0, ml);
   }
 }
 
@@ -21817,8 +31862,63 @@ static void testToneControls() {
     check(std::fabs(mid) < 1.5, "…and gentle enough to be near zero at 1 kHz");
     checkNear(hi, 6.0, 1.0, "treble +6 is +6 at 15 kHz");
     check(std::fabs(mid2) < 1.5, "…and near zero at 1 kHz");
+
+    // The knob reads the same at every rate. The pot was placed on the
+    // ANALOGUE response, and the bilinear transform squeezes the top octave
+    // toward Nyquist -- so +10 dB of treble read 10.98 at 15 kHz at 44.1k and
+    // 10.05 at 192k. Placed on the digital response, it reads what it says.
+    std::string readings;
+    double worst = 0.0;
+    for (double rate : {44100.0, 48000.0, 96000.0, 192000.0}) {
+      sonore::Baxandall t;
+      t.setSampleRate((float) rate);
+      t.setTreble(10.0f);
+      t.reset();
+      std::vector<float> out;
+      const int n = (int) (rate * 0.5);
+      for (int i = 0; i < n; ++i) {
+        const float y = t.process((float) std::sin(2.0 * kTestPi * 15000.0 * i / rate));
+        if (i >= n / 2) out.push_back(y);
+      }
+      const double db = 20.0 * std::log10(magnitudeAt(out, 15000.0, rate));
+      worst = std::max(worst, std::fabs(db - 10.0));
+      char one[32];
+      std::snprintf(one, sizeof(one), "%.2f ", db);
+      readings += one;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "treble +10 reads +10 at 15 kHz at 44.1, 48, 96 and 192 kHz "
+                  "(%s)", readings.c_str());
+    check(worst < 0.1, line);
   }
 }
+
+// COMPILE-TIME REGRESSION GUARD -- this block is the test; it never runs.
+//
+// Every generator in random.h must be usable as a DSP MEMBER, which means the
+// enclosing aggregate has to survive `{}`. The wrappers write `SonoreDsp dsp{}`
+// (clap_wrapper.h) and `static SonoreDsp x{}` (wasm_abi.h), and value-init
+// copy-initialises each member from `{}` -- which an `explicit` default ctor
+// makes ill-formed. These all had one, so any plugin holding noise or dither
+// compiled under GCC and failed under clang: built on Linux, FAILED ON MACOS,
+// and one shipped to the marketplace Linux-only before anyone noticed.
+//
+// If someone re-adds `explicit` to a default-constructible generator, this stops
+// compiling here instead of in a farm build for a plugin that has already sold.
+namespace sonore_aggregate_init_guard {
+struct AllGenerators {
+  sonore::Random random;
+  sonore::WhiteNoise white;
+  sonore::PinkNoise pink;
+  sonore::Dither dither;
+  sonore::VelvetNoise velvet;
+};
+[[maybe_unused]] static AllGenerators probe{};   // the whole point: braces
+// …and `explicit` must still do its job on the SEEDED constructor, or the fix
+// traded one bug for a silent integer-to-Random conversion.
+static_assert(!std::is_convertible<uint64_t, sonore::Random>::value,
+              "Random(seed) must stay explicit -- a bare integer is not a generator");
+}  // namespace sonore_aggregate_init_guard
 
 static void testVelvetNoise() {
   std::printf("velvet noise\n");
@@ -21960,6 +32060,43 @@ static void testStereoDelay() {
     check(leak < 1e-4, "...and with the feedback off nothing else comes out");
   }
 
+  // ── A time set before prepare() is the time after it ──
+  //
+  // The usual order -- parameters from the host's state, then prepare() at
+  // the session's rate. prepare() re-derives the time in samples for the new
+  // rate, and with a crossfade still running from the first setting that new
+  // time was QUEUED; prepare() then reset(), and reset() threw the queue
+  // away. 100 ms at 96 kHz came out after 4800 samples: the 48 kHz number.
+  {
+    auto delay = std::make_unique<Delay>();
+    delay->setParameters(wetOnly);
+    sonore::ProcessSpec fast;
+    fast.sampleRate = 96000.0;
+    fast.numChannels = 2;
+    delay->prepare(fast);
+    int at = -1;
+    for (int i = 0; i < 20000; ++i) {
+      float a = i == 0 ? 1.0f : 0.0f, b = a;
+      delay->process(a, b);
+      if (at < 0 && std::fabs(a) > 0.5f) at = i;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "100 ms set before a 96 kHz prepare comes out 9600 samples "
+                  "later (%d; the delay reports %.0f)", at, delay->delaySamples(0));
+    check(at == 9600 && std::fabs(delay->delaySamples(0) - 9600.0f) < 0.5f, line);
+
+    // The same queue, emptied by a plain reset().
+    Delay::Parameters longer = wetOnly;
+    longer.timeMs = 200.0f;
+    delay->setParameters(longer); // starts a fade towards 200 ms
+    longer.timeMs = 300.0f;
+    delay->setParameters(longer); // queued behind it
+    delay->reset();
+    std::snprintf(line, sizeof(line), "a time queued behind a fade survives reset() (%.0f samples)",
+                  delay->delaySamples(0));
+    check(std::fabs(delay->delaySamples(0) - 28800.0f) < 0.5f, line);
+  }
+
   // ── Feedback decays by the feedback, and the reported tail covers it ──
   {
     Delay::Parameters p = wetOnly;
@@ -22056,6 +32193,38 @@ static void testStereoDelay() {
     check(err < 1e-3, "...and lands on the new time exactly");
   }
 
+  // ── The mode switched while the head is moving ──
+  //
+  // Switched to Glide 25 ms into a crossfade, the glide read only the new
+  // head and the old one -- still half the output -- went in one sample: 50
+  // times the tone's largest step. The fade now lands first. The other way
+  // round (Crossfade mid-glide) fades from where the glide had got to. Both
+  // must end on the last time asked for, exactly.
+  {
+    double worst = 0.0, err = 0.0;
+    for (int way = 0; way < 2; ++way) {
+      configure(wetOnly, way == 0 ? Delay::TimeChange::Crossfade : Delay::TimeChange::Glide);
+      const int n = 48000 * 2;
+      std::vector<float> in = r2Sine(150.0, 0.3, n, sr), out((size_t) n);
+      Delay::Parameters p = wetOnly;
+      for (int i = 0; i < n; ++i) {
+        if (i == 24000) { p.timeMs = 237.0f; g_r2Delay.setParameters(p); }
+        if (i == 25200) g_r2Delay.setTimeChange(way == 0 ? Delay::TimeChange::Glide : Delay::TimeChange::Crossfade);
+        if (i == 25300) { p.timeMs = 180.0f; g_r2Delay.setParameters(p); }
+        float a = in[(size_t) i], b = a;
+        g_r2Delay.process(a, b);
+        out[(size_t) i] = a;
+      }
+      const double natural = r2MaxStep(r2Slice(out, 6000, 18000));
+      worst = std::max(worst, r2MaxStep(r2Slice(out, 25190, 600)) / natural);
+      for (int i = n - 4800; i < n; ++i) err = std::max(err, (double) std::fabs(out[(size_t) i] - in[(size_t) (i - 8640)]));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "the time-change mode switched mid-move never clicks (x%.2f the natural step) "
+                  "and lands on the last time (error %.1e)", worst, err);
+    check(worst < 1.5 && err < 1e-3, line);
+  }
+
   // ── Tempo sync ──
   {
     configure(wetOnly, Delay::TimeChange::Crossfade);
@@ -22083,6 +32252,38 @@ static void testTape() {
     for (size_t i = 0; i < in.size(); ++i) out[i] = ja.process(in[i]);
     const double gain = r2ToneDb(r2Slice(out, 4800, 4800), 1000.0, os, 0.01);
     checkNear(gain, 0.0, 0.5, "a small signal comes out at unity (normalised by the initial susceptibility)");
+
+    // A full-scale tone is never much louder than it went in, at any width
+    // or hysteresis. Normalised by the small-signal slope alone, the
+    // irreversible end came out +34 dB (a peak of 43) at hysteresis 1.
+    {
+      double loudest = -100.0;
+      std::vector<float> tone = r2Sine(440.0, 1.0, 48000, os), y(tone.size());
+      for (float w : {0.0f, 0.55f, 1.0f})
+        for (float hy : {0.0f, 0.3f, 0.6f, 0.9f, 1.0f}) {
+          sonore::JilesAtherton j;
+          j.setWidth(w);
+          j.setHysteresis(hy);
+          j.reset();
+          for (size_t i = 0; i < tone.size(); ++i) y[i] = j.process(tone[i]);
+          loudest = std::max(loudest, r2ToneDb(r2Slice(y, 24000, 24000), 440.0, os, 1.0));
+        }
+      char l[160];
+      std::snprintf(l, sizeof(l), "a full-scale tone through the loop is never above +3 dB, at any width or hysteresis (%+.1f dB)", loudest);
+      check(loudest < 3.0, l);
+      sonore::TapeSaturator tape;
+      tape.setSampleRate(48000.0f);
+      sonore::TapeSaturator::Parameters q;
+      q.eq = sonore::TapeEq::Off;
+      q.hysteresis = 1.0f;
+      tape.setParameters(q);
+      tape.reset();
+      std::vector<float> t48 = r2Sine(1000.0, 1.0, 48000, 48000.0), y48(t48.size());
+      for (size_t i = 0; i < t48.size(); ++i) y48[i] = tape.process(t48[i]);
+      const double machine = r2ToneDb(r2Slice(y48, 24000, 24000), 1000.0, 48000.0, 1.0);
+      std::snprintf(l, sizeof(l), "...and through the machine at hysteresis 1 (%+.1f dB)", machine);
+      check(machine < 3.0, l);
+    }
 
     // Hysteresis: the output at x = 0.5 differs between the rising and the
     // falling branch, and the difference shrinks with the hysteresis control.
@@ -22195,6 +32396,38 @@ static void testTape() {
     checkNear(l75_5k, l15_10k, 0.5, "...from 7.5 to 15 ips as well");
     check(l75_10k < l30_10k - 4.0, "7.5 ips is dull by 10 kHz where 30 ips is not");
 
+    // setParameters is what a plugin calls every block. It redesigned the
+    // head-loss FIR on every call -- 65 taps against a 128-point magnitude
+    // grid, tens of thousands of transcendentals -- though only a speed or
+    // head-geometry change moves it. Drive and wow are knobs; they must cost
+    // what knobs cost.
+    //
+    // Measured against the changes that DO redesign it, with relativeCost:
+    // 5 ms of wall time for 200 calls was a bound a loaded machine could
+    // reach with nothing wrong, and only a few times below the bug.
+    {
+      sonore::TapeSaturator::Parameters knob = p, head = p;
+      int turned = 0, moved = 0;
+      auto drive = [&] {
+        for (int k = 0; k < 200; ++k) {
+          knob.driveDb = -24.0f + (float) (turned++ % 7);
+          tape.setParameters(knob);
+        }
+      };
+      auto speed = [&] {
+        for (int k = 0; k < 200; ++k) {
+          head.speedIps = 7.5f + (float) (moved++ % 7);
+          tape.setParameters(head);
+        }
+      };
+      const double ratio = relativeCost(drive, speed, 0.2);
+      char line[200];
+      std::snprintf(line, sizeof(line), "200 drive changes cost %.3f of 200 speed changes: the head "
+                    "FIR is only redesigned when speed or geometry move", ratio);
+      check(ratio < 0.2, line);
+      tape.setParameters(p);
+    }
+
     // Wow spreads a tone off its frequency (wideband FM), and reset() is a reset.
     tape.setParameters(p);
     tape.reset();
@@ -22224,6 +32457,194 @@ static void testTape() {
     for (int i = 0; i < 2000; ++i) residue = std::max(residue, (double) std::fabs(tape.process(0.0f)));
     check(residue == 0.0, "reset() empties the loop, the FIR and the transport: silence in is exactly silence out");
   }
+
+  // A tone cut off mid-cycle. The loop keeps its remanence -- that is what a
+  // hysteresis loop is -- and NAB playback has +20 dB at DC, so the output
+  // sat at -0.92 for good. A playback head reads flux changing, not standing.
+  {
+    const double sr = 48000.0;
+    sonore::TapeSaturator tape;
+    tape.setSampleRate((float) sr);
+    tape.setParameters(sonore::TapeSaturator::Parameters{});
+    tape.reset();
+    std::vector<float> y((size_t) (2.0 * sr));
+    for (size_t i = 0; i < y.size(); ++i) {
+      const double t = (double) i / sr;
+      const double x = t < 0.5025 ? 0.5 * std::sin(2.0 * kTestPi * 100.0 * t) : 0.0;
+      y[i] = tape.process((float) x);
+    }
+    double dc = 0.0;
+    for (size_t i = (size_t) (1.5 * sr); i < y.size(); ++i) dc += y[i];
+    dc /= (double) (y.size() - (size_t) (1.5 * sr));
+    char l[160];
+    std::snprintf(l, sizeof(l), "a tone stopped at its peak leaves no DC on the output (%+.5f)", dc);
+    check(std::fabs(dc) < 1e-3, l);
+
+    // ...and the bottom octaves are left alone doing it.
+    auto level = [&](double hz) {
+      tape.reset();
+      std::vector<float> in = r2Sine(hz, 0.01, (int) (2.0 * sr), sr), out(in.size());
+      for (size_t i = 0; i < in.size(); ++i) out[i] = tape.process(in[i]);
+      return r2ToneDb(r2Slice(out, (size_t) sr, (size_t) sr), hz, sr, 0.01);
+    };
+    const double at40 = level(40.0), at400 = level(400.0);
+    std::snprintf(l, sizeof(l), "...while 40 Hz comes out level with 400 Hz (%+.2f vs %+.2f dB)", at40, at400);
+    check(std::fabs(at40 - at400) < 0.3, l);
+  }
+
+  // The hysteresis knob turned mid-tone. The output gain is 1/(initial
+  // susceptibility), which moves sixfold between 0.3 and 0.9; landed at once
+  // it met the magnetisation the old loop left, and a 0.3 sine came out at
+  // 2.1 for the next few milliseconds.
+  {
+    const double sr = 48000.0;
+    sonore::TapeSaturator tape;
+    tape.setSampleRate((float) sr);
+    sonore::TapeSaturator::Parameters q;
+    q.driveDb = -12.0f;
+    q.eq = sonore::TapeEq::Off;
+    q.hysteresis = 0.3f;
+    tape.setParameters(q);
+    tape.reset();
+    const int change = 24000 + 60;
+    double before = 0.0, just = 0.0, after = 0.0;
+    for (int i = 0; i < 72000; ++i) {
+      if (i == change) {
+        q.hysteresis = 0.9f;
+        tape.setParameters(q);
+      }
+      const double a = std::fabs(tape.process(0.3f * (float) std::sin(2.0 * kTestPi * 200.0 * i / sr)));
+      if (i > 12000 && i < change) before = std::max(before, a);
+      if (i >= change && i < change + 4800) just = std::max(just, a);
+      if (i > 60000) after = std::max(after, a);
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "turning hysteresis 0.3 -> 0.9 mid-tone glides there (peak %.3f before, %.3f in the "
+                  "first 100 ms, %.3f settled)", before, just, after);
+    check(just < 1.2 * std::max(before, after), l);
+  }
+
+  // Knobs that move a delay or a gain, turned mid-tone: the largest step the
+  // output takes at the change, against the largest it takes on its own (a
+  // 200 Hz sine at 0.5 steps 0.013 at most). A delay that jumps is a click:
+  // chorus depth 6 -> 12 ms stepped 33x, a flanger's depth 6x, tape wow 35x.
+  {
+    const double sr = 48000.0;
+    sonore::ProcessSpec spec{};
+    spec.sampleRate = sr;
+    spec.maximumBlockSize = 256;
+    spec.numChannels = 2;
+    auto worstRatio = [&](auto&& process, auto&& turn) {
+      double natural = 0.0, atChange = 0.0;
+      float prev = 0.0f;
+      for (int i = 0; i < 48000; ++i) {
+        if (i == 24000) turn();
+        const float y = process(0.5f * (float) std::sin(2.0 * kTestPi * 200.0 * i / sr));
+        const double step = std::fabs(y - prev);
+        prev = y;
+        if (i > 4000 && i < 24000) natural = std::max(natural, step);
+        if (i >= 24000 && i < 24300) atChange = std::max(atChange, step);
+      }
+      return natural > 0.0 ? atChange / natural : 1e9;
+    };
+    auto chorus = std::make_unique<sonore::Chorus>();
+    chorus->prepare(spec);
+    chorus->setMix(1.0f);
+    chorus->setRate(0.2f);
+    const double chorusRatio = worstRatio(
+        [&](float x) { float l = x, r = x; chorus->process(l, r); return l; },
+        [&] { chorus->setDepth(12.0f); });
+    auto flanger = std::make_unique<sonore::Flanger>();
+    flanger->prepare(spec);
+    flanger->setMix(1.0f);
+    flanger->setFeedback(0.0f);
+    flanger->setRate(0.2f);
+    flanger->setDepth(2.0f);
+    const double flangerRatio = worstRatio(
+        [&](float x) { float l = x, r = x; flanger->process(l, r); return l; },
+        [&] { flanger->setDepth(6.0f); });
+    auto tape = std::make_unique<sonore::TapeSaturator>();
+    tape->setSampleRate((float) sr);
+    sonore::TapeSaturator::Parameters q;
+    q.driveDb = -12.0f;
+    tape->setParameters(q);
+    tape->reset();
+    const double wowRatio = worstRatio([&](float x) { return tape->process(0.6f * x); },
+                                       [&] { q.wow = 0.5f; tape->setParameters(q); });
+    const double makeupRatio = worstRatio([&](float x) { return tape->process(0.6f * x); },
+                                          [&] { q.makeupDb = 6.0f; tape->setParameters(q); });
+    char l[220];
+    std::snprintf(l, sizeof(l),
+                  "chorus depth, flanger depth, tape wow and makeup glide when turned (largest step at "
+                  "the change x%.2f, x%.2f, x%.2f, x%.2f the natural one)",
+                  chorusRatio, flangerRatio, wowRatio, makeupRatio);
+    check(chorusRatio < 1.5 && flangerRatio < 1.5 && wowRatio < 1.5 && makeupRatio < 1.5, l);
+  }
+
+  // The record pre-emphasis as built, against the standard's curve. The
+  // bilinear design, prewarped at the 3.2 kHz corner, squeezed the curve
+  // above it towards Nyquist: NAB 15 ips was +4.9 dB hot at 20 kHz in a
+  // 44.1 kHz session, so the same tape hit the loop harder there.
+  {
+    double worst = 0.0;
+    for (double sr : {44100.0, 48000.0, 96000.0}) {
+      auto tape = std::make_unique<sonore::TapeSaturator>();
+      tape->setSampleRate((float) sr);
+      tape->setParameters(sonore::TapeSaturator::Parameters{});
+      for (float hz : {1000.0f, 5000.0f, 10000.0f, 15000.0f, 20000.0f})
+        worst = std::max(worst, (double) std::fabs(tape->recordEmphasisBuiltDb(hz) - tape->recordEmphasisDb(hz)));
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "the record pre-emphasis follows NAB to 20 kHz at 44.1, 48 and 96 kHz (worst %.2f dB off)", worst);
+    check(worst < 0.6, l);
+
+    // What that does to the sound: how much a hot 12 kHz tone compresses
+    // was 3.4 dB at 44.1 kHz and 2.2 at 192 -- the same tape, two machines.
+    auto squeeze = [](double rate) {
+      double gain[2];
+      for (int k = 0; k < 2; ++k) {
+        auto tape = std::make_unique<sonore::TapeSaturator>();
+        tape->setSampleRate((float) rate);
+        sonore::TapeSaturator::Parameters q;
+        q.driveDb = k ? 0.0f : -30.0f;
+        tape->setParameters(q);
+        tape->reset();
+        std::vector<float> in = r2Sine(12000.0, 0.5, (int) rate, rate), out(in.size());
+        for (size_t i = 0; i < in.size(); ++i) out[i] = tape->process(in[i]);
+        gain[k] = r2ToneDb(r2Slice(out, (size_t) (rate / 2), (size_t) (rate / 2)), 12000.0, rate, 0.5);
+      }
+      return gain[0] - gain[1];
+    };
+    const double at44 = squeeze(44100.0), at192 = squeeze(192000.0);
+    std::snprintf(l, sizeof(l), "...so a hot 12 kHz tone compresses alike at 44.1 and 192 kHz (%.2f vs %.2f dB)", at44, at192);
+    check(std::fabs(at44 - at192) < 0.4, l);
+  }
+
+  // The head loss at 192 kHz against its closed form. 65 taps resolve the
+  // curve to sr/65 -- 3 kHz there -- and it came out a decibel short from
+  // 1 to 10 kHz: the same tape brighter at the higher rate.
+  {
+    const double sr = 192000.0;
+    double worst = 0.0;
+    for (double hz : {3000.0, 5000.0, 10000.0}) {
+      auto tape = std::make_unique<sonore::TapeSaturator>();
+      tape->setSampleRate((float) sr);
+      sonore::TapeSaturator::Parameters q;
+      q.eq = sonore::TapeEq::Off;
+      q.driveDb = -24.0f;
+      q.speedIps = 7.5f;
+      tape->setParameters(q);
+      tape->reset();
+      std::vector<float> in = r2Sine(hz, 0.05, (int) sr, sr), out(in.size());
+      for (size_t i = 0; i < in.size(); ++i) out[i] = tape->process(in[i]);
+      const double got = r2ToneDb(r2Slice(out, (size_t) (sr / 2), (size_t) (sr / 2)), hz, sr, 0.05);
+      worst = std::max(worst, std::fabs(got - (double) tape->headLossDb((float) hz)));
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "at 192 kHz the head loss matches its closed form from 3 to 10 kHz (worst %.2f dB off)", worst);
+    check(worst < 0.3, l);
+  }
 }
 
 // ── Tube stage and tone stack ─────────────────────────────────────────────────
@@ -22231,6 +32652,52 @@ static void testTape() {
 static void testTube() {
   std::printf("triode stage + Bassman tone stack\n");
   const double sr = 48000.0;
+
+  // One NaN or Inf sample must not crash the stage, and settings at the edge
+  // of the controls must not make it ring or blow up. (int) NaN indexed the
+  // plate table at INT_MIN; a cathode resistor of 0 divided by zero; a 0.5 nF
+  // coupling cap with a 10 kOhm leak made the forward-Euler update diverge at
+  // 48 kHz, and a 0.01 uF bypass rang at Nyquist.
+  {
+    auto runs = [&](sonore::TubeStage& t, bool poison) {
+      double peak = 0.0;
+      bool finite = true;
+      for (int n = 0; n < 48000; ++n) {
+        float x = 0.1f * (float) std::sin(2.0 * kTestPi * 220.0 * n / sr);
+        if (poison && n == 1000) x = std::numeric_limits<float>::quiet_NaN();
+        if (poison && n == 2000) x = std::numeric_limits<float>::infinity();
+        const float y = t.process(x);
+        if (n > 4000) {
+          finite = finite && std::isfinite(y);
+          peak = std::max(peak, (double) std::fabs(y));
+        }
+      }
+      return finite && peak < 10.0;
+    };
+    auto fresh = [&]() {
+      auto t = std::make_unique<sonore::TubeStage>();
+      t->setSampleRate((float) sr);
+      return t;
+    };
+    auto poisoned = fresh();
+    auto noCathode = fresh();
+    noCathode->setCircuit(300.0f, 100.0f, 0.0f);
+    auto tinyCoupling = fresh();
+    tinyCoupling->setCoupling(0.5f, 0.01f, 5.0f);
+    auto tinyBypass = fresh();
+    tinyBypass->setCathodeBypass(0.01f);
+    check(runs(*poisoned, true), "a NaN and an Inf sample pass through a tube stage, which recovers");
+    check(runs(*noCathode, false) && runs(*tinyCoupling, false) && runs(*tinyBypass, false),
+          "and no cathode resistor, a 0.5 nF coupling cap or a 0.01 uF bypass keeps it finite");
+
+    sonore::ToneStack stack;
+    stack.setSampleRate((float) sr);
+    stack.process(std::numeric_limits<float>::infinity());
+    float after = 0.0f;
+    for (int n = 0; n < 4800; ++n) after = stack.process(0.25f);
+    check(std::isfinite(after) && std::fabs(after) < 10.0f,
+          "a tone stack recovers from an infinite sample instead of holding it");
+  }
 
   {
     sonore::TubeStage st;
@@ -22344,15 +32811,124 @@ static void testTube() {
     std::printf("  ---- the bass knob's reach at 100 Hz: %.1f dB with treble at 0, %.1f dB with treble at 1 ----\n", liftTrebleLow, liftTrebleHigh);
     check(std::fabs(liftTrebleLow - liftTrebleHigh) > 0.5, "the knobs interact as the network's do: the bass knob's reach depends on the treble");
   }
+
+  // Reported, not asserted: what the analog models cost, for comparison
+  // across builds. Best of three seconds of a driven 220 Hz tone each, with
+  // an output checksum so a speed-up that changed the sound would show.
+  {
+    auto report = [&](const char* what, auto&& make) {
+      double best = 1e9, checksum = 0.0;
+      float sink = 0.0f;
+      for (int round = 0; round < 3; ++round) {
+        auto model = make();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 48000; ++i)
+          sink += model->process((float) (0.3 * std::sin(2.0 * kTestPi * 220.0 * (double) i / sr)));
+        best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      }
+      auto model = make();
+      for (int i = 0; i < 4800; ++i)
+        checksum += (double) model->process((float) (0.3 * std::sin(2.0 * kTestPi * 220.0 * (double) i / sr))) *
+                    (double) (1 + i % 97);
+      std::printf("  ---- %s: %.1fx realtime, output checksum %.9f%s ----\n", what, 1.0 / best, checksum,
+                  sink == 12345.0f ? " " : "");
+    };
+    report("triode, bypassed cathode", [&] {
+      auto t = std::make_unique<sonore::TubeStage>();
+      t->setSampleRate((float) sr);
+      t->setCathodeBypass(25.0f);
+      t->reset();
+      return t;
+    });
+    report("triode, unbypassed cathode", [&] {
+      auto t = std::make_unique<sonore::TubeStage>();
+      t->setSampleRate((float) sr);
+      t->setCathodeBypass(0.0f);
+      t->reset();
+      return t;
+    });
+    report("tape, RK4", [&] {
+      auto t = std::make_unique<sonore::TapeSaturator>();
+      t->setSampleRate((float) sr);
+      sonore::TapeSaturator::Parameters p;
+      t->setParameters(p);
+      t->reset();
+      return t;
+    });
+    report("tape, Newton (accurate)", [&] {
+      auto t = std::make_unique<sonore::TapeSaturator>();
+      t->setSampleRate((float) sr);
+      sonore::TapeSaturator::Parameters p;
+      p.accurate = true;
+      t->setParameters(p);
+      t->reset();
+      return t;
+    });
+  }
 }
 
 // ── Multiband crossover ───────────────────────────────────────────────────────
+
+// The diode ladder at full resonance with saturation on: documented to self-
+// oscillate, but K = 17 is exactly the threshold, where a ring neither grows
+// nor decays -- a 0.001 impulse rang at 4.7e-6 for ever.
+static void testDiodeLadderOscillates() {
+  std::printf("\n[diode ladder]\n");
+  sonore::DiodeLadder f;
+  f.setSampleRate(48000.0f);
+  f.setCutoff(1000.0f);
+  f.setSaturation(1.0f);
+  f.setResonance(1.0f);
+  f.reset();
+  double late = 0.0;
+  bool finite = true;
+  for (int n = 0; n < 4 * 48000; ++n) {
+    const float y = f.process(n == 0 ? 0.001f : 0.0f);
+    finite = finite && std::isfinite(y);
+    if (n > 3 * 48000) late = std::max(late, (double) std::fabs(y));
+  }
+  char l[160];
+  std::snprintf(l, sizeof(l), "a saturated diode ladder at full resonance self-oscillates, bounded (peak %.3g after 3 s)", late);
+  check(finite && late > 0.01 && late < 4.0, l);
+}
 
 static void testMultibandSplitter() {
   std::printf("multiband splitter\n");
   const double sr = 48000.0;
   const int n = 48000;
   const double probes[] = {20, 50, 100, 150, 300, 600, 800, 1000, 2000, 4000, 8000, 16000, 20000};
+
+  // ── A visit to a low rate leaves the crossovers where they were set ──
+  //
+  // setCrossover() kept the frequency CLAMPED to the rate, and setSampleRate()
+  // designed again from what was kept: the default 8 kHz top split, seen at
+  // 11.025 kHz (0.45 of it is 4961 Hz), came back to 48 kHz at 4961 Hz.
+  {
+    sonore::MultibandSplitter<3> stayed, visited;
+    stayed.setSampleRate((float) sr);
+    visited.setSampleRate(11025.0f);
+    visited.setSampleRate((float) sr);
+    bool same = true;
+    double worst = 0.0;
+    uint32_t noise = 12345u;
+    for (int i = 0; i < 4800; ++i) {
+      noise = noise * 1664525u + 1013904223u;
+      const float x = (float) ((double) (noise >> 8) / 8388608.0 - 1.0) * 0.5f;
+      float a[3], b[3];
+      stayed.process(x, a);
+      visited.process(x, b);
+      for (int k = 0; k < 3; ++k) {
+        if (a[k] != b[k]) same = false;
+        worst = std::max(worst, (double) std::fabs(a[k] - b[k]));
+      }
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a splitter that visited 11.025 kHz splits at 48 kHz as one that never left "
+                  "(largest band difference %.6f)",
+                  worst);
+    check(same, line);
+  }
 
   // ── Eight bands an octave apart sum flat ──
   {
@@ -22435,6 +33011,604 @@ static void testMultibandSplitter() {
     levels(12000.0, low, high);
     check(high > low + 30.0, "...and 12 kHz in the top, 30 dB clear of the bottom");
   }
+
+  // ── Compensation is one allpass, not a crossover run and summed ──
+  //
+  // An LR4's low plus high is exactly a second-order allpass at Q = 1/sqrt(2)
+  // (the bilinear transform keeps the identity: every section shares one
+  // prewarp). Each compensation stage ran a whole crossover -- four biquads --
+  // and added its halves. The bands must come out the same, sample for
+  // sample, as the crossover-and-sum reference built here, and cost less:
+  // eight bands carry 21 compensation stages.
+  {
+    sonore::MultibandSplitter<8> mb;
+    mb.setSampleRate((float) sr);
+    for (int k = 0; k < 7; ++k) mb.setCrossover(k, 80.0f * (float) (1 << k));
+    mb.reset();
+    sonore::LinkwitzRiley split[7], comp[7][7];
+    for (int k = 0; k < 7; ++k) {
+      split[k].setSampleRate((float) sr);
+      split[k].setCrossover(80.0f * (float) (1 << k));
+      split[k].reset();
+      for (int j = 0; j < 7; ++j) {
+        comp[k][j].setSampleRate((float) sr);
+        comp[k][j].setCrossover(80.0f * (float) (1 << k));
+        comp[k][j].reset();
+      }
+    }
+    sonore::WhiteNoise noise(17);
+    double worst = 0.0;
+    for (int i = 0; i < 48000; ++i) {
+      const float x = noise.next();
+      float got[8], want[8];
+      mb.process(x, got);
+      float rest = x;
+      for (int k = 0; k < 7; ++k) {
+        float l, h;
+        split[k].process(rest, l, h);
+        want[k] = l;
+        rest = h;
+        for (int j = 0; j < k; ++j) {
+          float cl, ch;
+          comp[k][j].process(want[j], cl, ch);
+          want[j] = cl + ch;
+        }
+      }
+      want[7] = rest;
+      for (int b = 0; b < 8; ++b) worst = std::max(worst, (double) std::fabs(got[b] - want[b]));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "an allpass compensates exactly what a crossover run and "
+                  "summed did (worst difference %.2e over a second of noise)", worst);
+    check(worst < 1e-4, line);
+
+    // Cost, relative, measured by relativeCost() so a busy machine cannot
+    // decide it.
+    float sink = 0.0f;
+    auto oursBody = ([&] {
+      float bands[8];
+      for (int i = 0; i < 200000; ++i) {
+        mb.process((float) (i & 255) * 0.001f, bands);
+        sink += bands[0];
+      }
+    });
+    auto referenceBody = ([&] {
+      float bands[8];
+      for (int i = 0; i < 200000; ++i) {
+        float rest = (float) (i & 255) * 0.001f;
+        for (int k = 0; k < 7; ++k) {
+          float l, h;
+          split[k].process(rest, l, h);
+          bands[k] = l;
+          rest = h;
+          for (int j = 0; j < k; ++j) {
+            float cl, ch;
+            comp[k][j].process(bands[j], cl, ch);
+            bands[j] = cl + ch;
+          }
+        }
+        sink += bands[0];
+      }
+    });
+    const double ratio = relativeCost(oursBody, referenceBody, 0.7);
+    std::snprintf(line, sizeof(line), "...for %.2fx the work of the crossover-and-sum version "
+                  "(eight bands)", ratio);
+    check(ratio < 0.7, line);
+    if (sink == 12345.0f) std::printf(" ");
+  }
+  // A low crossover at a high rate. Float sections lost the corner's digits:
+  // a 40 Hz Linkwitz-Riley at 192 kHz summed to -1.13 dB at 20 Hz and a 20 Hz
+  // one to +0.95, where the promise is +-0.15 dB.
+  {
+    double worst = 0.0;
+    for (float corner : {20.0f, 40.0f, 80.0f}) {
+      sonore::LinkwitzRiley lr;
+      lr.setSampleRate(192000.0f);
+      lr.setCrossover(corner);
+      for (double hz : {0.5 * corner, (double) corner, 2.0 * corner}) {
+        lr.reset();
+        std::vector<float> sum((size_t) (4.0 * 192000.0));
+        for (size_t n = 0; n < sum.size(); ++n) {
+          float low = 0.0f, high = 0.0f;
+          lr.process((float) (0.5 * std::sin(2.0 * kTestPi * hz * (double) n / 192000.0)), low, high);
+          sum[n] = low + high;
+        }
+        const double db = r2ToneDb(r2Slice(sum, (size_t) (2.0 * 192000.0), (size_t) (2.0 * 192000.0)), hz, 192000.0, 0.5);
+        worst = std::max(worst, std::fabs(db));
+      }
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "20, 40 and 80 Hz Linkwitz-Riley crossovers sum flat at 192 kHz (worst %.3f dB)", worst);
+    check(worst < 0.15, l);
+  }
+
+  // A limiter's look-ahead applied every block at the value it already has,
+  // as a plugin applies its parameters, changes nothing. It cleared the
+  // limiter each time: 95% of a 64-sample block came out silent.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = 44100.0;
+    spec.maximumBlockSize = 64;
+    spec.numChannels = 2;
+    auto once = std::make_unique<sonore::Limiter<>>();
+    auto every = std::make_unique<sonore::Limiter<>>();
+    auto tpOnce = std::make_unique<sonore::TruePeakLimiter>();
+    auto tpEvery = std::make_unique<sonore::TruePeakLimiter>();
+    for (auto* l : {once.get(), every.get()}) {
+      l->prepare(spec);
+      l->setCeiling(-1.0f);
+      l->setLookahead(3.0f);
+    }
+    for (auto* l : {tpOnce.get(), tpEvery.get()}) {
+      l->prepare(spec);
+      l->setCeiling(-1.0f);
+      l->setLookahead(3.0f);
+    }
+    int differ = 0, tpDiffer = 0;
+    for (int n = 0; n < 44100; ++n) {
+      if (n % 64 == 0) {
+        every->setLookahead(3.0f);
+        tpEvery->setLookahead(3.0f);
+      }
+      const float x = 0.3f * (float) std::sin(2.0 * kTestPi * 220.0 * n / 44100.0);
+      float a = x, b = x, c = x, d = x, e = x, f = x, g = x, h = x;
+      once->process(a, b);
+      every->process(c, d);
+      tpOnce->process(e, f);
+      tpEvery->process(g, h);
+      if (a != c) ++differ;
+      if (e != g) ++tpDiffer;
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a limiter's look-ahead re-applied every 64 samples at the same value changes nothing "
+                  "(%d and %d of 44100 samples differ)", differ, tpDiffer);
+    check(differ == 0 && tpDiffer == 0, l);
+  }
+
+  // Parameters set after prepare() -- the plugin flow -- are settings, not
+  // movements: the render is the one with them set before. A chorus bent its
+  // pitch 124 cents for 400 ms on the way from the defaults, a flanger 254,
+  // a glide-mode delay slid its first echo from 375 ms, and tape's drive
+  // glided in 4 to 6 dB hot.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = 48000.0;
+    spec.maximumBlockSize = 512;
+    spec.numChannels = 2;
+    auto chorusA = std::make_unique<sonore::Chorus>(), chorusB = std::make_unique<sonore::Chorus>();
+    auto flangerA = std::make_unique<sonore::Flanger>(), flangerB = std::make_unique<sonore::Flanger>();
+    auto delayA = std::make_unique<sonore::StereoDelay<>>(), delayB = std::make_unique<sonore::StereoDelay<>>();
+    auto tapeA = std::make_unique<sonore::TapeSaturator>(), tapeB = std::make_unique<sonore::TapeSaturator>();
+    auto setChorus = [](sonore::Chorus& c) {
+      c.setRate(0.8f);
+      c.setDepth(6.5f);
+      c.setCentreDelay(9.0f);
+      c.setMix(0.5f);
+    };
+    auto setFlanger = [](sonore::Flanger& f) {
+      f.setRate(0.3f);
+      f.setDepth(2.0f);
+      f.setMinimumDelay(3.0f);
+      f.setMix(0.5f); // its default since it stopped being all dry; said, not assumed
+    };
+    sonore::StereoDelay<>::Parameters dp;
+    dp.timeMs = 120.0f;
+    dp.mix = 0.5f;
+    sonore::TapeSaturator::Parameters tp;
+    tp.driveDb = 18.0f;
+    tp.wow = 0.3f;
+    // B: settings first. A: prepare first, as a plugin does.
+    setChorus(*chorusB);
+    chorusB->prepare(spec);
+    chorusA->prepare(spec);
+    setChorus(*chorusA);
+    setFlanger(*flangerB);
+    flangerB->prepare(spec);
+    flangerA->prepare(spec);
+    setFlanger(*flangerA);
+    for (auto* d : {delayA.get(), delayB.get()}) d->setTimeChange(sonore::StereoDelay<>::TimeChange::Glide);
+    delayB->setParameters(dp);
+    delayB->prepare(spec);
+    delayA->prepare(spec);
+    delayA->setParameters(dp);
+    tapeB->setParameters(tp);
+    tapeB->setSampleRate(48000.0f);
+    tapeA->setSampleRate(48000.0f);
+    tapeA->setParameters(tp);
+    double chorusDiff = 0.0, flangerDiff = 0.0, delayDiff = 0.0, tapeDiff = 0.0;
+    for (int n = 0; n < 48000; ++n) {
+      const float x = 0.4f * (float) std::sin(2.0 * kTestPi * 330.0 * n / 48000.0);
+      float l1 = x, r1 = x, l2 = x, r2 = x;
+      chorusA->process(l1, r1);
+      chorusB->process(l2, r2);
+      chorusDiff = std::max(chorusDiff, (double) std::fabs(l1 - l2));
+      l1 = r1 = l2 = r2 = x;
+      flangerA->process(l1, r1);
+      flangerB->process(l2, r2);
+      flangerDiff = std::max(flangerDiff, (double) std::fabs(l1 - l2));
+      l1 = r1 = l2 = r2 = (n < 480 ? x : 0.0f);
+      delayA->process(l1, r1);
+      delayB->process(l2, r2);
+      delayDiff = std::max(delayDiff, (double) std::fabs(l1 - l2));
+      tapeDiff = std::max(tapeDiff, (double) std::fabs(tapeA->process(x) - tapeB->process(x)));
+    }
+    char l[220];
+    std::snprintf(l, sizeof(l),
+                  "chorus, flanger, glide-mode delay and tape set after prepare play as if set before "
+                  "(differ by %.2g, %.2g, %.2g, %.2g)", chorusDiff, flangerDiff, delayDiff, tapeDiff);
+    check(chorusDiff < 1e-6 && flangerDiff < 1e-6 && delayDiff < 1e-6 && tapeDiff < 1e-6, l);
+  }
+
+  // reset() is the fresh object: the same audio after it renders the same.
+  // Phaser, chorus and flanger had no reset() and prepare() kept the LFO's
+  // phase; the random LFO, the pluck's noise and the velvet noise drew on from
+  // wherever they were; a re-prepared gate kept its detector.
+  {
+    sonore::ProcessSpec spec;
+    spec.sampleRate = 48000.0;
+    spec.maximumBlockSize = 512;
+    spec.numChannels = 2;
+    auto phaser = std::make_unique<sonore::Phaser>();
+    auto chorus = std::make_unique<sonore::Chorus>();
+    auto flanger = std::make_unique<sonore::Flanger>();
+    phaser->prepare(spec);
+    phaser->setMix(0.5f);
+    chorus->prepare(spec);
+    chorus->setMix(0.5f);
+    flanger->prepare(spec);
+    flanger->setMix(0.5f);
+    sonore::Lfo lfo;
+    lfo.setSampleRate(48000.0f);
+    lfo.setShape(sonore::Lfo::Shape::SampleHold);
+    lfo.setRate(7.0f);
+    auto string = std::make_unique<sonore::KarplusStrong<>>();
+    string->setSampleRate(48000.0f);
+    sonore::VelvetNoise velvet;
+    velvet.setSampleRate(48000.0f);
+    auto render = [&](std::vector<float>& out) {
+      out.clear();
+      string->noteOn(220.0f, 0.8f);
+      for (int n = 0; n < 24000; ++n) {
+        const float x = 0.4f * (float) std::sin(2.0 * kTestPi * 330.0 * n / 48000.0);
+        float l = x, r = x;
+        phaser->process(l, r);
+        out.push_back(l);
+        l = r = x;
+        chorus->process(l, r);
+        out.push_back(l);
+        l = r = x;
+        flanger->process(l, r);
+        out.push_back(l);
+        out.push_back(lfo.next());
+        out.push_back(string->render());
+        velvet.setDensity(2000.0f); // every sample: the same density is no change
+        out.push_back(velvet.next());
+      }
+    };
+    std::vector<float> first, second;
+    phaser->prepare(spec); // a re-prepare is a reset
+    chorus->prepare(spec);
+    flanger->prepare(spec);
+    lfo.reset();
+    string->reset();
+    velvet.reset();
+    render(first);
+    phaser->prepare(spec); // a re-prepare is a reset
+    chorus->prepare(spec);
+    flanger->prepare(spec);
+    lfo.reset();
+    string->reset();
+    velvet.reset();
+    render(second);
+    const char* names[] = {"phaser", "chorus", "flanger", "random LFO", "pluck", "velvet noise"};
+    double worst[6] = {};
+    for (size_t k = 0; k < first.size(); ++k)
+      worst[k % 6] = std::max(worst[k % 6], (double) std::fabs(first[k] - second[k]));
+    char l[260];
+    std::snprintf(l, sizeof(l), "after reset() the same audio renders the same (%s %.2g, %s %.2g, %s %.2g, %s %.2g, %s %.2g, %s %.2g)",
+                  names[0], worst[0], names[1], worst[1], names[2], worst[2], names[3], worst[3], names[4], worst[4],
+                  names[5], worst[5]);
+    bool all = true;
+    for (double w : worst) all = all && w == 0.0;
+    check(all, l);
+
+    // The gate's detector, across a re-prepare.
+    auto gate = std::make_unique<sonore::NoiseGate>();
+    gate->prepare(spec);
+    gate->setThreshold(-30.0f);
+    for (int n = 0; n < 24000; ++n) gate->process(0.8f * (float) std::sin(2.0 * kTestPi * 200.0 * n / 48000.0));
+    gate->prepare(spec);
+    double leak = 0.0;
+    for (int n = 0; n < 24000; ++n)
+      leak = std::max(leak, (double) std::fabs(gate->process(0.00316f * (float) std::sin(2.0 * kTestPi * 200.0 * n / 48000.0))));
+    std::snprintf(l, sizeof(l), "a re-prepared gate does not open on a -50 dBFS tone under a -30 dB threshold (peak %.2g)", leak);
+    check(leak < 1e-4, l);
+  }
+
+  // The default FdnReverb sounds at 96 and 192 kHz as it does at 48. Its lines
+  // used to stop fitting past 51 kHz and were shortened together: 4.7 dB
+  // louder in the low mids at 192 kHz.
+  {
+    sonore::ProcessSpec spec;
+    spec.maximumBlockSize = 512;
+    spec.numChannels = 2;
+    double at48 = 0.0, worst = 0.0;
+    for (double rate : {48000.0, 96000.0, 192000.0}) {
+      auto fdn = std::make_unique<sonore::FdnReverb<>>();
+      spec.sampleRate = rate;
+      fdn->prepare(spec);
+      sonore::FdnReverb<>::Parameters p;
+      p.size = 1.0f;
+      p.decay = 1.5f;
+      p.mix = 1.0f;
+      fdn->setParameters(p);
+      // The low mids: two one-poles at 600 Hz on the impulse response.
+      const double k = 1.0 - std::exp(-2.0 * kTestPi * 600.0 / rate);
+      double z1 = 0.0, z2 = 0.0, energy = 0.0;
+      for (int n = 0; n < (int) (2.0 * rate); ++n) {
+        float l = n == 0 ? 1.0f : 0.0f, r = l;
+        fdn->process(l, r);
+        z1 += k * ((double) l - z1);
+        z2 += k * (z1 - z2);
+        energy += z2 * z2;
+      }
+      // Parseval: the sum of a unit impulse response's squares is the band's
+      // energy over the rate, so times the rate it compares across rates.
+      const double db = 10.0 * std::log10(energy * rate);
+      if (rate == 48000.0) at48 = db;
+      worst = std::max(worst, std::fabs(db - at48));
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "the default FDN's low mids are as loud at 96 and 192 kHz as at 48 (worst %.2f dB)", worst);
+    check(worst < 1.0, l);
+  }
+
+  // A sample read at another rate is band-limited. The four-point cubic read
+  // imaged a 44.1 kHz file's 10 kHz tone at 13.9 kHz in a 48 kHz session only
+  // 26 dB down, drooped 15 kHz by 1.65 dB, and folded a 96 kHz file's 30 kHz
+  // content back to 14.1 kHz in a 44.1 kHz session at -1.2 dB.
+  {
+    // Amplitude of `hz` in a whole number of cycles of `x` at `rate`.
+    auto amplitude = [](const std::vector<float>& x, double rate, double hz) {
+      double re = 0.0, im = 0.0;
+      for (size_t n = 0; n < x.size(); ++n) {
+        const double w = 2.0 * kTestPi * hz * (double) n / rate;
+        re += x[n] * std::cos(w);
+        im += x[n] * std::sin(w);
+      }
+      return 2.0 * std::sqrt(re * re + im * im) / (double) x.size();
+    };
+    auto play = [](const std::vector<float>& file, double fileRate, double hostRate, size_t frames,
+                   sonore::SampleVoice::Interpolation mode) {
+      sonore::SampleData data;
+      data.interleaved = file.data();
+      data.numFrames = file.size();
+      data.numChannels = 1;
+      data.sampleRate = fileRate;
+      data.rootNote = 60;
+      sonore::SampleVoice voice;
+      voice.setInterpolation(mode);
+      voice.setSampleRate(hostRate);
+      voice.setSample(&data);
+      voice.noteOn(60);
+      std::vector<float> out;
+      for (size_t i = 0; i < frames + 4800; ++i) {
+        const float y = voice.renderChannel(0);
+        voice.advance();
+        if (i >= 4800) out.push_back(y); // past the start
+      }
+      return out;
+    };
+    std::vector<float> tones(3 * 44100), fast(3 * 96000);
+    for (size_t n = 0; n < tones.size(); ++n)
+      tones[n] = 0.5f * (float) (std::sin(2.0 * kTestPi * 10000.0 * n / 44100.0) +
+                                 std::sin(2.0 * kTestPi * 15000.0 * n / 44100.0));
+    for (size_t n = 0; n < fast.size(); ++n)
+      fast[n] = 0.5f * (float) std::sin(2.0 * kTestPi * 30000.0 * n / 96000.0);
+    double images[2], droop[2], folded[2];
+    for (int m = 0; m < 2; ++m) {
+      const auto mode = m == 0 ? sonore::SampleVoice::Interpolation::Sinc : sonore::SampleVoice::Interpolation::Cubic;
+      const std::vector<float> up = play(tones, 44100.0, 48000.0, 48000, mode);
+      images[m] = 20.0 * std::log10(amplitude(up, 48000.0, 13900.0) / amplitude(up, 48000.0, 10000.0) + 1e-12);
+      droop[m] = 20.0 * std::log10(amplitude(up, 48000.0, 15000.0) / 0.5);
+      const std::vector<float> down = play(fast, 96000.0, 44100.0, 44100, mode);
+      folded[m] = 20.0 * std::log10(amplitude(down, 44100.0, 14100.0) / 0.5 + 1e-12);
+    }
+    char l[260];
+    std::snprintf(l, sizeof(l),
+                  "a sample read at another rate is band-limited: image %.1f dBc, 15 kHz %+.2f dB, fold %.1f dB "
+                  "(cubic: %.1f, %+.2f, %.1f)", images[0], droop[0], folded[0], images[1], droop[1], folded[1]);
+    check(images[0] < -70.0 && std::fabs(droop[0]) < 0.2 && folded[0] < -60.0, l);
+  }
+
+  // A tone network's tail ends in zeros, not in the float range's subnormals,
+  // and one NaN does not silence it for good.
+  {
+    sonore::ToneStack stack;
+    stack.setSampleRate(48000.0f);
+    sonore::Baxandall bax;
+    bax.setSampleRate(48000.0f);
+    bax.setBass(0.8f);
+    bax.setTreble(0.3f);
+    sonore::WhiteNoise noise(83);
+    int subnormal = 0;
+    for (int n = 0; n < 48000 * 6; ++n) {
+      const float x = n < 48000 ? 0.5f * noise.next() : 0.0f;
+      for (float y : {stack.process(x), bax.process(x)})
+        if (y != 0.0f && std::fabs(y) < 1.17549435e-38f) ++subnormal;
+    }
+    bax.process(std::numeric_limits<float>::quiet_NaN());
+    bool recovered = true;
+    for (int n = 0; n < 4800; ++n) recovered = recovered && std::isfinite(bax.process(0.25f));
+    char l[160];
+    std::snprintf(l, sizeof(l), "ToneStack and Baxandall tails reach zero without subnormals (%d), and a NaN passes", subnormal);
+    check(subnormal == 0 && recovered, l);
+  }
+
+  // A plucked note is as loud at every session rate. A period of white noise
+  // puts 1/sqrt(period) into each harmonic and the period grows with the
+  // rate: 3 dB quieter per doubling.
+  {
+    double at48 = 0.0, lo = 1e9, hi = -1e9, peak48 = 0.0, peakMax = 0.0;
+    for (float rate : {48000.0f, 44100.0f, 96000.0f, 192000.0f}) {
+      auto string = std::make_unique<sonore::KarplusStrong<>>();
+      string->setSampleRate(rate);
+      string->setDecay(2.0f);
+      string->setDamping(0.3f);
+      double energy = 0.0, peak = 0.0;
+      const int notes = 16;
+      for (int k = 0; k < notes; ++k) {
+        string->noteOn(196.0f, 1.0f);
+        const int from = (int) (0.02f * rate), to = (int) (0.3f * rate);
+        for (int n = 0; n < to; ++n) {
+          const float y = string->render();
+          if (n >= from) energy += (double) y * y;
+          peak = std::max(peak, (double) std::fabs(y));
+        }
+      }
+      const double db = 10.0 * std::log10(energy / (notes * (0.28 * rate)));
+      if (rate == 48000.0f) {
+        at48 = db;
+        peak48 = peak;
+      }
+      lo = std::min(lo, db - at48);
+      hi = std::max(hi, db - at48);
+      peakMax = std::max(peakMax, peak);
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a plucked 196 Hz note is as loud at 44.1 to 192 kHz (%+.2f to %+.2f dB re 48 kHz, peak %.2f vs %.2f)",
+                  lo, hi, peakMax, peak48);
+    // The peak may rise where the level does not: noise held to 24 kHz is
+    // nearly Gaussian, with a higher crest than the uniform noise a 48 kHz
+    // pluck is made of -- 1.65 against 1.04 at 192 kHz, at the same RMS.
+    check(lo > -1.0 && hi < 1.0 && peakMax < 2.0 * peak48, l);
+  }
+
+  // A Fuzz Face set up as a plugin sets one up -- rate first, then the knobs --
+  // is silent on silence. The operating point was solved for the pots as they
+  // were at setSampleRate(), and the first audio thumped at +7 dBFS.
+  {
+    double worst = 0.0;
+    for (float fuzz : {0.3f, 0.6f, 0.99f}) {
+      auto pedal = std::make_unique<sonore::FuzzFace>();
+      pedal->setSampleRate(48000.0f);
+      pedal->setFuzz(fuzz);
+      pedal->setVolume(0.7f);
+      for (int n = 0; n < 4800; ++n) worst = std::max(worst, (double) std::fabs(pedal->process(0.0f)));
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "a Fuzz Face whose knobs are set after its rate starts in silence (peak %.2g)", worst);
+    check(worst < 1e-3, l);
+  }
+
+  // A tube stage given its circuit and triode every block, the same each time,
+  // is the same stage running on. Each call rebuilt the plate curve (3.7 ms)
+  // and reset the stage: a click every block.
+  {
+    auto once = std::make_unique<sonore::TubeStage>();
+    auto every = std::make_unique<sonore::TubeStage>();
+    const sonore::TubeStage::Triode triode{};
+    for (auto* t : {once.get(), every.get()}) {
+      t->setSampleRate(48000.0f);
+      t->setInputGain(4.0f);
+      t->setCircuit(250.0f, 100.0f, 1.5f);
+      t->setTriode(triode);
+      t->reset();
+    }
+    double worst = 0.0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int n = 0; n < 48000; ++n) {
+      if (n % 512 == 0) {
+        every->setCircuit(250.0f, 100.0f, 1.5f);
+        every->setTriode(triode);
+      }
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * 100.0 * n / 48000.0);
+      worst = std::max(worst, (double) std::fabs(once->process(x) - every->process(x)));
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a tube stage given the same circuit and triode every block runs on unchanged (differs by %.2g, "
+                  "%.1f ms for a second of both)", worst, ms);
+    check(worst == 0.0, l);
+  }
+
+  // A cascade re-designed every block at the same cutoff, as a plugin applies
+  // its parameters, is the same filter running on. Every design reset it:
+  // crackle, and 3 dB off the fundamental at 64-sample blocks.
+  {
+    sonore::CascadedIir<8> once, every;
+    sonore::LinkwitzRileyN<8> lrOnce, lrEvery;
+    for (auto* f : {&once, &every}) {
+      f->setSampleRate(48000.0f);
+      f->designButterworthLowpass(1000.0f, 4);
+    }
+    for (auto* f : {&lrOnce, &lrEvery}) {
+      f->setSampleRate(48000.0f);
+      f->setCrossover(1000.0f, 4);
+    }
+    int differ = 0, lrDiffer = 0;
+    for (int n = 0; n < 48000; ++n) {
+      if (n % 64 == 0) {
+        every.designButterworthLowpass(1000.0f, 4);
+        lrEvery.setCrossover(1000.0f, 4);
+      }
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * 100.0 * n / 48000.0);
+      if (once.process(x) != every.process(x)) ++differ;
+      float a = 0.0f, b = 0.0f, c = 0.0f, d = 0.0f;
+      lrOnce.process(x, a, b);
+      lrEvery.process(x, c, d);
+      if (a != c || b != d) ++lrDiffer;
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a cascade and an order-4 crossover re-designed every 64 samples at the same corner change "
+                  "nothing (%d and %d of 48000 samples differ)", differ, lrDiffer);
+    check(differ == 0 && lrDiffer == 0, l);
+  }
+
+  // A crossover is a control, and a host automates it. In direct-form
+  // sections the state is made of the previous coefficients' outputs: swept
+  // between 500 Hz and Nyquist every sample at 8 kHz the crossover diverged to
+  // infinity, and the splitter example, automated every 8 samples, reached
+  // 4.6e26. State-variable sections keep integrator charges, valid under any
+  // coefficients.
+  {
+    double worstPeak = 0.0;
+    bool finite = true;
+    for (int every : {1, 8, 64}) {
+      sonore::LinkwitzRiley lr;
+      lr.setSampleRate(8000.0f);
+      lr.reset();
+      sonore::MultibandSplitter<4> bands;
+      bands.setSampleRate(8000.0f);
+      sonore::WhiteNoise noise(71);
+      for (int n = 0; n < 48000; ++n) {
+        if (n % every == 0) {
+          const float hz = 500.0f + 15500.0f * (float) ((n / every) % 8) / 7.0f;
+          lr.setCrossover(hz);
+          bands.setCrossover(0, hz * 0.25f);
+          bands.setCrossover(1, hz * 0.5f);
+          bands.setCrossover(2, hz);
+        }
+        const float x = 0.25f * noise.next();
+        float low = 0.0f, high = 0.0f, split[4];
+        lr.process(x, low, high);
+        bands.process(x, split);
+        for (float v : {low, high, split[0], split[1], split[2], split[3]}) {
+          if (!std::isfinite(v)) finite = false;
+          worstPeak = std::max(worstPeak, (double) std::fabs(v));
+        }
+      }
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a crossover swept from 500 Hz to Nyquist every 1, 8 and 64 samples at 8 kHz stays bounded "
+                  "(peak %.2f on a 0.25 input)", worstPeak);
+    check(finite && worstPeak < 8.0, l);
+  }
 }
 
 // ── Diode ladder and Sallen-Key ───────────────────────────────────────────────
@@ -22489,8 +33663,39 @@ static void testVaFilters() {
     };
     const double oscillating = ringRms(1.0f), damped = ringRms(0.5f);
     std::printf("  ---- one second after an impulse: %.5f rms at full resonance, %.7f at half ----\n", oscillating, damped);
-    check(oscillating > 5e-4, "at full resonance (K = 17, the textbook threshold) an impulse still rings a second later");
+    check(oscillating > 5e-4, "at full resonance (K = 17, the textbook threshold) an impulse still rings a second later, with saturation");
     check(damped < 1e-4, "...and at half it has long stopped");
+    // Linear -- saturation 0, the default -- nothing bounds an oscillation,
+    // and K = 17 is exactly where one stops decaying: a -26 dBFS tone at the
+    // ring frequency came out at +24 dBFS and still climbing. Without the
+    // saturation the top of the control stops just short, as the Moog
+    // ladder's does; with it, the top still self-oscillates (above).
+    {
+      sonore::DiodeLadder lin;
+      lin.setSampleRate((float) sr);
+      lin.setCutoff(1000.0f);
+      lin.setSaturation(1.0f);
+      lin.setSaturation(0.0f);
+      lin.setResonance(1.0f);
+      double worst = 0.0;
+      for (double hz : {690.0, 698.0, 705.0, 711.0}) {
+        lin.reset();
+        for (int i = 0; i < 96000; ++i) {
+          const float y = lin.process((float) (0.05 * std::sin(2.0 * kTestPi * hz * i / sr)));
+          worst = std::max(worst, (double) std::fabs(y));
+        }
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "linear at full resonance, a -26 dBFS tone at the ring "
+                    "frequency stays bounded (peak %.3f)", worst);
+      check(worst < 0.5, line);
+      lin.setSaturation(1.0f);
+      lin.reset();
+      std::vector<float> y(48000);
+      for (size_t i = 0; i < y.size(); ++i) y[i] = lin.process(i == 0 ? 1.0f : 0.0f);
+      check(rms(r2Slice(y, 38400, 9600)) > 5e-4,
+            "...and turning the saturation back on gives back the full resonance, whatever the order");
+    }
     // Modulation stability.
     dl.setResonance(0.9f);
     dl.setSaturation(1.0f);
@@ -22684,9 +33889,62 @@ static void testGranular() {
     }
     check(finite && most <= 32, "asked for 1000 grains a second of half a second each, the engine holds 32 and skips the rest");
   }
+
+  // ── A load of NOTHING, which is what a failed file read hands over ──
+  //
+  // load(p, 0) set a loaded length of zero, and the cubic read then wrapped
+  // its position with `while (pos < 0) pos += span` -- adding zero for ever,
+  // on the audio thread. Three samples was no better: the start clamp's
+  // upper bound went negative. Too short to hold a grain is now no sample at
+  // all, and the engine goes back to its live buffer.
+  {
+    Grains::Parameters p;
+    p.density = 50.0f;
+    p.sizeMs = 40.0f;
+    g_r2Grains.setParameters(p);
+    const float three[3] = {0.5f, -0.5f, 0.25f};
+    for (size_t count : {(size_t) 0, (size_t) 3}) {
+      g_r2Grains.load(count ? three : nullptr, count);
+      bool finite = true;
+      for (int i = 0; i < 4800; ++i) {
+        float l, r;
+        g_r2Grains.write(0.1f);
+        g_r2Grains.render(l, r);
+        if (!std::isfinite(l) || !std::isfinite(r)) finite = false;
+      }
+      char line[160];
+      std::snprintf(line, sizeof(line), "a load of %zu samples returns to the live buffer instead of "
+                    "hanging the audio thread", count);
+      check(finite, line);
+    }
+  }
 }
 
 // ── Phase vocoder ─────────────────────────────────────────────────────────────
+
+// The channel vocoder with a flat source in both inputs, swept: the bands
+// are each two bandpasses in cascade, so neighbours cross 180 degrees apart,
+// and summed in phase they notched between every pair of centres.
+static void testVocoderFlatness() {
+  std::printf("\n[channel vocoder]\n");
+  double lo = 1e9, hi = -1e9;
+  for (double f = 300.0; f <= 5000.0; f *= 1.02) {
+    auto v = std::make_unique<sonore::ChannelVocoder<16>>();
+    v->setSampleRate(48000.0f);
+    v->reset();
+    std::vector<float> y(24000);
+    for (size_t n = 0; n < y.size(); ++n) {
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * f * (double) n / 48000.0);
+      y[n] = v->process(x, x);
+    }
+    const double g = r2ToneDb(r2Slice(y, 12000, 12000), f, 48000.0, 0.5);
+    lo = std::min(lo, g);
+    hi = std::max(hi, g);
+  }
+  char l[160];
+  std::snprintf(l, sizeof(l), "a flat source through the vocoder comes out within %.2f dB from 300 Hz to 5 kHz", hi - lo);
+  check(hi - lo < 10.0, l);
+}
 
 static void testPhaseVocoder() {
   std::printf("phase vocoder (Laroche-Dolson peak shifting)\n");
@@ -22770,9 +34028,106 @@ static void testPhaseVocoder() {
     std::printf("  ---- gated tone at 24000: half amplitude reached at %d, reported latency %d ----\n", arrival, g_r2Vocoder.latencySamples());
     check(std::abs(arrival - (24000 + g_r2Vocoder.latencySamples())) <= 1200, "the onset arrives about one frame late, the reported latency");
   }
+
+  // A partial in bin 1: 110 Hz at 192 kHz, 30 Hz at 48. The peak search
+  // began at bin 2, the partial moved with a noise-floor bump far above it,
+  // and 110 Hz shifted up a fifth came out at 818 Hz.
+  {
+    struct Case { double sr, hz; };
+    const Case cases[] = {{192000.0, 110.0}, {48000.0, 30.0}, {48000.0, 440.0}};
+    const float ratio = 1.5f;
+    double worstCents = 0.0;
+    for (const Case& c : cases) {
+      g_r2Vocoder.reset();
+      g_r2Vocoder.setRatio(ratio);
+      std::vector<float> out((size_t) (2.0 * c.sr));
+      for (size_t n = 0; n < out.size(); ++n)
+        out[n] = g_r2Vocoder.process((float) (0.3 * std::sin(2.0 * kTestPi * c.hz * (double) n / c.sr)));
+      const double got = r2ZeroCrossingHz(r2Slice(out, out.size() / 2, out.size() / 2), c.sr);
+      worstCents = std::max(worstCents, std::fabs(1200.0 * std::log2(got / (c.hz * ratio))));
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "a low partial in the first bins shifts to the right pitch (worst %.1f cents off)", worstCents);
+    check(worstCents < 20.0, l);
+  }
+
+  // A pitch corrector used without setSampleRate: the retune glide was only
+  // worked out there, so the 40 ms default was 0 and the first correction
+  // snapped straight to its target.
+  {
+    auto pc = std::make_unique<sonore::PitchCorrector>();
+    float first = 1.0f;
+    for (int n = 0; n < 48000 && first == 1.0f; ++n) {
+      pc->process(0.25f * (float) std::sin(2.0 * kTestPi * 112.6 * n / 48000.0));
+      if (pc->ratio() != 1.0f) first = pc->ratio();
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "a pitch corrector never given a rate still glides to its target (first step %.5f)", first);
+    check(first > 0.99f && first < 1.0f, l);
+  }
 }
 
 // ── Spring reverb ─────────────────────────────────────────────────────────────
+
+// The plate's tank delays are the paper's, scaled to the rate, so they are
+// fractional; read linearly, each was a lowpass compounding every lap, and the
+// tail's top end depended on the host's rate. With the loop filters open the
+// 12 kHz decay should be the 4 kHz one.
+static sonore::PlateReverb g_bandPlate;
+static void testPlateTopEnd() {
+  std::printf("\n[plate top end]\n");
+  auto rt60 = [](const std::vector<double>& ir, double sr) {
+    std::vector<double> edc(ir.size());
+    double acc = 0.0;
+    for (size_t i = ir.size(); i-- > 0;) { acc += ir[i] * ir[i]; edc[i] = acc; }
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int cnt = 0;
+    for (size_t i = 0; i < ir.size(); ++i) {
+      const double d = 10.0 * std::log10(edc[i] / edc[0] + 1e-300);
+      if (d <= -5.0 && d >= -35.0) {
+        const double x = (double) i / sr;
+        sx += x; sy += d; sxx += x * x; sxy += x * d; ++cnt;
+      }
+    }
+    const double slope = (cnt * sxy - sx * sy) / (cnt * sxx - sx * sx);
+    return -60.0 / slope;
+  };
+  auto band = [](const std::vector<double>& x, double sr, double f0) {
+    const double w0 = 2.0 * kTestPi * f0 / sr, al = std::sin(w0) / (2.0 * 1.41);
+    const double a0 = 1.0 + al, b0 = al / a0, b2 = -al / a0, a1 = -2.0 * std::cos(w0) / a0, a2 = (1.0 - al) / a0;
+    std::vector<double> y(x.size());
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (size_t i = 0; i < x.size(); ++i) {
+      const double v = b0 * x[i] + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = x[i]; y2 = y1; y1 = v; y[i] = v;
+    }
+    return y;
+  };
+  const double sr = 44100.0;
+  sonore::ProcessSpec spec{};
+  spec.sampleRate = sr;
+  spec.numChannels = 2;
+  g_bandPlate.prepare(spec);
+  sonore::PlateReverb::Parameters pp;
+  pp.mix = 1.0f;
+  pp.modDepth = 0.0f;
+  pp.predelayMs = 0.0f;
+  pp.dampingHz = 19000.0f;
+  pp.bandwidthHz = 19000.0f;
+  g_bandPlate.setParameters(pp);
+  g_bandPlate.setDecayTime(2.0f);
+  g_bandPlate.reset();
+  std::vector<double> ir((size_t) (8.0 * sr));
+  for (size_t i = 0; i < ir.size(); ++i) {
+    float l = i == 0 ? 1.0f : 0.0f, r = l;
+    g_bandPlate.process(l, r);
+    ir[i] = l;
+  }
+  const double mid = rt60(band(ir, sr, 4000.0), sr), top = rt60(band(ir, sr, 12000.0), sr);
+  char l[160];
+  std::snprintf(l, sizeof(l), "with its filters open the plate's 12 kHz decay matches its 4 kHz one at 44.1 kHz (%.2f vs %.2f s)", top, mid);
+  check(top > 0.9 * mid, l);
+}
 
 static void testSpringReverb() {
   std::printf("spring reverb\n");
@@ -22787,6 +34142,26 @@ static void testSpringReverb() {
   p.tension = 0.6f;
   p.size = 0.5f;
   p.mix = 1.0f;
+  // Two coils of different lengths ARE the stereo: the right one 13% longer,
+  // so the echoes interleave. At high rates the lengths in samples ran past
+  // the line, and each was clamped on its own -- at 192 kHz from about a
+  // third of the size range both coils were the same 8184 samples, and the
+  // reverb collapsed to mono. A line too short now shortens both together.
+  {
+    sonore::ProcessSpec hi = spec;
+    hi.sampleRate = 192000.0;
+    Spring::Parameters big = p;
+    big.size = 1.0f;
+    g_r2Spring.prepare(hi);
+    g_r2Spring.setParameters(big);
+    const double ratio = g_r2Spring.transitSamples(1) / g_r2Spring.transitSamples(0);
+    char line[200];
+    std::snprintf(line, sizeof(line), "at 192 kHz and full size the two coils stay apart "
+                  "(%.0f and %.0f samples, ratio %.3f, want 1.13)", g_r2Spring.transitSamples(0),
+                  g_r2Spring.transitSamples(1), ratio);
+    check(std::fabs(ratio - 1.13) < 0.01, line);
+  }
+
   g_r2Spring.prepare(spec);
   g_r2Spring.setParameters(p);
   g_r2Spring.reset();
@@ -22861,9 +34236,121 @@ static void testSpringReverb() {
     Spring::Parameters dry = p;
     dry.mix = 0.0f;
     g_r2Spring.setParameters(dry);
+    g_r2Spring.reset(); // a running mix glides to a new setting; reset() lands it
     float a = 0.5f, b = -0.25f;
     g_r2Spring.process(a, b);
     checkNear(a, 0.5, 1e-6, "a fully dry mix passes the signal untouched");
+  }
+  // One Inf in, and the coils held NaN for good: the allpass chain turned it
+  // into Inf - Inf, and every section, line and filter kept it.
+  {
+    g_r2Spring.prepare(spec);
+    g_r2Spring.setParameters(p);
+    g_r2Spring.reset();
+    int bad = 0;
+    double late = 0.0;
+    for (int n = 0; n < (int) (3.0 * sr); ++n) {
+      float l = n == 1000 ? std::numeric_limits<float>::infinity()
+                          : (n < 24000 ? 0.1f * (float) std::sin(0.05 * n) : 0.0f);
+      float r = l;
+      g_r2Spring.process(l, r);
+      if (n > 1000 && (!std::isfinite(l) || !std::isfinite(r))) ++bad;
+      if (n > (int) (2.5 * sr)) late = std::max(late, (double) std::fabs(l) + std::fabs(r));
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "a spring reverb recovers from an infinite sample (%d bad samples after it, tail %.2g)", bad, late);
+    check(bad == 0 && late < 0.05, line);
+  }
+  // A tail report that does not fit an int: a frozen or near-frozen decay
+  // ran the float product past INT_MAX, and the conversion came out negative.
+  {
+    sonore::ProcessSpec fast = spec;
+    fast.sampleRate = 192000.0;
+    static sonore::PlateReverb tailPlate;
+    tailPlate.prepare(fast);
+    sonore::PlateReverb::Parameters pp;
+    pp.decay = 0.9999f;
+    tailPlate.setParameters(pp);
+    g_fdn.prepare(fast);
+    sonore::FdnReverb<8>::Parameters fp;
+    fp.decay = 1e9f;
+    g_fdn.setParameters(fp);
+    g_r2Spring.prepare(fast);
+    Spring::Parameters sp = p;
+    sp.decay = 1e9f;
+    g_r2Spring.setParameters(sp);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a near-frozen plate, fdn and spring report a tail, not a negative one (%d, %d, %d)",
+                  tailPlate.tailSamples(), g_fdn.tailSamples(), g_r2Spring.tailSamples());
+    check(tailPlate.tailSamples() > 0 && g_fdn.tailSamples() > 0 && g_r2Spring.tailSamples() > 0, line);
+  }
+
+  // The plate is the same plate at 384 kHz: its predelay and its size are
+  // seconds, not samples. Its lines were sized for 192 kHz, so above that
+  // the tank kept the 192 kHz delays -- half its size in time, a shorter,
+  // brighter tail -- and a 150 ms predelay stopped at 107 ms.
+  {
+    static sonore::PlateReverb ratePlate;
+    auto measure = [&](double rate, double* arrivalMs, double* tailMs) {
+      sonore::ProcessSpec at = spec;
+      at.sampleRate = rate;
+      ratePlate.prepare(at);
+      sonore::PlateReverb::Parameters pp;
+      pp.mix = 1.0f;
+      pp.predelayMs = 150.0f;
+      pp.decay = 0.5f;
+      pp.modDepth = 0.0f;
+      ratePlate.setParameters(pp);
+      ratePlate.reset();
+      const int n = (int) (rate * 3.0);
+      const int window = (int) (rate * 0.01);
+      double peak = 0.0, energy = 0.0;
+      int first = -1, lastLoud = 0;
+      std::vector<double> windows;
+      for (int i = 0; i < n; ++i) {
+        float l = i == 0 ? 1.0f : 0.0f, r = l;
+        ratePlate.process(l, r);
+        if (first < 0 && std::fabs(l) > 1e-6f) first = i;
+        energy += (double) l * l;
+        if ((i + 1) % window == 0) {
+          windows.push_back(energy);
+          peak = std::max(peak, energy);
+          energy = 0.0;
+        }
+      }
+      for (size_t w = 0; w < windows.size(); ++w)
+        if (windows[w] > peak * 1e-3) lastLoud = (int) w; // 30 dB down
+      *arrivalMs = 1000.0 * first / rate;
+      *tailMs = 10.0 * (lastLoud + 1);
+    };
+    double arrival48 = 0, tail48 = 0, arrival384 = 0, tail384 = 0;
+    measure(48000.0, &arrival48, &tail48);
+    measure(384000.0, &arrival384, &tail384);
+    char line[220];
+    std::snprintf(line, sizeof(line),
+                  "the plate at 384 kHz keeps its 150 ms predelay and its size (first sound %.1f against %.1f ms, "
+                  "30 dB down by %.0f against %.0f ms)",
+                  arrival384, arrival48, tail384, tail48);
+    check(std::fabs(arrival384 - arrival48) < 2.0 && std::fabs(tail384 - tail48) < 0.1 * tail48, line);
+  }
+
+  // The chirp in TIME at every rate. Its radius was fixed in the z-plane, so
+  // the group delay at 2.5 kHz was 15.0 ms at 44.1 kHz and 5.2 at 192.
+  {
+    double lo = 1e9, hi = 0.0;
+    for (double rate : {44100.0, 48000.0, 96000.0, 192000.0}) {
+      sonore::ProcessSpec at = spec;
+      at.sampleRate = rate;
+      g_r2Spring.prepare(at);
+      g_r2Spring.setParameters(p);
+      const double ms = 1000.0 * g_r2Spring.chainGroupDelay(2500.0f) / rate;
+      lo = std::min(lo, ms);
+      hi = std::max(hi, ms);
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "the spring's chirp lasts the same at 44.1 to 192 kHz (2.5 kHz group delay %.2f to %.2f ms)", lo, hi);
+    check(hi < 1.15 * lo, line);
   }
 }
 
@@ -23112,6 +34599,36 @@ static void testAuditRound() {
     check(std::fabs(sumHigh) < 1e-4, "a windowed-sinc highpass nulls DC (its lowpass was normalised before inversion)");
     checkNear(20.0 * std::log10(std::fabs(altHigh)), 0.0, 0.05, "...and passes Nyquist at unity");
     check(std::fabs(sumBand) < 1e-4, "a bandpass nulls DC too");
+
+    // Every designed kernel has a centre tap. The tap limit was even, so a
+    // highpass asked for more taps than it allows was made odd, clamped back
+    // to even, and inverted about a centre the lowpass did not have: -30 dB
+    // of stopband where the same design at 4095 taps gives -140. And an even
+    // lowpass delays by a half-sample its latency report could not say.
+    auto gainDb = [&](const sonore::FirFilter& f, double hz) {
+      double re = 0.0, im = 0.0;
+      const auto& c = f.coefficients();
+      for (size_t i = 0; i < c.size(); ++i) {
+        re += c[i] * std::cos(2.0 * kTestPi * hz / sr * (double) i);
+        im -= c[i] * std::sin(2.0 * kTestPi * hz / sr * (double) i);
+      }
+      return 20.0 * std::log10(std::sqrt(re * re + im * im) + 1e-30);
+    };
+    sonore::FirFilter big;
+    big.designHighpass(1000.0f, (float) sr, 8001);
+    char line[200];
+    std::snprintf(line, sizeof(line), "a highpass asked for more taps than the limit keeps a centre "
+                  "(%zu taps, %.1f dB at 500 Hz)", big.numTaps(), gainDb(big, 500.0));
+    check(big.numTaps() % 2 == 1 && gainDb(big, 500.0) < -100.0, line);
+    sonore::FirFilter even;
+    even.designLowpass(4000.0f, (float) sr, 64);
+    std::snprintf(line, sizeof(line), "an even lowpass request is made odd, so its latency is whole "
+                  "(%zu taps, latency %d)", even.numTaps(), even.latencySamples());
+    check(even.numTaps() % 2 == 1 && (size_t) even.latencySamples() * 2 + 1 == even.numTaps(), line);
+    sonore::FirFilter loose;
+    std::snprintf(line, sizeof(line), "a stopband under 6 dB is a trivial spec, met (%zu taps)",
+                  loose.designLowpassToSpec(4000.0f, (float) sr, 1000.0f, 3.0f));
+    check(loose.numTaps() >= 3, line);
   }
 
   // ── FM feedback: Tomisawa's bound, and the DX7's average ──
@@ -23170,6 +34687,53 @@ static void testAuditRound() {
     double residue = 0.0;
     for (int i = 0; i < 200; ++i) residue = std::max(residue, (double) std::fabs(loop.process(0.0f)));
     check(residue == 0.0, "Oversampled<>::reset() clears a stateful shaper along with its filters");
+  }
+
+  // ── Oversampled<>::processBlock is process() over a block ──
+  // Blocks of every length up to 300, and the two paths taking turns on one
+  // instance, against process() sample by sample. The same sums in the same
+  // order: equal bits on x86; within a hair where a compiler fuses the
+  // scalar path's multiply-adds and not the vector path's (ARM).
+  {
+    auto worst = [&](auto ref, auto blk, auto mix) {
+      std::vector<float> in(24000);
+      for (size_t i = 0; i < in.size(); ++i)
+        in[i] = 0.6f * (float) std::sin(0.013 * (double) i) + 0.3f * (float) std::sin(0.71 * (double) i);
+      std::vector<float> a(in), b(in), c(in);
+      for (auto& v : a) v = ref.process(v);
+      size_t at = 0, len = 1;
+      while (at < b.size()) {
+        const size_t n = std::min(len, b.size() - at);
+        blk.processBlock(b.data() + at, (int) n);
+        at += n;
+        len = len % 300 + 7;
+      }
+      at = 0;
+      bool block = false;
+      while (at < c.size()) {
+        const size_t n = std::min<size_t>(37, c.size() - at);
+        if (block) mix.processBlock(c.data() + at, (int) n);
+        else
+          for (size_t k = 0; k < n; ++k) c[at + k] = mix.process(c[at + k]);
+        block = !block;
+        at += n;
+      }
+      double d = 0.0;
+      for (size_t k = 0; k < in.size(); ++k)
+        d = std::max(d, (double) std::max(std::fabs(a[k] - b[k]), std::fabs(a[k] - c[k])));
+      return d;
+    };
+    const double d2 = worst(sonore::Oversampled<sonore::WaveFolder, 1>{}, sonore::Oversampled<sonore::WaveFolder, 1>{},
+                            sonore::Oversampled<sonore::WaveFolder, 1>{});
+    const double d8 = worst(sonore::Oversampled<sonore::WaveFolder, 3>{}, sonore::Oversampled<sonore::WaveFolder, 3>{},
+                            sonore::Oversampled<sonore::WaveFolder, 3>{});
+    const double dIir = worst(sonore::OversampledIir<sonore::WaveFolder, 2>{}, sonore::OversampledIir<sonore::WaveFolder, 2>{},
+                              sonore::OversampledIir<sonore::WaveFolder, 2>{});
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "Oversampled<>::processBlock matches process() at 2x, 8x and through the IIR filter, mixed or not "
+                  "(%.2g, %.2g, %.2g)", d2, d8, dIir);
+    check(d2 <= 1e-6 && d8 <= 1e-6 && dIir <= 1e-6, line);
   }
 
   // ── Karplus-Strong: in tune and on time at any damping ──
@@ -23238,6 +34802,37 @@ static void testEmulationRound() {
     std::vector<float> bareOut(in.size());
     for (size_t i = 0; i < in.size(); ++i) bareOut[i] = bare.process(in[i]);
     checkNear(r2ToneDb(r2Slice(bareOut, 24000, 24000), 1000.0, sr, 0.01), 0.0, 0.5, "...and the unbypassed stage is normalised to unity by its own gain");
+
+    // The coupling network and the cathode bypass do not shape the plate
+    // curve, but both setters rebuilt its 2048-point table -- some 330,000
+    // transcendentals, milliseconds each -- and then reset the stage. A bright
+    // switch or a bypass knob automated from process() dropped out and
+    // clicked. They now only re-derive the gain, and the stage plays on.
+    {
+      sonore::TubeStage moved, still;
+      moved.setSampleRate((float) sr);
+      still.setSampleRate((float) sr);
+      double worst = 0.0;
+      for (size_t i = 0; i < 24000; ++i) {
+        if (i == 12000) {
+          moved.setCoupling(22.0f, 1.0f, 38.0f); // the values it already has
+          moved.setCathodeBypass(25.0f);
+        }
+        worst = std::max(worst, (double) std::fabs(moved.process(in[i]) - still.process(in[i])));
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "re-setting the coupling and bypass mid-signal leaves the "
+                    "stage playing as it was (worst difference %.2e)", worst);
+      check(worst < 1e-6, line);
+
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int k = 0; k < 100; ++k) moved.setCoupling(22.0f + (float) (k % 3), 1.0f, 38.0f);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      std::snprintf(line, sizeof(line), "100 coupling changes take %.2f ms -- automation, not a "
+                    "rebuild", ms);
+      check(ms < 20.0, line);
+    }
 
     // Blocking distortion: a hot burst charges the coupling capacitor through
     // the grid, and the quiet signal after it is gated until it drains.
@@ -23526,6 +35121,33 @@ static void testHardwareRound() {
     check(grainy.second > 5.0 && grainy.first > -60.0 && grainy.first < -25.0, "under gain reduction the FET's drain dependence puts a second harmonic on the signal");
     check(clean.first < -90.0, "...which an ideal attenuator does not");
     check(idle.first < -90.0, "...and neither does the FET when it is not reducing");
+
+    // Driven hard on the negative half, the drain-dependent quadratic can
+    // have no real root; the attenuator fell back to x / (1 + G0) there, a
+    // different curve, so the output jumped as the input crossed into it --
+    // -3.00 at an input of -6.6, -1.675 at -6.7. A falling negative lobe of
+    // a 1 kHz tone at +20 dB through a slow attack is just that: its
+    // magnitude falls and the reduction grows, so the output's magnitude must
+    // fall every sample. It rose.
+    {
+      sonore::FetCompressor hard;
+      hard.setSampleRate((float) sr);
+      hard.setInput(20.0f);
+      hard.setAttack(800.0f);
+      hard.setRelease(300.0f);
+      hard.setGrain(0.2f);
+      hard.reset();
+      double previous = 1e9, worstRise = 0.0;
+      for (int i = 0; i < 12; ++i) {
+        const float y = hard.process((float) (-0.9 * std::cos(2.0 * kTestPi * 1000.0 * i / sr)));
+        worstRise = std::max(worstRise, std::fabs((double) y) - previous);
+        previous = std::fabs((double) y);
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "driven past the attenuator's real root, the output follows a "
+                    "falling lobe down without a jump (worst rise %.4f)", worstRise);
+      check(worstRise <= 0.0, line);
+    }
   }
 
   // ── VCA ──
@@ -23830,6 +35452,64 @@ static void testLibraryRoundA() {
     for (int i = 0; i < 8; ++i) { sonore::ParametricEq<8>::Band off; g_libEq.setBand(i, off, true); }
   }
 
+  // ── Linear phase with a HIGHPASS in the curve ──
+  //
+  // The kernel used to be trimmed to the curve's gain at DC, and a curve with
+  // a highpass (or bandpass) band in it has none: -300 dB there, so the whole
+  // kernel was scaled by ~1e-15. An 80 Hz highpass plus a bell came out at
+  // -273 dB at 1 kHz while magnitudeDb() drew +0.4. The test above only ever
+  // used a bell and a shelf.
+  {
+    g_libEq.setSampleRate((float) sr);
+    sonore::ParametricEq<8>::Band hp, bell;
+    hp.enabled = true; hp.shape = sonore::ParametricEq<8>::Shape::Highpass; hp.hz = 80.0f; hp.q = 0.7071f;
+    bell.enabled = true; bell.hz = 2500.0f; bell.gainDb = 4.0f; bell.q = 1.2f;
+    g_libEq.setBand(0, hp, true);
+    g_libEq.setBand(1, bell, true);
+    const double iir1k = g_libEq.magnitudeDb(1000.0f), iir2k5 = g_libEq.magnitudeDb(2500.0f);
+    const auto started = std::chrono::steady_clock::now();
+    g_libEq.setLinearPhase(2047);
+    const double designMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    g_libEq.reset();
+    const double fir1k = steadyDb([&](float x) { return g_libEq.process(x); }, 1000.0, sr);
+    const double fir2k5 = steadyDb([&](float x) { return g_libEq.process(x); }, 2500.0, sr);
+    const double fir30 = steadyDb([&](float x) { return g_libEq.process(x); }, 30.0, sr);
+    std::printf("  ---- highpass + bell, linear phase: 1 kHz %.2f/%.2f dB, 2.5 kHz %.2f/%.2f, 30 Hz %.1f; "
+                "designed in %.0f ms ----\n", fir1k, iir1k, fir2k5, iir2k5, fir30, designMs);
+    check(std::fabs(fir1k - iir1k) < 0.5 && std::fabs(fir2k5 - iir2k5) < 0.5,
+          "a curve with a highpass in it plays at the level it draws, not 270 dB under it");
+    check(fir30 < -10.0, "...and the highpass still cuts below its corner");
+    // The design time is PRINTED, not asserted: a timing threshold on shared
+    // CI hardware, or under the sanitizers, is a flaky test. It was 1.3 s for
+    // four bands with the curve evaluated inside the tap loop.
+    g_libEq.setLinearPhase(0);
+    for (int i = 0; i < 8; ++i) { sonore::ParametricEq<8>::Band off; g_libEq.setBand(i, off, true); }
+  }
+
+  // ── Linear phase across a rate change ──
+  //
+  // setSampleRate() redesigned the bands and kept the kernel: designed at
+  // 48 kHz and played at 96, every band sat an octave up.
+  {
+    g_libEq.setSampleRate((float) sr);
+    sonore::ParametricEq<8>::Band bell;
+    bell.enabled = true; bell.hz = 1000.0f; bell.gainDb = 6.0f; bell.q = 1.0f;
+    g_libEq.setBand(0, bell, true);
+    g_libEq.setLinearPhase(1023);
+    g_libEq.reset();
+    const double at48 = steadyDb([&](float x) { return g_libEq.process(x); }, 1000.0, sr);
+    g_libEq.setSampleRate(96000.0f);
+    g_libEq.reset();
+    const double at96 = steadyDb([&](float x) { return g_libEq.process(x); }, 1000.0, 96000.0);
+    std::printf("  ---- linear-phase 1 kHz +6 dB bell: %.2f dB at 48 kHz, %.2f dB after a change to 96 kHz ----\n",
+                at48, at96);
+    check(std::fabs(at48 - 6.0) < 0.5 && std::fabs(at96 - 6.0) < 0.5,
+          "a linear-phase EQ is designed again for a new rate: its bell stays where it was set");
+    g_libEq.setSampleRate((float) sr);
+    g_libEq.setLinearPhase(0);
+    for (int i = 0; i < 8; ++i) { sonore::ParametricEq<8>::Band off; g_libEq.setBand(i, off, true); }
+  }
+
   // ── Diode clipper ──
   {
     sonore::OversampledDiodeClipper<3> clip;
@@ -23942,6 +35622,25 @@ static void testLibraryRoundA() {
     shifter.reset();
     for (size_t n = 0; n < y.size(); ++n) y[n] = shifter.process((float) (0.5 * std::sin(2.0 * kTestPi * 3000.0 * (double) n / sr)));
     checkNear(r2ToneDb(r2Slice(y, 24000, 24000), 500.0, sr, 0.5), 0.0, 0.3, "a -2500 Hz shift takes 3 kHz to 500 Hz: hertz, not semitones");
+
+    // The same band at any rate. The pair's transition was a fixed 0.005 of
+    // the sample rate -- 240 Hz at 48 kHz, 960 Hz at 192 -- so at high rates
+    // the low octaves were nowhere near ninety degrees apart and the image
+    // came back. The shifter now designs its pair for a 240 Hz edge.
+    for (double rate : {96000.0, 192000.0}) {
+      sonore::FrequencyShifter fast;
+      fast.setSampleRate((float) rate);
+      fast.setShift(100.0f);
+      fast.reset();
+      std::vector<float> z((size_t) rate);
+      for (size_t n = 0; n < z.size(); ++n) z[n] = fast.process((float) (0.5 * std::sin(2.0 * kTestPi * 500.0 * (double) n / rate)));
+      const std::vector<float> settled = r2Slice(z, z.size() / 2, z.size() / 2);
+      const double up = r2ToneDb(settled, 600.0, rate, 0.5), down = r2ToneDb(settled, 400.0, rate, 0.5);
+      char line[200];
+      std::snprintf(line, sizeof(line), "at %.0f kHz, 500 Hz shifted +100 Hz keeps its image 40 dB down "
+                    "(600 Hz %.2f dB, image %.1f dB)", rate / 1000.0, up, down);
+      check(std::fabs(up) < 0.2 && down < -40.0, line);
+    }
   }
 
   // ── Modulation ──
@@ -24021,6 +35720,88 @@ static void testLibraryRoundA() {
     const double centsUp = 1200.0 * std::log2(hi / 1000.0), centsDown = 1200.0 * std::log2(lo / 1000.0);
     std::printf("  ---- vibrato +/-50 cents at 5 Hz: measured +%.0f / %.0f cents ----\n", centsUp, centsDown);
     check(centsUp > 30.0 && centsUp < 60.0 && centsDown < -30.0 && centsDown > -60.0, "vibrato depth in cents is the pitch deviation measured");
+
+    // The same, set up WITHOUT setRate: the LFO ran at its own 1 Hz while the
+    // swing was worked out for the class's 5 Hz, and 50 cents swung 10.
+    {
+      sonore::Vibrato<> plain;
+      plain.setSampleRate((float) sr);
+      plain.setDepthCents(50.0f);
+      plain.reset();
+      std::vector<float> py(96000);
+      for (size_t i = 0; i < py.size(); ++i)
+        py[i] = plain.process((float) (0.5 * std::sin(2.0 * kTestPi * 1000.0 * (double) i / sr)));
+      double phi = 0.0, plo = 1e9;
+      for (int start = 48000; start + 2400 < 96000; start += 600) {
+        const double hz = r2ZeroCrossingHz(r2Slice(py, (size_t) start, 2400), sr);
+        phi = std::max(phi, hz);
+        plo = std::min(plo, hz);
+      }
+      const double up = 1200.0 * std::log2(phi / 1000.0);
+      char vl[160];
+      std::snprintf(vl, sizeof(vl), "a vibrato never given setRate swings the 50 cents asked for (+%.0f)", up);
+      check(up > 30.0 && up < 60.0, vl);
+    }
+
+    // The rate knob turned while it plays, 5 Hz to 4. The swing and the
+    // centre both follow the rate, and set in one sample they moved the read
+    // point five samples at once: a splice 3.1 times the largest step the
+    // tone takes under the vibrato. Now they glide there.
+    {
+      sonore::Vibrato<> turned;
+      turned.setSampleRate((float) sr);
+      turned.setRate(5.0f);
+      turned.setDepthCents(20.0f);
+      turned.reset();
+      float prev = 0.0f, steady = 0.0f, atChange = 0.0f;
+      for (int i = 0; i < 72000; ++i) {
+        if (i == 48000) turned.setRate(4.0f);
+        const float yv = turned.process((float) std::sin(2.0 * kTestPi * 1000.0 * (double) i / sr));
+        const float stepNow = std::fabs(yv - prev);
+        prev = yv;
+        if (i > 24000 && i < 48000) steady = (std::max)(steady, stepNow);
+        if (i >= 48000) atChange = (std::max)(atChange, stepNow);
+      }
+      char vl[200];
+      std::snprintf(vl, sizeof(vl), "turning a vibrato's rate does not splice the signal (largest "
+                    "step %.3f after, %.3f before)", atChange, steady);
+      check(atChange < steady * 1.1f, vl);
+    }
+
+    // The latency it reports is its mean delay. The delay swings around a
+    // centre of swing + 8 samples -- 25.75 at the default 20 cents and 5 Hz --
+    // and (int) told the host 25: a dry path compensated by that is 3/4 of a
+    // sample early, which in a parallel mix is a comb notch at 32 kHz with a
+    // -3 dB edge already inside the audio band at 48 kHz.
+    // Measured as the centroid of the response to each of a train of impulses,
+    // averaged over whole LFO cycles; the cubic reproduces a line exactly, so
+    // each centroid is the delay at that instant.
+    for (float cents : {20.0f, 50.0f, 7.0f}) {
+      sonore::Vibrato<> v;
+      v.setSampleRate((float) sr);
+      v.setRate(5.0f);
+      v.setDepthCents(cents);
+      v.reset();
+      const int spacing = 200, cycles = 5, total = (int) (sr / 5.0) * cycles;
+      std::vector<float> out((size_t) total + 400);
+      for (int i = 0; i < (int) out.size(); ++i) out[(size_t) i] = v.process(i % spacing == 0 && i < total ? 1.0f : 0.0f);
+      double sumDelay = 0.0;
+      int impulses = 0;
+      for (int at = 0; at < total; at += spacing) {
+        double mass = 0.0, moment = 0.0;
+        for (int k = 0; k < spacing; ++k) {
+          mass += out[(size_t) (at + k)];
+          moment += (double) k * out[(size_t) (at + k)];
+        }
+        sumDelay += moment / mass;
+        ++impulses;
+      }
+      const double mean = sumDelay / impulses;
+      char line[200];
+      std::snprintf(line, sizeof(line), "a %.0f-cent vibrato reports its mean delay as its latency "
+                    "(measured %.3f, reported %d)", cents, mean, v.latencySamples());
+      check(std::fabs(mean - (double) v.latencySamples()) < 0.05, line);
+    }
 
     sonore::RingModulator ring;
     ring.setSampleRate((float) sr);
@@ -24133,6 +35914,34 @@ static void testLibraryRoundB() {
     room.order = 2;
     g_libReflections.setRoom(room);
     check(g_libReflections.tapCount() == 24, "...and order 2 adds the eighteen two-bounce images");
+    // The images a room has but the line cannot hold are COUNTED. MaxDelay is
+    // in samples, so a big room at a high order loses its far images at
+    // 192 kHz and nowhere else; droppedTaps() says so instead of the room
+    // quietly sounding smaller there.
+    {
+      sonore::ProcessSpec hiSpec;
+      hiSpec.sampleRate = 192000.0;
+      hiSpec.maximumBlockSize = 512;
+      hiSpec.numChannels = 2;
+      static sonore::EarlyReflections<> hiRate;
+      sonore::EarlyReflections<>::Room big;
+      big.length = 20.0f;
+      big.width = 15.0f;
+      big.height = 6.0f;
+      big.order = 3;
+      hiRate.prepare(hiSpec);
+      hiRate.setRoom(big);
+      const int droppedAt192 = hiRate.droppedTaps();
+      hiSpec.sampleRate = 48000.0;
+      hiRate.prepare(hiSpec);
+      hiRate.setRoom(big);
+      char rl[200];
+      std::snprintf(rl, sizeof(rl),
+                    "a 20 m room at order 3 reports the images the line cannot hold: %d at 192 kHz, "
+                    "%d at 48 kHz",
+                    droppedAt192, hiRate.droppedTaps());
+      check(droppedAt192 > 0 && hiRate.droppedTaps() == 0, rl);
+    }
     // The floor and ceiling images of a source 4 m away at the same height
     // are 5 m away: 14.6 ms, and together they weigh 2 x (4/5) sqrt(0.7).
     const double expectedSamples = 5.0 / 343.0 * sr;
@@ -24185,6 +35994,99 @@ static void testLibraryRoundB() {
     const double tuned = corrected(440.0, sonore::PitchCorrector::kChromatic, 20.0f);
     checkNear(tuned, 440.0, 0.5, "an in-tune note is left where it is");
     checkNear(g_libCorrector.ratio(), 1.0, 0.002, "...with a ratio of one");
+
+    // At high rates, a low voice. The detector's 2048-sample window holds a
+    // 1022-sample period: 47 Hz at 48 kHz, but 94 at 96 and 188 at 192 kHz,
+    // so a baritone's E2 inside the corrector's own 60 Hz floor was never
+    // detected and never corrected. The detector now runs on the input
+    // decimated to about 48 kHz.
+    for (double rate : {96000.0, 192000.0}) {
+      auto corrector = std::make_unique<sonore::PitchCorrector>();
+      corrector->setSampleRate((float) rate);
+      corrector->setRetune(20.0f);
+      corrector->reset();
+      const double e2 = 440.0 * std::pow(2.0, (40.0 - 69.0) / 12.0), flatE2 = e2 * std::pow(2.0, -20.0 / 1200.0);
+      for (int i = 0; i < (int) (rate * 1.0); ++i)
+        corrector->process((float) (0.5 * std::sin(2.0 * kTestPi * flatE2 * (double) i / rate)));
+      char line[200];
+      std::snprintf(line, sizeof(line), "at %.0f kHz a 20-cent-flat E2 is detected and aimed at %.2f Hz "
+                    "(detected %.2f, target %.2f)", rate / 1000.0, e2, corrector->detectedHz(), corrector->targetHz());
+      check(std::fabs(corrector->detectedHz() - flatE2) < 0.3 && std::fabs(corrector->targetHz() - e2) < 0.01, line);
+    }
+
+    // Every harmonic moves by the ratio, not by the fundamental's offset. The
+    // phase vocoder's 2048-point frame could not part the harmonics of a low
+    // voice at a high rate, and moved them all by the same few hertz: at
+    // 96 kHz a 112 Hz voice aimed at 110 had its second harmonic at 222, not
+    // 220, and at 384 kHz the fundamental was lost.
+    auto amplitudeAt = [](const std::vector<float>& v, double f, double rate) {
+      double re = 0.0, im = 0.0, ws = 0.0;
+      for (size_t i = 0; i < v.size(); ++i) {
+        const double w = 0.5 - 0.5 * std::cos(2.0 * kTestPi * (double) i / (double) (v.size() - 1));
+        const double a = 2.0 * kTestPi * f * (double) i / rate;
+        re += w * v[i] * std::cos(a);
+        im += w * v[i] * std::sin(a);
+        ws += w;
+      }
+      return 2.0 * std::sqrt(re * re + im * im) / ws;
+    };
+    struct Voice {
+      double rate, f0;
+    };
+    for (const Voice voice : {Voice{48000.0, 63.0}, Voice{96000.0, 112.0}, Voice{384000.0, 112.0}}) {
+      auto corrector = std::make_unique<sonore::PitchCorrector>();
+      corrector->setSampleRate((float) voice.rate);
+      corrector->setRetune(0.0f);
+      const int n = (int) (voice.rate * 3.0);
+      std::vector<float> tail;
+      double phase = 0.0;
+      for (int i = 0; i < n; ++i) {
+        double x = 0.0;
+        for (int k = 1; k <= 8; ++k) x += std::sin(2.0 * kTestPi * k * phase) / k;
+        phase += voice.f0 / voice.rate;
+        if (phase >= 1.0) phase -= 1.0;
+        const float y = corrector->process((float) (0.3 * x));
+        if (i >= n - (int) voice.rate) tail.push_back(y);
+      }
+      const double target = corrector->targetHz(), offset = voice.f0 - target;
+      double worst = 1e9;
+      for (int k = 1; k <= 5; ++k) {
+        const double right = amplitudeAt(tail, k * target, voice.rate);
+        const double wrong = amplitudeAt(tail, k * target + offset, voice.rate);
+        worst = std::min(worst, right / (wrong > 1e-9 ? wrong : 1e-9));
+      }
+      char line[220];
+      std::snprintf(line, sizeof(line),
+                    "at %.0f kHz a %.0f Hz voice aimed at %.2f has every harmonic at k times the target, not "
+                    "shifted by %.2f Hz (worst right/wrong %.1f)",
+                    voice.rate / 1000.0, voice.f0, target, offset, worst);
+      check(worst > 3.0, line);
+    }
+
+    // With nothing to correct -- noise, which no pitch is detected in -- the
+    // output is the input, latencySamples() later.
+    {
+      auto corrector = std::make_unique<sonore::PitchCorrector>();
+      corrector->setSampleRate(96000.0f);
+      const int lat = corrector->latencySamples();
+      uint32_t seed = 1;
+      std::vector<float> x(96000), y(96000);
+      for (size_t i = 0; i < x.size(); ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        x[i] = 0.25f * ((float) (seed >> 8) / 16777216.0f - 0.5f);
+        y[i] = corrector->process(x[i]);
+      }
+      double err = 0.0, sig = 0.0;
+      for (size_t i = (size_t) lat + 4096; i < y.size(); ++i) {
+        err += (double) (y[i] - x[i - (size_t) lat]) * (y[i] - x[i - (size_t) lat]);
+        sig += (double) x[i - (size_t) lat] * x[i - (size_t) lat];
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line),
+                    "with nothing to correct the output is the input %d samples (%.1f ms) later (error %.1f dB)",
+                    lat, 1000.0 * lat / 96000.0, 10.0 * std::log10(err / sig + 1e-30));
+      check(err < sig * 1e-6, line);
+    }
   }
 
   // ── Distortion ──
@@ -24210,6 +36112,37 @@ static void testLibraryRoundB() {
     }
     std::printf("  ---- a -12 dBFS tone through 0..36 dB of tanh drive: level held within %.2f dB ----\n", worst);
     check(held, "auto-gain: the drive changes the tone, not the volume (a -12 dBFS tone stays within 1.5 dB)");
+    // The MIX, at its middle. The wet path is latencySamples() late through
+    // the oversampler, and it used to be summed against an UNdelayed dry
+    // signal: a comb with its first notch at sr / (2 L), 857 Hz at 8x. Here a
+    // quiet tone, where the curve is nearly linear, at that notch and at a
+    // frequency well clear of it -- aligned, the two read the same.
+    {
+      const int lat = sonore::Distortion<>::latencySamples();
+      const double notchHz = sr / (2.0 * (double) lat);
+      dist.setMix(0.5f);
+      run(0.0f, sonore::Distortion<>::Curve::Soft, notchHz, 0.02, y);
+      const double atNotch = r2ToneDb(r2Slice(y, 24000, 24000), notchHz, sr, 0.02);
+      run(0.0f, sonore::Distortion<>::Curve::Soft, 200.0, 0.02, y);
+      const double clear = r2ToneDb(r2Slice(y, 24000, 24000), 200.0, sr, 0.02);
+      std::printf("  ---- half wet, %d samples of wet latency: %.2f dB at %.0f Hz (where the comb's first "
+                  "notch fell), %.2f dB at 200 Hz ----\n", lat, atNotch, notchHz, clear);
+      check(std::fabs(atNotch - clear) < 0.5, "a half-wet mix is flat: the dry path waits for the oversampled wet one");
+      dist.setMix(1.0f);
+    }
+    // And out of the box it DISTORTS. The mixer it was built on starts fully
+    // dry, so a Distortion nobody called setMix on passed its input through
+    // untouched.
+    {
+      sonore::Distortion<> fresh;
+      fresh.setSampleRate((float) sr);
+      fresh.setCurve(sonore::Distortion<>::Curve::Tanh);
+      fresh.setDrive(30.0f);
+      std::vector<float> f(48000);
+      for (size_t i = 0; i < f.size(); ++i) f[i] = fresh.process((float) (0.25 * std::sin(2.0 * kTestPi * 1000.0 * (double) i / sr)));
+      const double h3 = r2ToneDb(r2Slice(f, 24000, 24000), 3000.0, sr) - r2ToneDb(r2Slice(f, 24000, 24000), 1000.0, sr);
+      check(h3 > -40.0, "a Distortion with its mix never set is wet: driven, it makes harmonics");
+    }
     run(6.0f, sonore::Distortion<>::Curve::Tanh, 1000.0, 0.25, y);
     const double mild = r2ToneDb(r2Slice(y, 24000, 24000), 3000.0, sr) - r2ToneDb(r2Slice(y, 24000, 24000), 1000.0, sr);
     run(30.0f, sonore::Distortion<>::Curve::Tanh, 1000.0, 0.25, y);
@@ -24261,6 +36194,34 @@ static void testLibraryRoundB() {
     check(aliasHard < -20.0, "even a full 15 kHz square holds them 20 dB down at 8x, and the header says why not more");
     check(sonore::Distortion<>::latencySamples() == 28, "...and the 8x oversampler's 28 samples are reported");
   }
+  // A band bypassed while loud, then un-bypassed once the signal had dropped
+  // 40 dB: its detectors had stopped at the bypass, and the band came back
+  // 25 dB down on a signal far under threshold.
+  {
+    sonore::ProcessSpec mbSpec;
+    mbSpec.sampleRate = 48000.0;
+    mbSpec.numChannels = 2;
+    auto mb = std::make_unique<sonore::MultibandDynamics<3>>();
+    mb->prepare(mbSpec);
+    sonore::MultibandDynamics<3>::BandSettings band;
+    band.ratio = 8.0f;
+    band.thresholdDb = -30.0f;
+    band.releaseMs = 100.0f;
+    mb->setBand(1, band);
+    for (int n = 0; n < 3 * 48000; ++n) {
+      if (n == 48000) { band.bypass = true; mb->setBand(1, band); }
+      const float amp = n < 48000 ? 1.0f : 0.01f;
+      float l = amp * (float) std::sin(2.0 * kTestPi * 1000.0 * n / 48000.0), r = l;
+      mb->process(l, r);
+    }
+    band.bypass = false;
+    mb->setBand(1, band);
+    float l = 0.0f, r = 0.0f;
+    mb->process(l, r);
+    char line[160];
+    std::snprintf(line, sizeof(line), "a band un-bypassed after the signal dropped applies no stale reduction (%.2f dB)", mb->gainChangeDb(1));
+    check(mb->gainChangeDb(1) > -1.0f, line);
+  }
 }
 
 // ── The library round, C: the circuit engine, the Fuzz Face, the passive EQ ──
@@ -24274,6 +36235,45 @@ static void testLibraryRoundC() {
   // ── The engine, on circuits with answers ──
   {
     // A divider with a supply: pure linear algebra.
+    // A half-wave diode clipper driven hard and fast: 24 V at 5 kHz is
+    // 15.7 V a sample. Every Newton step was capped at 0.25 V in either
+    // direction, so 24 iterations moved a port 6 V at most: 2798 of 4800
+    // samples unconverged, 20 V wrong. Memoryless, so the exact answer per
+    // sample is a scalar root, found here by bisection.
+    {
+      auto exact = [](double vin) {
+        const double is = 2.52e-9, vt = 0.02585 * 1.752;
+        double lo = -100.0, hi = 100.0;
+        for (int i = 0; i < 200; ++i) {
+          const double v = 0.5 * (lo + hi);
+          const double f = (vin - v) / 1000.0 - is * (std::exp(std::min(v / vt, 80.0)) - 1.0) - v * 1e-9;
+          if (f > 0.0) lo = v;
+          else hi = v;
+        }
+        return 0.5 * (lo + hi);
+      };
+      sonore::NodalCircuit<4, 1, 1, 1, 0> clip;
+      clip.setSampleRate(48000.0);
+      const int in = clip.addNode(), out = clip.addNode();
+      const int src = clip.addVoltageSource(in, 0, 0.0);
+      clip.addResistor(in, out, 1000.0);
+      clip.addDiode(out, 0);
+      clip.reset();
+      int unconverged = 0;
+      double worst = 0.0;
+      for (int i = 0; i < 4800; ++i) {
+        const double vin = 24.0 * std::sin(2.0 * kTestPi * 5000.0 * i / 48000.0);
+        clip.setSource(src, vin);
+        clip.step();
+        if (!clip.converged()) ++unconverged;
+        worst = std::max(worst, std::fabs(clip.voltage(out) - exact(vin)));
+      }
+      char l[160];
+      std::snprintf(l, sizeof(l),
+                    "a diode clipper fed 24 V at 5 kHz converges every sample (%d unconverged, worst %.2g V off)",
+                    unconverged, worst);
+      check(unconverged == 0 && worst < 1e-3, l);
+    }
     sonore::NodalCircuit<4, 1, 2, 2> div;
     const int a = div.addNode(), b = div.addNode();
     div.addVoltageSource(a, 0, 9.0);
@@ -24283,6 +36283,55 @@ static void testLibraryRoundC() {
     div.reset();
     div.step();
     checkNear(div.voltage(b), 4.5, 1e-4, "two equal resistors halve nine volts (to the gmin)");
+
+    // Node numbers are checked. One that addNode() never made was stamped as
+    // it came: 99 wrote far past the 4x4 matrix on the stack, and 3, inside it,
+    // into the voltage source's row. And addNode() past MaxNodes handed out
+    // 0, so a part meant for a third node was wired to ground without a word.
+    {
+      sonore::NodalCircuit<2, 1, 1, 1, 1> small;
+      const int n1 = small.addNode(), n2 = small.addNode(), n3 = small.addNode();
+      check(n1 == 1 && n2 == 2 && n3 == -1, "addNode() past MaxNodes is -1, not ground");
+      check(small.addResistor(n1, 99, 1e3) == -1 && small.addResistor(n1, n3, 1e3) == -1 &&
+                small.addResistor(-2, n2, 1e3) == -1 && small.addCapacitor(n1, 3, 1e-6) == -1 &&
+                small.addInductor(7, 0, 1e-3) == -1 && small.addVoltageSource(n1, 5, 1.0) == -1 &&
+                small.addOpamp(n1, n2, 4) == -1 && small.addDiode(n1, 9) == -1 &&
+                small.addBjt(n1, n2, 3, 1e-14, 100.0) == -1 && small.addJfet(3, n1, n2, 1e-3, -2.0) == -1,
+            "every kind of part refuses a node addNode() did not make");
+      small.addVoltageSource(n1, 0, 2.0);
+      small.addResistor(n1, n2, 1e3);
+      small.addResistor(n2, 0, 1e3);
+      small.setSampleRate(sr);
+      small.reset();
+      small.step();
+      checkNear(small.voltage(n2), 1.0, 1e-4, "the circuit around the refused parts solves as if they were never offered");
+      check(small.voltage(3) == 0.0 && small.voltage(99) == 0.0 && small.voltage(-1) == 0.0,
+            "and voltage() of a number that is not a node is 0, not another unknown");
+    }
+
+    // Stepped without a reset() first. The solver's state -- the Newton
+    // guess, the node voltages, the port currents -- had no initialiser, so
+    // it was whatever the memory held: here every byte 0xFF, a NaN in every
+    // double, and a NaN Newton guess never converges to anything else.
+    {
+      using Circuit = sonore::NodalCircuit<4, 1, 2, 2>;
+      alignas(Circuit) static unsigned char raw[sizeof(Circuit)];
+      std::memset(raw, 0xFF, sizeof(raw));
+      Circuit* clip = new (raw) Circuit;
+      const int ca = clip->addNode(), cb = clip->addNode();
+      const int src = clip->addVoltageSource(ca, 0, 0.0);
+      clip->addResistor(ca, cb, 1e3);
+      clip->addDiode(cb, 0);
+      clip->setSampleRate(sr);
+      bool finite = true;
+      for (int i = 0; i < 64; ++i) {
+        clip->setSource(src, 2.0 * std::sin(2.0 * kTestPi * 1000.0 * (double) i / sr));
+        clip->step();
+        if (!std::isfinite(clip->voltage(cb))) finite = false;
+      }
+      check(finite, "a circuit stepped before any reset() starts from zero, not from whatever the memory held");
+      clip->~Circuit();
+    }
 
     // An RC lowpass driven by a sine: the companion model is the physics.
     sonore::NodalCircuit<4, 1, 2, 2> rc;
@@ -24316,6 +36365,29 @@ static void testLibraryRoundC() {
       yc[i] = (float) rl.voltage(lb);
     }
     checkNear(r2ToneDb(r2Slice(yc, 12000, 12000), fl, sr, 0.5), -3.01, 0.1, "an RL highpass is -3 dB at R/(2 pi L)");
+
+    // "Starts settled": an inductor carrying a DC bias must still carry it on
+    // the first sample. reset() solved the DC point and then gave the
+    // inductor's history no current, so 10 mA through a choke became 0 A and
+    // climbed back with L/R -- a thump at the start of every render.
+    {
+      sonore::NodalCircuit<4, 1, 2, 2> bias;
+      const int top = bias.addNode(), mid = bias.addNode();
+      bias.addVoltageSource(top, 0, 1.0);
+      bias.addInductor(top, mid, 0.1);
+      bias.addResistor(mid, 0, 100.0); // 10 mA, settled: 1 V across the resistor
+      bias.setSampleRate(sr);
+      bias.reset();
+      double worst = 0.0;
+      for (int i = 0; i < 480; ++i) {
+        bias.step();
+        worst = std::max(worst, std::fabs(bias.voltage(mid) - 1.0));
+      }
+      char line[200];
+      std::snprintf(line, sizeof(line), "a biased inductor starts settled: the load stays at its "
+                    "DC voltage from the first sample (worst %.4f V off)", worst);
+      check(worst < 1e-3, line);
+    }
 
     // An emitter follower: the BJT model biases itself and follows.
     sonore::NodalCircuit<4, 2, 2, 2> ef;
@@ -24365,6 +36437,56 @@ static void testLibraryRoundC() {
     check(worst < 1e-3, "the nodal engine and the hand-derived clipper agree to a millivolt: two derivations, one circuit");
   }
 
+  // ── The clipper driven HARD, at the rate it is meant to run at ──
+  //
+  // Every check above stops at a volt or two. At 384 kHz -- the 8x the header
+  // recommends -- a 10 V sine at 10 kHz, a 7 V sine at 20 kHz, or a -6 dBFS
+  // saw through setInputGain(20) used to send the solver past the point where
+  // its exponential was capped: the current went flat there while the slope
+  // it reported did not, so each Newton step crept by a fraction of a
+  // millivolt, the eight ran out, and the next sample's explicit predictor
+  // threw it further. The output alternated around +/-8e10 V and stayed there
+  // through half a second of silence. Two back-to-back diodes cannot hold a
+  // capacitor past about a volt; that is the bound asserted.
+  {
+    const double rate = 384000.0;
+    struct Drive { const char* what; double amp, hz, gain; bool saw; };
+    const Drive drives[] = {{"a 10 V sine at 10 kHz", 10.0, 10000.0, 1.0, false},
+                            {"a 7 V sine at 20 kHz", 7.0, 20000.0, 1.0, false},
+                            {"a -6 dBFS 220 Hz saw at input gain 20", 0.5, 220.0, 20.0, true}};
+    for (const Drive& d : drives) {
+      sonore::DiodeClipper clip;
+      clip.setSampleRate((float) rate);
+      clip.setInputGain((float) d.gain);
+      clip.reset();
+      double peak = 0.0, settled = 0.0;
+      bool finite = true;
+      const int loud = (int) (rate * 0.25), quiet = (int) (rate * 0.5);
+      for (int i = 0; i < loud + quiet; ++i) {
+        double x = 0.0;
+        if (i < loud) {
+          const double t = (double) i / rate;
+          if (d.saw) {
+            // Band-limited: every harmonic of 220 Hz below 20 kHz.
+            for (int k = 1; k * d.hz < 20000.0; ++k)
+              x += (k % 2 ? 1.0 : -1.0) * std::sin(2.0 * kTestPi * d.hz * k * t) / k;
+            x *= d.amp * 2.0 / kTestPi;
+          } else {
+            x = d.amp * std::sin(2.0 * kTestPi * d.hz * t);
+          }
+        }
+        const float y = clip.process((float) x);
+        if (!std::isfinite(y)) finite = false;
+        if (i < loud) peak = std::fmax(peak, std::fabs((double) y));
+        else settled = std::fabs((double) y);
+      }
+      char line[220];
+      std::snprintf(line, sizeof(line), "%s at 384 kHz: peak %.3g V, %.3g V after half a second of "
+                    "silence", d.what, peak, settled);
+      check(finite && peak < 1.5 && settled < 1e-3, line);
+    }
+  }
+
   // ── The Fuzz Face ──
   {
     g_libFuzz.setSampleRate((float) sr);
@@ -24395,6 +36517,25 @@ static void testLibraryRoundC() {
     check(std::fabs(pos / (neg < -1e-6 ? -neg : 1e-6) - 1.0) > 0.1, "driven, it clips asymmetrically: the bias point is not centred");
     check(h2 > -35.0, "...which is even harmonics, the fuzz's signature");
     check(allFinite(hot), "and it stays finite");
+    {
+      // Reported, not asserted: the nodal solver's cost, for comparison
+      // across builds. Best of three seconds of a driven 220 Hz tone.
+      double best = 1e9;
+      float sink = 0.0f;
+      for (int round = 0; round < 3; ++round) {
+        g_libFuzz.reset();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 48000; ++i)
+          sink += g_libFuzz.process((float) (0.2 * std::sin(2.0 * kTestPi * 220.0 * (double) i / sr)));
+        best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      }
+      double checksum = 0.0;
+      g_libFuzz.reset();
+      for (int i = 0; i < 4800; ++i)
+        checksum += (double) g_libFuzz.process((float) (0.2 * std::sin(2.0 * kTestPi * 220.0 * (double) i / sr))) * (double) (1 + i % 97);
+      std::printf("  ---- fuzz face: %.1fx realtime, output checksum %.9f%s ----\n", 1.0 / best, checksum,
+                  sink == 12345.0f ? " " : "");
+    }
     g_libFuzz.setFuzz(0.2f);
     std::vector<float> lowFuzz;
     runFuzz(0.0001, lowFuzz);
@@ -24466,6 +36607,30 @@ static void testLibraryRoundC() {
     std::printf("  ---- high atten full at 10 kHz: %.1f dB at 18 kHz ----\n", atten);
     check(atten < -10.0, "the atten shelf pulls the top down by double digits");
     check(std::fabs(at(500.0)) < 1.0, "...and leaves the mids alone");
+
+    // The first-order shelves are the analog network through the bilinear
+    // transform, which squeezes the whole axis into Nyquist: without a prewarp
+    // the 20 kHz atten's 14 kHz hinge sat near 11 kHz at 44.1 kHz. At the
+    // hinge the prototype (G s + w) / (s + w) reads |G j + 1| / |j + 1|, which
+    // for -16 dB is -2.9 dB -- and must, at any rate.
+    for (double rate : {44100.0, 96000.0}) {
+      sonore::PassiveEq top;
+      top.setSampleRate((float) rate);
+      top.setHighCutFrequency(20000.0f);
+      top.setHighCut(1.0f);
+      const double hinge = 14000.0;
+      std::vector<float> y((size_t) (rate * 0.5));
+      for (size_t i = 0; i < y.size(); ++i)
+        y[i] = top.process((float) (0.25 * std::sin(2.0 * kTestPi * hinge * (double) i / rate)));
+      const size_t half = y.size() / 2;
+      const double got = r2ToneDb(r2Slice(y, half, half), hinge, rate, 0.25);
+      const double g = std::pow(10.0, -16.0 / 20.0);
+      const double want = 20.0 * std::log10(std::sqrt(g * g + 1.0) / std::sqrt(2.0));
+      char line[200];
+      std::snprintf(line, sizeof(line), "at %.1f kHz the high atten's 14 kHz hinge reads %.2f dB, "
+                    "the analog network's %.2f", rate / 1000.0, got, want);
+      check(std::fabs(got - want) < 0.5, line);
+    }
   }
 }
 
@@ -24639,6 +36804,37 @@ static void testLibraryRoundD() {
     const double bright = r2ToneDb(r2Slice(y, 9600, 9600), 5000.0, sr, 3e-4);
     check(bright - dark > 10.0, "the tone knob swings 5 kHz by over 10 dB");
     check(sonore::TubeScreamer::latencySamples() == 24, "...and the 4x oversampler's 24 samples are reported");
+    // The same drive again is no change now: every setDrive() moved the
+    // resistor, and the matrix was re-factorised even for the value it held
+    // (1.3-1.5x the time, set per sample). The skip must not cost the stage
+    // the drive it was BUILT with -- build() applies it directly, since
+    // setDrive(drive_) would now return early -- nor stop a real move.
+    {
+      auto fresh = std::make_unique<sonore::TubeScreamer>();  // built at 0.5
+      auto turned = std::make_unique<sonore::TubeScreamer>(); // 0.5 -> 0 -> 0.5
+      auto resent = std::make_unique<sonore::TubeScreamer>(); // 0.5 sent every sample
+      turned->setDrive(0.0f);
+      turned->setDrive(0.5f);
+      for (sonore::TubeScreamer* s : {fresh.get(), turned.get(), resent.get()}) {
+        s->setSampleRate((float) sr);
+        s->setLevel(1.0f);
+      }
+      double worstTurned = 0.0, worstResent = 0.0, moved = 0.0;
+      for (int n = 0; n < 9600; ++n) {
+        const float x = (float) (0.2 * std::sin(2.0 * kTestPi * 220.0 * n / sr));
+        resent->setDrive(n < 4800 ? 0.5f : 1.0f);
+        const float a = fresh->process(x), b = turned->process(x), c = resent->process(x);
+        worstTurned = std::max(worstTurned, (double) std::fabs(a - b));
+        if (n < 4800) worstResent = std::max(worstResent, (double) std::fabs(a - c));
+        else moved = std::max(moved, (double) std::fabs(a - c));
+      }
+      char tl[240];
+      std::snprintf(tl, sizeof(tl), "a screamer turned 0.5 -> 0 -> 0.5, and one sent 0.5 every sample, "
+                    "play bit-identically to one built at 0.5 (%.3g, %.3g)", worstTurned, worstResent);
+      check(worstTurned == 0.0 && worstResent == 0.0, tl);
+      std::snprintf(tl, sizeof(tl), "...and a new drive still moves the circuit (%.3f V apart at full)", moved);
+      check(moved > 0.01, tl); // unmoved, it would be exactly 0, as above
+    }
   }
 
   // ── The dynamic EQ ──
@@ -24667,6 +36863,38 @@ static void testLibraryRoundD() {
     checkNear(tone(1000.0, 0.1, 0.0, 0.0), 6.0, 0.2, "at ratio 1 a band is a static matched bell");
     checkNear(tone(100.0, 0.1, 0.0, 0.0), 0.0, 0.3, "...that leaves the rest of the spectrum alone");
     g_libDynEq.setBand(0, off);
+    // Every SHAPE does what its name says. The band design had no cookbook
+    // fallback here, unlike ParametricEq's, and the matched design never
+    // solves a highpass or a notch -- so those bands installed a unity filter
+    // and silently did nothing: a 1 kHz highpass read 0.00 dB at 100 Hz, a
+    // notch 0 dB at its own centre.
+    {
+      sonore::DynamicEq<4>::Band shaped;
+      shaped.enabled = true;
+      shaped.hz = 1000.0f;
+      shaped.q = 0.7071f;
+      shaped.shape = sonore::eqdetail::Shape::Highpass;
+      g_libDynEq.setBand(0, shaped);
+      const double hpBelow = tone(100.0, 0.1, 0.0, 0.0), hpAbove = tone(8000.0, 0.1, 0.0, 0.0);
+      shaped.shape = sonore::eqdetail::Shape::Notch;
+      shaped.q = 4.0f;
+      g_libDynEq.setBand(0, shaped);
+      const double notch = tone(1000.0, 0.1, 0.0, 0.0);
+      std::printf("  ---- dynamic EQ shapes: highpass 1 kHz reads %.1f dB at 100 Hz, %.2f at 8 kHz; "
+                  "notch %.1f dB at its centre ----\n", hpBelow, hpAbove, notch);
+      check(hpBelow < -30.0 && std::fabs(hpAbove) < 0.5,
+            "a highpass band cuts below its corner and passes above it");
+      check(notch < -30.0, "...and a notch band notches");
+      // And a Q of zero, which made the matched design hand back NaN
+      // coefficients as a success.
+      shaped.shape = sonore::eqdetail::Shape::Bell;
+      shaped.staticGainDb = 6.0f;
+      shaped.q = 0.0f;
+      g_libDynEq.setBand(0, shaped);
+      const double zeroQ = tone(1000.0, 0.1, 0.0, 0.0);
+      check(std::isfinite(zeroQ), "a band given Q = 0 still produces finite audio");
+      g_libDynEq.setBand(0, off);
+    }
     // Downward: the Giannoulis law, band-selectively.
     sonore::DynamicEq<4>::Band dn;
     dn.enabled = true;
@@ -24722,6 +36950,44 @@ static void testLibraryRoundD() {
     checkNear(lifted, 6.0, 0.5, "the upward band lifts a quiet slice, and the range cap holds it to +6");
     checkNear(g_libDynEq.gainDb(2), 6.0, 0.4, "...reported as +6");
     g_libDynEq.setBand(2, off);
+
+    // The detector holds its level at every rate. It was a float biquad, and
+    // a 40 Hz low shelf's lowpass read -0.6 dB in its passband at 192 kHz and
+    // +2.3 dB at 384: the same 20 Hz tone, 10 dB over a 4:1 threshold, was
+    // cut 6.6 dB at 192 kHz and 7.9 at 384, against 7.2 at 48.
+    {
+      double lo = 1e9, hi = -1e9;
+      char rates[160] = "";
+      for (double rate : {48000.0, 96000.0, 192000.0, 384000.0}) {
+        sonore::DynamicEq<1> shelf;
+        shelf.setSampleRate((float) rate);
+        sonore::DynamicEq<1>::Band b;
+        b.enabled = true;
+        b.shape = sonore::eqdetail::Shape::LowShelf;
+        b.hz = 40.0f;
+        b.thresholdDb = -20.0f;
+        b.ratio = 4.0f;
+        b.kneeDb = 0.0f;
+        b.rangeDb = 30.0f;
+        shelf.setBand(0, b);
+        shelf.reset();
+        double sum = 0.0;
+        int count = 0;
+        const int n = (int) (2.0 * rate);
+        for (int i = 0; i < n; ++i) {
+          shelf.process(0.316f * (float) std::sin(2.0 * kTestPi * 20.0 * i / rate));
+          if (i >= n / 2) { sum += shelf.gainDb(0); ++count; }
+        }
+        const double cut = -sum / count;
+        lo = std::min(lo, cut);
+        hi = std::max(hi, cut);
+        const size_t used = std::strlen(rates);
+        std::snprintf(rates + used, sizeof(rates) - used, "%s%.2f", used ? ", " : "", cut);
+      }
+      char dl[260];
+      std::snprintf(dl, sizeof(dl), "a 40 Hz dynamic low shelf cuts a 20 Hz tone alike at 48 to 384 kHz (%s dB)", rates);
+      check(hi - lo < 0.25, dl);
+    }
   }
 
   // ── The true-peak limiter ──
@@ -24762,9 +37028,71 @@ static void testLibraryRoundD() {
       out[i] = l;
       if (i > (size_t) lat + 100 && std::fabs(out[i] - in[i - (size_t) lat]) > 2e-4f) transparent = false;
     }
-    std::printf("  ---- latency %d (look-ahead + the interpolator's 8) ----\n", lat);
-    check(lat == 96 + 8, "latency is the look-ahead plus the detector FIR's centre, and it is reported");
+    std::printf("  ---- latency %d (look-ahead + the interpolator's 32) ----\n", lat);
+    check(lat == 96 + 32, "latency is the look-ahead plus the detector FIR's centre, and it is reported");
     check(transparent, "below the ceiling the limiter is a wire with that delay");
+
+    // A single-sample click at 0 dBFS, with a release and a look-ahead short
+    // enough to expose WHEN each detector acts. The audio is delayed by the
+    // look-ahead plus the true-peak interpolator's 8; the inter-sample
+    // estimate is 8 samples late by construction, but the SAMPLE peak was
+    // taken from the sample arriving now -- 8 samples early -- so its ramp
+    // had already released by the time the click came out: -0.40 dBFS
+    // through a -1 dB ceiling.
+    {
+      bool held = true;
+      double worstDb = -200.0;
+      for (float rel : {0.1f, 1.0f}) {
+        for (float la : {0.1f, 0.5f}) {
+          g_libTpl.prepare(spec);
+          g_libTpl.setCeiling(-1.0f);
+          g_libTpl.setRelease(rel);
+          g_libTpl.setLookahead(la);
+          double peak = 0.0;
+          for (int i = 0; i < 4800; ++i) {
+            float l = i == 1000 ? 1.0f : 0.0f, r = 0.0f;
+            g_libTpl.process(l, r);
+            peak = std::max(peak, (double) std::fabs(l));
+          }
+          const double db = 20.0 * std::log10(peak);
+          worstDb = std::max(worstDb, db);
+          if (db > -1.0 + 0.01) held = false;
+        }
+      }
+      std::printf("  ---- a 0 dBFS click, releases of 0.1 and 1 ms, look-aheads of 0.1 and 0.5 ms: "
+                  "loudest out %.2f dBFS ----\n", worstDb);
+      check(held, "a click is held to the ceiling however short the release: both detectors act "
+                  "on the sample the delay is about to emit");
+      g_libTpl.setRelease(80.0f);
+      g_libTpl.setLookahead(2.0f);
+    }
+  }
+
+  // ── A look-ahead longer than the buffer is clamped to what the buffer DELAYS ──
+  //
+  // setLookahead clamped to MaxLookaheadSamples + 1, but the delay line can
+  // only read MaxLookaheadSamples - 2 back, and the sliding minimum's ring
+  // holds one less than its size. So Limiter<1024> at 384 kHz with the
+  // default 3 ms reported 1025 samples of latency and delayed 1022 -- a host
+  // compensating by the number it was told smeared every parallel mix by 3.
+  {
+    static sonore::Limiter<1024> wide;
+    sonore::ProcessSpec hi;
+    hi.sampleRate = 384000.0;
+    hi.numChannels = 2;
+    wide.prepare(hi);
+    wide.setCeiling(0.0f);
+    wide.setLookahead(3.0f);
+    const int told = wide.latencySamples();
+    int actual = -1;
+    for (int i = 0; i < 4096; ++i) {
+      float l = i == 0 ? 0.5f : 0.0f, r = 0.0f;
+      wide.process(l, r);
+      if (actual < 0 && std::fabs(l) > 0.25f) actual = i;
+    }
+    std::printf("  ---- Limiter<1024> asked for 3 ms at 384 kHz: reports %d samples, delays %d ----\n",
+                told, actual);
+    check(told == actual, "the latency a clamped look-ahead reports is the delay it applies");
   }
 
   // ── The Dattorro plate ──
@@ -24881,9 +37209,1290 @@ static void testLibraryRoundD() {
   }
 }
 
+// An EQ band against its analogue prototype. The matched design fits DC, w0
+// and Nyquist exactly and can wander between them: a 15 kHz +12 dB high shelf
+// at 44.1 kHz read -5.45 dB at 8 kHz, a cut in a boost.
+static void testEqStaysOnTarget() {
+  std::printf("\n[eq on target]\n");
+  using Shape = sonore::eqdetail::Shape;
+  // A band that glided to its target and settled glides on from exactly
+  // there -- the same glide, sample for sample, as a band snapped to it. Its
+  // smoothers stayed wherever "settled" caught them, up to a thousandth off,
+  // and the next glide set out from a curve that was not the one playing.
+  {
+    using Eq = sonore::ParametricEq<1>;
+    Eq glided, snapped;
+    glided.setSampleRate(48000.0f);
+    snapped.setSampleRate(48000.0f);
+    Eq::Band from;
+    from.enabled = true;
+    from.hz = 200.0f;
+    from.gainDb = 0.0f;
+    from.q = 0.7071f;
+    Eq::Band to = from;
+    to.hz = 3000.0f;
+    to.gainDb = 9.0f;
+    to.q = 2.0f;
+    glided.setBand(0, from, true);
+    glided.setBand(0, to);
+    for (int i = 0; i < 48000; ++i) glided.process(0.0f); // a second: long settled
+    snapped.setBand(0, to, true);
+    Eq::Band next = to;
+    next.hz = 500.0f;
+    next.gainDb = -6.0f;
+    glided.setBand(0, next);
+    snapped.setBand(0, next);
+    float worst = 0.0f;
+    for (int i = 0; i < 9600; ++i) {
+      const float x = (float) (0.5 * std::sin(2.0 * kTestPi * 440.0 * (double) i / 48000.0));
+      worst = std::max(worst, std::fabs(glided.process(x) - snapped.process(x)));
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "a settled band's next glide is the glide of a band snapped to "
+                  "where it settled (largest difference %.3g)", (double) worst);
+    check(worst == 0.0f, l);
+  }
+  auto analogueDb = [](Shape shape, double f, double hz, double q, double gainDb) {
+    return 10.0 * std::log10(sonore::eqdetail::prototypeMag2(shape, f / hz, q, std::pow(10.0, gainDb / 20.0)));
+  };
+  {
+    sonore::Biquad b;
+    b.setSampleRate(44100.0f);
+    sonore::eqdetail::designBand(b, Shape::HighShelf, 15000.0f, 0.7071f, 12.0f, 44100.0f);
+    const double at5 = b.magnitudeDb(5000.0f), at8 = b.magnitudeDb(8000.0f);
+    char l[200];
+    std::snprintf(l, sizeof(l),
+                  "a 15 kHz +12 dB high shelf at 44.1 kHz boosts where its prototype does "
+                  "(5 kHz %+.2f vs %+.2f, 8 kHz %+.2f vs %+.2f dB)",
+                  at5, analogueDb(Shape::HighShelf, 5000, 15000, 0.7071, 12), at8,
+                  analogueDb(Shape::HighShelf, 8000, 15000, 0.7071, 12));
+    check(at5 > -0.25 && at8 > 0.0 && std::fabs(at8 - analogueDb(Shape::HighShelf, 8000, 15000, 0.7071, 12)) < 1.5, l);
+  }
+  // Across the band: never further from the prototype, up to 0.9 of Nyquist,
+  // than the cookbook design would have been (plus a hair for float rounding).
+  {
+    double worstExcess = 0.0;
+    const Shape shapes[] = {Shape::Bell, Shape::LowShelf, Shape::HighShelf};
+    for (double sr : {44100.0, 96000.0})
+      for (Shape shape : shapes)
+        for (float g : {6.0f, 12.0f, 18.0f, -12.0f})
+          for (float q : {0.7071f, 2.0f})
+            for (float hz : {1000.0f, 5000.0f, 8000.0f, 12000.0f, 15000.0f, 18000.0f}) {
+              sonore::Biquad b, cook;
+              b.setSampleRate((float) sr);
+              cook.setSampleRate((float) sr);
+              sonore::eqdetail::designBand(b, shape, hz, q, g, (float) sr);
+              if (shape == Shape::Bell) cook.peak(hz, q, g);
+              else if (shape == Shape::LowShelf) cook.lowShelf(hz, q, g);
+              else cook.highShelf(hz, q, g);
+              double eb = 0.0, ec = 0.0;
+              for (int k = 0; k <= 40; ++k) {
+                const double f = 20.0 * std::pow(0.45 * sr / 20.0, k / 40.0);
+                const double a = analogueDb(shape, f, hz, q, g);
+                eb = std::max(eb, std::fabs(b.magnitudeDb((float) f) - a));
+                ec = std::max(ec, std::fabs(cook.magnitudeDb((float) f) - a));
+              }
+              worstExcess = std::max(worstExcess, eb - ec);
+            }
+    char l[160];
+    std::snprintf(l, sizeof(l),
+                  "no bell or shelf strays further from its prototype than the cookbook would "
+                  "(worst excess %+.2f dB)", worstExcess);
+    check(worstExcess < 0.75, l);
+  }
+  // A low band at a high rate. A 20 Hz Q 4 bell's poles sit 8e-5 inside the
+  // unit circle at 192 kHz; float resolved that to a few percent and the
+  // +12 dB band measured +8.08. The tone is run, not just the coefficients
+  // read: the state needs the precision as much as the design does.
+  {
+    const double sr = 192000.0;
+    sonore::ParametricEq<1> eq;
+    eq.setSampleRate((float) sr);
+    sonore::ParametricEq<1>::Band band;
+    band.shape = Shape::Bell;
+    band.hz = 20.0f;
+    band.q = 4.0f;
+    band.gainDb = 12.0f;
+    band.enabled = true;
+    eq.setBand(0, band, true);
+    std::vector<float> y((size_t) (3.0 * sr));
+    for (size_t i = 0; i < y.size(); ++i)
+      y[i] = eq.process((float) (0.1 * std::sin(2.0 * kTestPi * 20.0 * (double) i / sr)));
+    const double ran = r2ToneDb(r2Slice(y, (size_t) (2.0 * sr), (size_t) sr), 20.0, sr, 0.1);
+    char l[160];
+    std::snprintf(l, sizeof(l), "a 20 Hz +12 dB bell at 192 kHz boosts 12 dB (curve %+.2f, measured %+.2f)",
+                  eq.magnitudeDb(20.0f), ran);
+    check(std::fabs(eq.magnitudeDb(20.0f) - 12.0) < 0.1 && std::fabs(ran - 12.0) < 0.2, l);
+
+    // ...and the passive EQ's low boost reads the same at 192 kHz as at 48.
+    auto passiveAt = [](double rate) {
+      sonore::PassiveEq p;
+      p.setSampleRate((float) rate);
+      p.setLowFrequency(30.0f);
+      p.setLowBoost(1.0f);
+      p.setLowCut(0.5f);
+      std::vector<float> out((size_t) (3.0 * rate));
+      for (size_t i = 0; i < out.size(); ++i)
+        out[i] = p.process((float) (0.1 * std::sin(2.0 * kTestPi * 30.0 * (double) i / rate)));
+      return r2ToneDb(r2Slice(out, (size_t) (2.0 * rate), (size_t) rate), 30.0, rate, 0.1);
+    };
+    const double p48 = passiveAt(48000.0), p192 = passiveAt(192000.0);
+    std::snprintf(l, sizeof(l), "the passive EQ's 30 Hz boost is the same at 192 kHz as at 48 (%+.2f vs %+.2f dB)",
+                  p192, p48);
+    check(std::fabs(p192 - p48) < 0.3, l);
+  }
+}
+
+// What counts as text in a state bag, and so what reaches the page. A blob
+// with a high byte that starts no character passed as text and the page's
+// __state() argument was invalid UTF-8.
+static void testBagText() {
+  std::printf("\n[state bag text]\n");
+  sonore::StateBag bag;
+  const uint8_t blob[] = {0x6D, 0xE7, 0xFB, 0x3D};
+  bag.setBytes("blob", blob, sizeof(blob));
+  bag.setString("name", "Caf\xC3\xA9 \xE2\x99\xAA \xF0\x9F\x8E\xB5\tok");
+  check(!bag.valueIsText(0) && bag.valueIsText(1),
+        "a blob with a stray high byte is not text; accented, symbol and emoji text is");
+  auto text = [](const char* bytes) {
+    return sonore::StateBag::isUtf8Text((const uint8_t*) bytes, std::strlen(bytes));
+  };
+  check(!text("\xC0\xAE") && !text("\xE0\x80\xAF") && !text("\xED\xA0\x80") &&
+            !text("\xF4\x90\x80\x80") && !text("\xE2\x82") && !text("\x80") &&
+            !text("a\x01-") && text("plain") && text(""),
+        "overlong forms, surrogates, past U+10FFFF, truncated and control bytes are not text");
+  const std::string json = sonore::bagToJson(bag);
+  check(json.find("blob") == std::string::npos && json.find("name") != std::string::npos,
+        "and only the text reaches the page");
+}
+
+// A rate of 0, or a negative one, which these setSampleRate()s took as given
+// and the next design divided by: a Biquad's, an IirSection's and an SVF's
+// coefficients came out NaN, an Oscillator's phase increment was 0 / 0, a
+// DcBlocker's pole minus infinity, and an EnvFollower or a Smooth at a
+// negative rate grew without bound. They take 48 kHz now, as OnePole,
+// SvfSection and the LadderFilter always did -- so each must match a twin
+// set to 48 kHz sample for sample.
+static void testZeroSampleRates() {
+  std::printf("\n[sample rates of 0 and below]\n");
+  const auto input = [](int i) {
+    return (i == 0 ? 1.0f : 0.0f) + 0.5f * (float) std::sin(0.05 * (double) i);
+  };
+  for (float bad : {0.0f, -48000.0f}) {
+    auto same = [&](const char* name, auto&& fresh) {
+      auto a = fresh(bad), b = fresh(48000.0f);
+      bool match = true;
+      for (int i = 0; i < 2048 && match; ++i) {
+        const float x = input(i);
+        const float ya = a(x), yb = b(x);
+        match = ya == yb;
+      }
+      char line[160];
+      std::snprintf(line, sizeof(line), "%s at a rate of %.0f runs as at 48 kHz", name, bad);
+      check(match, line);
+    };
+    same("a Biquad lowpass", [](float sr) {
+      sonore::Biquad f;
+      f.setSampleRate(sr);
+      f.lowpass(1000.0f, 0.7071f);
+      return [f](float x) mutable { return f.process(x); };
+    });
+    same("an IirSection lowpass", [](float sr) {
+      sonore::IirSection f;
+      f.setSampleRate(sr);
+      f.lowpass(1000.0, 0.7071);
+      return [f](float x) mutable { return f.process(x); };
+    });
+    same("an SVF", [](float sr) {
+      sonore::SVF f;
+      f.setSampleRate(sr);
+      f.set(1000.0f, 0.7071f);
+      return [f](float x) mutable { f.process(x); return f.lp; };
+    });
+    same("a DcBlocker", [](float sr) {
+      sonore::DcBlocker f;
+      f.setSampleRate(sr);
+      return [f](float x) mutable { return f.process(x); };
+    });
+    same("an Oscillator", [](float sr) {
+      sonore::Oscillator o;
+      o.setSampleRate(sr);
+      o.setFreq(440.0f);
+      return [o](float x) mutable { return x * 0.0f + o.saw(); };
+    });
+    same("an EnvFollower", [](float sr) {
+      sonore::EnvFollower e;
+      e.setSampleRate(sr);
+      e.setTimes(5.0f, 50.0f);
+      return [e](float x) mutable { return e.process(x); };
+    });
+    same("a Smooth", [](float sr) {
+      sonore::Smooth s;
+      s.setup(sr, 8.0f);
+      return [s](float x) mutable { return s.next(x); };
+    });
+    same("a Compressor", [](float sr) {
+      sonore::Compressor c;
+      c.setSampleRate(sr);
+      c.setThreshold(-30.0f);
+      return [c](float x) mutable { return c.process(x); };
+    });
+    same("an Expander", [](float sr) {
+      sonore::Expander e;
+      e.setSampleRate(sr);
+      return [e](float x) mutable { return e.process(x * 0.01f); };
+    });
+  }
+}
+
+// A NaN handed to a ratio or a ceiling. Compressor::setRatio tested
+// `ratio < 1`, which a NaN fails, so the ratio was NaN and so was every gain
+// above the knee. A NaN ceiling compared false against every peak: the
+// true-peak limiter stopped limiting, and the sample-peak one's output clamp
+// turned every sample into NaN.
+static void testNanDynamicsSettings() {
+  std::printf("\n[NaN ratios and ceilings]\n");
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const double sr = 48000.0;
+  sonore::ProcessSpec spec;
+  spec.sampleRate = sr;
+  spec.maximumBlockSize = 512;
+  spec.numChannels = 2;
+  char line[200];
+
+  {
+    sonore::Compressor comp;
+    comp.setSampleRate((float) sr);
+    comp.setThreshold(-20.0f);
+    comp.setRatio(nan);
+    bool finite = true;
+    float peak = 0.0f;
+    for (int i = 0; i < 48000; ++i) {
+      const float y = comp.process(0.9f * (float) std::sin(2.0 * kTestPi * 100.0 * i / sr));
+      if (!std::isfinite(y)) finite = false;
+      if (i > 24000) peak = std::max(peak, std::fabs(y));
+    }
+    std::snprintf(line, sizeof(line),
+                  "a NaN ratio is taken as 1:1 (output finite %d, peak %.3f against an input of 0.9)",
+                  (int) finite, peak);
+    check(finite && std::fabs(peak - 0.9f) < 0.01f, line);
+  }
+
+  // Each limiter set to -6 dB, then handed a NaN: the -6 dB must hold.
+  const float ceiling = sonore::dbToGain(-6.0f);
+  {
+    auto lim = std::make_unique<sonore::TruePeakLimiter>();
+    lim->prepare(spec);
+    lim->setCeiling(-6.0f);
+    lim->setCeiling(nan);
+    float peak = 0.0f;
+    bool finite = true;
+    for (int i = 0; i < 48000; ++i) {
+      float l = (float) std::sin(2.0 * kTestPi * 997.0 * i / sr), r = l;
+      lim->process(l, r);
+      if (!std::isfinite(l)) finite = false;
+      if (i > 4800) peak = std::max(peak, std::fabs(l));
+    }
+    std::snprintf(line, sizeof(line),
+                  "a NaN ceiling leaves the true-peak limiter at -6 dB (sample peak %.2f dBFS)",
+                  sonore::gainToDb(peak));
+    check(finite && peak <= ceiling * 1.0001f, line);
+  }
+  {
+    auto lim = std::make_unique<sonore::Limiter<>>();
+    lim->prepare(spec);
+    lim->setCeiling(-6.0f);
+    lim->setCeiling(nan);
+    float peak = 0.0f;
+    bool finite = true;
+    for (int i = 0; i < 48000; ++i) {
+      float l = (float) std::sin(2.0 * kTestPi * 997.0 * i / sr), r = l;
+      lim->process(l, r);
+      if (!std::isfinite(l)) finite = false;
+      if (i > 4800) peak = std::max(peak, std::fabs(l));
+    }
+    std::snprintf(line, sizeof(line),
+                  "...and the sample-peak limiter there too (finite %d, peak %.2f dBFS)",
+                  (int) finite, sonore::gainToDb(peak));
+    check(finite && peak <= ceiling * 1.0001f, line);
+  }
+}
+
+// A DiodeLadder or SallenKeyFilter nobody prepared. Both keep a 1 kHz cutoff
+// and a 48 kHz rate from construction, and computed nothing from them until
+// setSampleRate() or setCutoff(): their coefficients were zero and the
+// lowpass put out silence. A fresh one must now play as one prepared at
+// 48 kHz, sample for sample.
+static void testFreshVaFilters() {
+  std::printf("\n[virtual-analogue filters, never prepared]\n");
+  auto same = [](const char* name, auto& fresh, auto& prepared) {
+    double peak = 0.0;
+    bool match = true;
+    for (int i = 0; i < 4800; ++i) {
+      const float x = 0.5f * (float) std::sin(2.0 * kTestPi * 200.0 * i / 48000.0);
+      const float a = fresh.process(x), b = prepared.process(x);
+      if (a != b) match = false;
+      peak = std::max(peak, (double) std::fabs(a));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "a %s never prepared filters as one prepared at 48 kHz (a 200 Hz tone comes out at peak %.3f)",
+                  name, peak);
+    check(match && peak > 0.1, line);
+  };
+  sonore::DiodeLadder freshLadder, ladder;
+  ladder.setSampleRate(48000.0f);
+  same("DiodeLadder", freshLadder, ladder);
+  sonore::SallenKeyFilter freshKorg, korg;
+  korg.setSampleRate(48000.0f);
+  same("SallenKeyFilter", freshKorg, korg);
+}
+
+// Dynamics nobody prepared. Each keeps its documented attack and release and
+// a 48 kHz rate from construction, and its detector's coefficients were only
+// worked out by setSampleRate(), setAttack() or setRelease(): until then the
+// detector followed the input sample by sample -- a compressor modulating a
+// 100 Hz tone's gain at 200 Hz, a transient shaper doing nothing. A fresh one
+// must now run as one prepared at 48 kHz, sample for sample.
+static void testFreshDetectors() {
+  std::printf("\n[dynamics, never prepared]\n");
+  auto same = [](const char* name, auto& fresh, auto& prepared, float amp) {
+    bool match = true;
+    for (int i = 0; i < 4800; ++i) {
+      const float x = amp * (float) std::sin(2.0 * kTestPi * 100.0 * i / 48000.0) * (i < 2400 ? 1.0f : 0.1f);
+      if (fresh.process(x) != prepared.process(x)) match = false;
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line), "a %s never prepared runs as one prepared at 48 kHz", name);
+    check(match, line);
+  };
+  sonore::Compressor freshComp, comp;
+  comp.setSampleRate(48000.0f);
+  same("Compressor", freshComp, comp, 0.9f);
+  sonore::Expander freshExp, expander;
+  expander.setSampleRate(48000.0f);
+  same("Expander", freshExp, expander, 0.05f);
+  sonore::UpwardCompressor freshUp, up;
+  up.setSampleRate(48000.0f);
+  same("UpwardCompressor", freshUp, up, 0.05f);
+  sonore::TransientShaper freshShaper, shaper;
+  shaper.setSampleRate(48000.0f);
+  freshShaper.setAttack(1.0f);
+  shaper.setAttack(1.0f);
+  same("TransientShaper", freshShaper, shaper, 0.5f);
+}
+
+// The stereo effects' mix, per side and at the rate. Reverb, Chorus (and the
+// Flanger on it), Phaser, FdnReverb, StereoDelay and SpringReverb ran both
+// sides through ONE DryWetMixer, which steps its glide per call: a moved mix
+// glided in half its time, the right side a step ahead of the left. None of
+// them, nor PlateReverb or RingModulator, gave a mixer the rate, so the glide
+// was 960 calls at any rate. Each side must now glide as a lone DryWetMixer
+// set to the session's rate does, stepped once a frame. The expected output
+// is built from the dry input and a twin held fully wet: the mix does not
+// reach any of these effects' state, so the twin's wet signal is the one the
+// moving instance mixes.
+static void testStereoMixGlides() {
+  std::printf("\n[stereo effects: the mix glides per side, at the rate]\n");
+  const double rate = 96000.0;
+  sonore::ProcessSpec spec;
+  spec.sampleRate = rate;
+  spec.maximumBlockSize = 512;
+  spec.numChannels = 2;
+  auto input = [&](int n, float& l, float& r) {
+    l = 0.4f * (float) std::sin(2.0 * kTestPi * 440.0 * n / rate) + (n % 997 == 0 ? 0.5f : 0.0f);
+    r = 0.4f * (float) std::sin(2.0 * kTestPi * 660.0 * n / rate);
+  };
+  auto glideError = [&](const char* name, auto& moving, auto& held, auto&& setMix) {
+    moving.prepare(spec);
+    held.prepare(spec);
+    setMix(moving, 0.0f);
+    setMix(held, 1.0f);
+    sonore::DryWetMixer expectL, expectR, heldDryL, heldDryR;
+    expectL.setSampleRate((float) rate);
+    expectR.setSampleRate((float) rate);
+    expectL.setMix(0.0f);
+    expectR.setMix(0.0f);
+    heldDryL.setMix(1.0f); // the dry share, cos(pi/2), of a mix held at 1
+    heldDryR.setMix(1.0f);
+    double worst = 0.0;
+    for (int n = 0; n < 9600; ++n) {
+      if (n == 2400) {
+        setMix(moving, 1.0f);
+        expectL.setMix(1.0f);
+        expectR.setMix(1.0f);
+      }
+      float dryL, dryR;
+      input(n, dryL, dryR);
+      float aL = dryL, aR = dryR, bL = dryL, bR = dryR;
+      moving.process(aL, aR);
+      held.process(bL, bR);
+      const float wetL = bL - heldDryL.process(dryL, 0.0f), wetR = bR - heldDryR.process(dryR, 0.0f);
+      const float eL = expectL.process(dryL, wetL), eR = expectR.process(dryR, wetR);
+      worst = std::max(worst, (double) std::max(std::fabs(aL - eL), std::fabs(aR - eR)));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "%s: a 0 -> 1 mix at 96 kHz glides each side 20 ms, once a frame (largest difference %.2g)",
+                  name, worst);
+    check(worst < 1e-5, line);
+  };
+  {
+    auto a = std::make_unique<sonore::Reverb>(), b = std::make_unique<sonore::Reverb>();
+    glideError("Reverb", *a, *b, [](sonore::Reverb& fx, float m) {
+      sonore::Reverb::Parameters p;
+      p.mix = m;
+      fx.setParameters(p);
+    });
+  }
+  {
+    auto a = std::make_unique<sonore::Chorus>(), b = std::make_unique<sonore::Chorus>();
+    glideError("Chorus", *a, *b, [](sonore::Chorus& fx, float m) { fx.setMix(m); });
+  }
+  {
+    auto a = std::make_unique<sonore::Phaser>(), b = std::make_unique<sonore::Phaser>();
+    glideError("Phaser", *a, *b, [](sonore::Phaser& fx, float m) { fx.setMix(m); });
+  }
+  {
+    using Fdn = sonore::FdnReverb<8>;
+    auto a = std::make_unique<Fdn>(), b = std::make_unique<Fdn>();
+    glideError("FdnReverb", *a, *b, [](Fdn& fx, float m) {
+      Fdn::Parameters p;
+      p.mix = m;
+      fx.setParameters(p);
+    });
+  }
+  {
+    using Delay = sonore::StereoDelay<>;
+    auto a = std::make_unique<Delay>(), b = std::make_unique<Delay>();
+    glideError("StereoDelay", *a, *b, [](Delay& fx, float m) {
+      Delay::Parameters p;
+      p.mix = m;
+      fx.setParameters(p);
+    });
+  }
+  {
+    using Spring = sonore::SpringReverb<>;
+    auto a = std::make_unique<Spring>(), b = std::make_unique<Spring>();
+    glideError("SpringReverb", *a, *b, [](Spring& fx, float m) {
+      Spring::Parameters p;
+      p.mix = m;
+      fx.setParameters(p);
+    });
+  }
+  {
+    auto a = std::make_unique<sonore::PlateReverb>(), b = std::make_unique<sonore::PlateReverb>();
+    glideError("PlateReverb", *a, *b, [](sonore::PlateReverb& fx, float m) {
+      sonore::PlateReverb::Parameters p;
+      p.mix = m;
+      fx.setParameters(p);
+    });
+  }
+  // The ring modulator is mono, so it never stepped twice; it only lacked
+  // the rate.
+  {
+    sonore::RingModulator moving, held;
+    moving.setSampleRate((float) rate);
+    held.setSampleRate((float) rate);
+    moving.setMix(0.0f);
+    held.setMix(1.0f);
+    sonore::DryWetMixer expect, heldDry;
+    expect.setSampleRate((float) rate);
+    expect.setMix(0.0f);
+    heldDry.setMix(1.0f);
+    double worst = 0.0;
+    for (int n = 0; n < 9600; ++n) {
+      if (n == 2400) {
+        moving.setMix(1.0f);
+        expect.setMix(1.0f);
+      }
+      float x, unused;
+      input(n, x, unused);
+      const float a = moving.process(x), b = held.process(x);
+      const float e = expect.process(x, b - heldDry.process(x, 0.0f));
+      worst = std::max(worst, (double) std::fabs(a - e));
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "RingModulator: a 0 -> 1 mix at 96 kHz glides 20 ms (largest difference %.2g)", worst);
+    check(worst < 1e-5, line);
+  }
+}
+
+// The default mix of the chorus, the phaser, the flanger and the ring
+// modulator: 0.5, as the reference's chorus and phaser start, held from
+// construction. It was 0, so one never given a mix played the dry signal
+// alone. Each is checked three ways against twins: a fresh one renders what a
+// twin given setMix(0.5) renders, bit for bit, from the first sample (a mixer
+// that glided up from 0 after prepare() would be near the dry signal there);
+// that is the equal-power half, cos(pi/4) of the dry plus sin(pi/4) of the
+// wet, from a twin held at 0 and one held at 1 (the mix reaches none of these
+// effects' state); and a mix of 0 set explicitly is still the dry input bit
+// for bit, which is what a plugin that wanted the old default asks for.
+static void testEffectsDefaultMix() {
+  std::printf("\n[chorus, phaser, flanger, ring modulator: the default mix]\n");
+  const double rate = 96000.0;
+  sonore::ProcessSpec spec;
+  spec.sampleRate = rate;
+  spec.maximumBlockSize = 512;
+  spec.numChannels = 2;
+  // Not zero at n = 0: the first frame is where a glide from 0 would show.
+  auto input = [&](int n, float& l, float& r) {
+    l = 0.4f * (float) std::cos(2.0 * kTestPi * 440.0 * n / rate) + (n % 997 == 0 ? 0.3f : 0.0f);
+    r = 0.3f * (float) std::cos(2.0 * kTestPi * 660.0 * n / rate) - 0.1f;
+  };
+  const float half = (float) std::sqrt(0.5);
+  auto compare = [&](const char* name, auto& fresh, auto& atHalf, auto& atDry, auto& atWet,
+                     auto&& setMix) {
+    fresh.prepare(spec);
+    for (auto* fx : {&atHalf, &atDry, &atWet}) fx->prepare(spec);
+    setMix(atHalf, 0.5f);
+    setMix(atDry, 0.0f);
+    setMix(atWet, 1.0f);
+    bool same = true, dryIsInput = true;
+    double worst = 0.0, firstFrame = 0.0;
+    for (int n = 0; n < 9600; ++n) {
+      float l, r;
+      input(n, l, r);
+      float fL = l, fR = r, hL = l, hR = r, dL = l, dR = r, wL = l, wR = r;
+      fresh.process(fL, fR);
+      atHalf.process(hL, hR);
+      atDry.process(dL, dR);
+      atWet.process(wL, wR);
+      if (fL != hL || fR != hR) same = false;
+      if (dL != l || dR != r) dryIsInput = false;
+      const double e = std::max(std::fabs(fL - half * (dL + wL)), std::fabs(fR - half * (dR + wR)));
+      worst = std::max(worst, e);
+      if (n == 0) firstFrame = e;
+    }
+    char line[220];
+    std::snprintf(line, sizeof(line), "%s: never given a mix, it renders setMix(0.5) bit for bit", name);
+    check(same, line);
+    std::snprintf(line, sizeof(line),
+                  "%s: ...which is half dry and half wet, equal-power, from the first frame "
+                  "(largest difference %.2g, %.2g at the first)", name, worst, firstFrame);
+    check(worst < 1e-5 && firstFrame < 1e-6, line);
+    std::snprintf(line, sizeof(line), "%s: a mix of 0 set explicitly is still the input bit for bit", name);
+    check(dryIsInput, line);
+  };
+  {
+    using Fx = sonore::Chorus;
+    auto a = std::make_unique<Fx>(), b = std::make_unique<Fx>(), c = std::make_unique<Fx>(),
+         d = std::make_unique<Fx>();
+    compare("Chorus", *a, *b, *c, *d, [](Fx& fx, float m) { fx.setMix(m); });
+  }
+  {
+    using Fx = sonore::Phaser;
+    auto a = std::make_unique<Fx>(), b = std::make_unique<Fx>(), c = std::make_unique<Fx>(),
+         d = std::make_unique<Fx>();
+    compare("Phaser", *a, *b, *c, *d, [](Fx& fx, float m) { fx.setMix(m); });
+  }
+  {
+    using Fx = sonore::Flanger;
+    auto a = std::make_unique<Fx>(), b = std::make_unique<Fx>(), c = std::make_unique<Fx>(),
+         d = std::make_unique<Fx>();
+    // With feedback, so the wet path is the flanger's own and not the dry
+    // signal delayed: the mix still reaches none of its state.
+    for (Fx* fx : {a.get(), b.get(), c.get(), d.get()}) fx->setFeedback(0.5f);
+    compare("Flanger", *a, *b, *c, *d, [](Fx& fx, float m) { fx.setMix(m); });
+  }
+  // The ring modulator is mono and has a setSampleRate() where the others
+  // have prepare(): adapted to the same comparison through a stereo face.
+  {
+    struct Ring {
+      sonore::RingModulator ring[2];
+      void prepare(const sonore::ProcessSpec& s) {
+        for (auto& m : ring) {
+          m.setSampleRate((float) s.sampleRate);
+          m.setCarrier(170.0f);
+        }
+      }
+      void setMix(float m) {
+        for (auto& x : ring) x.setMix(m);
+      }
+      void process(float& l, float& r) {
+        l = ring[0].process(l);
+        r = ring[1].process(r);
+      }
+    };
+    Ring a, b, c, d;
+    compare("RingModulator", a, b, c, d, [](Ring& fx, float m) { fx.setMix(m); });
+  }
+}
+
+// An Audio Unit host's identity: the part of reading
+// kAudioUnitProperty_AUHostIdentifier that is not Apple's. The AU wrapper
+// copies the name out of the host's CFString and hands it, with the UInt32
+// version, to detail::auHostInfo(); what that returns is the HostInfo the DSP
+// is told, and a PluginHostType made from it is what a plugin asks. The
+// wrapper's own case is compiled only -- no Mac here -- and this is what it
+// calls. The property was refused, so under Logic on Apple silicon, whose
+// Audio Units run in AUHostingService, the host classified as unknown.
+static void testAuHostIdentity() {
+  std::printf("\n[Audio Unit host identity]\n");
+  using sonore::PluginHostType;
+  using sonore::detail::auHostVersionText;
+  check(auHostVersionText(0x10410000u) == "10.4.1",
+        "an AU host's version 0x10410000, a NumVersion, reads 10.4.1: the major in BCD");
+  check(auHostVersionText(0x0A400000u) == "10.4.0",
+        "a major version written in binary, 0x0A, reads as 10");
+  check(auHostVersionText(0x01238042u) == "1.2.3",
+        "the release stage and the pre-release revision are not shown");
+  check(auHostVersionText(0x99990000u) == "99.9.9", "the largest BCD version reads 99.9.9");
+  check(auHostVersionText(0).empty(), "a version of 0 is no version");
+
+  const sonore::HostInfo logic = sonore::detail::auHostInfo("Logic Pro X", 0x10720000u);
+  check(logic.name == "Logic Pro X" && logic.version == "10.7.2" && logic.vendor.empty(),
+        "an AU host's name and version become HostInfo's name and version, and no vendor");
+  const sonore::HostInfo nameless = sonore::detail::auHostInfo(nullptr, 0);
+  check(nameless.name.empty() && nameless.version.empty() && nameless.vendor.empty(),
+        "a host that gave no name and no version is an empty HostInfo");
+
+  // The process Logic on Apple silicon runs Audio Units in says nothing of
+  // Logic; the name the host set is what classifies it.
+  const std::string service =
+      "/System/Library/Frameworks/AudioToolbox.framework/XPCServices/AUHostingService.xpc/"
+      "Contents/MacOS/AUHostingService";
+  const std::string serviceId = "com.apple.audio.AUHostingService";
+  check(PluginHostType::fromProcess(service, serviceId).type == PluginHostType::UnknownHost,
+        "AUHostingService on its own classifies as unknown");
+  const PluginHostType told = PluginHostType::fromProcess(service, serviceId, logic.name, logic.version);
+  check(told.isLogic() && told.getHostVersion() == "10.7.2" && told.getMajorVersion() == 10,
+        "...and with the identity an AU host sets, as Logic 10.7.2");
+  const sonore::HostInfo garageBand = sonore::detail::auHostInfo("GarageBand", 0x10400000u);
+  check(PluginHostType::fromProcess(service, serviceId, garageBand.name, garageBand.version)
+            .isGarageBand(),
+        "...and as GarageBand when GarageBand sets it");
+}
+
+// A grain engine handed a NaN or an absurd setting. A NaN position, pitch or
+// jitter became a NaN read position and (int) NaN an index outside the
+// buffer: the host crashed. A huge pitch made the wrap loop run for ever.
+static sonore::GrainEngine<16, 48000> g_badGrains;
+static void testGrainEngineBadSettings() {
+  std::printf("\n[grain engine settings]\n");
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  bool finite = true;
+  for (int which = 0; which < 5; ++which) {
+    g_badGrains.setSampleRate(48000.0f);
+    g_badGrains.reset();
+    sonore::GrainEngine<16, 48000>::Parameters q;
+    q.density = 200.0f;
+    if (which == 0) q.position = nan;
+    if (which == 1) q.pitch = nan;
+    if (which == 2) q.jitter = nan;
+    if (which == 3) q.pitch = 1e30f;
+    if (which == 4) { q.sizeMs = nan; q.pitchJitter = nan; q.spread = nan; }
+    g_badGrains.setParameters(q);
+    for (int n = 0; n < 9600; ++n) {
+      g_badGrains.write(0.3f * (float) std::sin(0.05 * n));
+      float l = 0.0f, r = 0.0f;
+      g_badGrains.render(l, r);
+      if (!std::isfinite(l) || !std::isfinite(r)) finite = false;
+    }
+  }
+  check(finite && g_badGrains.grainsStarted() > 0,
+        "a grain engine given NaN position, pitch, jitter or size, or a 1e30 pitch, plays on");
+
+  // A loaded sample survives reset(), which a host calls on every stop and
+  // prepare: it used to be dropped, and the plugin went silent until the
+  // file was loaded again.
+  {
+    std::vector<float> sample(24000);
+    for (size_t n = 0; n < sample.size(); ++n) sample[n] = 0.4f * (float) std::sin(0.03 * (double) n);
+    g_badGrains.setSampleRate(48000.0f);
+    g_badGrains.setParameters(sonore::GrainEngine<16, 48000>::Parameters{});
+    g_badGrains.load(sample.data(), sample.size());
+    g_badGrains.reset();
+    double energy = 0.0;
+    for (int n = 0; n < 24000; ++n) {
+      float l = 0.0f, r = 0.0f;
+      g_badGrains.render(l, r); // nothing written: only the loaded sample can sound
+      energy += (double) l * l + (double) r * r;
+    }
+    g_badGrains.unload();
+    double after = 0.0;
+    for (int n = 0; n < 24000; ++n) {
+      float l = 0.0f, r = 0.0f;
+      g_badGrains.render(l, r);
+      after += (double) l * l + (double) r * r;
+    }
+    char l[160];
+    std::snprintf(l, sizeof(l), "a loaded sample still plays after reset() (energy %.3g), and unload() clears it (%.3g)", energy, after);
+    check(energy > 1.0 && after == 0.0, l);
+  }
+
+  // Reversed grains from the far end of a live buffer, where the head is
+  // writing: they read the newest samples in the middle of the oldest.
+  {
+    g_badGrains.setSampleRate(48000.0f);
+    g_badGrains.reset();
+    sonore::GrainEngine<16, 48000>::Parameters q;
+    q.position = 1.0f;
+    q.jitter = 0.0f;
+    q.reverse = 1.0f;
+    q.sizeMs = 100.0f;
+    q.density = 30.0f;
+    g_badGrains.setParameters(q);
+    double natural = 0.0, worst = 0.0;
+    float prev = 0.0f;
+    for (int n = 0; n < 4 * 48000; ++n) {
+      const float x = 0.3f * (float) std::sin(2.0 * kTestPi * 97.13 * n / 48000.0);
+      if (n > 0) natural = std::max(natural, (double) std::fabs(x - 0.3f * (float) std::sin(2.0 * kTestPi * 97.13 * (n - 1) / 48000.0)));
+      g_badGrains.write(x);
+      float l = 0.0f, r = 0.0f;
+      g_badGrains.render(l, r);
+      if (n > 2 * 48000) worst = std::max(worst, (double) std::fabs(l - prev));
+      prev = l;
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "reversed grains from the far end of a live buffer read no freshly written audio (step %.4f, the tone's own %.4f)", worst, natural);
+    check(worst < 4.0 * natural, l);
+  }
+
+  // Grains at a NEGATIVE pitch read backwards as they play, away from the
+  // head while it writes towards them, so the oldest audio is used up at one
+  // plus the rate a sample, not at one. The start clamp counted one: a pitch
+  // of -1 from the far end read the newest samples in the middle of the
+  // oldest -- the reversed grain's bug again, by the other road.
+  for (float pitch : {-1.0f, -2.5f}) {
+    g_badGrains.setSampleRate(48000.0f);
+    g_badGrains.reset();
+    sonore::GrainEngine<16, 48000>::Parameters q;
+    q.position = 1.0f;
+    q.jitter = 0.0f;
+    q.pitch = pitch;
+    q.sizeMs = 100.0f;
+    q.density = 30.0f;
+    g_badGrains.setParameters(q);
+    double natural = 0.0, worst = 0.0;
+    float prev = 0.0f;
+    for (int n = 0; n < 4 * 48000; ++n) {
+      const float x = 0.3f * (float) std::sin(2.0 * kTestPi * 97.13 * n / 48000.0);
+      if (n > 0) natural = std::max(natural, (double) std::fabs(x - 0.3f * (float) std::sin(2.0 * kTestPi * 97.13 * (n - 1) / 48000.0)));
+      g_badGrains.write(x);
+      float l = 0.0f, r = 0.0f;
+      g_badGrains.render(l, r);
+      if (n > 2 * 48000) worst = std::max(worst, (double) std::fabs(l - prev));
+      prev = l;
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "grains at pitch %.1f from the far end of a live buffer read no freshly written audio "
+                  "(step %.4f, the tone's own at that rate %.4f)", (double) pitch, worst, natural * -pitch);
+    check(worst < 4.0 * natural * -pitch, l);
+  }
+}
+
+// The circuit pedals, past the two things that broke them. One infinite input
+// sample drove the Newton state to NaN for good -- silence, with converged()
+// still true. And reset() solved the operating point against whatever sample
+// went through last: silence afterwards came out of the fuzz at +17 dBFS.
+static void testCircuitPedalsRecover() {
+  std::printf("\n[circuit pedals]\n");
+  const double sr = 48000.0;
+  auto tone = [&](int n) { return 0.3f * (float) std::sin(2.0 * kTestPi * 220.0 * n / sr); };
+  auto run = [&](auto& pedal, double& before, double& after, double& thump) {
+    double sb = 0.0, sa = 0.0;
+    for (int n = 0; n < (int) (3.0 * sr); ++n) {
+      const float x = n == (int) sr ? std::numeric_limits<float>::infinity() : tone(n);
+      const float y = pedal.process(x);
+      if (n > (int) (0.5 * sr) && n < (int) sr) sb += (double) y * y;
+      if (n > (int) (2.5 * sr)) sa += (double) y * y;
+    }
+    before = std::sqrt(sb / (0.5 * sr));
+    after = std::sqrt(sa / (0.5 * sr));
+    pedal.reset();
+    thump = 0.0;
+    for (int n = 0; n < 9600; ++n) thump = std::max(thump, (double) std::fabs(pedal.process(0.0f)));
+  };
+  auto fuzz = std::make_unique<sonore::FuzzFace>();
+  fuzz->setSampleRate((float) sr);
+  fuzz->setFuzz(1.0f);
+  fuzz->setVolume(1.0f);
+  auto screamer = std::make_unique<sonore::TubeScreamer>();
+  screamer->setSampleRate((float) sr);
+  screamer->setLevel(1.0f);
+  double fb, fa, ft, sb, sa, st;
+  run(*fuzz, fb, fa, ft);
+  run(*screamer, sb, sa, st);
+  char l[220];
+  std::snprintf(l, sizeof(l),
+                "a fuzz and a screamer play on after an infinite sample (RMS %.3f -> %.3f, %.3f -> %.3f)",
+                fb, fa, sb, sa);
+  check(fa > 0.8 * fb && sa > 0.8 * sb && fuzz->converged(), l);
+  std::snprintf(l, sizeof(l), "...and are silent after reset() (peaks %.2g and %.2g)", ft, st);
+  check(ft < 1e-3 && st < 1e-3, l);
+
+  // A circuit driven directly, without an oversampler's filters in front to
+  // clear the Inf first: an infinite source drove the Newton state to NaN,
+  // and NaN never converges to anything else.
+  {
+    sonore::NodalCircuit<4, 1, 1, 1, 0> clip;
+    clip.setSampleRate(sr);
+    const int in = clip.addNode(), out = clip.addNode();
+    const int src = clip.addVoltageSource(in, 0, 0.0);
+    clip.addResistor(in, out, 1000.0);
+    clip.addDiode(out, 0);
+    clip.reset();
+    int bad = 0;
+    double lastOut = 0.0;
+    for (int n = 0; n < 4800; ++n) {
+      const double vin = n == 100 ? std::numeric_limits<double>::infinity() : 2.0 * std::sin(0.05 * n);
+      clip.setSource(src, vin);
+      clip.step();
+      if (n > 100 && (!std::isfinite(clip.voltage(out)) || !clip.converged())) ++bad;
+      lastOut = clip.voltage(out);
+    }
+    std::snprintf(l, sizeof(l), "a nodal circuit given an infinite source recovers (%d bad steps after, last %.3f V)", bad, lastOut);
+    check(bad == 0 && std::isfinite(lastOut), l);
+  }
+}
+
+// A limiter's clock, reached the one legal way a test can reach a private
+// member: an explicit instantiation may name it, and a friend defined in the
+// instantiated template hands the pointer out. Running 2^32 samples to get
+// there takes four and a half minutes.
+template <typename Tag, typename Tag::type Member>
+struct LimiterClockAccess {
+  friend typename Tag::type clockOf(Tag) { return Member; }
+};
+struct TruePeakClock {
+  using type = uint64_t sonore::TruePeakLimiter::*;
+  friend type clockOf(TruePeakClock);
+};
+struct LookaheadClock {
+  using type = uint64_t sonore::Limiter<>::*;
+  friend type clockOf(LookaheadClock);
+};
+template struct LimiterClockAccess<TruePeakClock, &sonore::TruePeakLimiter::counter_>;
+template struct LimiterClockAccess<LookaheadClock, &sonore::Limiter<>::counter_>;
+
+// A click near sample 2^32, where the 32-bit clock wrapped: in the last
+// `window` samples before it the sliding minimum emptied, and a +12 dBFS
+// click went through a -1 dB ceiling untouched. Every 24.9 h at 48 kHz.
+static void testLimiterClockWrap() {
+  std::printf("\n[limiter clock]\n");
+  auto peakAt = [](auto& lim, auto tag, uint64_t start, int clickAt) {
+    sonore::ProcessSpec spec{};
+    spec.sampleRate = 48000.0;
+    spec.numChannels = 2;
+    lim.prepare(spec);
+    lim.setCeiling(-1.0f);
+    lim.setRelease(50.0f);
+    lim.setLookahead(2.0f);
+    lim.*clockOf(tag) = start;
+    double peak = 0.0;
+    for (int n = 0; n < 4000; ++n) {
+      float l = n == clickAt ? 4.0f : 0.0f, r = l;
+      lim.process(l, r);
+      peak = std::max(peak, (double) std::fabs(l));
+    }
+    return peak;
+  };
+  const uint64_t nearWrap = 4294967296ull - 2000ull;
+  double worstTp = 0.0, worstLim = 0.0;
+  for (int offset : {-100, -60, -30, -10, 0, 20}) {
+    auto tp = std::make_unique<sonore::TruePeakLimiter>();
+    auto lim = std::make_unique<sonore::Limiter<>>();
+    worstTp = std::max(worstTp, peakAt(*tp, TruePeakClock{}, nearWrap, 2000 + offset));
+    worstLim = std::max(worstLim, peakAt(*lim, LookaheadClock{}, nearWrap, 2000 + offset));
+  }
+  char l[200];
+  std::snprintf(l, sizeof(l),
+                "a +12 dBFS click at the old 2^32-sample wrap is held to the -1 dB ceiling (true-peak %+.2f, "
+                "lookahead %+.2f dBFS)", 20.0 * std::log10(worstTp), 20.0 * std::log10(worstLim));
+  check(worstTp < 0.90 && worstLim < 0.90, l);
+
+  // The ceiling against a real reconstruction. Clipped, band-limited noise at
+  // 44.1 kHz is full of inter-sample overs, and the 4x, 16-tap detector read
+  // it a decibel low: a -1 dBTP ceiling let -0.09 dBTP through. Measured here
+  // the way a DAC would put it out: a 32x, 129-tap Kaiser reconstruction.
+  {
+    const double sr = 44100.0;
+    std::vector<float> x((size_t) sr / 2);
+    sonore::Random noise;
+    noise.setSeed(1234);
+    sonore::Biquad lp1, lp2;
+    lp1.setSampleRate((float) sr);
+    lp2.setSampleRate((float) sr);
+    lp1.lowpass(19000.0f, 0.54f);
+    lp2.lowpass(19000.0f, 1.31f);
+    for (float& v : x) {
+      const float g = (noise.nextFloat() + noise.nextFloat() + noise.nextFloat() - 1.5f) * 1.2f;
+      v = sonore::clampf(lp2.process(lp1.process(g)), -0.5f, 0.5f) * 2.0f; // hot: 0 dBFS samples
+    }
+    auto limiter = std::make_unique<sonore::TruePeakLimiter>();
+    sonore::ProcessSpec spec{};
+    spec.sampleRate = sr;
+    spec.numChannels = 2;
+    limiter->prepare(spec);
+    limiter->setCeiling(-1.0f);
+    std::vector<float> y(x.size());
+    for (size_t n = 0; n < x.size(); ++n) {
+      float l = x[n], r = x[n];
+      limiter->process(l, r);
+      y[n] = l;
+    }
+    const int H = 64, OS = 32;
+    std::vector<double> tab((size_t) OS * (2 * H + 1));
+    auto i0 = [](double v) {
+      double sum = 1.0, term = 1.0;
+      for (int k = 1; k < 40; ++k) { term *= (v / (2.0 * k)) * (v / (2.0 * k)); sum += term; }
+      return sum;
+    };
+    for (int k = 0; k < OS; ++k)
+      for (int m = -H; m <= H; ++m) {
+        const double t = (double) k / OS - m;
+        const double sinc = std::fabs(t) < 1e-12 ? 1.0 : std::sin(kTestPi * t) / (kTestPi * t);
+        const double rr = t / (H + 1);
+        const double w = std::fabs(rr) >= 1.0 ? 0.0 : i0(9.0 * std::sqrt(1.0 - rr * rr)) / i0(9.0);
+        tab[(size_t) k * (2 * H + 1) + (size_t) (m + H)] = sinc * w;
+      }
+    double peak = 0.0;
+    const size_t from = 4410; // past the limiter's own start
+    for (size_t n = from; n + H < y.size(); ++n) {
+      peak = std::max(peak, (double) std::fabs(y[n]));
+      if (std::fabs(y[n]) < 0.5f) continue; // overs live next to loud samples
+      for (int k = 1; k < OS; ++k) {
+        double acc = 0.0;
+        for (int m = -H; m <= H; ++m) acc += y[n + (size_t) m] * tab[(size_t) k * (2 * H + 1) + (size_t) (m + H)];
+        peak = std::max(peak, std::fabs(acc));
+      }
+    }
+    char l[200];
+    std::snprintf(l, sizeof(l), "a -1 dBTP ceiling holds on clipped program by a 32x reconstruction (%+.2f dBTP)", 20.0 * std::log10(peak));
+    check(20.0 * std::log10(peak) <= -0.95, l);
+  }
+}
+
+// One infinite sample through the biquad-based processors. flushDenormal let
+// Inf through, a lowpass or bandpass biquad re-read it as Inf - Inf, and the
+// state held NaN until reset(): 31934 of the next 47900 lowpass outputs were
+// not finite, and the DeEsser in split mode and MultibandDynamics never came
+// back at all.
+static void testInfiniteSampleRecovery() {
+  std::printf("\n[an infinite sample]\n");
+  const double sr = 48000.0;
+  sonore::ProcessSpec spec{};
+  spec.sampleRate = sr;
+  spec.numChannels = 2;
+  const float inf = std::numeric_limits<float>::infinity();
+  auto countBad = [&](auto&& run) {
+    int bad = 0;
+    for (int n = 0; n < 48000; ++n) {
+      const float x = n == 1000 ? inf : 0.25f * (float) std::sin(2.0 * kTestPi * 6000.0 * n / sr);
+      const float y = run(x);
+      if (n > 1100 && !std::isfinite(y)) ++bad;
+    }
+    return bad;
+  };
+  sonore::Biquad lp;
+  lp.setSampleRate((float) sr);
+  lp.lowpass(1000.0f, 0.7071f);
+  const int lpBad = countBad([&](float x) { return lp.process(x); });
+  auto split = std::make_unique<sonore::DeEsser>();
+  split->prepare(spec);
+  split->setThreshold(-40.0f);
+  split->setRatio(4.0f);
+  const int splitBad = countBad([&](float x) { return split->process(x); });
+  auto multi = std::make_unique<sonore::MultibandDynamics<3>>();
+  multi->prepare(spec);
+  for (int b = 0; b < 3; ++b) {
+    sonore::MultibandDynamics<3>::BandSettings band;
+    band.ratio = 4.0f;
+    band.thresholdDb = -30.0f;
+    multi->setBand(b, band);
+  }
+  const int multiBad = countBad([&](float x) { float l = x, r = x; multi->process(l, r); return l; });
+  char l[200];
+  std::snprintf(l, sizeof(l),
+                "a lowpass biquad, a split DeEsser and MultibandDynamics recover from one infinite sample "
+                "(%d, %d, %d bad outputs after it)", lpBad, splitBad, multiBad);
+  check(lpBad == 0 && splitBad == 0 && multiBad == 0, l);
+
+  // ...and a wideband DeEsser, which stayed finite, still de-esses.
+  auto meanGr = [&](bool poison) {
+    sonore::DeEsser d;
+    d.prepare(spec);
+    d.setMode(sonore::DeEsser::Mode::Wideband);
+    d.setThreshold(-30.0f);
+    d.setRatio(4.0f);
+    double sum = 0.0;
+    int count = 0;
+    for (int n = 0; n < 96000; ++n) {
+      float x = 0.316f * (float) std::sin(2.0 * kTestPi * 7000.0 * n / sr);
+      if (poison && n == 24000) x = inf;
+      (void) d.process(x);
+      if (n > 72000) { sum += d.gainReduction(); ++count; }
+    }
+    return sum / count;
+  };
+  const double clean = meanGr(false), after = meanGr(true);
+  std::snprintf(l, sizeof(l), "...and a wideband DeEsser goes on de-essing (%.2f dB after, %.2f without)", after, clean);
+  check(std::fabs(after - clean) < 0.5, l);
+
+  // The tape machine: its record equalisation kept one NaN or infinite
+  // sample in its state for good, the loop flushed what it was fed to zero,
+  // and the machine went on playing finite silence -- rms 0.18 before the
+  // sample, 0.0000 after, with nothing non-finite for a guard to see.
+  {
+    double worstDb = 0.0;
+    int worstBad = 0;
+    for (float poison : {std::numeric_limits<float>::quiet_NaN(), inf, -inf}) {
+      for (sonore::TapeEq standard : {sonore::TapeEq::NAB, sonore::TapeEq::IEC}) {
+        auto tape = std::make_unique<sonore::TapeSaturator>();
+        tape->setSampleRate((float) sr);
+        sonore::TapeSaturator::Parameters q;
+        q.eq = standard;
+        tape->setParameters(q);
+        double before = 0.0, afterE = 0.0;
+        int bad = 0;
+        for (int n = 0; n < 72000; ++n) {
+          const float x = n == 24000 ? poison : 0.25f * (float) std::sin(2.0 * kTestPi * 440.0 * n / sr);
+          const float y = tape->process(x);
+          if (n > 25000 && !std::isfinite(y)) ++bad;
+          if (n >= 12000 && n < 24000) before += (double) y * y;
+          if (n >= 60000) afterE += (double) y * y;
+        }
+        worstDb = std::max(worstDb, std::fabs(10.0 * std::log10((afterE + 1e-30) / (before + 1e-30))));
+        worstBad = std::max(worstBad, bad);
+      }
+    }
+    std::snprintf(l, sizeof(l), "a tape machine plays on after one NaN or infinite sample (level %.2f dB off, %d bad outputs)",
+                  worstDb, worstBad);
+    check(worstDb < 0.5 && worstBad == 0, l);
+  }
+}
+
+// Gain controls turned mid-tone: the largest output step at the change,
+// against the tone's own largest step. A compressor's input, makeup or
+// threshold, an expander's threshold, a screamer's level -- each moved in
+// one sample, and stepped the output up to 17 times over.
+static void testGainControlsGlide() {
+  std::printf("\n[gain controls glide]\n");
+  const float sr = 48000.0f;
+  // Against the larger of the natural steps before and after: a gain that
+  // rises smoothly lets the tone's own steps grow with it, a gain that jumps
+  // at a peak steps by the whole difference at once.
+  auto ratio = [&](float amp, auto&& process, auto&& turn) {
+    double before = 0.0, after = 0.0, atChange = 0.0;
+    float prev = 0.0f;
+    for (int n = 0; n < 48000; ++n) {
+      if (n == 24012) turn(); // a quarter cycle in: the tone at its peak
+      const float y = process(amp * (float) std::sin(2.0 * kTestPi * 1000.0 * n / sr));
+      const double step = std::fabs(y - prev);
+      prev = y;
+      if (n > 12000 && n < 24012) before = std::max(before, step);
+      if (n >= 24012 && n < 24312) atChange = std::max(atChange, step);
+      if (n > 36000) after = std::max(after, step);
+    }
+    const double natural = std::max(before, after);
+    return natural > 0.0 ? atChange / natural : 0.0;
+  };
+  sonore::FetCompressor fet;
+  fet.setSampleRate(sr);
+  const double fetIn = ratio(0.3f, [&](float x) { return fet.process(x); }, [&] { fet.setInput(12.0f); });
+  sonore::VcaCompressor vca;
+  vca.setSampleRate(sr);
+  vca.setDetector(sonore::VcaCompressor::Detector::Peak);
+  vca.setThreshold(-6.0f);
+  const double vcaThr = ratio(0.5f, [&](float x) { return vca.process(x); }, [&] { vca.setThreshold(-30.0f); });
+  sonore::VcaCompressor vcaM;
+  vcaM.setSampleRate(sr);
+  const double vcaMake = ratio(0.1f, [&](float x) { return vcaM.process(x); }, [&] { vcaM.setMakeup(12.0f); });
+  sonore::OptoCompressor opto;
+  opto.setSampleRate(sr);
+  const double optoMake = ratio(0.1f, [&](float x) { return opto.process(x); }, [&] { opto.setMakeup(12.0f); });
+  sonore::Expander ex;
+  ex.setSampleRate(sr);
+  ex.setThreshold(-60.0f);
+  const double exThr = ratio(0.05f, [&](float x) { return ex.process(x); }, [&] { ex.setThreshold(-10.0f); });
+  auto ts = std::make_unique<sonore::TubeScreamer>();
+  ts->setSampleRate(sr);
+  ts->setLevel(0.1f);
+  const double tsLevel = ratio(0.3f, [&](float x) { return ts->process(x); }, [&] { ts->setLevel(1.0f); });
+  char l[260];
+  std::snprintf(l, sizeof(l),
+                "FET input, VCA peak threshold, VCA and opto makeup, expander threshold and screamer level glide "
+                "(x%.2f x%.2f x%.2f x%.2f x%.2f x%.2f)", fetIn, vcaThr, vcaMake, optoMake, exThr, tsLevel);
+  check(fetIn < 1.5 && vcaThr < 1.5 && vcaMake < 1.5 && optoMake < 1.5 && exThr < 1.5 && tsLevel < 1.5, l);
+
+  // ...and land after reset(), as before the first process(). The FET's
+  // reset() left its input and output gliding, so a compressor reset and set
+  // again glided in from its old knobs where a fresh one landed: two renders
+  // of the same settings were 0.2 apart.
+  {
+    auto render = [&](sonore::FetCompressor& c, float inputDb) {
+      c.setInput(inputDb);
+      c.setOutput(-0.5f * inputDb);
+      std::vector<float> out(4800);
+      for (int n = 0; n < 4800; ++n) out[(size_t) n] = c.process(0.3f * (float) std::sin(2.0 * kTestPi * 1000.0 * n / sr));
+      return out;
+    };
+    sonore::FetCompressor used, fresh;
+    used.setSampleRate(sr);
+    fresh.setSampleRate(sr);
+    (void) render(used, 0.0f);
+    used.reset();
+    const std::vector<float> again = render(used, 20.0f), first = render(fresh, 20.0f);
+    double worst = 0.0;
+    for (size_t i = 0; i < again.size(); ++i) worst = std::max(worst, (double) std::fabs(again[i] - first[i]));
+    std::snprintf(l, sizeof(l), "a FET compressor after reset() renders as a fresh one (worst difference %.2e)", worst);
+    check(worst < 1e-6, l);
+  }
+
+  // The ratios, and the upward compressor's largest boost, turned the same
+  // way. They did not glide with the thresholds: VCA peak 2:1 -> 10:1 stepped
+  // the output x4.99, the expander's 1.5 -> 4 x7.30, the upward
+  // compressor's ratio x4.97 and its largest boost 3 -> 20 dB x6.00, and a
+  // MultibandDynamics band, a VCA inside, x4.86.
+  {
+    sonore::VcaCompressor vr;
+    vr.setSampleRate(sr);
+    vr.setDetector(sonore::VcaCompressor::Detector::Peak);
+    vr.setThreshold(-30.0f);
+    vr.setRatio(2.0f);
+    vr.setKnee(0.0f);
+    const double vcaRatio = ratio(0.5f, [&](float x) { return vr.process(x); }, [&] { vr.setRatio(10.0f); });
+    sonore::Expander er;
+    er.setSampleRate(sr);
+    er.setThreshold(-20.0f);
+    er.setRatio(1.5f);
+    er.setKnee(0.0f);
+    const double exRatio = ratio(0.03f, [&](float x) { return er.process(x); }, [&] { er.setRatio(4.0f); });
+    sonore::UpwardCompressor ur;
+    ur.setSampleRate(sr);
+    ur.setThreshold(-10.0f);
+    ur.setRatio(1.5f);
+    ur.setKnee(0.0f);
+    const double upRatio = ratio(0.03f, [&](float x) { return ur.process(x); }, [&] { ur.setRatio(4.0f); });
+    sonore::UpwardCompressor um;
+    um.setSampleRate(sr);
+    um.setThreshold(-10.0f);
+    um.setRatio(4.0f);
+    um.setMaxGain(3.0f);
+    const double upMax = ratio(0.03f, [&](float x) { return um.process(x); }, [&] { um.setMaxGain(20.0f); });
+    sonore::ProcessSpec mspec{};
+    mspec.sampleRate = sr;
+    mspec.numChannels = 2;
+    auto mb = std::make_unique<sonore::MultibandDynamics<3>>();
+    mb->prepare(mspec);
+    sonore::MultibandDynamics<3>::BandSettings band;
+    band.thresholdDb = -30.0f;
+    band.ratio = 2.0f;
+    band.kneeDb = 0.0f;
+    for (int b = 0; b < 3; ++b) mb->setBand(b, band);
+    const double mbRatio = ratio(0.5f, [&](float x) { float a = x, c = x; mb->process(a, c); return a; }, [&] {
+      band.ratio = 10.0f;
+      for (int b = 0; b < 3; ++b) mb->setBand(b, band);
+    });
+    std::snprintf(l, sizeof(l),
+                  "VCA, expander and upward ratios, the upward largest boost and a multiband ratio glide "
+                  "(x%.2f x%.2f x%.2f x%.2f x%.2f)", vcaRatio, exRatio, upRatio, upMax, mbRatio);
+    check(vcaRatio < 1.5 && exRatio < 1.5 && upRatio < 1.5 && upMax < 1.5 && mbRatio < 1.5, l);
+  }
+
+  // The distortion's drive, turned from clean to 40 dB on a low note: the
+  // curve went from a sine to a near-square in one sample, and the step at
+  // the change was 1.7 times the largest the square makes on its own.
+  {
+    auto dist = std::make_unique<sonore::Distortion<>>();
+    dist->setSampleRate(sr);
+    dist->setCurve(sonore::Distortion<>::Curve::Tanh);
+    double atChange = 0.0, after = 0.0;
+    float prev = 0.0f;
+    for (int n = 0; n < 48000; ++n) {
+      if (n == 24037) dist->setDrive(40.0f);
+      const float y = dist->process(0.25f * (float) std::sin(2.0 * kTestPi * 110.0 * n / sr));
+      const double step = std::fabs(y - prev);
+      prev = y;
+      if (n >= 24037 && n < 24337) atChange = std::max(atChange, step);
+      if (n > 36000) after = std::max(after, step);
+    }
+    char dl[200];
+    std::snprintf(dl, sizeof(dl), "the distortion's drive glides from clean to 40 dB (step at the change x%.2f the driven one)", atChange / after);
+    check(atChange < 1.2 * after, dl);
+  }
+
+  // ...and its bias. The push before the curve moved in one sample, the
+  // curve's DC stepped with it, and the DC blocker let the step through:
+  // 0 -> 0.5 under 12 dB of drive stepped a 110 Hz tone x6.55.
+  {
+    auto dist = std::make_unique<sonore::Distortion<>>();
+    dist->setSampleRate(sr);
+    dist->setCurve(sonore::Distortion<>::Curve::Tanh);
+    dist->setDrive(12.0f);
+    dist->reset();
+    double before = 0.0, atChange = 0.0, after = 0.0;
+    float prev = 0.0f;
+    for (int n = 0; n < 48000; ++n) {
+      if (n == 24109) dist->setBias(0.5f); // a quarter cycle in
+      const float y = dist->process(0.25f * (float) std::sin(2.0 * kTestPi * 110.0 * n / sr));
+      const double step = std::fabs(y - prev);
+      prev = y;
+      if (n > 12000 && n < 24109) before = std::max(before, step);
+      if (n >= 24109 && n < 24409) atChange = std::max(atChange, step);
+      if (n > 36000) after = std::max(after, step);
+    }
+    const double bias = atChange / std::max(before, after);
+    char dl[200];
+    std::snprintf(dl, sizeof(dl), "the distortion's bias glides (x%.2f the natural step)", bias);
+    check(bias < 1.5, dl);
+  }
+
+  // The phaser's depth sets where the sweep sits, so in one sample it moved
+  // every stage's frequency at once: 0 -> 1 stepped the output x3.37.
+  {
+    sonore::ProcessSpec pspec{};
+    pspec.sampleRate = sr;
+    pspec.numChannels = 2;
+    auto phaser = std::make_unique<sonore::Phaser>();
+    phaser->prepare(pspec);
+    phaser->setMix(0.5f);
+    phaser->setDepth(0.0f);
+    const double depth = ratio(0.3f, [&](float x) { float a = x, c = x; phaser->process(a, c); return a; },
+                               [&] { phaser->setDepth(1.0f); });
+    char dl[200];
+    std::snprintf(dl, sizeof(dl), "the phaser's depth glides (x%.2f the natural step)", depth);
+    check(depth < 1.5, dl);
+  }
+}
+
+// One infinite sample must peg the editor's meter, not latch it: inf decayed
+// to inf, and the meter and its dB readout sat at the top for good.
+static void testMeterRecovers() {
+  std::printf("\n[meter state]\n");
+  sonore::MeterState meter;
+  meter.push(std::numeric_limits<float>::infinity(), 0.1f);
+  meter.tick(0.033);
+  const float pegged = meter.level();
+  meter.push(0.0f, 0.0f);
+  for (int i = 0; i < 300; ++i) meter.tick(0.033);
+  char ml[160];
+  std::snprintf(ml, sizeof(ml), "an infinite peak pegs the meter (%.0f dBFS) and it falls back (%.0f dBFS after 10 s)",
+                20.0 * std::log10((double) pegged), (double) meter.db());
+  check(pegged >= 1.0f && std::isfinite(pegged) && meter.level() < 0.01f && std::isfinite(meter.db()), ml);
+}
+
 int main() {
   std::printf("Sonore SDK tests\n\n");
+  testSdkVersion();
   testBridgeLocale();
+  testMeterRecovers();
+  testGainControlsGlide();
+  testInfiniteSampleRecovery();
+  testLimiterClockWrap();
+  testCircuitPedalsRecover();
+  testGrainEngineBadSettings();
+  testZeroSampleRates();
+  testNanDynamicsSettings();
+  testFreshVaFilters();
+  testFreshDetectors();
+  testStereoMixGlides();
+  testEffectsDefaultMix();
+  testAuHostIdentity();
+  testBagText();
+  testEqStaysOnTarget();
   testSimd();
   testFilters();
   testOscillator();
@@ -24894,6 +38503,7 @@ int main() {
   testVoiceStealingAndPedals();
   testNoteState();
   testUserSettings();
+  testUnicodePaths();
   testUncalledDsp();
   testFileDialog();
   testFileBridge();
@@ -24901,6 +38511,7 @@ int main() {
   testStateToPage();
   testParamSkew();
   testFastSine();
+  testVst3Uid();
   testHostileFiles();
   testMalformedWav();
   testFileAnswer();
@@ -24954,10 +38565,13 @@ int main() {
   testTape();
   testTube();
   testMultibandSplitter();
+  testDiodeLadderOscillates();
   testVaFilters();
   testGranular();
   testPhaseVocoder();
+  testVocoderFlatness();
   testSpringReverb();
+  testPlateTopEnd();
   testVocoder();
   testAuditRound();
   testEmulationRound();
@@ -24978,12 +38592,17 @@ int main() {
   testCompensatedDryWetMixer();
   testFilterSettlingTimes();
   testAsioFormats();
+#if defined(_WIN32)
+  testAsioSecondOutput();
+#endif
   testDeviceBridge();
+  testWebviewNavigation();
   testLoadMeasurer();
   testRpnGenerator();
   testGfxGeometry();
   testGfxTransform();
   testGfxColour();
+  testGfxBlendRuns();
   testGfxPath();
   testGfxRaster();
   testGfxStroke();
@@ -25015,6 +38634,7 @@ int main() {
   testGfxSplitter();
   testGfxBrowsers();
   testGfxTreeView();
+  testGfxTreeLazyRoot();
   testFiles();
   testGfxAccessibility();
   testGfxKeyboardOperation();
@@ -25033,6 +38653,8 @@ int main() {
   testRandom();
   testJson();
   testGfxSvg();
+  testGfxSvgDocuments();
+  testGfxClipLayersMasks();
   testGfxPng();
   testGfxTooltip();
   testGfxResizeCorner();
@@ -25045,7 +38667,11 @@ int main() {
   testGfxPopupMenu();
   testEditorChoice();
   testGfxTrueType();
+  testGfxCff();
+  testGfxVariableFont();
+  testGfxBidiAndShaping();
   testGfxText();
+  testGfxFontThreads();
   testUmp();
   testMidiQueueSysex();
   testSysexBuffer();

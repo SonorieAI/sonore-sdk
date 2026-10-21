@@ -83,6 +83,10 @@ struct Clipboard {
     return false;
   }
 
+  /** Replaces the clipboard's contents with `utf8`, put there as Unicode
+   *  text. False when the clipboard stayed busy through every retry or
+   *  refused the data. While the clipboard is busy it sleeps between up to
+   *  ten tries (Sleep(1), so 10 ms or more): not on the audio thread. */
   static bool setText(const std::string& utf8) {
     if (!openWithRetry()) return false;
     EmptyClipboard();
@@ -112,6 +116,10 @@ struct Clipboard {
     return ok;
   }
 
+  /** The clipboard's text, as UTF-8, into `*out` (cleared first). False when
+   *  `out` is null, the clipboard holds no text, or it stayed busy; true with
+   *  an empty string when the text is empty. Sleeps between retries while
+   *  the clipboard is busy, as setText does. */
   static bool getText(std::string* out) {
     if (!out) return false;
     out->clear();
@@ -173,12 +181,16 @@ struct Clipboard {
     return text;
   }
 
+  /** Hands `utf8` to the window peer's clipboard when one is set, and keeps a
+   *  copy in the in-process store either way. Always true. */
   static bool setText(const std::string& utf8) {
     fallbackStore() = utf8;
     if (*setter()) (*setter())(utf8);
     return true;
   }
 
+  /** The peer's clipboard text when it has some, else the in-process copy.
+   *  False when `out` is null or there is nothing to paste. */
   static bool getText(std::string* out) {
     if (!out) return false;
     if (*getter() && (*getter())(out)) return true;

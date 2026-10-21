@@ -18,8 +18,8 @@
 // longer than the interval, what happens after the editor was hidden for four
 // seconds.
 //
-// Driven from the editor's own 33 ms tick, alongside everything else that
-// crosses that boundary.
+// Driven by its owner: advance() from an editor's editorTick(), a NativeWindow's
+// onTick or an application's timer. Nothing in the SDK calls it by itself.
 //
 // ── Catching up, and deciding not to ───────────────────────────────────────
 //
@@ -29,12 +29,28 @@
 // sees. So a late timer fires ONCE and resets. That is a decision rather than
 // an oversight, and it is the one a caller most needs to know about.
 #pragma once
+#include <cmath>
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace sonore {
 
+/**
+ * Several timers in one object, each known by an int id and all reported
+ * through one onTimer callback. Mirrors the reference's class of the same
+ * name, with the difference that matters: it has no clock of its own. Its
+ * owner calls advance() with the milliseconds that passed -- from the
+ * editor's tick, or from a test -- and the callbacks run inside that call.
+ * See the file comment for why, and for why a late timer fires once rather
+ * than catching up.
+ *
+ * Intervals are in milliseconds. One thread, the one calling advance(),
+ * usually the UI thread: nothing here is locked. A callback may start and
+ * stop timers, its own included, or delete the MultiTimer; nothing else
+ * fires in that advance() then.
+ */
 class MultiTimer {
 public:
   /** Called with whichever timer came due. One callback rather than one per
@@ -66,27 +82,35 @@ public:
     timers_.push_back(timer);
   }
 
+  /** Stops timer `id`; it keeps its interval and can be started again. An
+   *  unknown id does nothing. */
   void stopTimer(int id) {
     for (Timer& timer : timers_)
       if (timer.id == id) timer.running = false;
   }
 
+  /** Stops every timer. */
   void stopAllTimers() {
     for (Timer& timer : timers_) timer.running = false;
   }
 
+  /** True while timer `id` is started; false once stopped, and for an
+   *  unknown id. */
   bool isTimerRunning(int id) const {
     for (const Timer& timer : timers_)
       if (timer.id == id) return timer.running;
     return false;
   }
 
+  /** Timer `id`'s interval in milliseconds, running or stopped; 0 for an id
+   *  never started. */
   double intervalFor(int id) const {
     for (const Timer& timer : timers_)
       if (timer.id == id) return timer.interval;
     return 0.0;
   }
 
+  /** How many timers are RUNNING; stopped ones are not counted. */
   int numTimers() const {
     int running = 0;
     for (const Timer& timer : timers_)
@@ -108,31 +132,61 @@ public:
   int advance(double elapsedMs) {
     if (elapsedMs <= 0.0) return 0;
     int fired = 0;
-    // Over a COPY of the ids, because a callback may start or stop a timer --
-    // an editor closing a panel from inside its own tick is the ordinary case
+    // A callback may also DELETE this object -- a splash or a notice closing
+    // itself on its own timer, the window that owns the MultiTimer going with
+    // it. The loop then read the dead object's timers: freed memory, or
+    // another MultiTimer built there since, whose timers it advanced and
+    // fired from a call that was never made on it.
+    const std::weak_ptr<char> alive = lifetime_.token;
+    // By index, never by reference or iterator, and only over the timers
+    // there were at the start: a callback may start or stop a timer -- an
+    // editor closing a panel from inside its own tick is the ordinary case
     // -- and that can reallocate the vector underneath the loop.
     const size_t count = timers_.size();
     for (size_t i = 0; i < count && i < timers_.size(); ++i) {
       if (!timers_[i].running) continue;
       timers_[i].elapsed += elapsedMs;
       if (timers_[i].elapsed < timers_[i].interval) continue;
-      timers_[i].elapsed = 0.0;
+      // The REMAINDER carries over -- and only the remainder, so a stall
+      // still fires once. Zeroing it threw away the part of the tick past the
+      // deadline: a 100 ms timer on the 33 ms editor clock fired every fourth
+      // tick, 132 ms, and a 30 Hz one at 15 Hz.
+      timers_[i].elapsed = std::fmod(timers_[i].elapsed - timers_[i].interval,
+                                     timers_[i].interval);
       const int id = timers_[i].id;
       ++fired;
       if (onTimer) onTimer(id);
+      if (alive.expired()) break;
     }
     return fired;
   }
 
 private:
+  /** Gone with this object: how advance() knows a callback deleted it. A
+   *  copy of a MultiTimer gets a token of its own: one shared with a copy
+   *  would not expire when this object is deleted. */
+  struct Lifetime {
+    std::shared_ptr<char> token = std::make_shared<char>('\0'); ///< expires with this object
+    /** A fresh token. */
+    Lifetime() = default;
+    /** A fresh token, not the other's: see above. */
+    Lifetime(const Lifetime&) {}
+    /** Keeps this object's own token. */
+    Lifetime& operator=(const Lifetime&) { return *this; }
+  };
+
+  /** One timer: its interval, how far it is into the current one, and
+   *  whether it runs. A stopped timer keeps its slot and its interval, which
+   *  intervalFor() still reports. */
   struct Timer {
-    int id = 0;
-    double interval = 0.0;
-    double elapsed = 0.0;
-    bool running = true;
+    int id = 0;            ///< the caller's id for it
+    double interval = 0.0; ///< milliseconds, always above 0
+    double elapsed = 0.0;  ///< milliseconds into the current interval
+    bool running = true;   ///< false once stopped
   };
 
   std::vector<Timer> timers_;
+  Lifetime lifetime_;
 };
 
 } // namespace sonore

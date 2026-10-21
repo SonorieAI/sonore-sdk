@@ -66,6 +66,15 @@ const NOT_A_CAPABILITY = new Set([
   "WantsTransport", "WantsHostInfo", "WantsTrackInfo", "WantsFile", "HasVoiceCapacity",
   "HasActiveVoices", "HasStateBag", "HasLatency", "HasTail", "HasPrepare", "HasReset",
   "SonoreTakesMidi", "SonoreTakesContext", "SonoreTakesSidechain",
+  "SonoreWantsTransport", "SonoreHasLatency",
+
+  // ── Conditional storage ──
+  //
+  // The wasm ABI's key buffers, on a template so that a plugin with no
+  // sidechain signature emits neither. They are where the host writes, not a
+  // capability anybody reaches for -- "sidechain input" is the row, and it is
+  // claimed by the entry points, not by the arrays behind them.
+  "SonoreKeyStore", "SonoreKeyPool",
 
   // ── The licence check's internals ──
   //
@@ -81,14 +90,45 @@ const NOT_A_CAPABILITY = new Set([
   // them. The format rows -- "VST3 wrapper", "LV2 wrapper", "AudioUnit (AUv2)
   // wrapper" -- are what somebody looks for; these are what those are made of.
   "Instance", "Plugin", "Unit", "Factory", "View", "ViewFactoryRegistrar",
+  // The standalone's per-block buffers, owned by its App: the "standalone app"
+  // row is what somebody looks for.
+  "StandaloneScratch",
+  // The CLAP and VST3 wrappers' views of one piece of a block longer than the
+  // host promised -- its events, parameter queues and buses, offset to where
+  // the piece starts: what the format rows are made of, nothing to look for.
+  "SliceEventsIn", "SliceEventsOut", "SliceEventList", "SliceParamQueue", "SliceParamChanges",
+  // The hosting layer's lock-free hand-over of parameter changes and plugin
+  // edits between threads: the "plugin hosting" row is what somebody looks for.
+  "MpscQueue",
+  // The hosting layer's id-to-position table for parameter events, so a
+  // plugin reporting every parameter does not cost their square: also part of
+  // the "plugin hosting" row.
+  "ParamIdIndex",
+  // CascadedIir's double-precision second-order section and the bilinear
+  // coefficients it is built from: how the "filter design" row is computed,
+  // not something a plugin author looks for by name.
+  "IirSection", "BilinearCoefficients",
+  // IirSection's three responses as a state-variable filter, for corners
+  // that move -- what the crossovers are built from: part of the same row.
+  "SvfSection",
+  // A control that glides once audio runs: the zipper-free knob behind the
+  // compressors, expander and pedals -- part of the "parameter smoothing"
+  // story Smooth already belongs to, not a capability of its own.
+  "Glide",
+  // The MIDI input backends' shared byte parser -- running status, SysEx
+  // framing, system common sizes -- behind the "MIDI input" row.
+  "StreamParser",
   "AudioComponentPlugInInstance", "ComponentIface", "ProcessorIface", "ControllerIface",
   "ViewIface", "ViewScaleIface", "UnitInfoIface", "MidiMappingIface", "NoteExpressionIface",
-  "InfoListenerIface", "ContextRequirementsIface", "ComponentHandler", "PlugFrame",
-  "ParameterChanges", "ParamQueue", "EventList", "StateHeader", "BypassState",
+  "InfoListenerIface", "ContextRequirementsIface", "ComponentHandler", "ComponentHandler2Face",
+  "PlugFrame",
+  "ParameterChanges", "ParamQueue", "OutParameterChanges", "OutParamQueue", "EventList",
+  "StateHeader", "BypassState",
   "Steinberg_IPlugView", "Steinberg_ViewRect", "Steinberg_Vst_Event",
   "Steinberg_Vst_NoteExpressionTypeInfo",
   "Lv2Feature", "Lv2UiDescriptor", "Lv2UiIdleInterface", "Lv2UiResize", "UiInstance",
-  "Lv2WorkerInterface", "Lv2WorkerSchedule", "HostLv2Feature", "HostLv2UiDescriptor",
+  "Lv2WorkerInterface", "Lv2WorkerSchedule", "Lv2Log", "HostLv2Feature", "HostLv2Option", "HostLv2WorkerSchedule",
+  "HostLv2WorkerInterface", "HostLv2WorkRing", "HostLv2UiResize", "HostLv2UiDescriptor",
   "HostLv2UiIdle", "Lv2Plugin", "Lv2Port", "Lv2Preset", "ClapPlugin", "HostedPlugin",
   "Document",
 

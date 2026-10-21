@@ -15,13 +15,16 @@
 #include <cstring>
 #include <vector>
 
+#include "path_io.h"
+
 namespace sonore {
 
 /** Decoded audio: interleaved floats, -1..1, plus the facts about them. */
 struct WavData {
-  std::vector<float> samples; // interleaved
-  uint32_t sampleRate = 0;
-  uint16_t numChannels = 0;
+  std::vector<float> samples; ///< Interleaved: frame 0's channels, then frame 1's.
+  uint32_t sampleRate = 0;     ///< In Hz; 0 for nothing decoded.
+  uint16_t numChannels = 0;    ///< Samples per frame.
+  /** Frames held: samples.size() / numChannels, 0 with no channels. */
   size_t numFrames() const {
     return numChannels ? samples.size() / numChannels : 0;
   }
@@ -65,17 +68,17 @@ inline void writeU16(std::vector<uint8_t>& out, uint16_t v) {
 } // namespace wavdetail
 
 /**
- * Read a WAV file. Returns false, leaving `out` empty, on anything it does
+ * Read a WAV file. Returns false (leaving `out` empty) on anything it does
  * not understand, rather than guessing at bytes: a wrong guess here becomes a
  * blast of full-scale noise through a user's monitors.
  */
-inline bool readWav(const char* path, WavData* out) {
+inline bool readWav(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
   if (!path || !out) return false;
   out->samples.clear();
   out->sampleRate = 0;
   out->numChannels = 0;
 
-  std::FILE* f = std::fopen(path, "rb");
+  std::FILE* f = ::sonore::pathio::open(path, "rb");
   if (!f) return false;
   std::fseek(f, 0, SEEK_END);
   const long size = std::ftell(f);
@@ -106,7 +109,19 @@ inline bool readWav(const char* path, WavData* out) {
     const uint8_t* header = bytes.data() + pos;
     const uint32_t chunkSize = readU32(header + 4);
     const size_t body = pos + 8;
-    if (body + chunkSize > bytes.size()) break;
+    if (chunkSize > bytes.size() - body) { // body <= size: the loop guard
+      // A data chunk that claims more than the file holds is a take whose
+      // header was never finished -- a crash, a full disk, a writer that
+      // streams and leaves the length open. What is on the disk is read, as
+      // the streaming reader always has; this reader refused the file and
+      // the take with it.
+      if (std::memcmp(header, "data", 4) == 0) {
+        const size_t there = bytes.size() - body;
+        data = bytes.data() + body;
+        dataSize = (uint32_t) (there < 0xFFFFFFFFu ? there : 0xFFFFFFFFu);
+      }
+      break;
+    }
 
     if (std::memcmp(header, "fmt ", 4) == 0 && chunkSize >= 16) {
       format = readU16(bytes.data() + body);
@@ -137,7 +152,15 @@ inline bool readWav(const char* path, WavData* out) {
   if (!pcm8 && !pcm16 && !pcm24 && !pcm32 && !float32) return false;
 
   const uint32_t bytesPerSample = bits / 8;
+  // Whole frames: a take cut off mid-frame leaves a sample of one channel
+  // without its partners, and every frame after it would read skewed.
+  const uint32_t frameBytes = bytesPerSample * channels;
+  dataSize -= dataSize % frameBytes;
   const size_t count = dataSize / bytesPerSample;
+  // The ceiling every other reader is held to. The 1 GB file cap above is
+  // not one: a gigabyte of 8-bit audio is a billion samples, four gigabytes
+  // of floats, and the bad_alloc takes the host down with it.
+  if (count > maxSamples) return false;
   out->samples.resize(count);
   out->sampleRate = rate;
   out->numChannels = channels;
@@ -190,8 +213,12 @@ inline bool writeWav(const char* path, const float* interleaved, size_t numFrame
   const uint64_t wide = (uint64_t) numFrames * numChannels * sizeof(float);
   if (wide > 0xFFFFFFFFull - 44ull) return false;
   const uint32_t dataBytes = (uint32_t) wide;
+  // The header alone is built here; the audio goes from the caller's buffer
+  // straight to the file. Building the whole file in a second vector first
+  // doubled the memory a long render needed just to be saved -- 230 MB more
+  // for ten minutes of stereo.
   std::vector<uint8_t> out;
-  out.reserve(44 + dataBytes);
+  out.reserve(44);
 
   out.insert(out.end(), {'R', 'I', 'F', 'F'});
   writeU32(out, 36 + dataBytes);
@@ -207,14 +234,13 @@ inline bool writeWav(const char* path, const float* interleaved, size_t numFrame
   out.insert(out.end(), {'d', 'a', 't', 'a'});
   writeU32(out, dataBytes);
 
-  const auto* p = (const uint8_t*) interleaved;
-  out.insert(out.end(), p, p + dataBytes);
-
-  std::FILE* f = std::fopen(path, "wb");
+  std::FILE* f = ::sonore::pathio::open(path, "wb");
   if (!f) return false;
-  const size_t wrote = std::fwrite(out.data(), 1, out.size(), f);
-  std::fclose(f);
-  return wrote == out.size();
+  const bool headerOk = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+  const bool dataOk =
+      dataBytes == 0 || std::fwrite(interleaved, 1, dataBytes, f) == (size_t) dataBytes;
+  const bool closed = std::fclose(f) == 0;
+  return headerOk && dataOk && closed;
 }
 
 } // namespace sonore

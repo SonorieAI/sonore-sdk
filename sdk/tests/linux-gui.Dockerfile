@@ -2,7 +2,7 @@
 #
 # A container with the toolchain, WebKitGTK and a virtual X display, so BOTH
 # Linux backends are exercised the way a Linux DAW exercises them: the X11
-# peer against a real server, and the webview — a real GTK
+# peer against a real server, and the webview: a real GTK
 # main loop, a real X window, a real page. Without this the Linux GUI checks
 # only verify the extension CONTRACT, which a backend that never manages to
 # create a view passes just as happily.

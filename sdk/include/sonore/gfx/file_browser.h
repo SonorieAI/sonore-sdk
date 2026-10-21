@@ -42,8 +42,20 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A file tree that lives inside the editor, for a sampler's library rather
+ * than a one-off "open" -- see the file comment for why it is not the system
+ * dialog, and what its root is when none is given.
+ *
+ * Folders are read lazily, one directory listing when the user opens one,
+ * and on the calling thread: message thread only, and a folder on a slow
+ * network share blocks the UI while it is read. Nothing watches the disk;
+ * refresh() is how a change made elsewhere shows up. Paths are UTF-8, and
+ * every node's id is its full path.
+ */
 class FileBrowser : public Widget {
 public:
+  /** Starts at the synthetic root, showing every file but the hidden ones. */
   FileBrowser() {
     addChild(&tree_);
     tree_.onNeedChildren = [this](TreeNode& node) { fill(node); };
@@ -51,7 +63,13 @@ public:
       if (onSelectionChange) onSelectionChange(node ? node->id : std::string());
     };
     tree_.onItemChosen = [this](TreeNode* node) {
-      if (node && onFileChosen) onFileChosen(node->id);
+      // The tree chooses whatever has no twisty, and an opened EMPTY folder
+      // has lost its twisty: it is still a folder, and reporting it as the
+      // chosen file had a host load a directory. A folder picker is the
+      // exception -- there, folders are what is being chosen.
+      if (!node || !onFileChosen) return;
+      if (!directoriesOnly_ && isDirectory(node->id)) return;
+      onFileChosen(node->id);
     };
     setRoots({});
   }
@@ -87,6 +105,9 @@ public:
     rebuildRoot();
   }
 
+  /** Show hidden entries too (off by default): a leading dot on POSIX, the
+   *  hidden or system attribute on Windows. Like the other settings it reads
+   *  the tree again from its roots, closed, with nothing selected. */
   void setShowHidden(bool show) {
     showHidden_ = show;
     rebuildRoot();
@@ -104,11 +125,17 @@ public:
     return node ? node->id : std::string();
   }
 
+  /** Whether the selection is a folder, an opened empty one included.
+   *  Answered from the tree rather than the disk: each node was made a
+   *  folder or a file from its directory listing. A folder offers a twisty
+   *  until it is opened and found empty, and from then on has had its
+   *  children read -- which a file never has. */
   bool selectionIsDirectory() const {
     TreeNode* node = tree_.selectedNode();
-    return node && node->mightHaveChildren;
+    return node && (node->mightHaveChildren || node->childrenBuilt);
   }
 
+  /** The selection moved: the new node's full path, or empty for none. */
   std::function<void(const std::string&)> onSelectionChange;
   /** A double click or Return on a FILE. What a browser means by "load this". */
   std::function<void(const std::string&)> onFileChosen;
@@ -132,7 +159,10 @@ public:
     const std::string wasSelected = selectedPath();
 
     rebuildRoot();
-    for (const std::string& path : openPaths) openPath(path);
+    // openPath() opens everything ABOVE a path and returns the node at it;
+    // the folder that was open is that node, and is opened here.
+    for (const std::string& path : openPaths)
+      if (TreeNode* node = openPath(path)) tree_.setOpen(node, true);
     if (!wasSelected.empty()) selectPath(wasSelected);
   }
 
@@ -151,8 +181,12 @@ public:
     return true;
   }
 
+  /** The tree inside, for styling or a test. Its callbacks are this
+   *  browser's wiring: replacing onNeedChildren, onSelectionChange or
+   *  onItemChosen disconnects the browser. */
   TreeView& tree() { return tree_; }
 
+  /** The tree fills the browser. */
   void resized() override { tree_.setBounds(localBounds()); }
 
   AccessibleInfo accessibleInfo() const override {

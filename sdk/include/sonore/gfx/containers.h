@@ -18,6 +18,7 @@
 // them. Everything below the fold costs nothing here.
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -40,8 +41,11 @@ namespace gfx {
  */
 class ListBox : public Widget {
 public:
+  /** Logical pixels, until setRowHeight. */
   static constexpr float kDefaultRowHeight = 22.0f;
 
+  /** Empty, with nothing selected (-1). Takes no keyboard focus until
+   *  withKeyboardFocus(). */
   ListBox() {
     scrollBar_.setVertical(true);
     addChild(&scrollBar_);
@@ -51,7 +55,8 @@ public:
     };
   }
 
-  /** How many rows the model has. */
+  /** How many rows the model has. When it changes without setItems(), call
+   *  updateContent(); until then the list still draws what is there. */
   std::function<int()> getNumRows;
   /** Draw one. `area` is in the LIST's coordinates, already scrolled. */
   std::function<void(Graphics&, int row, const Rect& area, bool selected)> drawRow;
@@ -86,17 +91,35 @@ public:
     repaint();
   }
 
+  /** The strings setItems gave; empty for a list drawn by getNumRows and
+   *  drawRow. */
   const std::vector<std::string>& items() const { return items_; }
 
+  /** Every row's height in logical pixels; anything under 1 is 1. */
   void setRowHeight(float height) {
     rowHeight_ = height > 1.0f ? height : 1.0f;
     updateScrollBar();
     repaint();
   }
+  /** Every row's height in logical pixels. */
   float rowHeight() const { return rowHeight_; }
 
+  /** What getNumRows says, or 0 without one. */
   int numRows() const { return getNumRows ? getNumRows() : 0; }
 
+  /** The model changed size: bring the selection and the scroll bar back in
+   *  line with it. setItems() does this itself; a list driven by its own
+   *  getNumRows had no way to. */
+  void updateContent() {
+    const int count = numRows();
+    if (count == 0) selected_ = -1;
+    else if (selected_ >= count) selected_ = count - 1;
+    updateScrollBar();
+    scrollBar_.setPosition(scrollY_, false);
+    repaint();
+  }
+
+  /** 0-based, or -1 for none. */
   int selectedRow() const { return selected_; }
 
   AccessibleInfo accessibleInfo() const override {
@@ -122,6 +145,9 @@ public:
     return info;
   }
 
+  /** Select `row`, held to the last row; a negative one selects none. Scrolls
+   *  it into view, and calls onSelectionChange when the selection moved and
+   *  `notify` is true. */
   void setSelectedRow(int row, bool notify = true) {
     const int count = numRows();
     const int clamped = count == 0 ? -1 : (row < 0 ? -1 : (row >= count ? count - 1 : row));
@@ -158,6 +184,10 @@ public:
     g.setColour(lf.background().darkened(0.02f));
     g.fillRect(area);
     if (!drawRow) return;
+    // A model that shrank under a scrolled list left the scroll past its end,
+    // and the list drew nothing at all. Re-clamped against the rows there are
+    // NOW, which costs two comparisons and touches nothing but the number.
+    clampScroll();
 
     // Only the rows that are actually visible. A list of four thousand presets
     // draws the twelve on screen, which is the entire point of not building a
@@ -228,6 +258,8 @@ public:
     }
   }
 
+  /** Let the list take the keyboard focus, so the arrows, Page Up and Down,
+   *  Home, End and Return work; returns this list. */
   ListBox& withKeyboardFocus() {
     setWantsKeyboardFocus(true);
     return *this;
@@ -239,8 +271,10 @@ private:
 
   void clampScroll() {
     const float most = contentHeight() - localBounds().h;
-    if (scrollY_ > most) scrollY_ = most;
-    if (scrollY_ < 0.0f) scrollY_ = 0.0f;
+    // Written to catch a NaN too: one set as a scroll position failed both
+    // tests and reached the row arithmetic, and its conversion to int.
+    if (!(scrollY_ <= most)) scrollY_ = most;
+    if (!(scrollY_ >= 0.0f)) scrollY_ = 0.0f;
   }
 
   void updateScrollBar() {
@@ -268,10 +302,16 @@ private:
  */
 class TabbedComponent : public Widget {
 public:
+  /** The tab row's height in logical pixels; the pages fill the rest. */
   static constexpr float kTabHeight = 26.0f;
 
+  /** The new 0-based index, after a click on a tab or setCurrentTab with
+   *  `notify`. */
   std::function<void(int index)> onTabChanged;
 
+  /** Append a tab called `name` showing `page`, which becomes a child but is
+   *  not owned (null is a tab with no page). The first tab becomes current
+   *  without calling onTabChanged. */
   void addTab(std::string name, Component* page) {
     tabs_.push_back(Tab{std::move(name), page});
     if (page) addChild(page);
@@ -281,10 +321,20 @@ public:
     repaint();
   }
 
+  /** How many tabs there are. */
   int numTabs() const { return (int) tabs_.size(); }
+  /** 0-based; -1 before the first addTab. */
   int currentTab() const { return current_; }
-  const std::string& tabName(int index) const { return tabs_[(size_t) index].name; }
+  /** Tab `index`'s name, or an empty string out of range -- as tabBounds
+   *  answers an empty rectangle. It read past the vector instead. */
+  const std::string& tabName(int index) const {
+    static const std::string none;
+    if (index < 0 || index >= (int) tabs_.size()) return none;
+    return tabs_[(size_t) index].name;
+  }
 
+  /** Show tab `index` and hide the other pages; ignored when out of range or
+   *  already current. Calls onTabChanged when `notify` is true. */
   void setCurrentTab(int index, bool notify = true) {
     if (index < 0 || index >= (int) tabs_.size() || index == current_) return;
     current_ = index;
@@ -342,6 +392,7 @@ public:
   }
 
 private:
+  /** One tab: the text on it and the page it shows, which is not owned. */
   struct Tab {
     std::string name;
     Component* page = nullptr;
@@ -362,33 +413,58 @@ private:
 /**
  * A bar that fills.
  *
- * Reads its value through a pointer to a double rather than being told, because
- * the thing making progress is usually on another thread -- a sample library
- * loading -- and a bar that had to be pushed at would need that thread to know
- * about the UI.
+ * Reads its value through a pointer rather than being told, because the thing
+ * making progress is usually on another thread -- a sample library loading --
+ * and a bar that had to be pushed at would need that thread to know about the
+ * UI. A value another thread writes is a std::atomic<double>; a plain double
+ * is for one written on the message thread, which is the thread that reads it.
  */
 class ProgressBar : public Widget {
 public:
   /** `source` must outlive this. A null one shows an indeterminate bar, which
    *  is the honest picture of "something is happening and nobody knows how
-   *  much is left". */
+   *  much is left". It is read as a plain double, on the message thread, at
+   *  every tick and paint -- so it must be WRITTEN there too. A job on another
+   *  thread uses the std::atomic<double> overload, or copies its progress
+   *  into this double on the message thread, as ThreadWithProgressWindow
+   *  does. */
   void setSource(const double* source) {
     source_ = source;
+    atomicSource_ = nullptr;
     repaint();
   }
 
+  /** A source another thread writes, read with one atomic load at each tick
+   *  and paint. A reference, so there is no null to be ambiguous about:
+   *  setSource(nullptr) is still the indeterminate bar. `source` must
+   *  outlive this. */
+  void setSource(const std::atomic<double>& source) {
+    atomicSource_ = &source;
+    source_ = nullptr;
+    repaint();
+  }
+  /** A temporary would be gone before the first tick. */
+  void setSource(const std::atomic<double>&&) = delete;
+
+  /** Text drawn on the bar. */
   void setText(std::string text) {
     text_ = std::move(text);
     repaint();
   }
 
+  /** The source's value held to 0..1, or -1 while indeterminate. */
   double progress() const {
-    if (!source_) return -1.0;
-    const double v = *source_;
+    double v = 0.0;
+    // Relaxed is enough: the bar publishes nothing through this value and
+    // reads nothing else beside it, it only has to see a whole double.
+    if (atomicSource_) v = atomicSource_->load(std::memory_order_relaxed);
+    else if (source_) v = *source_;
+    else return -1.0;
     return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
   }
 
-  bool isIndeterminate() const { return source_ == nullptr; }
+  /** Whether there is no source. */
+  bool isIndeterminate() const { return source_ == nullptr && atomicSource_ == nullptr; }
 
   /** Called from the editor's tick. Returns whether the picture changed, so a
    *  caller repaints only when it did rather than thirty times a second. */
@@ -406,6 +482,7 @@ public:
 
 private:
   const double* source_ = nullptr;
+  const std::atomic<double>* atomicSource_ = nullptr; // at most one of the two is set
   std::string text_;
   double lastDrawn_ = -2.0;
 };

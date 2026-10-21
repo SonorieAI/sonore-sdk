@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 171 headers, 426 public types.
+not have. 270 headers, 724 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -19,9 +19,9 @@ check the inventory below rather than assuming.
 ## The shape of a plugin
 
 ```cpp
-// One file is a whole plugin. This builds a .clap, and the same source builds
-// every other format by defining SONORE_BUILD_<FORMAT> and including one more
-// header at the bottom.
+// One file is a whole plugin. The same source builds every format: the build
+// defines SONORE_BUILD_<FORMAT> for each one it makes (sonore_add_plugin does),
+// and formats.h at the bottom includes what each of them needs.
 
 #define SONORE_NUM_PARAMS 2
 #include <sonore/dsp.h>
@@ -38,11 +38,13 @@ struct SonoreDsp {
   void process(sonore::AudioBlock<float>& io, const float* p) {
     for (size_t i = 0; i < io.getNumSamples(); ++i) {
       const float g = gainSm.next(sonore::dbToGain(p[0]));
-      for (int c = 0; c < io.getNumChannels(); ++c)
+      for (size_t c = 0; c < io.getNumChannels(); ++c)
         io.getChannelPointer(c)[i] *= g;
     }
   }
 };
+
+#include <sonore/plugin.h>
 
 // id, label, unit, min, max, default, stepCount
 static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
@@ -59,21 +61,7 @@ static const sonore::PluginDescriptor kDesc = {
     "utility",                   // category
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as
 ```
 
 ## Rules that are not guessable from the API
@@ -82,7 +70,7 @@ static const sonore::PluginDescriptor kDesc = {
 - **Declare latency or the host cannot align you.** Anything that delays its signal (look-ahead limiter, convolver, oversampler) must define `int latencySamples() const`. A plugin that delays and reports zero silently smears every parallel path it sits in. It is detected the same way as the process signature.
 - **prepare() is where you learn the sample rate, and the only place to allocate.** `process()` runs on the audio thread: no allocation, no locks, no file or network access, no `new`, no `std::string`. Size every buffer in `prepare()`. The rate is not fixed: a plugin that assumes 44100 or 48000 is a plugin that breaks at 96k.
 - **Rebuild filter coefficients only when a control moved.** Recomputing a biquad or a ladder every block costs more than the filter does. Keep the last value and compare, as the examples do.
-- **Big objects are members, never locals.** `FdnReverb` is around 320 KB, `Convolver<256,32>` around 400 KB, `StereoDelay` about 1.5 MB. The WebAssembly stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
+- **Big objects are members, never locals.** `FdnReverb<>` is about 1.1 MB, `StereoDelay<>` about 1.5 MB, `Convolver<256,32>` about 140 KB. Emscripten's default stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
 - **Parameters are plain values, in the order of the table.** `p[0]` is the first row of `kParamTable`. Not normalised: if the row says -24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each format's own convention.
 
 ## Building
@@ -100,6 +88,38 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 If a name is not in this list, the SDK does not have it. Reaching for a class
 that sounds like it should exist is the most common way generated code fails to
 compile against this library.
+
+### analytics.h
+
+Analytics: events a plugin decides to record, and the destinations it
+
+`sdk/include/sonore/analytics.h`
+
+AnalyticsEvent, AnalyticsDestination, Analytics, ThreadedAnalyticsDestination
+
+### apple_block.h
+
+an Apple block, built by hand, for the APIs that take one
+
+`sdk/include/sonore/apple_block.h`
+
+(no public types)
+
+### application.h
+
+An application built on the SDK: the object that owns the process, and the
+
+`sdk/include/sonore/application.h`
+
+Application
+
+### application_properties.h
+
+An application's settings files: one for the user, one for the machine
+
+`sdk/include/sonore/application_properties.h`
+
+PropertiesFile, ApplicationProperties
 
 ### asio_format.h
 
@@ -157,6 +177,14 @@ ASIO output, without Steinberg's SDK
 
 AsioClockSource, AsioChannelInfo, AsioBufferInfo, AsioTimeStamp, AsioSamples, AsioCallbacks, IAsio, DriverInfo, AsioOutput
 
+### audio_cd.h
+
+. Audio CDs: reading them (AudioCDReader) and burning them
+
+`sdk/include/sonore/audio_cd.h`
+
+CDToc, AudioCDReader, AudioCDBurner
+
 ### audio_coreaudio.h
 
 macOS audio output (the default-output AudioUnit)
@@ -205,6 +233,14 @@ the one lock-free ring both directions of audio use
 
 AudioRing
 
+### audio_source.h
+
+. The pull model: sources that are ASKED for their next block
+
+`sdk/include/sonore/audio_source.h`
+
+AudioSourceChannelInfo, AudioSource, PositionableAudioSource, MemoryAudioSource, AudioFormatReaderSource, ToneGeneratorAudioSource, ChannelRemappingAudioSource, IIRFilterAudioSource, ReverbAudioSource, ResamplingAudioSource, MixerAudioSource, ReadAheadThread, BufferingAudioSource, AudioTransportSource, AudioSourcePlayer
+
 ### audio_wasapi.h
 
 Windows audio output (WASAPI, shared mode, event driven)
@@ -220,6 +256,14 @@ Windows audio capture (WASAPI, shared mode, event driven)
 `sdk/include/sonore/audio_wasapi_input.h`
 
 WasapiInput
+
+### audio_workgroup.h
+
+. Audio workgroups: putting a helper thread under the audio
+
+`sdk/include/sonore/audio_workgroup.h`
+
+RealtimeThreadHints, AudioWorkgroup, WorkgroupToken
 
 ### audiofile.h
 
@@ -244,6 +288,22 @@ reading an audio file without holding all of it
 `sdk/include/sonore/audiostream.h`
 
 AudioFileReader
+
+### bigint.h
+
+BigInteger: signed integers of any size
+
+`sdk/include/sonore/bigint.h`
+
+BigInteger
+
+### bluetooth_midi.h
+
+Pairing a Bluetooth LE MIDI device: the system's own dialogue, where there is
+
+`sdk/include/sonore/bluetooth_midi.h`
+
+BluetoothMidiDevicePairingDialogue
 
 ### broadcaster.h
 
@@ -275,7 +335,7 @@ the CLAP format wrapper
 
 `sdk/include/sonore/clap_wrapper.h`
 
-TakesMidi, TakesSidechain, TakesContext, TakesDouble, TakesDoubleCtx, WantsTransport, WantsHostInfo, WantsTrackInfo, WantsFile, StateHeader, HasVoiceCapacity, HasActiveVoices, HasStateBag, SharedParam, SharedFlag, BypassState, Instance, HasLatency, HasStateDirty, HasTail, PresetProvider
+TakesMidi, TakesSidechain, TakesContext, TakesDouble, TakesDoubleCtx, WantsTransport, WantsHostInfo, WantsTrackInfo, WantsFile, StateHeader, HasVoiceCapacity, HasActiveVoices, HasStateBag, SharedParam, SharedFlag, BypassState, Instance, HasLatency, HasStateDirty, HasTail, SliceEventsIn, SliceEventsOut, PresetProvider
 
 ### clipper.h
 
@@ -295,7 +355,7 @@ Shortcut, CommandInfo, CommandManager
 
 ### compressors.h
 
-the hardware compressors: opto, FET, VCA
+. The hardware compressors: opto, FET, VCA
 
 `sdk/include/sonore/compressors.h`
 
@@ -308,6 +368,14 @@ a crossover into any number of bands that still sums flat
 `sdk/include/sonore/crossover.h`
 
 MultibandSplitter
+
+### crypto.h
+
+BlowFish, RSAKey and Primes -- the reference's cryptography -- and the
+
+`sdk/include/sonore/crypto.h`
+
+Primes, RSAKey, BlowFish
 
 ### delay.h
 
@@ -339,11 +407,11 @@ the DSP toolkit. Header-only, allocation-free, dependency-free
 
 `sdk/include/sonore/dsp.h`
 
-Smooth, LogRamp, OnePole, Biquad, SVF, LadderFilter, DcBlocker, Oscillator, EnvFollower, ADSR, Compressor, DelayLine, Allpass, Comb, DryWetMixer, CompensatedDryWetMixer, VoiceManager
+Smooth, Glide, LogRamp, OnePole, Biquad, IirSection, SvfSection, SVF, LadderFilter, DcBlocker, Oscillator, EnvFollower, ADSR, Compressor, DelayLine, Allpass, Comb, DryWetMixer, CompensatedDryWetMixer, VoiceManager
 
 ### dynamic_eq.h
 
-the dynamic equaliser: a band that compresses itself
+. The dynamic equaliser: a band that compresses itself
 
 `sdk/include/sonore/dynamic_eq.h`
 
@@ -372,6 +440,14 @@ the parametric equaliser, as a machine
 `sdk/include/sonore/eq.h`
 
 ParametricEq
+
+### expression.h
+
+arithmetic parsed from text, with named symbols, evaluated at
+
+`sdk/include/sonore/expression.h`
+
+Expression
 
 ### fast_math.h
 
@@ -405,6 +481,22 @@ asking the user for a file
 
 FileFilter, FileDialog
 
+### file_document.h
+
+A document that lives in a file: open, save, save as, and the questions
+
+`sdk/include/sonore/file_document.h`
+
+FileBasedDocument
+
+### file_types.h
+
+files as streams, mapped files, temporary files, wildcard
+
+`sdk/include/sonore/file_types.h`
+
+FileInputStream, FileOutputStream, FileInputSource, TemporaryFile, MemoryMappedFile, WildcardFileFilter, FileSearchPath, MountedVolumeListChangeDetector
+
 ### files.h
 
 Looking at a directory
@@ -419,7 +511,7 @@ filters steeper than one biquad
 
 `sdk/include/sonore/filter_design.h`
 
-ChebyshevSection, Chebyshev2Section, CascadedIir, LinkwitzRileyN
+ChebyshevSection, BilinearCoefficients, Chebyshev2Section, CascadedIir, LinkwitzRileyN
 
 ### fir.h
 
@@ -437,6 +529,14 @@ writing FLAC
 
 BitWriter
 
+### formats.h
+
+every plugin format a build asks for, from one include
+
+`sdk/include/sonore/formats.h`
+
+(no public types)
+
 ### fuzz.h
 
 the Fuzz Face, as its circuit
@@ -451,7 +551,15 @@ Walking the tree a screen reader would want to see
 
 `sdk/include/sonore/gfx/accessibility.h`
 
-AccessibleNode
+AccessibleRoleMapping, AccessibleNode
+
+### accessibility_mac.h
+
+The macOS end of accessibility: handing our component tree to NSAccessibility
+
+`sdk/include/sonore/gfx/accessibility_mac.h`
+
+AxPoint, AxSize, AxRect, AppKitAccessibilityApi, MacAccessibilityRoot
 
 ### accessible_info.h
 
@@ -469,13 +577,21 @@ Telling the user something, and asking them something
 
 Overlay, AlertOverlay, CallOutBox
 
+### animated_position.h
+
+AnimatedPosition: a position that a finger throws, and that carries on
+
+`sdk/include/sonore/gfx/animated_position.h`
+
+ContinuousWithMomentum, SnapToPageBoundaries, AnimatedPosition, ViewportDragScroller
+
 ### animator.h
 
 Bounds that move over time rather than jumping
 
 `sdk/include/sonore/gfx/animator.h`
 
-CubicBezierEasing, Animator, ValueAnimator
+CubicBezierEasing, SpringEasingOptions, Animator, ValueAnimator
 
 ### audio_display.h
 
@@ -493,6 +609,14 @@ The backing store a window peer paints into, and the one place scale lives
 
 Backing
 
+### bidi.h
+
+The Unicode Bidirectional Algorithm (UAX #9, Unicode 15): which way each
+
+`sdk/include/sonore/gfx/bidi.h`
+
+BidiParagraph
+
 ### bitmap.h
 
 Bitmap: premultiplied RGBA8, and the antialiased rasteriser that fills it
@@ -500,6 +624,30 @@ Bitmap: premultiplied RGBA8, and the antialiased rasteriser that fills it
 `sdk/include/sonore/gfx/bitmap.h`
 
 Bitmap, TiledImage, Rasteriser
+
+### box2d_renderer.h
+
+Box2DRenderer: draws a Box2D world through this SDK's Graphics
+
+`sdk/include/sonore/gfx/box2d_renderer.h`
+
+Box2DRenderer
+
+### button_tracker.h
+
+ButtonTracker: an analytics event every time a button is clicked
+
+`sdk/include/sonore/gfx/button_tracker.h`
+
+ButtonTracker
+
+### cached_image.h
+
+StandardCachedComponentImage: what Component::setBufferedToImage installs
+
+`sdk/include/sonore/gfx/cached_image.h`
+
+StandardCachedComponentImage
 
 ### clipboard.h
 
@@ -509,6 +657,14 @@ The system clipboard
 
 Clipboard
 
+### code_editor.h
+
+A source code editor: a document kept as lines, tokenisers that colour
+
+`sdk/include/sonore/gfx/code_editor.h`
+
+CodeDocument, CodeTokeniser, CPlusPlusCodeTokeniser, LuaTokeniser, XmlTokeniser, CodeEditorComponent
+
 ### colour.h
 
 Colour, and blending
@@ -517,13 +673,37 @@ Colour, and blending
 
 Colour, PremulColour
 
+### colour_selector.h
+
+ColourSelector: choosing a colour
+
+`sdk/include/sonore/gfx/colour_selector.h`
+
+ColourSelector
+
 ### component.h
 
 Component: the tree, and the mouse
 
 `sdk/include/sonore/gfx/component.h`
 
-MouseEvent, KeyPress, DragSource, Component, MouseRouter
+PenDetails, PointerInput, MouseEvent, KeyPress, DragSource, Component, MouseRouter
+
+### component_builder.h
+
+ComponentBuilder: a component tree built from a data tree, and kept in step
+
+`sdk/include/sonore/gfx/component_builder.h`
+
+ComponentBuilder
+
+### component_listeners.h
+
+The hooks a component offers to things that are not it: listeners for its
+
+`sdk/include/sonore/gfx/component_listeners.h`
+
+ComponentListener, MouseListener, CachedComponentImage, TextDragAndDropTarget, ComponentPaintObserver
 
 ### concertina.h
 
@@ -549,6 +729,22 @@ The screens, and which one something is on
 
 Display, Displays
 
+### document_window.h
+
+Desktop windows for an application: TopLevelWindow, ResizableWindow and
+
+`sdk/include/sonore/gfx/document_window.h`
+
+TopLevelWindow, ResizableWindow, DocumentWindow
+
+### drawable_component.h
+
+DrawableComponent and OwningDrawableComponent: a component that IS a
+
+`sdk/include/sonore/gfx/drawable_component.h`
+
+DrawableComponent, OwningDrawableComponent
+
 ### effects2d.h
 
 Blur, drop shadows, rectangle fitting, and the named colours
@@ -565,13 +761,29 @@ Choosing a file from inside the editor
 
 FileBrowser
 
+### file_chooser.h
+
+The pieces of a file chooser drawn inside the editor
+
+`sdk/include/sonore/gfx/file_chooser.h`
+
+FilePreviewComponent, ImagePreviewComponent, FileListComponent, FileTreeComponent, FileChooserDialogBox, FilenameComponent, FileSearchPathListComponent
+
 ### font.h
 
 Font: a typeface at a size, and drawing text with it
 
 `sdk/include/sonore/gfx/font.h`
 
-Font
+CharacterLayout, Font
+
+### font_match.h
+
+FontMatcher: a CSS font-family list, a weight and a style, to a typeface
+
+`sdk/include/sonore/gfx/font_match.h`
+
+FontMatch, FontMatcher
 
 ### geometry.h
 
@@ -580,6 +792,14 @@ Points, rectangles, lines and affine transforms
 `sdk/include/sonore/gfx/geometry.h`
 
 Point, Rect, PixelRect, Transform
+
+### gif.h
+
+GIF, every frame of it, into premultiplied RGBA Bitmaps
+
+`sdk/include/sonore/gfx/gif.h`
+
+GifFrame, GifImage, GifDecoder
 
 ### gradient.h
 
@@ -605,6 +825,22 @@ A titled box around a set of controls
 
 GroupComponent
 
+### image.h
+
+The things the reference builds around an image -- its storage type, its
+
+`sdk/include/sonore/gfx/image.h`
+
+ImageType, NativeImageType, SoftwareImageType, ScaledImage, ImageCache
+
+### image_format.h
+
+ImageFileFormat: whatever image a plugin is handed, decoded by what it is
+
+`sdk/include/sonore/gfx/image_format.h`
+
+DecodedImage, ImageFileFormat
+
 ### inflate.h
 
 DEFLATE, because PNG is a container around it
@@ -612,6 +848,22 @@ DEFLATE, because PNG is a container around it
 `sdk/include/sonore/gfx/inflate.h`
 
 HuffmanTable, Inflater
+
+### jpeg.h
+
+JPEG, into the same premultiplied RGBA a Bitmap holds -- and back out
+
+`sdk/include/sonore/gfx/jpeg.h`
+
+JpegImage, JpegDecoder, JpegEncoder
+
+### key_mapping_editor.h
+
+KeyMappingEditorComponent: letting the user choose the keys
+
+`sdk/include/sonore/gfx/key_mapping_editor.h`
+
+KeyMappingEditorComponent
 
 ### layout.h
 
@@ -621,6 +873,14 @@ FlexBox and Grid: two ways to place things without arithmetic in resized()
 
 Margin, FlexItem, FlexBox, TrackSize, GridItem, Grid
 
+### line_break.h
+
+Where a line of text may end: the Unicode Line Breaking Algorithm (UAX #14)
+
+`sdk/include/sonore/gfx/line_break.h`
+
+(no public types)
+
 ### lookandfeel.h
 
 LookAndFeel: where a widget's appearance lives, separately from what it does
@@ -628,6 +888,38 @@ LookAndFeel: where a widget's appearance lives, separately from what it does
 `sdk/include/sonore/gfx/lookandfeel.h`
 
 WidgetState, LookAndFeel
+
+### lookandfeel_versions.h
+
+LookAndFeel_V1, V2, V3 and V4: the reference's four generations of default
+
+`sdk/include/sonore/gfx/lookandfeel_versions.h`
+
+LookAndFeel_V1, LookAndFeel_V2, LookAndFeel_V3, LookAndFeel_V4
+
+### maths3d.h
+
+Three-dimensional vectors, 4x4 matrices, quaternions, and an arcball that
+
+`sdk/include/sonore/gfx/maths3d.h`
+
+Vector3D, Matrix3D, Quaternion, Draggable3DOrientation
+
+### menu_bar.h
+
+A menu bar, and the same menus as a list for a narrow editor
+
+`sdk/include/sonore/gfx/menu_bar.h`
+
+MenuBarModel, MenuBarComponent, BurgerMenuComponent
+
+### message_box.h
+
+The operating system's own message boxes, for an application: a message,
+
+`sdk/include/sonore/gfx/message_box.h`
+
+MessageBoxOptions, ScopedMessageBox, NativeMessageBox
 
 ### midi_keyboard.h
 
@@ -637,6 +929,38 @@ An on-screen keyboard
 
 MidiKeyboard
 
+### mouse_input.h
+
+MouseInputSource: the mouse, every finger and the pen, as separate pointers
+
+`sdk/include/sonore/gfx/mouse_input.h`
+
+PointerSample, MouseInputSource, MouseInputSources, MouseInactivityDetector
+
+### movement_watcher.h
+
+ComponentMovementWatcher: told when a component moves on screen -- because it
+
+`sdk/include/sonore/gfx/movement_watcher.h`
+
+ComponentMovementWatcher
+
+### mpe_keyboard.h
+
+An on-screen keyboard for MPE: every sounding note drawn as a circle that
+
+`sdk/include/sonore/gfx/mpe_keyboard.h`
+
+MPEKeyboardComponent
+
+### multi_document.h
+
+MultiDocumentPanel: several documents in one area, as tabs or as windows
+
+`sdk/include/sonore/gfx/multi_document.h`
+
+MultiDocumentPanelWindow, MultiDocumentPanel
+
 ### native_editor.h
 
 The native editor as a plugin format sees it: one object with a window in
@@ -644,6 +968,54 @@ The native editor as a plugin format sees it: one object with a window in
 `sdk/include/sonore/gfx/native_editor.h`
 
 PopupWindow, TooltipWindow, NativeEditor
+
+### native_embed.h
+
+A platform control inside a component tree: HWNDComponent, NSViewComponent,
+
+`sdk/include/sonore/gfx/native_embed.h`
+
+HWNDComponent, ActiveXControlComponent, NSViewComponent, XEmbedComponent
+
+### nsview_component.h
+
+NSViewComponentWithParent: a native NSView inside an editor's component
+
+`sdk/include/sonore/gfx/nsview_component.h`
+
+NSViewComponentWithParent
+
+### opengl.h
+
+OpenGL inside a native editor: a context attached to a component, the
+
+`sdk/include/sonore/gfx/opengl.h`
+
+OpenGLRenderer, OpenGLContext, OpenGLHelpers, OpenGLShaderProgram, OpenGLTexture, OpenGLFrameBuffer, OpenGLImageType, OpenGLGraphicsContextCustomShader, OpenGLAppComponent
+
+### opengl_api.h
+
+The OpenGL entry points, loaded by hand, and the three platform halves of a
+
+`sdk/include/sonore/gfx/opengl_api.h`
+
+OpenGLPixelFormat, OpenGLFunctions
+
+### paint_diagnostics.h
+
+ComponentPaintDiagnostics: how long each component takes to paint, and
+
+`sdk/include/sonore/gfx/paint_diagnostics.h`
+
+ComponentPaintDiagnostics
+
+### parallelogram.h
+
+Parallelogram: a rectangle after an affine transform, as three corners
+
+`sdk/include/sonore/gfx/parallelogram.h`
+
+Parallelogram
 
 ### path.h
 
@@ -659,7 +1031,15 @@ Binding the native UI to plugin parameters, and the editor a plugin gets
 
 `sdk/include/sonore/gfx/plugin_editor.h`
 
-EditorHost, SliderAttachment, ButtonAttachment, ComboAttachment, GenericEditor
+PresetManager, EditorHost, SliderAttachment, ButtonAttachment, ComboAttachment, GenericEditor, AudioProcessorEditor
+
+### plugin_list.h
+
+PluginListComponent: the table a host shows of the plugins it knows about
+
+`sdk/include/sonore/gfx/plugin_list.h`
+
+PluginListComponent
 
 ### png.h
 
@@ -685,6 +1065,38 @@ One row of a popup menu
 
 PopupItem
 
+### popup_overlay.h
+
+A PopupMenu shown INSIDE the editor, and driven from the keyboard
+
+`sdk/include/sonore/gfx/popup_overlay.h`
+
+PopupMenuOverlay
+
+### preferences_panel.h
+
+A preferences window's contents: a row of page buttons along the top, and
+
+`sdk/include/sonore/gfx/preferences_panel.h`
+
+PreferencesPanel
+
+### preset_bar.h
+
+The preset bar: the strip along the top of an editor that says which
+
+`sdk/include/sonore/gfx/preset_bar.h`
+
+PresetBar
+
+### progress_window.h
+
+ThreadWithProgressWindow: a job on a thread of its own, with a window that
+
+`sdk/include/sonore/gfx/progress_window.h`
+
+ThreadWithProgressWindow
+
 ### region.h
 
 A set of rectangles, and the reason it exists: partial repaint
@@ -692,6 +1104,14 @@ A set of rectangles, and the reason it exists: partial repaint
 `sdk/include/sonore/gfx/region.h`
 
 RectangleList
+
+### relative_position.h
+
+Relative positioning: a component's edges as EXPRESSIONS against its parent,
+
+`sdk/include/sonore/gfx/relative_position.h`
+
+RelativeScope, RelativeCoordinate, MarkerList, RelativePoint, RelativeRectangle, RelativeParallelogram, RelativePointPath, RelativeCoordinatePositionerBase
 
 ### resizer.h
 
@@ -708,6 +1128,22 @@ Choosing several things, and moving them
 `sdk/include/sonore/gfx/selection.h`
 
 SelectedItemSet, LassoComponent, ComponentDragger
+
+### side_panel.h
+
+SidePanel: a drawer that slides in over the editor from one edge
+
+`sdk/include/sonore/gfx/side_panel.h`
+
+SidePanel
+
+### splash_screen.h
+
+SplashScreen: a borderless window that shows an image while an application
+
+`sdk/include/sonore/gfx/splash_screen.h`
+
+SplashScreen
 
 ### splitter.h
 
@@ -731,7 +1167,7 @@ SVG, into Paths this rasteriser already knows how to draw
 
 `sdk/include/sonore/gfx/svg.h`
 
-SvgShape, Drawable
+SvgShape, DrawableText, Drawable
 
 ### system_font.h
 
@@ -741,6 +1177,14 @@ Finding a typeface on the machine the plugin is running on
 
 (no public types)
 
+### system_tray.h
+
+An icon in the system tray (the notification area, the macOS menu bar's
+
+`sdk/include/sonore/gfx/system_tray.h`
+
+SystemTrayIconComponent, PushNotifications
+
 ### table.h
 
 A list with columns you can sort and resize
@@ -749,6 +1193,22 @@ A list with columns you can sort and resize
 
 TableColumn, TableListBox
 
+### text_area.h
+
+A text field of several lines
+
+`sdk/include/sonore/gfx/text_area.h`
+
+TextArea
+
+### text_drag.h
+
+Dragging TEXT: between components, in from other applications, and out to
+
+`sdk/include/sonore/gfx/text_drag.h`
+
+TextDragDispatcher
+
 ### text_editor.h
 
 A single-line text field
@@ -756,6 +1216,30 @@ A single-line text field
 `sdk/include/sonore/gfx/text_editor.h`
 
 TextEditor
+
+### text_input.h
+
+Composed text: what an input method has typed before it has decided what it
+
+`sdk/include/sonore/gfx/text_input.h`
+
+TextComposition, TextInputTarget, TextRange16, TextInputSession
+
+### text_shaper.h
+
+OpenType shaping: a run of text in one script and one direction, made into
+
+`sdk/include/sonore/gfx/text_shaper.h`
+
+ShapedGlyph
+
+### toolbar.h
+
+Toolbar: a row of buttons the user can rearrange
+
+`sdk/include/sonore/gfx/toolbar.h`
+
+ToolbarItemComponent, ToolbarItemFactory, ToolbarButton, Toolbar, ToolbarItemPalette
 
 ### tooltip.h
 
@@ -775,11 +1259,11 @@ TreeNode, TreeView
 
 ### truetype.h
 
-A TrueType parser: glyph outlines out of a .ttf, as ordinary Paths
+A TrueType and OpenType parser: glyph outlines out of a .ttf or an .otf, as
 
 `sdk/include/sonore/gfx/truetype.h`
 
-Typeface
+FontAxis, ColourLayer, ImageLayer, Typeface
 
 ### uia_win32.h
 
@@ -796,6 +1280,30 @@ A readout you can type into
 `sdk/include/sonore/gfx/value_box.h`
 
 ValueBox
+
+### value_tree_state_attachments.h
+
+AudioProcessorValueTreeState's widget attachments: SliderAttachment,
+
+`sdk/include/sonore/gfx/value_tree_state_attachments.h`
+
+AudioProcessorValueTreeState
+
+### vblank.h
+
+VBlankAttachment: a callback once per display refresh, on the UI thread
+
+`sdk/include/sonore/gfx/vblank.h`
+
+VBlankAttachment
+
+### video.h
+
+Video: a file played inside an editor, and frames from a camera -- both as
+
+`sdk/include/sonore/gfx/video.h`
+
+VideoReader, VideoComponent, CameraDevice
 
 ### viewport.h
 
@@ -871,11 +1379,11 @@ BlockLevel, MeterState, UiEventQueue, NoteState, BridgeMessage
 
 ### hash.h
 
-SHA-256
+SHA-256, MD5 and Whirlpool
 
 `sdk/include/sonore/hash.h`
 
-Sha256
+Sha256, MD5, Whirlpool
 
 ### hilbert.h
 
@@ -891,7 +1399,15 @@ hosting OTHER people's plugins
 
 `sdk/include/sonore/host.h`
 
-PluginDescription, HostedParam, ParamEdit, HostedPlugin, ClapPlugin, ParamQueue, ParameterChanges, ComponentHandler, PlugFrame, Steinberg_IPlugView, Steinberg_ViewRect, MemoryStream, EventList, Steinberg_Vst_Event, Vst3Plugin, HostLv2Feature, HostLv2UiDescriptor, HostLv2UiIdle, Lv2Port, Lv2Preset, Lv2Plugin
+MpscQueue, PluginDescription, HostedParam, ParamIdIndex, ParamEdit, HostedPlugin, ClapPlugin, ParamQueue, ParameterChanges, OutParamQueue, OutParameterChanges, ComponentHandler2Face, ComponentHandler, PlugFrame, Steinberg_IPlugView, Steinberg_ViewRect, MemoryStream, EventList, Steinberg_Vst_Event, Vst3Plugin, HostLv2Feature, HostLv2Option, HostLv2WorkerSchedule, HostLv2WorkerInterface, HostLv2WorkRing, HostLv2UiDescriptor, HostLv2UiIdle, HostLv2UiResize, Lv2Port, Lv2Preset, Lv2Plugin, LadspaPlugin, LADSPAPluginFormat
+
+### host_au.h
+
+hosting an Audio Unit (AUv2, and AUv3 through AUv2's API)
+
+`sdk/include/sonore/host_au.h`
+
+AuPlugin, AudioUnitPluginFormat
 
 ### impulse.h
 
@@ -909,6 +1425,22 @@ reading a stream at a rate that is not one sample per sample
 
 ZeroOrderHoldKernel, LinearKernel, CatmullRomKernel, Lagrange3Kernel, WindowedSincKernel, Interpolator
 
+### ipc.h
+
+processes talking to each other
+
+`sdk/include/sonore/ipc.h`
+
+NamedPipe, InterprocessConnection, InterprocessConnectionServer, ChildProcessCoordinator, ChildProcessWorker, NetworkServiceDiscovery
+
+### javascript.h
+
+a small JavaScript interpreter, for scripting and for
+
+`sdk/include/sonore/javascript.h`
+
+JsVar, DynamicObject
+
 ### json.h
 
 JSON, and Base64, for state a plugin has to write down
@@ -916,6 +1448,30 @@ JSON, and Base64, for state a plugin has to write down
 `sdk/include/sonore/json.h`
 
 JsonValue, Base64
+
+### ladspa_abi.h
+
+the LADSPA binary interface, declared from the specification
+
+`sdk/include/sonore/ladspa_abi.h`
+
+PortRangeHint, Descriptor
+
+### lame_encoder.h
+
+MP3 out, through the user's own LAME
+
+`sdk/include/sonore/lame_encoder.h`
+
+LAMEEncoderAudioFormat
+
+### leak_detector.h
+
+a count of live objects per class, reported at exit if any
+
+`sdk/include/sonore/leak_detector.h`
+
+LeakedObjectDetector
 
 ### license.h
 
@@ -949,9 +1505,17 @@ LoadMeasurer: how much of the audio deadline a DSP is using
 
 LoadMeasurer
 
+### localisation.h
+
+the interface's text in the user's language, looked up by the
+
+`sdk/include/sonore/localisation.h`
+
+LocalisedStrings
+
 ### lofi.h
 
-degradation on purpose: bit depth, sample rate, wavefolding
+. Degradation on purpose: bit depth, sample rate, wavefolding
 
 `sdk/include/sonore/lofi.h`
 
@@ -964,6 +1528,14 @@ A log a user can send you
 `sdk/include/sonore/logger.h`
 
 Logger
+
+### lv2_atom.h
+
+walking an LV2 atom sequence a host filled in
+
+`sdk/include/sonore/lv2_atom.h`
+
+(no public types)
 
 ### lv2_ports.h
 
@@ -987,7 +1559,23 @@ the LV2 format wrapper
 
 `sdk/include/sonore/lv2_wrapper.h`
 
-Lv2WorkerSchedule, Lv2WorkerInterface, Plugin
+Lv2WorkerSchedule, Lv2WorkerInterface, Lv2Log, Plugin
+
+### matrix.h
+
+a small dense matrix, and the linear solve that is usually
+
+`sdk/include/sonore/matrix.h`
+
+Matrix
+
+### message_manager.h
+
+The message thread: running code on it, and holding it still
+
+`sdk/include/sonore/message_manager.h`
+
+ThreadExitSignal, MessageManager, CallbackMessage, Message, MessageListener, MessageManagerLock, LockingAsyncUpdater
 
 ### metering.h
 
@@ -1013,6 +1601,14 @@ MIDI clock: tempo and transport from the wire
 
 MidiClock
 
+### midi_collector.h
+
+MidiMessageCollector: MIDI from other threads, into the next audio block,
+
+`sdk/include/sonore/midi_collector.h`
+
+MidiMessageCollector
+
 ### midi_file.h
 
 Standard MIDI Files
@@ -1027,7 +1623,7 @@ live MIDI input for the standalone build
 
 `sdk/include/sonore/midi_input.h`
 
-MessageQueue, Device
+MessageQueue, StreamParser, Device
 
 ### midi_output.h
 
@@ -1069,13 +1665,37 @@ multiband dynamics, wired once
 
 MultibandDynamics
 
+### net.h
+
+networking: addresses, TCP and UDP sockets, URLs, and HTTP(S)
+
+`sdk/include/sonore/net.h`
+
+IPAddress, MACAddress, StreamingSocket, DatagramSocket, URL, WebInputStream
+
+### number_text.h
+
+numbers in text, whatever the C locale says
+
+`sdk/include/sonore/number_text.h`
+
+(no public types)
+
 ### osc.h
 
 Open Sound Control
 
 `sdk/include/sonore/osc.h`
 
-Argument, Message, Receiver, Sender
+OSCColour, Argument, Message, OSCAddressPattern, Dispatcher, Receiver, Sender
+
+### output_guard.h
+
+the output guard: a block with NaN or infinity in it leaves as
+
+`sdk/include/sonore/output_guard.h`
+
+(no public types)
 
 ### passive_eq.h
 
@@ -1084,6 +1704,22 @@ a Pultec-style passive program equaliser
 `sdk/include/sonore/passive_eq.h`
 
 PassiveEq
+
+### path_io.h
+
+opening files by UTF-8 path, on every platform
+
+`sdk/include/sonore/path_io.h`
+
+(no public types)
+
+### phase.h
+
+a phase accumulator that does not drift
+
+`sdk/include/sonore/phase.h`
+
+Phase
 
 ### phase_vocoder.h
 
@@ -1133,6 +1769,22 @@ remembering what a scan found, and what killed it
 
 FileStamp, PluginCache
 
+### plugin_host_type.h
+
+which host loaded this plugin, and as which format
+
+`sdk/include/sonore/plugin_host_type.h`
+
+PluginHostType
+
+### polynomial.h
+
+a polynomial as a value: evaluate it, add it, multiply it
+
+`sdk/include/sonore/polynomial.h`
+
+Polynomial
+
 ### preset_file.h
 
 presets as FILES, in the format the rest of the world uses
@@ -1149,6 +1801,14 @@ factory presets
 
 Preset
 
+### process.h
+
+other processes: launching one, a lock shared between
+
+`sdk/include/sonore/process.h`
+
+ChildProcess, InterProcessLock, DynamicLibrary, DeletedAtShutdown
+
 ### random.h
 
 Randomness, and the noise a DSP makes out of it
@@ -1156,6 +1816,14 @@ Randomness, and the noise a DSP makes out of it
 `sdk/include/sonore/random.h`
 
 Random, WhiteNoise, PinkNoise, Dither, VelvetNoise
+
+### recent_files.h
+
+The "Open Recent" list: most recent first, a fixed length, and the OS told
+
+`sdk/include/sonore/recent_files.h`
+
+RecentlyOpenedFilesList
 
 ### record.h
 
@@ -1235,7 +1903,7 @@ the handful of functions the standard library does not carry
 
 `sdk/include/sonore/special.h`
 
-(no public types)
+SpecialFunctions
 
 ### spring.h
 
@@ -1251,7 +1919,7 @@ the standalone application
 
 `sdk/include/sonore/standalone.h`
 
-FileSource, TestSource, App, Options, DeviceHub
+StandaloneScratch, FileSource, TestSource, App, Options, DeviceHub
 
 ### state_bag.h
 
@@ -1261,6 +1929,14 @@ state a plugin has beyond its parameters
 
 StateBag
 
+### statistics.h
+
+running mean, variance, minimum, maximum and RMS of a stream
+
+`sdk/include/sonore/statistics.h`
+
+StatisticsAccumulator
+
 ### stft.h
 
 a short-time Fourier transform you can process in the middle of
@@ -1268,6 +1944,14 @@ a short-time Fourier transform you can process in the middle of
 `sdk/include/sonore/stft.h`
 
 Stft
+
+### streams.h
+
+byte streams: one interface for a file, a buffer, a URL, or a
+
+`sdk/include/sonore/streams.h`
+
+InputStream, OutputStream, MemoryInputStream, MemoryOutputStream, BufferedInputStream, SubregionStream, InputSource
 
 ### synth.h
 
@@ -1285,6 +1969,14 @@ SysexAssembler: one complete message out of however many pieces arrive
 
 SysexAssembler
 
+### system_audio_format.h
+
+the operating system's own audio decoders
+
+`sdk/include/sonore/system_audio_format.h`
+
+WindowsMediaAudioFormat, CoreAudioFormat
+
 ### system_stats.h
 
 What machine this is
@@ -1293,6 +1985,14 @@ What machine this is
 
 CpuFeatures
 
+### system_volume.h
+
+SystemAudioVolume: the machine's master output level and mute
+
+`sdk/include/sonore/system_volume.h`
+
+SystemAudioVolume
+
 ### tape.h
 
 tape, modelled rather than named
@@ -1300,6 +2000,14 @@ tape, modelled rather than named
 `sdk/include/sonore/tape.h`
 
 JilesAtherton, TapeSaturator
+
+### text_diff.h
+
+the changes that turn one string into another
+
+`sdk/include/sonore/text_diff.h`
+
+TextDiff
 
 ### thread_pool.h
 
@@ -1316,6 +2024,14 @@ AudioThumbnail: the peak envelope a waveform display is drawn from
 `sdk/include/sonore/thumbnail.h`
 
 ThumbnailBucket, AudioThumbnail
+
+### thumbnail_cache.h
+
+AudioThumbnailCache: waveforms already computed, kept by source
+
+`sdk/include/sonore/thumbnail_cache.h`
+
+AudioThumbnailCache
 
 ### time.h
 
@@ -1365,6 +2081,14 @@ Universal MIDI Packets: the MIDI 2.0 wire format
 
 Sysex7Assembler
 
+### ump128.h
+
+The 128-bit Universal MIDI Packets ump.h left out: Flex Data (message type
+
+`sdk/include/sonore/ump128.h`
+
+FlexHeader, TimeSignature, Metronome, KeySignature, ChordAlteration, ChordName, FlexTextAssembler, EndpointInfo, StreamConfiguration, FunctionBlockInfo, StreamTextAssembler, Sysex8Assembler, MixedDataSetHeader, MixedDataSetAssembler
+
 ### undo.h
 
 UndoHistory: undo and redo for a plugin's own editor
@@ -1372,6 +2096,22 @@ UndoHistory: undo and redo for a plugin's own editor
 `sdk/include/sonore/undo.h`
 
 UndoHistory
+
+### unit_test.h
+
+a small unit-test framework for plugin authors' own tests
+
+`sdk/include/sonore/unit_test.h`
+
+UnitTest, UnitTestRunner
+
+### user_presets.h
+
+the user's own presets: saved, named and browsed, in a folder
+
+`sdk/include/sonore/user_presets.h`
+
+PresetMetadata, PresetFileContents, UserPresetStore, PresetManager
 
 ### user_settings.h
 
@@ -1397,6 +2137,22 @@ the two other synth filters people ask for by name
 
 DiodeLadder, SallenKeyFilter
 
+### value_tree_state.h
+
+AudioProcessorValueTreeState: the reference's parameter object,
+
+`sdk/include/sonore/value_tree_state.h`
+
+NormalisableRange, ParameterID, RangedAudioParameter, AudioParameterFloat, AudioParameterInt, AudioParameterBool, AudioParameterChoice, AudioProcessorParameterGroup, AudioProcessorValueTreeState
+
+### version.h
+
+which SDK this is, for code that has to know
+
+`sdk/include/sonore/version.h`
+
+(no public types)
+
 ### vocoder.h
 
 the channel vocoder and the formant filter
@@ -1405,13 +2161,21 @@ the channel vocoder and the formant filter
 
 ChannelVocoder, FormantFilter
 
+### vst3_uid.h
+
+a VST3 class id, between its bytes and its text
+
+`sdk/include/sonore/vst3_uid.h`
+
+(no public types)
+
 ### vst3_wrapper.h
 
 the VST3 format wrapper
 
 `sdk/include/sonore/vst3_wrapper.h`
 
-UnitInfoIface, MidiMappingIface, NoteExpressionIface, ContextRequirementsIface, InfoListenerIface, ComponentIface, ProcessorIface, ControllerIface, ViewIface, ViewScaleIface, View, Plugin, NoteExpressionSpec, Steinberg_Vst_NoteExpressionTypeInfo, Factory
+UnitInfoIface, MidiMappingIface, NoteExpressionIface, ContextRequirementsIface, InfoListenerIface, ComponentIface, ProcessorIface, ControllerIface, ViewIface, ViewScaleIface, View, Plugin, SliceEventList, SliceParamQueue, SliceParamChanges, NoteExpressionSpec, Steinberg_Vst_NoteExpressionTypeInfo, Factory
 
 ### wasm_abi.h
 
@@ -1419,7 +2183,7 @@ the WebAssembly ABI glue (GENERATED, never authored against)
 
 `sdk/include/sonore/wasm_abi.h`
 
-SonoreTakesMidi, SonoreTakesSidechain, SonoreTakesContext
+SonoreTakesMidi, SonoreTakesSidechain, SonoreKeyStore, SonoreTakesContext, SonoreWantsTransport, SonoreHasLatency, SonoreKeyPool
 
 ### wav.h
 
@@ -1460,6 +2224,22 @@ the Windows webview backend (Edge WebView2)
 `sdk/include/sonore/webview_win32.h`
 
 ComCallback, WebViewHost
+
+### win_com.h
+
+COM on a thread somebody else owns
+
+`sdk/include/sonore/win_com.h`
+
+(no public types)
+
+### xml.h
+
+XML: a tree of elements, read from text and written back
+
+`sdk/include/sonore/xml.h`
+
+XmlElement, XmlDocument
 
 ### zip.h
 

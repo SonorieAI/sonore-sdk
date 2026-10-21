@@ -45,6 +45,7 @@ function buildWasm(name, sourcePath, extraFlags = []) {
   // and the param count only: exactly what /api/compile sends.
   const dspOnly = source
     .replace(/#include <sonore\/plugin\.h>[\s\S]*$/, "")
+    .replace(/#include <sonore\/formats\.h>[\s\S]*$/, "")
     .replace(/#include <sonore\/clap_wrapper\.h>[\s\S]*$/, "");
   const glued = `${dspOnly}\n#include <sonore/wasm_abi.h>\n`;
   const cpp = join(out, `${name}.cpp`);
@@ -55,7 +56,23 @@ function buildWasm(name, sourcePath, extraFlags = []) {
     "_sonore_init", "_sonore_process", "_sonore_in_ptr", "_sonore_out_ptr",
     "_sonore_params_ptr", "_sonore_num_params", "_sonore_max_frames",
     "_sonore_channels", "_sonore_midi_ptr", "_sonore_midi_count", "_sonore_wants_midi",
+    // HOW MUCH THIS DSP DELAYS ITS OUTPUT. The native wrappers have reported it
+    // since Limiter and Convolver landed and the browser ABI had nowhere to put
+    // it, so a host compensating a look-ahead limiter had to be told the number
+    // out of band -- which cannot be right at two sample rates at once.
+    "_sonore_latency",
+    // How many blocks the output guard has played as silence: the module has
+    // no log of its own, so the host reads this and says so.
+    "_sonore_output_guard_trips",
   ];
+  // The pooled entry points, only when the build asked for slots. Exporting
+  // them unconditionally would fail to link every ordinary plugin.
+  if (extraFlags.some((f) => String(f).includes("SONORE_MAX_INSTANCES")))
+    exports.push("_sonore_latency_at", "_sonore_output_guard_trips_at",
+                 "_sonore_new", "_sonore_delete", "_sonore_max_instances",
+                 "_sonore_init_at", "_sonore_process_at", "_sonore_in_ptr_at",
+                 "_sonore_out_ptr_at", "_sonore_params_ptr_at",
+                 "_sonore_midi_ptr_at", "_sonore_midi_count_at");
   execFileSync(
     "em++",
     [
@@ -133,6 +150,16 @@ for (const [name, rel, kind] of [
   const nParams = ex.sonore_num_params();
   check(frames === 128 && channels === 2, "the ABI reports the host's buffer geometry");
   check(nParams > 0, "the ABI reports the parameter count");
+  // HOW MUCH IT DELAYS, which the browser ABI could not say until now: the
+  // native wrappers have reported it since Limiter and Convolver landed, and
+  // a host that does not know it has one track sliding against the others.
+  // None of these examples delays, so the number to see here is ZERO -- which
+  // is the honest default for a DSP that does not declare latencySamples(),
+  // rather than a guess. A DSP that DOES declare one is proved where there is
+  // a look-ahead limiter to prove it with.
+  const lat = typeof ex.sonore_latency === "function" ? ex.sonore_latency() : -1;
+  check(lat >= 0 && Number.isInteger(lat),
+        `the ABI reports its latency (${lat} samples)`);
   check(
     ex.sonore_wants_midi() === (isInstrument || isNoteEffect || isContextEffect ? 1 : 0),
     isInstrument ? "the instrument advertises wantsMidi"
@@ -232,6 +259,74 @@ for (const [name, rel, kind] of [
     check(peak < 10, "the output does not blow up");
   }
   console.log("");
+}
+
+// ── many instances in one module ───────────────────────────────────────────
+//
+// A browser gives a tab about 125 WebAssembly memories -- process-wide, and a
+// Worker gets none of its own -- so a host that instantiates a module per
+// plugin INSTANCE stops at 125 of them however little each one costs. One
+// module holding N DSPs is one reservation. `SONORE_MAX_INSTANCES` is what
+// makes that possible and it has to be two things: invisible when off, because
+// every plugin ever built compiles against this header, and genuinely separate
+// when on.
+{
+  const saw = buildWasm("pooled", join(sdk, "examples", "saturator", "plugin.cpp"),
+                        ["-DSONORE_MAX_INSTANCES=4"]);
+  const x = await instantiate(saw);
+
+  check(x.sonore_max_instances() === 4, "the module reports the slots it was built with");
+  const handles = [x.sonore_new(), x.sonore_new(), x.sonore_new(), x.sonore_new()];
+  check(handles.join(",") === "0,1,2,3", "slots are handed out in order");
+  check(x.sonore_new() === -1, "a slot past the last is refused, not wrapped");
+  x.sonore_delete(1);
+  check(x.sonore_new() === 1, "a released slot comes back");
+
+  // Handle 0 IS the singleton, which is what makes the whole addition
+  // backwards compatible: a host that never learned about handles drives it
+  // through the original entry points and nothing has moved.
+  check(x.sonore_in_ptr_at(0) === x.sonore_in_ptr(),
+        "handle 0 is the module's original instance");
+  check(x.sonore_in_ptr_at(1) !== x.sonore_in_ptr_at(0),
+        "and every other slot has buffers of its own");
+
+  // DRIVEN DIFFERENTLY, because separate storage is not the same as separate
+  // behaviour: a shared coefficient cache or a shared filter state would still
+  // give each slot its own buffers and the same sound.
+  const stride = x.sonore_max_frames();
+  const nParams = x.sonore_num_params();
+  const mem = () => new Float32Array(x.memory.buffer);
+  const level = [];
+  for (const h of [0, 1, 2, 3]) {
+    x.sonore_init_at(h, 48000);
+    const pp = x.sonore_params_ptr_at(h) / 4;
+    // Every parameter at its own slot's fraction of the range: whatever the
+    // example's controls are, four settings that differ.
+    for (let i = 0; i < nParams; ++i) mem()[pp + i] = (h + 1) / 5;
+  }
+  for (const h of [0, 1, 2, 3]) {
+    const ip = x.sonore_in_ptr_at(h) / 4, op = x.sonore_out_ptr_at(h) / 4;
+    let e = 0, t = 0, finite = true;
+    for (let b = 0; b < 60; ++b) {
+      const m = mem();
+      for (let i = 0; i < stride; ++i, ++t) {
+        const v = 0.3 * Math.sin((2 * Math.PI * 220 * t) / 48000);
+        m[ip + i] = v;
+        m[ip + stride + i] = v;
+      }
+      x.sonore_process_at(h, stride);
+      const m2 = mem();
+      for (let i = 0; i < stride; ++i) {
+        const y = m2[op + i];
+        if (!Number.isFinite(y)) finite = false;
+        e += y * y;
+      }
+    }
+    check(finite, `slot ${h} produces finite audio`);
+    level.push(Math.sqrt(e / (60 * stride)));
+  }
+  check(new Set(level.map((v) => v.toFixed(4))).size > 1,
+        `slots driven differently sound different (${level.map((v) => v.toFixed(4)).join(" ")})`);
 }
 
 console.log(`${checks} checks, ${failures} failure(s)`);

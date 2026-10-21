@@ -35,6 +35,12 @@
 namespace sonore {
 namespace turtle {
 
+/** One RDF statement as the parser emits it: subject, predicate, object.
+ *  Names are stored resolved -- prefixed names expanded against the
+ *  document's prefixes and relative references against the base -- and
+ *  blank nodes as `_:` labels, generated for the anonymous ones, so two
+ *  triples about the same thing compare equal as strings. A literal object
+ *  is its text, without quotes or language tag. */
 struct Triple {
   std::string subject;
   std::string predicate;
@@ -109,6 +115,20 @@ struct Parser {
   Document* out = nullptr;
   int blankCounter = 0;
 
+  /** How deep collections and blank nodes may nest. Each level is a C++
+   *  frame, and this runs inside a host scanning bundles it did not write: a
+   *  few kilobytes of "((((" used to overflow the scanning process's stack.
+   *  A real TTL nests three or four deep. */
+  static constexpr int kMaxNesting = 64;
+  int nesting = 0;
+  struct NestGuard {
+    int& depth;
+    explicit NestGuard(int& d) : depth(++d) {}
+    ~NestGuard() { --depth; }
+    NestGuard(const NestGuard&) = delete;
+    NestGuard& operator=(const NestGuard&) = delete;
+  };
+
   Parser(const std::string& t, const std::string& baseUri, Document* d)
       : text(t), base(baseUri), out(d) {}
 
@@ -137,6 +157,48 @@ struct Parser {
 
   std::string freshBlank() { return "_:sonore" + std::to_string(++blankCounter); }
 
+  /** A \uXXXX or \UXXXXXXXX escape, with `pos` on the u or U: the code point
+   *  appended as UTF-8, and `pos` left on the escape's last digit. False for
+   *  an escape that is short or not hexadecimal, which the grammar does not
+   *  allow. A code point no UTF-8 can carry -- a surrogate, or past U+10FFFF
+   *  -- is U+FFFD.
+   *
+   *  The code point used to be cast to one char, so "Café" read as the
+   *  Latin-1 byte E9 -- a plugin name that is not UTF-8 -- and \U was not
+   *  known at all and read as a U and its digits. */
+  bool readUnicodeEscape(std::string* into) {
+    const size_t digits = text[pos] == 'U' ? 8 : 4;
+    if (pos + digits >= text.size()) return false;
+    uint32_t cp = 0;
+    for (size_t i = 1; i <= digits; ++i) {
+      const char c = text[pos + i];
+      const int v = c >= '0' && c <= '9'   ? c - '0'
+                    : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                    : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                           : -1;
+      if (v < 0) return false;
+      cp = (cp << 4) | (uint32_t) v;
+    }
+    pos += digits;
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+    if (cp < 0x80) {
+      *into += (char) cp;
+    } else if (cp < 0x800) {
+      *into += (char) (0xC0 | (cp >> 6));
+      *into += (char) (0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      *into += (char) (0xE0 | (cp >> 12));
+      *into += (char) (0x80 | ((cp >> 6) & 0x3F));
+      *into += (char) (0x80 | (cp & 0x3F));
+    } else {
+      *into += (char) (0xF0 | (cp >> 18));
+      *into += (char) (0x80 | ((cp >> 12) & 0x3F));
+      *into += (char) (0x80 | ((cp >> 6) & 0x3F));
+      *into += (char) (0x80 | (cp & 0x3F));
+    }
+    return true;
+  }
+
   /** Resolve a relative reference against the base, the way a bundle's own
    *  file references are written: <plugin.ttl> beside the manifest. Only the
    *  cases an LV2 bundle produces -- absolute URIs pass through, everything
@@ -158,12 +220,12 @@ struct Parser {
     std::string raw;
     while (pos < text.size() && text[pos] != '>') {
       if (text[pos] == '\\' && pos + 1 < text.size()) {
-        // \uXXXX inside a URI. Rare, and skipping it silently would build a
-        // URI that does not match the one the plugin publishes.
+        // \uXXXX or \UXXXXXXXX inside a URI. Rare, and skipping it silently
+        // would build a URI that does not match the one the plugin publishes.
         ++pos;
-        if (text[pos] == 'u' && pos + 4 < text.size()) {
-          raw += (char) std::strtol(text.substr(pos + 1, 4).c_str(), nullptr, 16);
-          pos += 5;
+        if (text[pos] == 'u' || text[pos] == 'U') {
+          if (!readUnicodeEscape(&raw)) return false;
+          ++pos;
           continue;
         }
       }
@@ -226,10 +288,8 @@ struct Parser {
           case '"': result += '"'; break;
           case '\'': result += '\''; break;
           case 'u':
-            if (pos + 4 < text.size()) {
-              result += (char) std::strtol(text.substr(pos + 1, 4).c_str(), nullptr, 16);
-              pos += 4;
-            }
+          case 'U':
+            if (!readUnicodeEscape(&result)) return false;
             break;
           default: result += text[pos]; break;
         }
@@ -286,15 +346,10 @@ struct Parser {
     return true;
   }
 
-  /** Any term in object position. Blank nodes and collections recurse, which
-   *  is why this emits triples as it goes rather than returning a tree. */
-  bool parseObject(std::string* value, bool* isLiteral, std::string* datatype) {
-    skipSpace();
-    *isLiteral = false;
-    datatype->clear();
-
-    if (peek() == '<') return parseUriRef(value);
-
+  /** The two terms that recurse: a blank node's predicate list and a
+   *  collection's items. Only ever reached through parseObject, which holds
+   *  the nesting guard around this call. */
+  bool parseNested(std::string* value) {
     if (peek() == '[') {
       ++pos;
       *value = freshBlank();
@@ -344,6 +399,25 @@ struct Parser {
         head = tail;
       }
       return true;
+    }
+
+    return false;
+  }
+
+  /** Any term in object position. Blank nodes and collections recurse, which
+   *  is why this emits triples as it goes rather than returning a tree. */
+  bool parseObject(std::string* value, bool* isLiteral, std::string* datatype) {
+    skipSpace();
+    *isLiteral = false;
+    datatype->clear();
+
+    if (peek() == '<') return parseUriRef(value);
+
+    if (peek() == '[' || peek() == '(') {
+      // One guard for both, released however parseNested returns.
+      NestGuard guard(nesting);
+      if (nesting > kMaxNesting) return false;
+      return parseNested(value);
     }
 
     if (text.compare(pos, 2, "_:") == 0) {

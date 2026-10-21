@@ -1,0 +1,55 @@
+cmake_minimum_required(VERSION 3.21)
+# A Release build unless asked otherwise, whatever the generator. `--config
+# Release` chooses only with Visual Studio and Xcode; Ninja (what VS Code and
+# Visual Studio's folder view use) and Makefiles (the default on Linux and
+# macOS) build what CMAKE_BUILD_TYPE said at configure time and ignore it.
+# Left unset, that was Debug with MSVC -- a plugin linked to the debug
+# runtime, which no machine without Visual Studio can load -- and no
+# optimisation at all with gcc and clang. Before project(), which would
+# otherwise fill it in.
+get_property(_multiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _multiConfig AND NOT DEFINED CMAKE_BUILD_TYPE AND NOT DEFINED ENV{CMAKE_BUILD_TYPE})
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Debug, Release, RelWithDebInfo or MinSizeRel")
+endif()
+project(@TARGET@ VERSION @VERSION@ LANGUAGES CXX)
+
+# The Sonore SDK, from a source checkout (its sdk/ folder) or installed (its
+# prefix in CMAKE_PREFIX_PATH). Empty means installed.
+set(SONORE_SDK_SOURCE "@SDK_SOURCE@" CACHE PATH
+    "The sdk/ folder of a Sonore SDK checkout; empty to use an installed SDK")
+if(TARGET sonore_sdk)
+  # Already here: this project is one of several under a top-level
+  # CMakeLists that add_subdirectory()s each. Adding the checkout a second
+  # time stopped the configure at "add_library cannot create target
+  # sonore_sdk because another target with the same name already exists".
+elseif(SONORE_SDK_SOURCE)
+  add_subdirectory("${SONORE_SDK_SOURCE}" sonore-sdk EXCLUDE_FROM_ALL)
+else()
+  find_package(SonoreSDK 1.0 REQUIRED)
+endif()
+
+# Every format from one compile of the source. The AU is built on macOS only.
+# Its codes are how macOS registers it: SUBTYPE and MANUFACTURER must be
+# unique to you, and MANUFACTURER needs an upper-case letter (all lower case
+# is Apple's).
+sonore_add_plugin(@TARGET@ SOURCES src/plugin.cpp
+  CLAP @TARGET@
+  VST3 @TARGET@VST3
+  AU   @TARGET@AU
+  LV2  @TARGET@LV2
+  AU_TYPE @AU_TYPE@  AU_SUBTYPE "@AU_SUBTYPE@"  AU_MANUFACTURER "@AU_MANUFACTURER@"
+  AU_VENDOR "@VENDOR@"  AU_NAME "@NAME@"  AU_BUNDLE_ID @ID@
+  VERSION ${PROJECT_VERSION})
+
+# The same source as an app with its own window and audio, and an offline
+# self-check that needs neither: `@TARGET@App --verify`.
+sonore_add_standalone(@TARGET@App SOURCES src/plugin.cpp)
+
+enable_testing()
+add_test(NAME verify COMMAND @TARGET@App --verify)
+# The real-time audit -- every allocation on the audio thread, across rates
+# and block sizes -- comes with a source checkout of the SDK only.
+if(SONORE_SDK_SOURCE)
+  sonore_add_rt_test(@TARGET@Rt SOURCES src/plugin.cpp)
+  add_test(NAME realtime COMMAND @TARGET@Rt)
+endif()

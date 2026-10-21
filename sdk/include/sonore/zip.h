@@ -53,8 +53,12 @@ struct ZipEntry {
   /** As stored, with forward slashes -- the format mandates them, whatever the
    *  machine that wrote it uses. */
   std::string name;
+  /** Bytes as stored in the archive. */
   uint64_t compressedSize = 0;
+  /** Bytes once extracted, as the archive CLAIMS: extract() trusts its own
+   *  limit, not this. */
   uint64_t uncompressedSize = 0;
+  /** The CRC-32 of the extracted bytes, which extract() checks. */
   uint32_t crc = 0;
   /** 0 = stored, 8 = deflated. Anything else is refused rather than guessed. */
   uint16_t method = 0;
@@ -66,6 +70,18 @@ struct ZipEntry {
   bool isDirectory = false;
 };
 
+/**
+ * A .zip read from memory: its directory, and any entry decompressed into a
+ * buffer with its CRC checked. The reading half of the reference's class of
+ * the same name; the file comment says why there is no writer and what is
+ * checked.
+ *
+ * It does NOT copy the archive. openFromMemory keeps a pointer to the
+ * caller's bytes, which must stay alive and unchanged for as long as entries
+ * are extracted -- until the ZipFile is destroyed or opened on something
+ * else. Stored and deflated entries only, and no Zip64. Nothing here writes
+ * to disk; a caller that does checks isSafeEntryName() first.
+ */
 class ZipFile {
 public:
   /**
@@ -147,8 +163,12 @@ public:
     return true;
   }
 
+  /** How many entries the directory lists, directories included; 0 before
+   *  a successful open. */
   int numEntries() const { return (int) entries_.size(); }
 
+  /** Entry `index` (0-based), or an empty entry when out of range. Valid
+   *  until the next open. */
   const ZipEntry& entry(int index) const {
     static const ZipEntry empty;
     if (index < 0 || index >= (int) entries_.size()) return empty;
@@ -185,7 +205,9 @@ public:
     // one's -- extra fields are routinely present in one and not the other, and
     // assuming they match is how a reader lands in the middle of the data.
     const size_t local = (size_t) e.localHeaderOffset;
-    if (local + kLocalHeaderSize > size_) return false;
+    // Both halves, so the sum is never formed: a header offset near 4 GB
+    // wraps it on a 32-bit build and passes.
+    if (local > size_ || kLocalHeaderSize > size_ - local) return false;
     if (read32(data_, size_, local) != 0x04034b50u) return false;
     const uint16_t nameLength = read16(data_, size_, local + 26);
     const uint16_t extraLength = read16(data_, size_, local + 28);
@@ -216,6 +238,7 @@ public:
     return true;
   }
 
+  /** The same, by exact name; false for a name not in the archive. */
   bool extract(const std::string& name, std::vector<uint8_t>* out,
                size_t limit = 256u * 1024u * 1024u) const {
     return extract(indexOf(name), out, limit);
@@ -235,6 +258,16 @@ public:
    */
   static bool isSafeEntryName(const std::string& name) {
     if (name.empty()) return false;
+    // Valid UTF-8 and nothing a path should hold, before any of the checks
+    // below can be trusted. They look at BYTES, and the bytes of a malformed
+    // sequence are decoded by something else later -- an overlong C0 AE is a
+    // '.' to a lax decoder and nothing at all to this loop. A NUL ends the
+    // name early wherever it is turned into a C string; a control character
+    // has no business in a file name; a colon on Windows names an alternate
+    // data stream of some other file.
+    if (!validUtf8(name)) return false;
+    for (unsigned char c : name)
+      if (c < 0x20 || c == 0x7F || c == ':') return false;
     // Absolute, in either convention, and a Windows drive.
     if (name[0] == '/' || name[0] == '\\') return false;
     if (name.size() >= 2 && name[1] == ':') return false;
@@ -250,6 +283,30 @@ public:
       } else if (name[i] == '\\') {
         return false;
       }
+    }
+    return true;
+  }
+
+  /** Strict UTF-8: no overlong forms, no surrogates, nothing past U+10FFFF,
+   *  no stray or missing continuation bytes. */
+  static bool validUtf8(const std::string& s) {
+    const unsigned char* p = (const unsigned char*) s.data();
+    const unsigned char* end = p + s.size();
+    while (p < end) {
+      const unsigned char b = *p++;
+      if (b < 0x80) continue;
+      int extra;
+      uint32_t cp, least;
+      if ((b & 0xE0) == 0xC0) extra = 1, cp = b & 0x1F, least = 0x80;
+      else if ((b & 0xF0) == 0xE0) extra = 2, cp = b & 0x0F, least = 0x800;
+      else if ((b & 0xF8) == 0xF0) extra = 3, cp = b & 0x07, least = 0x10000;
+      else return false;
+      if (end - p < extra) return false;
+      for (int i = 0; i < extra; ++i) {
+        if ((*p & 0xC0) != 0x80) return false;
+        cp = (cp << 6) | (*p++ & 0x3F);
+      }
+      if (cp < least || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
     }
     return true;
   }

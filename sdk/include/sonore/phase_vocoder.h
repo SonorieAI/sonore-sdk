@@ -37,6 +37,9 @@
 //
 // Included by dsp.h. Depends on Fft<> from fft.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "phase_vocoder.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include <cstddef>
 #include "audio.h"
@@ -55,14 +58,23 @@ class PhaseVocoder {
   static_assert(Overlap >= 2 && Size % Overlap == 0, "Overlap must divide Size");
 
 public:
+  /** The frame length in samples: the FFT size. */
   static constexpr size_t size() { return Size; }
+  /** Samples between frames, Size / Overlap: every hop()-th process() call
+   *  runs a frame. */
   static constexpr size_t hop() { return Size / Overlap; }
+  /** Bins per frame, DC to Nyquist: Size / 2 + 1. */
   static constexpr size_t numBins() { return Size / 2 + 1; }
   /** One frame, at every ratio. */
   static constexpr int latencySamples() { return (int) Size; }
 
+  /** Ready to use at ratio 1. There is no sample rate to set: the shifter
+   *  works in fractions of whatever rate the samples arrive at. */
   PhaseVocoder() { prepare(); }
 
+  /** Rebuild the window and its overlap-add normalisation, then reset().
+   *  The constructor has already done it, so a plugin need not call it.
+   *  Every buffer is a member: nothing here allocates. */
   void prepare() {
     // The periodic Hann, whose overlapped copies sum to a constant.
     for (size_t i = 0; i < Size; ++i)
@@ -78,6 +90,10 @@ public:
     reset();
   }
 
+  /** Forget every past sample, as at construction: the input, the
+   *  overlap-add, the output queue and the phases. The ratio is kept. Call it
+   *  when the stream restarts (a transport jump, a re-activation). No
+   *  allocation. */
   void reset() {
     for (size_t i = 0; i < Size; ++i) { input_[i] = 0.0f; ola_[i] = 0.0f; outQueue_[i] = 0.0f; }
     for (size_t k = 0; k < numBins(); ++k) { lastPhase_[k] = 0.0f; synthPhase_[k] = 0.0f; }
@@ -88,13 +104,24 @@ public:
     outWrite_ = hop(); // see stft.h: the writer starts one hop ahead of the reader
   }
 
+  /** The shift in semitones (12 is an octave up, -12 one down), stored as
+   *  the ratio 2^(semitones / 12) and so clamped to -24 .. +24. */
   void setSemitones(float semitones) { setRatio(std::pow(2.0f, semitones / 12.0f)); }
   /** 0.25 .. 4: two octaves either way. */
   void setRatio(float ratio) { ratio_ = clampf(ratio, 0.25f, 4.0f); }
+  /** The frequency ratio in use, 0.25 .. 4; 1 leaves the pitch alone. */
   float ratio() const { return ratio_; }
 
+  /** [audio-thread] One sample in, one out, latencySamples() later. A NaN or
+   *  infinite input is taken as 0. The cost is not even: every hop()-th call
+   *  runs the frame's two FFTs and the peak search, the others only queue.
+   *  No allocation, no lock. */
   inline float process(float x) {
-    input_[inPos_] = x;
+    // Finite or nothing: a NaN reached the analysis, its bins' frequencies
+    // came out NaN, and the synthesis phase it propagated into held NaN for
+    // good -- on x64 a NaN-to-long cast happens to skip the bin, on ARM it
+    // is 0 and the vocoder latched. The cast was undefined either way.
+    input_[inPos_] = std::isfinite(x) ? x : 0.0f;
     inPos_ = (inPos_ + 1) % Size;
     if (++sinceHop_ >= hop()) {
       sinceHop_ = 0;
@@ -125,10 +152,21 @@ private:
     // A peak out-magnitudes its two neighbours on each side. The boundary
     // between two adjacent peaks is the magnitude minimum between them, and
     // bound_[i] is the first bin of region i + 1.
+    //
+    // From bin 1, and against the frame's own loudest bin. The search began
+    // at bin 2, so a partial in bin 1 -- 110 Hz at 192 kHz in a 2048 frame,
+    // 30 Hz at 48 kHz -- was never a peak: it fell into region 0 and moved
+    // with whatever peaked first above it, often a noise-floor bump a
+    // hundred bins up. 110 Hz came out at 818. And a floor 100 dB under the
+    // frame's peak is not structure to lock to.
+    float loudest = 0.0f;
+    for (size_t k = 1; k < nb; ++k) loudest = mag_[k] > loudest ? mag_[k] : loudest;
+    const float floorMag = loudest * 1e-5f > 1e-6f ? loudest * 1e-5f : 1e-6f;
     size_t peakCount = 0;
-    for (size_t k = 2; k + 2 < nb && peakCount < kMaxPeaks; ++k) {
+    for (size_t k = 1; k + 2 < nb && peakCount < kMaxPeaks; ++k) {
       const float m = mag_[k];
-      if (m > mag_[k - 1] && m > mag_[k - 2] && m >= mag_[k + 1] && m >= mag_[k + 2] && m > 1e-6f)
+      if (m > mag_[k - 1] && (k < 2 || m > mag_[k - 2]) && m >= mag_[k + 1] && m >= mag_[k + 2] &&
+          m > floorMag)
         peaks_[peakCount++] = k;
     }
     for (size_t i = 0; i + 1 < peakCount; ++i) {
@@ -203,6 +241,7 @@ private:
   /** How many whole bins a partial at `omega` (radians per sample) moves
    *  when its frequency is multiplied by the ratio. */
   inline long shiftBins(float omega) const {
+    if (!std::isfinite(omega)) return (long) Size; // out of the band: skipped, never cast
     const float bin = omega * (float) Size / (2.0f * kPi);
     return (long) std::floor((ratio_ - 1.0f) * bin + 0.5f);
   }

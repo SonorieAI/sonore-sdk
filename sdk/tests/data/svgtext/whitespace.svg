@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="96" viewBox="0 0 220 96">
+  <text x="4" y="26" font-family="Sonore Text" font-size="18">
+      Two    words	here
+  </text>
+  <text x="4" y="56" font-family="Sonore Text" font-size="18" xml:space="preserve">  Kept   spaces</text>
+  <text x="4" y="86" font-family="Sonore Text" font-size="18">Line
+break <tspan fill="#a02000">and</tspan>  span</text>
+</svg>

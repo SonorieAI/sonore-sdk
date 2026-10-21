@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sonore SDK: degradation on purpose: bit depth, sample rate, wavefolding.
+// Sonore SDK. Degradation on purpose: bit depth, sample rate, wavefolding.
 //
 // Three tiny nonlinearities and one wrapper, and the wrapper is the point.
 // The quantiser and the folder are the most violently aliasing shapes a plugin
@@ -17,6 +17,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "lofi.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include <type_traits>
 #include <utility>
@@ -43,13 +46,19 @@ struct HasReset<T, decltype((void) std::declval<T&>().reset())> : std::true_type
  */
 class BitCrusher {
 public:
+  /** The word length, held to 1..24 (a NaN to 1): 2^bits levels across
+   *  -1..+1, so the step is 2^(1 - bits). The default is 24, transparent. */
   void setBits(float bits) {
     bits_ = clampf(bits, 1.0f, 24.0f);
     step_ = std::pow(2.0f, 1.0f - bits_); // 2^bits levels across -1..+1
     inv_ = 1.0f / step_;
   }
+  /** The word length setBits() kept, 1..24. */
   float bits() const { return bits_; }
 
+  /** [audio-thread] `x` rounded to the nearest step. Nothing is clipped: a
+   *  sample past +/-1 is quantised past it. Stateless and allocation-free, so
+   *  one instance can serve every channel. */
   inline float process(float x) const {
     // Mid-tread quantiser: zero is a level, so silence stays silent instead
     // of buzzing at the lowest step.
@@ -70,6 +79,9 @@ private:
  */
 class Decimator {
 public:
+  /** The host's rate in Hz; one of 1 or less, or NaN, is taken as 48000.
+   *  The hold rate is kept -- 48 kHz until setRate() says otherwise, which
+   *  at a 96 kHz host already holds every second sample. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; setRate(rateHz_); }
   /** The rate to hold at. At or above the host's rate this is transparent. */
   void setRate(float hz) {
@@ -77,8 +89,11 @@ public:
     inc_ = rateHz_ / sr_;
     if (inc_ > 1.0f) inc_ = 1.0f;
   }
+  /** Zero held, and the next sample taken at once. */
   void reset() { phase_ = 1.0f; held_ = 0.0f; }
 
+  /** [audio-thread] The held sample: `x` when the rate's phase comes round,
+   *  the one taken last otherwise. Allocation-free. */
   inline float process(float x) {
     phase_ += inc_;
     if (phase_ >= 1.0f) {
@@ -110,14 +125,25 @@ private:
  */
 class WaveFolder {
 public:
+  /** `x` reflected back into -1..+1 at each end, as often as it takes:
+   *  -1..+1 passes unchanged, 1.5 comes out 0.5, 3 comes out -1. A NaN stays
+   *  a NaN. */
   static inline float fold(float x) {
     const float t = x * 0.25f + 0.25f;
     const float frac = t - std::floor(t);
     return 1.0f - 4.0f * std::fabs(frac - 0.5f);
   }
 
+  /** The input gain, linear (1, the default, is unity); a negative one
+   *  becomes 0. Above 1 the signal starts to fold. */
   void setDrive(float gain) { drive_ = gain < 0.0f ? 0.0f : gain; }
+  /** Added to the driven input before the fold, in the same full-scale units;
+   *  0, the default, is a symmetric fold. Silence comes out as fold(bias), so
+   *  a bias puts DC on the output. */
   void setBias(float bias) { bias_ = bias; }
+  /** [audio-thread] fold(x * drive + bias), in -1..+1. Stateless and
+   *  allocation-free. Unoversampled: wrap it in Oversampled to keep the
+   *  folded harmonics from aliasing. */
   inline float process(float x) const { return fold(x * drive_ + bias_); }
 
 private:
@@ -144,10 +170,18 @@ private:
 template <typename Shaper, int Stages = 2, typename Filter = HalfBandFilter<33>>
 class Oversampled {
 public:
+  /** The oversampling factor, 2^Stages: how many times the shaper runs per
+   *  input sample. */
   static constexpr int factor() { return 1 << Stages; }
+  /** The cascade's delay in samples at the base rate: the number the plugin
+   *  reports to the host. 0 for OversampledIir. */
   static constexpr int latencySamples() { return OversamplerT<Stages, Filter>::latencySamples(); }
 
+  /** The shaper this wrapper owns, to set its controls; it lives as long as
+   *  the wrapper. A shaper that takes a sample rate runs at factor() times
+   *  the host's. */
   Shaper& shaper() { return shaper_; }
+  /** As above, read-only. */
   const Shaper& shaper() const { return shaper_; }
 
   /** Clears the filter cascade, and the shaper too if it has state. */
@@ -156,8 +190,19 @@ public:
     if constexpr (lofidetail::HasReset<Shaper>::value) shaper_.reset();
   }
 
+  /** [audio-thread] One base-rate sample in, one out, latencySamples() late:
+   *  up, the shaper factor() times, down. Allocation-free. */
   inline float process(float x) {
     return os_.process(x, [this](float v) { return shaper_.process(v); });
+  }
+
+  /** process() over a block, in place: the same bits as n calls. With the
+   *  default HalfBandFilter the filters run four samples at a time and the
+   *  2x and 4x cascades cost a seventh to a ninth of the per-sample calls; the
+   *  shaper still runs once per oversampled sample, in order. Mixes freely
+   *  with process() on the same instance. */
+  void processBlock(float* io, int n) {
+    os_.processBlock(io, n, [this](float v) { return shaper_.process(v); });
   }
 
 private:
@@ -165,6 +210,8 @@ private:
   OversamplerT<Stages, Filter> os_;
 };
 
+/** Oversampled with the polyphase IIR half-band: no latency, at the cost of
+ *  phase linearity, so a dry/wet mix with it does not null. */
 template <typename Shaper, int Stages = 2>
 using OversampledIir = Oversampled<Shaper, Stages, PolyphaseIirHalfBand<9>>;
 

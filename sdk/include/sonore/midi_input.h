@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "audio.h"
+#include "path_io.h"
 #include "sysex.h"
 
 #if defined(_WIN32) && !defined(SONORE_APPLE_SYNTAX_CHECK)
@@ -49,8 +50,10 @@ namespace midiin {
  *  writes, the audio thread drains; neither ever blocks the other. */
 class MessageQueue {
 public:
-  static constexpr int kCapacity = 512;
+  static constexpr int kCapacity = 512; ///< Ring slots; one stays empty, so 511 messages wait at most.
 
+  /** [driver-thread] One short message, as the device sent it. Dropped
+   *  without a word when the ring is full: the device thread never waits. */
   void push(uint8_t status, uint8_t d1, uint8_t d2) {
     const uint32_t w = write_.load(std::memory_order_relaxed);
     const uint32_t next = (w + 1) % kCapacity;
@@ -91,41 +94,61 @@ public:
    *  quietly stops answering MIDI-CI should be able to say why. */
   uint32_t droppedSysex() const { return droppedSysex_.load(std::memory_order_relaxed); }
 
-  /** Drain everything pending into a block's MIDI buffer. Events land at
-   *  offset 0: a USB keyboard's jitter is already larger than one block, so
-   *  pretending to know the sample offset would be false precision. */
+  /** Drain what fits into a block's MIDI buffer. Events land at offset 0: a
+   *  USB keyboard's jitter is already larger than one block, so pretending
+   *  to know the sample offset would be false precision.
+   *
+   *  What does NOT fit stays in the ring for the next block. It used to be
+   *  taken out regardless and dropped by the full buffer -- note-offs
+   *  included, which is a stuck note -- when waiting one block costs a few
+   *  milliseconds of a latency the comment above already calls jitter. */
   void drain(MidiBuffer& out) {
     uint32_t r = read_.load(std::memory_order_relaxed);
     const uint32_t w = write_.load(std::memory_order_acquire);
     while (r != w) {
       const Slot& s = slots_[r];
-      if (deliverableToDsp(s.status)) out.addEvent(MidiMessage(s.status, s.d1, s.d2), 0);
+      if (deliverableToDsp(s.status)) {
+        if (out.isFull()) break;
+        out.addEvent(MidiMessage(s.status, s.d1, s.d2), 0);
+      }
       r = (r + 1) % kCapacity;
     }
     read_.store(r, std::memory_order_release);
 
+    // The same rule for SysEx: a message the block cannot take waits for the
+    // next one. The slot was released whether addSysex took it or not, so
+    // two 1500-byte messages in one block lost the second -- uncounted, since
+    // droppedSysex() only sees a full RING.
     uint32_t sr = sysexRead_.load(std::memory_order_relaxed);
     const uint32_t sw = sysexWrite_.load(std::memory_order_acquire);
     while (sr != sw) {
       const SysexSlot& slot = sysex_[sr];
-      out.addSysex(slot.bytes, slot.length, 0);
+      if (!out.addSysex(slot.bytes, slot.length, 0)) break;
       sr = (sr + 1) % kSysexSlots;
     }
     sysexRead_.store(sr, std::memory_order_release);
   }
 
 private:
+  /** One short message as the driver gave it, unfiltered: drain() is where
+   *  a status a DSP does not take is skipped. */
   struct Slot {
-    uint8_t status = 0, d1 = 0, d2 = 0;
+    uint8_t status = 0, ///< The status byte.
+        d1 = 0,         ///< The first data byte, or 0.
+        d2 = 0;         ///< The second, or 0.
   };
   // Four in flight is generous for what actually arrives: MIDI-CI is a
-  // negotiation of a few messages, not a stream. Sized to match what a block
-  // can carry, so the ring never holds something MidiBuffer would refuse.
-  static constexpr int kSysexSlots = 4;
+  // negotiation of a few messages, not a stream. FIVE slots for four: a ring
+  // keeps one empty to tell full from empty, and four held three. Each slot
+  // holds what one empty block can carry, so a message that waits always
+  // fits in the next block.
+  static constexpr int kSysexSlots = 5;
   static constexpr int kSysexBytes = MidiBuffer::kSysexCapacity;
+  /** One complete SysEx, copied in, F0 to F7. Sized to a whole block's SysEx
+   *  arena, so a message that waits always fits the next block. */
   struct SysexSlot {
-    uint8_t bytes[kSysexBytes] = {0};
-    uint16_t length = 0;
+    uint8_t bytes[kSysexBytes] = {0}; ///< The message, F0 to F7.
+    uint16_t length = 0;              ///< Its length in bytes.
   };
   Slot slots_[kCapacity];
   std::atomic<uint32_t> write_{0};
@@ -136,25 +159,128 @@ private:
   std::atomic<uint32_t> droppedSysex_{0};
 };
 
+/**
+ * Bytes in, messages out, for ONE source.
+ *
+ * The byte-stream backends -- ALSA rawmidi, and CoreMIDI, whose packets are
+ * byte runs that may split a SysEx -- each had a parser of their own, and
+ * each got different things wrong:
+ *
+ *   * Linux treated every 0xF1..0xF7 status as a three-byte message that set
+ *     running status. MTC quarter frames, song select and tune request never
+ *     came out, and the bytes after a SysEx came out as [F7 xx yy] events.
+ *   * macOS shared one SysEx assembler between every source, so a note from
+ *     one keyboard in the middle of another's SysEx was lost with the SysEx;
+ *     it dropped a clock byte inside a SysEx packet and anything after the
+ *     F7 in the same packet; and it read a data byte past the packet's end.
+ *
+ * One parser, then, with the rules written once: realtime bytes pass
+ * through wherever they fall, SysEx is collected until its F7 or until a
+ * status byte ends it (which then starts its own message), system common
+ * messages are sized by shortMessageLength and cancel running status, and
+ * channel messages keep it. Platform-free, so it is tested on any machine.
+ */
+class StreamParser {
+public:
+  /** `onShort(status, d1, d2)` for each complete short message,
+   *  `onSysex(bytes, length)` for each complete SysEx. */
+  template <typename OnShort, typename OnSysex>
+  void feed(uint8_t byte, OnShort&& onShort, OnSysex&& onSysex) {
+    if (byte >= 0xF8) { // realtime: anywhere, even inside a SysEx
+      onShort(byte, 0, 0);
+      return;
+    }
+    if (isSysexStart(byte) || sysex_.inProgress()) {
+      if (sysex_.push(byte)) onSysex(sysex_.data(), sysex_.size());
+      if (byte >= 0x80) have_ = 0; // a SysEx cancels running status
+      if (byte < 0x80 || isSysexStart(byte) || byte == 0xF7) return;
+      // Any other status byte ended the SysEx unfinished, and is still the
+      // start of a message of its own.
+    }
+    if (byte >= 0x80) {
+      const int length = shortMessageLength(byte);
+      have_ = 0;
+      if (length == 0) return; // 0xF4, 0xF5, a stray 0xF7: not messages
+      if (length == 1) {       // tune request
+        onShort(byte, 0, 0);
+        return;
+      }
+      message_[0] = byte;
+      have_ = 1;
+      wanted_ = length;
+      return;
+    }
+    if (have_ == 0) return; // a data byte with no status in front of it
+    message_[have_++] = byte;
+    if (have_ == wanted_) {
+      onShort(message_[0], message_[1], wanted_ == 3 ? message_[2] : 0);
+      // Running status is for channel messages; a system common message
+      // leaves none behind.
+      have_ = message_[0] < 0xF0 ? 1 : 0;
+    }
+  }
+
+  /** Into a queue, as every backend wants. */
+  void feed(uint8_t byte, MessageQueue& queue) {
+    feed(
+        byte, [&queue](uint8_t s, uint8_t d1, uint8_t d2) { queue.push(s, d1, d2); },
+        [&queue](const uint8_t* bytes, size_t n) { queue.pushSysex(bytes, n); });
+  }
+
+  /** Forget a message part way through, SysEx included, and running
+   *  status: for a source that was disconnected and reconnected. */
+  void reset() {
+    sysex_.reset();
+    have_ = 0;
+    wanted_ = 0;
+  }
+
+private:
+  SysexAssembler sysex_;
+  uint8_t message_[3] = {0, 0, 0};
+  int have_ = 0, wanted_ = 0;
+};
+
 // ── Windows: winmm ───────────────────────────────────────────────────────────
 #if defined(_WIN32) && !defined(SONORE_APPLE_SYNTAX_CHECK)
 
+/**
+ * One open MIDI input, feeding a MessageQueue: winmm here, ALSA rawmidi on
+ * Linux, CoreMIDI on macOS, the same five calls on each.
+ *
+ * open() and close() belong to the main thread; the bytes arrive on the
+ * driver's thread (a winmm callback, a CoreMIDI read proc, a reader thread of
+ * this class's own on Linux), which pushes into the queue, and the audio
+ * thread drains the queue. The queue is the caller's: it must outlive the
+ * device's open life, and only one Device may feed it, since it has one
+ * producer side. open() closes whatever was open first; the destructor
+ * closes too. It owns OS handles: do not copy one.
+ *
+ * On failure open() returns false and error() says why in a sentence fit for
+ * a user; an open() that succeeds leaves it empty. No device at all is the
+ * common case and an ordinary answer.
+ */
 class Device {
 public:
-  /** Every MIDI input the machine has, in the order --midi-input numbers
-   *  them. Empty is a normal answer, not a failure: most machines have none. */
+  /** Every MIDI input the machine has, in UTF-8 and in the order
+   *  --midi-input numbers them. Empty is a normal answer, not a failure: most
+   *  machines have none. */
   static std::vector<std::string> listDevices() {
     std::vector<std::string> names;
-    HMODULE lib = LoadLibraryA("winmm.dll");
+    HMODULE lib = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) return names;
     auto numDevs = (UINT(WINAPI*)()) GetProcAddress(lib, "midiInGetNumDevs");
-    auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSA*, UINT))
-        GetProcAddress(lib, "midiInGetDevCapsA");
+    // The wide call: the A one answers in the ANSI code page, not UTF-8, so
+    // an accented name came out as bytes no UTF-8 reader takes and one
+    // outside the code page as question marks.
+    auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSW*, UINT))
+        GetProcAddress(lib, "midiInGetDevCapsW");
     if (numDevs && getCaps) {
       const UINT count = numDevs();
       for (UINT i = 0; i < count; ++i) {
-        MIDIINCAPSA caps{};
-        if (getCaps(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR) names.push_back(caps.szPname);
+        MIDIINCAPSW caps{};
+        if (getCaps(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+          names.push_back(::sonore::pathio::narrow(caps.szPname, MAXPNAMELEN));
         else names.push_back("MIDI input " + std::to_string(i));
       }
     }
@@ -162,16 +288,27 @@ public:
     return names;
   }
 
+  /** The name of the input open() chose, for a picker or a status line;
+   *  empty before the first open(). */
   const std::string& deviceName() const { return deviceName_; }
 
+  /** [main-thread] Close whatever was open, then open input `index`, as
+   *  listDevices() numbers them, and start delivering into `queue`. -1, or
+   *  an index that is not there, takes the first input on Windows and every
+   *  source at once on macOS; Linux has one virtual port and ignores it.
+   *  False, with error() saying why, when there is no device or it refused. */
   bool open(MessageQueue* queue, int index = -1) {
     // Idempotent, because a second open() used to OVERWRITE the handle and
     // leave the first one still delivering -- the same note arriving twice,
     // then three times, with no sign of where the copies came from. Closing
     // first costs nothing when nothing is open.
     close();
+    // And forget why the LAST open failed: error() is empty while healthy,
+    // and a device that opened after a refusal -- plugged in since, say --
+    // went on reporting the refusal. midiout's Device did the same.
+    error_.clear();
     queue_ = queue;
-    lib_ = LoadLibraryA("winmm.dll");
+    lib_ = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib_) {
       error_ = "winmm.dll is not available";
       return false;
@@ -245,8 +382,11 @@ public:
   // RAII: a Device dropped without an explicit close() must still stop the
   // driver and return its buffers, or it leaks the open device and the pinned
   // SysEx headers.
+  /** close(). */
   ~Device() { close(); }
 
+  /** [main-thread] Stop the device and give its buffers back; nothing
+   *  reaches the queue afterwards. Harmless when nothing is open. */
   void close() {
     closing_ = true;
     if (handle_) {
@@ -268,26 +408,42 @@ public:
     }
   }
 
+  /** Why the last open() failed, in a sentence fit for a user; empty after
+   *  one that succeeded. */
   const std::string& error() const { return error_; }
 
 private:
+  friend struct DeviceTest; // midi_stack_test drives the callback with a fake winmm
+
   static void CALLBACK callback(HMIDIIN, UINT msg, DWORD_PTR instance, DWORD_PTR p1, DWORD_PTR) {
     auto* self = (Device*) instance;
-    if (msg == MIM_LONGDATA) {
+    if (msg == MIM_LONGDATA || msg == MIM_LONGERROR) {
       // A SysEx buffer coming back. winmm fills the MIDIHDR we lent it and
       // returns it here; dwBytesRecorded says how much of it is real, and a
       // message longer than one buffer arrives as several of these.
+      //
+      // MIM_LONGERROR is the same buffer holding a SysEx the driver saw cut
+      // short -- a status byte before its F7. Neither that nor what the
+      // assembler holds of it is a message. But the buffer is ours again
+      // all the same, and only lending it back keeps SysEx arriving: winmm
+      // throws SysEx away, unannounced, while it holds no buffer. This
+      // answered MIM_LONGDATA alone, so two cut-short messages took both
+      // buffers and the input was deaf to SysEx -- MIDI-CI included --
+      // until it was reopened.
       //
       // Zero bytes means the buffer is being returned at CLOSE, not filled.
       // Requeuing it there is how a close hangs for ever.
       if (self && self->queue_) {
         auto* header = (MIDIHDR*) p1;
         if (header && header->dwBytesRecorded > 0) {
-          self->assembler_.pushBlock((const uint8_t*) header->lpData,
-                                     (size_t) header->dwBytesRecorded,
-                                     [self](const uint8_t* bytes, size_t n) {
-                                       self->queue_->pushSysex(bytes, n);
-                                     });
+          if (msg == MIM_LONGDATA)
+            self->assembler_.pushBlock((const uint8_t*) header->lpData,
+                                       (size_t) header->dwBytesRecorded,
+                                       [self](const uint8_t* bytes, size_t n) {
+                                         self->queue_->pushSysex(bytes, n);
+                                       });
+          else
+            self->assembler_.reset();
           self->requeue(header);
         }
       }
@@ -320,10 +476,11 @@ private:
   /** One device's name, for the log and the picker. */
   std::string nameOf(UINT index) const {
     if (!lib_) return std::string();
-    auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSA*, UINT))
-        GetProcAddress(lib_, "midiInGetDevCapsA");
-    MIDIINCAPSA caps{};
-    if (getCaps && getCaps(index, &caps, sizeof(caps)) == MMSYSERR_NOERROR) return caps.szPname;
+    auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSW*, UINT))
+        GetProcAddress(lib_, "midiInGetDevCapsW");
+    MIDIINCAPSW caps{};
+    if (getCaps && getCaps(index, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
+      return ::sonore::pathio::narrow(caps.szPname, MAXPNAMELEN);
     return "MIDI input " + std::to_string(index);
   }
   MMRESULT(WINAPI* midiInStop_)(HMIDIIN) = nullptr;
@@ -333,6 +490,8 @@ private:
 // ── Linux: ALSA sequencer, dlopened ─────────────────────────────────────────
 #elif defined(__linux__) && !defined(SONORE_APPLE_SYNTAX_CHECK)
 
+/** The Linux Device: the contract of the winmm one above, over one ALSA
+ *  virtual rawmidi port read by a thread of its own, which close() joins. */
 class Device {
 public:
   /** ALSA rawmidi through a VIRTUAL port, which is one endpoint whatever is
@@ -353,6 +512,7 @@ public:
     // then three times, with no sign of where the copies came from. Closing
     // first costs nothing when nothing is open.
     close();
+    error_.clear(); // the last failure is not this open's, as on Windows
     queue_ = queue;
     deviceName_ = "ALSA virtual rawmidi port";
     lib_ = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
@@ -421,8 +581,7 @@ private:
     const bool canPoll = nfds > 0 && !fds.empty();
 
     uint8_t byte = 0;
-    uint8_t message[3] = {0, 0, 0};
-    int wanted = 0, have = 0;
+    parser_.reset();
     while (running_.load(std::memory_order_acquire)) {
       if (canPoll) {
         if (::poll(fds.data(), (nfds_t) nfds, 100 /* ms */) <= 0) continue;
@@ -433,41 +592,11 @@ private:
         nanosleep(&ts, nullptr);
       }
       // Drain every byte the nonblocking handle has; read returns < 1 at EAGAIN.
-      while (running_.load(std::memory_order_acquire) && read_(handle_, &byte, 1) == 1) {
-      if (byte >= 0xf8) {
-        // A realtime byte may appear BETWEEN the bytes of another message --
-        // that is legal MIDI, and it is why they are handled here rather than
-        // as part of whatever is half-assembled. Passed through now, and the
-        // partial message below is left exactly as it was.
-        queue_->push(byte, 0, 0);
-        continue;
-      }
-      // SysEx first: while one is being collected every byte belongs to it,
-      // including status bytes, which is what ends it. Letting the
-      // running-status parser below see those bytes would rebuild a note-on
-      // out of the middle of a manufacturer's payload.
-      if (isSysexStart(byte) || assembler_.inProgress()) {
-        if (assembler_.push(byte)) queue_->pushSysex(assembler_.data(), assembler_.size());
-        // A status byte that TERMINATED a SysEx without 0xF7 is still a status
-        // byte, and the message it starts must not be lost.
-        if (isDataByte(byte) || isSysexStart(byte) || assembler_.inProgress()) continue;
-      }
-      if (byte >= 0x80) {
-        message[0] = byte;
-        have = 1;
-        // Program change and channel pressure are two bytes, the rest three.
-        const uint8_t high = byte & 0xf0;
-        wanted = (high == 0xc0 || high == 0xd0) ? 2 : 3;
-        continue;
-      }
-      if (have == 0) continue; // data before any status: running status we
-                               // never saw the start of
-      message[have++] = byte;
-      if (have == wanted) {
-        queue_->push(message[0], message[1], wanted == 3 ? message[2] : 0);
-        have = 1; // running status: the same status may repeat
-      }
-      } // drain loop: back to poll() when the handle reports EAGAIN
+      // Through the shared parser: realtime bytes between the bytes of
+      // another message, SysEx framing, system common sizes, running status.
+      while (running_.load(std::memory_order_acquire) && read_(handle_, &byte, 1) == 1)
+        parser_.feed(byte, *queue_);
+      // back to poll() when the handle reports EAGAIN
     }
   }
 
@@ -476,7 +605,7 @@ private:
   MessageQueue* queue_ = nullptr;
   std::string error_;
   std::thread thread_;
-  SysexAssembler assembler_;
+  StreamParser parser_;
   std::string deviceName_;
   std::atomic<bool> running_{false};
   int (*open_)(void**, void**, const char*, int) = nullptr;
@@ -489,6 +618,9 @@ private:
 // ── macOS: CoreMIDI ─────────────────────────────────────────────────────────
 #elif defined(__APPLE__) || defined(SONORE_APPLE_SYNTAX_CHECK)
 
+/** The macOS Device: the contract of the winmm one above, over CoreMIDI --
+ *  one source, or every source at once when none is chosen, each with a
+ *  StreamParser of its own. */
 class Device {
 public:
   /** Every CoreMIDI source. Compiled on macOS; unrun against a device, because
@@ -508,6 +640,7 @@ public:
     // then three times, with no sign of where the copies came from. Closing
     // first costs nothing when nothing is open.
     close();
+    error_.clear(); // the last failure is not this open's, as on Windows
     queue_ = queue;
     sourceIndex_ = index;
     if (MIDIGetNumberOfSources() == 0) {
@@ -523,10 +656,28 @@ public:
       error_ = "CoreMIDI refused to create an input port";
       return false;
     }
-    // Every source at once: the standalone has no UI to choose with, and a
-    // player expects whatever they plugged in to just work.
+    // The source the picker chose, as on every other platform. This said the
+    // standalone had no UI to choose with; it has one, and here the choice
+    // was ignored -- every source connected, and no name for the picker to
+    // show. With no choice (-1, or one that has gone), every source at once:
+    // whatever was plugged in should just work.
+    //
+    // A parser PER SOURCE, handed to CoreMIDI as the connection's refCon. One
+    // shared parser meant one shared SysEx in progress: a note from a second
+    // keyboard in the middle of the first one's SysEx ended it, and both were
+    // lost. Sized before anything connects, so the pointers never move.
     const ItemCount sources = MIDIGetNumberOfSources();
-    for (ItemCount i = 0; i < sources; ++i) MIDIPortConnectSource(port_, MIDIGetSource(i), nullptr);
+    const bool one = index >= 0 && (ItemCount) index < sources;
+    parsers_.assign(one ? 1 : (size_t) sources, StreamParser());
+    if (one) {
+      const MIDIEndpointRef source = MIDIGetSource((ItemCount) index);
+      MIDIPortConnectSource(port_, source, &parsers_[0]);
+      deviceName_ = sourceName(source);
+    } else {
+      for (ItemCount i = 0; i < sources; ++i)
+        MIDIPortConnectSource(port_, MIDIGetSource(i), &parsers_[(size_t) i]);
+      deviceName_ = sources == 1 ? sourceName(MIDIGetSource(0)) : std::string("every MIDI source");
+    }
     return true;
   }
 
@@ -544,54 +695,18 @@ public:
   const std::string& error() const { return error_; }
 
 private:
-  static void readProc(const MIDIPacketList* list, void* refCon, void*) {
+  static void readProc(const MIDIPacketList* list, void* refCon, void* connRefCon) {
     auto* self = (Device*) refCon;
-    if (!self || !self->queue_ || !list) return;
+    auto* parser = (StreamParser*) connRefCon;
+    if (!self || !self->queue_ || !list || !parser) return;
+    // Every byte of every packet through this source's own parser. A packet
+    // is a byte run: it may hold several messages, a fragment of a SysEx
+    // that continues in the next, a clock byte inside either, and a message
+    // after a SysEx's F7. The parser keeps its state between packets, and
+    // never reads past the bytes a packet actually holds.
     const MIDIPacket* packet = &list->packet[0];
     for (UInt32 p = 0; p < list->numPackets; ++p) {
-      // A packet may carry several messages back to back; walk them by the
-      // length their status byte implies rather than assuming one each.
-      for (UInt16 i = 0; i < packet->length;) {
-        const uint8_t status = packet->data[i];
-        // Realtime first: one byte, no data, and it may sit between two
-        // halves of anything else.
-        if (isSystemRealtime(status)) {
-          self->queue_->push(status, 0, 0);
-          ++i;
-          continue;
-        }
-        if (isSysexStart(status) || self->assembler_.inProgress()) {
-          // A packet may carry a fragment: CoreMIDI splits a long SysEx
-          // across packets, so the assembler holds state between them rather
-          // than each packet being a whole message.
-          const UInt16 remaining = (UInt16) (packet->length - i);
-          const UInt16 used = (UInt16) self->assembler_.pushBlock(
-              packet->data + i, remaining,
-              [self](const uint8_t* bytes, size_t n) { self->queue_->pushSysex(bytes, n); });
-          (void) used;
-          // pushBlock consumes the rest of the packet. Anything after the
-          // terminator was pushed through the assembler too, which ignores
-          // bytes outside a message -- so nothing is lost and nothing is
-          // parsed twice.
-          break;
-        }
-        if (!deliverableToDsp(status)) {
-          // A data byte with no status in front of it, or the start of a
-          // SysEx this queue cannot carry. The SAME policy the wrappers use,
-          // rather than a second range test that could drift from it.
-          ++i;
-          continue;
-        }
-        const uint8_t high = status & 0xf0;
-        // System common: 0xF1 and 0xF3 carry one data byte, 0xF2 carries two,
-        // and the rest carry none. Sharing the channel-message table here
-        // would read a byte that is not there.
-        UInt16 len = (high == 0xc0 || high == 0xd0) ? 2 : 3;
-        if (status >= 0xF1) len = (status == 0xF2) ? 3 : ((status == 0xF1 || status == 0xF3) ? 2 : 1);
-        if (i + len > packet->length) break;
-        self->queue_->push(status, packet->data[i + 1], len == 3 ? packet->data[i + 2] : 0);
-        i += len;
-      }
+      for (UInt16 i = 0; i < packet->length; ++i) parser->feed(packet->data[i], *self->queue_);
       packet = MIDIPacketNext(packet);
     }
   }
@@ -601,10 +716,9 @@ private:
   MessageQueue* queue_ = nullptr;
   std::string error_, deviceName_;
   int sourceIndex_ = -1;
-  /** Held BETWEEN packets: CoreMIDI splits a long SysEx across several, so a
-   *  per-packet assembler would emit nothing at all for exactly the messages
-   *  worth having. */
-  SysexAssembler assembler_;
+  /** One per connected source, held BETWEEN packets: CoreMIDI splits a long
+   *  SysEx across several, and two sources must not share one in progress. */
+  std::vector<StreamParser> parsers_;
 
   static std::string sourceName(MIDIEndpointRef endpoint) {
     CFStringRef name = nullptr;
@@ -621,6 +735,8 @@ private:
 
 #else
 
+/** No MIDI backend for this platform: the same calls, an empty list, and an
+ *  open() that says so. */
 class Device {
 public:
   static std::vector<std::string> listDevices() { return {}; }

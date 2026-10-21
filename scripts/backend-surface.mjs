@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// Every audio backend offers the same surface: checked without the hardware.
+// Every audio backend offers the same surface, checked without the hardware.
 //
 // ── Why this exists ─────────────────────────────────────────────────────────
 //
@@ -11,8 +11,8 @@
 // Nobody in this project can compile the macOS one. CI is the only machine
 // that could, and CI is blocked. So CoreAudioOutput drifted: it had no
 // listDevices, no setDeviceIndex and no deviceName, while standalone.h called
-// all three unconditionally. That is not a subtle bug: the macOS standalone
-// simply did not compile, and it sat there because the only instrument that
+// all three unconditionally. That is not a subtle bug (the macOS standalone
+// simply did not compile), and it sat there because the only instrument that
 // would have caught it was one nobody could run.
 //
 // This is an instrument that runs anywhere. It does not compile anything; it

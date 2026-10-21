@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "special.h"
 
@@ -52,6 +53,13 @@ inline double sinc(double x) {
   return std::sin(a) / a;
 }
 
+/** Whether a kernel has a static warm(): work it wants done before the first
+ *  read, off the audio thread. A kernel of the caller's own need not. */
+template <typename K, typename = void>
+struct HasWarm : std::false_type {};
+template <typename K>
+struct HasWarm<K, decltype(K::warm(), void())> : std::true_type {};
+
 } // namespace interpdetail
 
 // ── The kernels ──────────────────────────────────────────────────────────────
@@ -62,17 +70,26 @@ inline double sinc(double x) {
 
 /** No interpolation at all: the newest sample, held. */
 struct ZeroOrderHoldKernel {
+  /** Samples at() reads: the newest one only. */
   static constexpr int kPoints = 1;
+  /** Delay in input samples: none. */
   static constexpr double kLatency = 0.0;
+  /** The name Interpolator::name() gives, for a display. */
   static constexpr const char* kName = "zero-order hold";
+  /** The newest sample, whatever the fraction. */
   static float at(const float* newestFirst, float) { return newestFirst[0]; }
 };
 
 /** Straight line between the two samples the point falls between. */
 struct LinearKernel {
+  /** Samples at() reads: the two the point falls between. */
   static constexpr int kPoints = 2;
+  /** Delay in input samples: one, the point lying between the newest sample
+   *  and the one before it. */
   static constexpr double kLatency = 1.0;
+  /** The name Interpolator::name() gives, for a display. */
   static constexpr const char* kName = "linear";
+  /** The line from newestFirst[1] at `frac` 0 to newestFirst[0] at 1. */
   static float at(const float* newestFirst, float frac) {
     const float y1 = newestFirst[1]; // the older one; frac 0 lands here
     const float y2 = newestFirst[0];
@@ -84,9 +101,14 @@ struct LinearKernel {
  *  setting the slopes. Continuous in value and first derivative, which is why
  *  a swept delay using it does not buzz. */
 struct CatmullRomKernel {
+  /** Samples at() reads: four, the point between the middle two. */
   static constexpr int kPoints = 4;
+  /** Delay in input samples: two. */
   static constexpr double kLatency = 2.0;
+  /** The name Interpolator::name() gives, for a display. */
   static constexpr const char* kName = "Catmull-Rom";
+  /** The cubic from newestFirst[2] at `frac` 0 to newestFirst[1] at 1, the
+   *  outer two points setting its slopes. */
   static float at(const float* newestFirst, float frac) {
     return at4(newestFirst[3], newestFirst[2], newestFirst[1], newestFirst[0], frac);
   }
@@ -109,9 +131,14 @@ struct CatmullRomKernel {
  *  two. Fitting all four exactly costs some smoothness at the joins, and
  *  which of the two sounds better depends on the material -- hence both. */
 struct Lagrange3Kernel {
+  /** Samples at() reads: four, the point between the middle two. */
   static constexpr int kPoints = 4;
+  /** Delay in input samples: two. */
   static constexpr double kLatency = 2.0;
+  /** The name Interpolator::name() gives, for a display. */
   static constexpr const char* kName = "Lagrange 3rd order";
+  /** The cubic through all four points, read from newestFirst[2] at `frac`
+   *  0 to newestFirst[1] at 1. */
   static float at(const float* newestFirst, float frac) {
     // Positions -1, 0, 1, 2 with frac measured from y1.
     const float y0 = newestFirst[3], y1 = newestFirst[2];
@@ -137,11 +164,24 @@ struct Lagrange3Kernel {
  *  that spacing the blend error is far below the window's own stopband. */
 template <int HalfWidth = 8>
 struct WindowedSincKernel {
+  /** Taps: twice HalfWidth, 16 at the default. */
   static constexpr int kPoints = HalfWidth * 2;
+  /** Delay in input samples: HalfWidth, 8 at the default. */
   static constexpr double kLatency = (double) HalfWidth;
+  /** The name Interpolator::name() gives, for a display. */
   static constexpr const char* kName = "windowed sinc";
+  /** Fractions the weight table holds; between two of them the weights are
+   *  blended linearly. */
   static constexpr int kPhases = 512;
 
+  /** Builds the table. The interpolator calls this when it is constructed,
+   *  which is where a plugin's members are built: off the audio thread. */
+  static void warm() { (void) tableInstance(); }
+
+  /** The windowed-sinc sum over the last kPoints samples at `frac`, from the
+   *  shared table; no allocation. The table is built by warm(): a caller
+   *  using the kernel outside an Interpolator (through sampleAt(), say)
+   *  calls warm() first, or the first call builds it, about 0.8 ms. */
   static float at(const float* newestFirst, float frac) {
     const Table& table = tableInstance();
     const float scaled = frac * (float) kPhases;
@@ -165,9 +205,14 @@ struct WindowedSincKernel {
   }
 
 private:
+  /** The Kaiser-windowed sinc weights for kPhases + 1 fractions, each row
+   *  normalised to sum to one. Built once, by tableInstance(), and shared by
+   *  every interpolator of this width. */
   struct Table {
-    // kPhases + 1 rows: the last one is the endpoint the blend reaches for.
+    /** kPhases + 1 rows: the last one is the endpoint the blend reaches for.
+     *  Each row is in tap order, oldest sample first. */
     float weights[kPhases + 1][kPoints];
+    /** Every row, for fractions 0, 1/kPhases, ... 1. */
     Table() {
       for (int p = 0; p <= kPhases; ++p) {
         const double frac = (double) p / (double) kPhases;
@@ -197,7 +242,10 @@ private:
   };
 
   /** Built once, on first use. A function-local static so the cost lands on
-   *  whoever uses it rather than on every plugin that includes the header. */
+   *  whoever uses it rather than on every plugin that includes the header --
+   *  and first use is warm(), from the interpolator's constructor. It was the
+   *  first read: about 0.8 ms of Bessel series and sin() inside the first
+   *  audio block, behind a static-initialisation guard. */
   static const Table& tableInstance() {
     static const Table table;
     return table;
@@ -219,12 +267,23 @@ private:
 template <typename Kernel>
 class Interpolator {
 public:
+  /** Silent history, ready to read. A kernel with a table (windowed sinc)
+   *  builds it here, so construct the interpolator where a plugin's members
+   *  are built, off the audio thread. */
+  Interpolator() {
+    if constexpr (interpdetail::HasWarm<Kernel>::value) Kernel::warm();
+  }
+
   /** The delay this kernel imposes, in input samples. Declared by the kernel
    *  and measured by the test, because a documented latency that is wrong is
    *  worse than none: a host compensates by it. */
   static constexpr double baseLatency() { return Kernel::kLatency; }
+  /** The kernel's name, for a display: "linear", "Catmull-Rom" and so on. */
   static constexpr const char* name() { return Kernel::kName; }
 
+  /** Back to silence at the start of a stream, as at construction: the next
+   *  process() pushes its first input before it produces anything. No
+   *  allocation. */
   void reset() {
     for (int i = 0; i < Kernel::kPoints; ++i) history_[i] = 0.0f;
     // ONE, not zero. At zero the first output is produced before anything has
@@ -245,7 +304,7 @@ public:
    *  does not carry its length. */
   int process(double speedRatio, const float* in, float* out, int numOut) {
     if (!in || !out || numOut <= 0) return 0;
-    if (speedRatio <= 0.0) speedRatio = 1.0;
+    speedRatio = usableRatio(speedRatio);
 
     int used = 0;
     double position = position_;
@@ -265,7 +324,7 @@ public:
    *  the shape a voice mixing into a shared bus needs. */
   int processAdding(double speedRatio, const float* in, float* out, int numOut, float gain) {
     if (!in || !out || numOut <= 0) return 0;
-    if (speedRatio <= 0.0) speedRatio = 1.0;
+    speedRatio = usableRatio(speedRatio);
 
     int used = 0;
     double position = position_;
@@ -282,6 +341,15 @@ public:
   }
 
 private:
+  /** Zero and below, NaN and infinity all read as unity. Only the first two
+   *  did: a NaN went into the read position and stayed there, so every
+   *  later call -- at any ratio -- consumed nothing and returned NaN, a voice
+   *  dead after one glitch of its pitch modulation; an infinite ratio pushed
+   *  input for ever, past the end of the caller's block. */
+  static double usableRatio(double ratio) {
+    return ratio > 0.0 && std::isfinite(ratio) ? ratio : 1.0;
+  }
+
   void push(float sample) {
     // Newest first, so the kernels read in the order the stream arrived.
     for (int i = Kernel::kPoints - 1; i > 0; --i) history_[i] = history_[i - 1];
@@ -292,10 +360,17 @@ private:
   double position_ = 1.0;
 };
 
+/** No interpolation and no latency: for a control signal, or lo-fi on
+ *  purpose. */
 using ZeroOrderHoldInterpolator = Interpolator<ZeroOrderHoldKernel>;
+/** Two points, one sample of latency; duller as the fraction moves. */
 using LinearInterpolator = Interpolator<LinearKernel>;
+/** Four points, two samples of latency, continuous in slope. */
 using CatmullRomInterpolator = Interpolator<CatmullRomKernel>;
+/** Four points, two samples of latency, the cubic through all of them. */
 using LagrangeInterpolator = Interpolator<Lagrange3Kernel>;
+/** 2 x HalfWidth taps and HalfWidth samples of latency; the weight table is
+ *  shared by every interpolator of the same width. */
 template <int HalfWidth = 8>
 using WindowedSincInterpolator = Interpolator<WindowedSincKernel<HalfWidth>>;
 

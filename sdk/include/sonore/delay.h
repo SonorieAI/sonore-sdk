@@ -37,6 +37,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "delay.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -51,20 +54,36 @@ class StereoDelay {
   static_assert(MaxSamples >= 1024, "a delay needs at least some room");
 
 public:
-  enum class TimeChange { Crossfade, Glide };
-
-  struct Parameters {
-    float timeMs = 375.0f;      // left channel, or both
-    float timeRightMs = 0.0f;   // 0 = same as left
-    float feedback = 0.4f;      // 0..1 of the delayed signal fed back
-    float dampingHz = 6000.0f;  // lowpass in the loop: each repeat darker
-    float lowCutHz = 80.0f;     // highpass in the loop: no mud build-up
-    float modDepthMs = 0.0f;    // read-point modulation, tape wobble
-    float modRateHz = 0.5f;
-    float mix = 0.35f;
-    bool pingPong = false;
+  /** What a change of delay time does while audio runs (the file comment
+   *  has the detail); chosen with setTimeChange(). */
+  enum class TimeChange {
+    Crossfade, ///< a second head opens at the new time, 50 ms equal-power fade, no pitch change; the default
+    Glide      ///< the read point slides to the new time and the repeats bend in pitch on the way
   };
 
+  /** The machine's settings, set together with setParameters(), which
+   *  clamps them: times from 1 ms up to maxTimeMs() (a right time of 0
+   *  follows the left), feedback 0..0.98, the loop's damping lowpass from
+   *  200 Hz up to 0.45 of the rate and its low cut 10..2000 Hz, modulation
+   *  0..20 ms deep at 0.01..20 Hz, mix 0..1 from dry to wet. Ping-pong sends
+   *  the input, summed to mono, into the left line and crosses every repeat
+   *  over to the other side. */
+  struct Parameters {
+    float timeMs = 375.0f;      ///< left delay in ms, and the right's too while timeRightMs is 0
+    float timeRightMs = 0.0f;   ///< right delay in ms; 0 or less follows timeMs
+    float feedback = 0.4f;      ///< fraction of each repeat fed back, clamped to 0..0.98
+    float dampingHz = 6000.0f;  ///< lowpass in the loop, Hz: each repeat darker
+    float lowCutHz = 80.0f;     ///< highpass in the loop, Hz: no mud build-up
+    float modDepthMs = 0.0f;    ///< read-point wobble depth in ms, 0..20; 0 is off; a change glides
+    float modRateHz = 0.5f;     ///< wobble rate in Hz, 0.01..20; one sine moves both channels
+    float mix = 0.35f;          ///< 0 dry only, 1 wet only, equal-power between; a change glides
+    bool pingPong = false;      ///< mono input into the left line, every repeat crossing sides
+  };
+
+  /** Sets the rate, applies the last Parameters again for it (times are kept
+   *  in ms, so a repeat stays as long at the new rate) and reset()s. The
+   *  lines are fixed arrays, so nothing is allocated. The channel count is
+   *  not read: the machine is always stereo. */
   void prepare(const ProcessSpec& spec) {
     sr_ = (float) spec.sampleRate;
     for (int c = 0; c < 2; ++c) {
@@ -74,16 +93,30 @@ public:
     fadeSamples_ = (int) (0.05f * sr_);
     // 100 ms time constant, whatever the rate.
     glide_ = 1.0 - std::exp(-1.0 / (0.1 * (double) sr_));
+    depthGlide_.setSampleRate(sr_, 20.0f);
+    for (DryWetMixer& m : mixer_) m.setSampleRate(sr_);
     lfoInc_ = 0.0f;
     setParameters(params_);
     reset();
   }
 
+  /** Silence: clears both lines, the loop filters and the wobble's phase. A
+   *  time change in progress lands at once (on the queued time if there is
+   *  one), the mix and the depth jump to their settings, and the next
+   *  setParameters() before process() lands without a fade or a glide. */
   void reset() {
+    running_ = false;
+    for (DryWetMixer& m : mixer_) m.snap();
+    depthGlide_.snap();
     for (int c = 0; c < 2; ++c) {
       line_[c].reset();
       damp_[c].reset();
       cut_[c].reset();
+      // A time queued behind a running fade is where the head was going:
+      // land there, not on the time the fade was heading for. prepare() sets
+      // the parameters again for the new rate and then resets, so dropping
+      // the queue left the delay at the OLD rate's sample count.
+      if (hasPending_[c]) target_[c] = pending_[c];
       current_[c] = target_[c];
       fadeFrom_[c] = target_[c];
       fadePos_[c] = 1.0f;
@@ -92,8 +125,30 @@ public:
     lfoPhase_ = 0.0f;
   }
 
-  void setTimeChange(TimeChange mode) { mode_ = mode; }
+  /** Switched to Crossfade while a glide is still travelling, the head
+   *  fades from where it IS to the target. The crossfade read only the
+   *  target, so the switch itself jumped the read point: 29.5 times the
+   *  largest natural step. Switched to Glide while a crossfade is running,
+   *  the fade lands first and the glide starts from there: the glide read
+   *  only the new head, so the old one, still half the output, was dropped
+   *  in one sample -- 50 times the largest natural step. */
+  void setTimeChange(TimeChange mode) {
+    if (mode == TimeChange::Crossfade && mode_ == TimeChange::Glide) {
+      for (int c = 0; c < 2; ++c) {
+        if ((float) current_[c] != target_[c]) {
+          fadeFrom_[c] = (float) current_[c];
+          fadePos_[c] = 0.0f;
+        }
+      }
+    }
+    mode_ = mode;
+  }
 
+  /** Stores and clamps the settings (the ranges are on Parameters). Once
+   *  process() has run, a new time crossfades or glides as setTimeChange()
+   *  says, and the mix and depth glide; before that, after prepare() or
+   *  reset(), everything lands at once. No allocation: safe to call every
+   *  block. */
   void setParameters(const Parameters& p) {
     params_ = p;
     const float maxMs = 1000.0f * (float) (MaxSamples - 8) / sr_;
@@ -108,8 +163,11 @@ public:
       cut_[c].setCutoff(clampf(p.lowCutHz, 10.0f, 2000.0f));
     }
     modDepth_ = clampf(p.modDepthMs, 0.0f, 20.0f) * 0.001f * sr_;
+    // Glides once audio runs (see Glide): a depth that jumps is a read point
+    // that jumps, and 0 -> 2 ms stepped the output 79 times over.
+    depthGlide_.set(modDepth_);
     lfoInc_ = clampf(p.modRateHz, 0.01f, 20.0f) / sr_;
-    mixer_.setMix(clampf(p.mix, 0.0f, 1.0f));
+    for (DryWetMixer& m : mixer_) m.setMix(clampf(p.mix, 0.0f, 1.0f));
   }
 
   /** Set the time from the host's tempo: a dotted eighth at whatever the
@@ -122,6 +180,12 @@ public:
     if (rightToo) p.timeRightMs = 0.0f;
     setParameters(p);
   }
+
+  /** The longest time the line holds at the running rate, in ms. MaxSamples
+   *  is in samples, so this halves each time the rate doubles: 4 s at
+   *  48 kHz, 1 s at 192. A longer time is clamped here -- ask, rather than
+   *  find out by ear that 2000 ms played as 1000. */
+  float maxTimeMs() const { return 1000.0f * (float) (MaxSamples - 8) / sr_; }
 
   /** The delay each channel is heading for, in samples: a change queued
    *  behind a running fade counts, because it is where the head will land. */
@@ -142,10 +206,12 @@ public:
 
   /** One stereo frame, in place. */
   inline void process(float& left, float& right) {
+    running_ = true;
     const float dryL = left, dryR = right;
     lfoPhase_ += lfoInc_;
     if (lfoPhase_ >= 1.0f) lfoPhase_ -= 1.0f;
-    const float wobble = modDepth_ > 0.0f ? modDepth_ * fastmath::sinTurns(lfoPhase_) : 0.0f;
+    const float depth = depthGlide_.next();
+    const float wobble = depth > 0.0f ? depth * fastmath::sinTurns(lfoPhase_) : 0.0f;
 
     const float outL = readHead(0, wobble);
     const float outR = readHead(1, wobble);
@@ -164,13 +230,24 @@ public:
       line_[1].write(flushDenormal(dryR + fbR));
     }
 
-    left = mixer_.process(dryL, outL);
-    right = mixer_.process(dryR, outR);
+    left = mixer_[0].process(dryL, outL);
+    right = mixer_[1].process(dryR, outR);
   }
 
 private:
   void setTime(int c, float samples) {
-    if (mode_ == TimeChange::Glide) {
+    // Until the first process() a time is a setting, not a movement: it
+    // lands. Set after prepare() -- the plugin flow -- a glide-mode delay
+    // slid from the default 375 ms, its first echo 130 ms late and pitched a
+    // fifth up on the way.
+    if (!running_) {
+      target_[c] = samples; // not chained: current_ is a double
+      current_[c] = samples;
+      fadePos_[c] = 1.0f;
+      hasPending_[c] = false;
+      return;
+    }
+    if (mode_ == TimeChange::Glide && fadePos_[c] >= 1.0f) {
       target_[c] = samples;
       hasPending_[c] = false;
       return;
@@ -193,7 +270,14 @@ private:
   }
 
   inline float readHead(int c, float wobble) {
-    if (mode_ == TimeChange::Glide) {
+    // A time queued behind a fade that has landed: the next fade, or, in a
+    // delay switched to Glide while the fade ran, where the glide goes.
+    if (fadePos_[c] >= 1.0f && hasPending_[c]) {
+      hasPending_[c] = false;
+      if (mode_ == TimeChange::Glide) target_[c] = pending_[c];
+      else startFade(c, pending_[c]);
+    }
+    if (mode_ == TimeChange::Glide && fadePos_[c] >= 1.0f) {
       // Slide the delay itself, and the pitch bends while it moves. The
       // rate is a one-pole, capped at half a sample per sample, so a big
       // move spins at a fixed pitch and then eases in. The position is a
@@ -209,14 +293,8 @@ private:
       return line_[c].readCubic((float) current_[c] + wobble);
     }
     if (fadePos_[c] >= 1.0f) {
-      if (hasPending_[c]) {
-        hasPending_[c] = false;
-        startFade(c, pending_[c]);
-      }
-      if (fadePos_[c] >= 1.0f) {
-        current_[c] = target_[c];
-        return line_[c].readCubic(target_[c] + wobble);
-      }
+      current_[c] = target_[c];
+      return line_[c].readCubic(target_[c] + wobble);
     }
     // Two heads, equal-power. The old one keeps playing exactly what it was
     // playing; the new one opens at the new time. Nothing is pitched.
@@ -234,10 +312,14 @@ private:
 
   DelayLine<MaxSamples> line_[2];
   OnePole damp_[2], cut_[2];
-  DryWetMixer mixer_;
+  /** One mix glide per side, set to the rate in prepare(). One shared by
+   *  both stepped twice a frame, gliding in half its time, and was never
+   *  given a rate. */
+  DryWetMixer mixer_[2];
   Parameters params_{};
   TimeChange mode_ = TimeChange::Crossfade;
   float sr_ = 48000.0f, feedback_ = 0.4f, modDepth_ = 0.0f, lfoInc_ = 0.0f, lfoPhase_ = 0.0f;
+  Glide depthGlide_;
   double glide_ = 1.0 / 4800.0;
   float target_[2] = {18000.0f, 18000.0f};
   double current_[2] = {18000.0, 18000.0};
@@ -245,6 +327,7 @@ private:
   float pending_[2] = {18000.0f, 18000.0f};
   bool hasPending_[2] = {false, false};
   int fadeSamples_ = 2400;
+  bool running_ = false; // process() has run since reset()
 };
 
 } // namespace sonore

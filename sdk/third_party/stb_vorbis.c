@@ -82,7 +82,9 @@
 #include <stdio.h>
 #endif
 
-#ifdef __cplusplus
+// SONORE LOCAL CHANGE: no C linkage when the SDK compiles this inside an
+// anonymous namespace (SONORE_CODEC_CPP_LINKAGE); see audiofile_codecs.h.
+#if defined(__cplusplus) && !defined(SONORE_CODEC_CPP_LINKAGE)
 extern "C" {
 #endif
 
@@ -407,7 +409,7 @@ enum STBVorbisError
 };
 
 
-#ifdef __cplusplus
+#if defined(__cplusplus) && !defined(SONORE_CODEC_CPP_LINKAGE) // SONORE LOCAL CHANGE
 }
 #endif
 
@@ -949,7 +951,19 @@ static void *make_block_array(void *mem, int count, int size)
 
 static void *setup_malloc(vorb *f, int sz)
 {
+   // SONORE LOCAL FIX (third in this file): sizes reach here computed from
+   // the FILE, and a length near 2^32 arrives negative. Rounded and handed to
+   // malloc, a negative int is a request for sixteen exabytes -- which ASan
+   // aborts on and a plain allocator fails, by luck rather than design. Too
+   // big is an allocation failure, said here, before any arithmetic.
+   if (sz < 0 || sz > 0x7FFFFFF0) return NULL;
    sz = (sz+7) & ~7; // round up to nearest 8 for alignment of future allocs.
+   // SONORE LOCAL FIX (sixth): a ceiling on the whole setup. The codebook
+   // sizes are the file's, up to 2^24 entries times their dimensions, and a
+   // 17 KB file found by fuzzing asked for 1.36 GB -- allocated, and touched,
+   // for 1.6 s before the stream was refused. A real stream's setup is a few
+   // hundred kilobytes; 64 MB is a refusal, not a limit anyone meets.
+   if ((long long) f->setup_memory_required + sz > 64LL * 1024 * 1024) return NULL;
    f->setup_memory_required += sz;
    if (f->alloc.alloc_buffer) {
       void *p = (char *) f->alloc.alloc_buffer + f->setup_offset;
@@ -968,6 +982,10 @@ static void setup_free(vorb *f, void *p)
 
 static void *setup_temp_malloc(vorb *f, int sz)
 {
+   // SONORE LOCAL FIX (sixth, continued): the same guard setup_malloc has,
+   // and the same ceiling. A negative size rounded and handed to malloc is a
+   // request for exabytes.
+   if (sz < 0 || sz > 64 * 1024 * 1024) return NULL;
    sz = (sz+7) & ~7; // round up to nearest 8 for alignment of future allocs.
    if (f->alloc.alloc_buffer) {
       if (f->temp_offset - sz < f->setup_offset) return NULL;
@@ -3650,6 +3668,8 @@ static int start_decoder(vorb *f)
    if (!vorbis_validate(header))                    return error(f, VORBIS_invalid_setup);
    //file vendor
    len = get32_packet(f);
+   // SONORE LOCAL FIX (fourth): len + 1 below would overflow the int.
+   if (len < 0 || len > 0x7FFFFFF0)                return error(f, VORBIS_invalid_setup);
    f->vendor = (char*)setup_malloc(f, sizeof(char) * (len+1));
    if (f->vendor == NULL)                           return error(f, VORBIS_outofmem);
    for(i=0; i < len; ++i) {
@@ -3659,11 +3679,17 @@ static int start_decoder(vorb *f)
    //user comments
    f->comment_list_length = get32_packet(f);
    f->comment_list = NULL;
+   // SONORE LOCAL FIX (fifth): the count is the file's, and sizeof(char*)
+   // times it was computed in size_t and then truncated to setup_malloc's
+   // int -- 0x20000001 comments became an 8-byte allocation, and the memset
+   // and the loop below ran across gigabytes of heap. No packet holds a
+   // million comments; a count that large is a broken header.
+   if (f->comment_list_length > (1 << 20))         return error(f, VORBIS_invalid_setup);
    if (f->comment_list_length > 0)
    {
       f->comment_list = (char**) setup_malloc(f, sizeof(char*) * (f->comment_list_length));
       if (f->comment_list == NULL)                  return error(f, VORBIS_outofmem);
-      // SONORE LOCAL FIX (second of two in this file, see vorbis_deinit):
+      // SONORE LOCAL FIX (second in this file, see vorbis_deinit):
       // the entries are filled one at a time below, and an entry whose
       // allocation fails returns an error with every LATER entry still
       // uninitialised -- which vorbis_deinit then handed to free(). Zeroed
@@ -3674,6 +3700,7 @@ static int start_decoder(vorb *f)
 
    for(i=0; i < f->comment_list_length; ++i) {
       len = get32_packet(f);
+      if (len < 0 || len > 0x7FFFFFF0)             return error(f, VORBIS_invalid_setup);
       f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * (len+1));
       if (f->comment_list[i] == NULL)               return error(f, VORBIS_outofmem);
 
@@ -4217,7 +4244,7 @@ static void vorbis_deinit(stb_vorbis *p)
    int i,j;
 
    setup_free(p, p->vendor);
-   // SONORE LOCAL FIX (one of two in this file): start_decoder stores
+   // SONORE LOCAL FIX (first in this file): start_decoder stores
    // comment_list_length BEFORE it allocates comment_list, so when that
    // allocation fails -- a corrupt header asking for an absurd count, which
    // production malloc answers with NULL -- the error path arrives here with

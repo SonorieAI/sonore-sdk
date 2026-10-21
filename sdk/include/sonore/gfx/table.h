@@ -40,24 +40,50 @@
 namespace sonore {
 namespace gfx {
 
+/** One column of a TableListBox: its header text and its width in pixels,
+ *  which the user can drag down to `minWidth` but no further. */
 struct TableColumn {
+  /** The header text. */
   std::string title;
+  /** In logical pixels. A drag changes it in the table's copy, so read
+   *  columns() back to save a layout. */
   float width = 120.0f;
+  /** The narrowest a drag makes the column. A `width` set below it is not
+   *  raised. */
   float minWidth = 40.0f;
   /** A column nobody can sort by -- a preview button, an icon. Clicking its
    *  header does nothing rather than sorting by something meaningless. */
   bool sortable = true;
 };
 
+/**
+ * Rows of text under column headers that can be resized and clicked to sort
+ * -- the reference's TableListBox, driven by callbacks rather than a model
+ * class. The file comment says why sorting is left to the owner.
+ *
+ * The table holds no row data. Tell it how many rows there are
+ * (setNumRows), answer getCellText for the rows on screen, and call
+ * updateContent() after changing or re-sorting the data; a row index always
+ * means the owner's row. Message thread only.
+ */
 class TableListBox : public Widget {
 public:
+  /** Empty. It takes the keyboard focus: Up, Down, Home, End, Page Up and
+   *  Page Down move the selection, Return chooses. */
   TableListBox() { setWantsKeyboardFocus(true); }
 
+  /** Replace the columns, left to right. A column drag in progress ends. The
+   *  sort column is kept by index, whatever is now at that index. */
   void setColumns(std::vector<TableColumn> columns) {
     columns_ = std::move(columns);
+    // A drag in progress was resizing a column of the OLD set by index; it
+    // ends here rather than writing a stale width into a new column -- or
+    // past the end, when there are fewer.
+    draggingColumn_ = -1;
     repaint();
   }
 
+  /** The columns, with the widths the user has dragged them to. */
   const std::vector<TableColumn>& columns() const { return columns_; }
 
   /** How many rows the model has. The table never asks for a row outside
@@ -70,6 +96,7 @@ public:
     repaint();
   }
 
+  /** The count setNumRows set; never negative. */
   int numRows() const { return numRows_; }
 
   /** What to draw in one cell. Called only for the rows on screen. */
@@ -79,6 +106,8 @@ public:
    *  `forwards` alternates on each click of the same column. */
   std::function<void(int column, bool forwards)> onSortChanged;
 
+  /** The selection moved, by a click, a key or setSelectedRow: the row, or -1
+   *  for none. Not fired when setNumRows cuts the selection short. */
   std::function<void(int row)> onSelectionChange;
   /** A double click or Return. "Load this one". */
   std::function<void(int row)> onRowChosen;
@@ -91,22 +120,30 @@ public:
     repaint();
   }
 
+  /** Each row's height in logical pixels, at least 4; 20 by default. */
   void setRowHeight(float height) {
     rowHeight_ = height > 4.0f ? height : 4.0f;
     clampScroll();
     repaint();
   }
+  /** Each row's height, in logical pixels. */
   float rowHeight() const { return rowHeight_; }
 
+  /** The header's height in logical pixels; 22 by default. 0 hides it, and
+   *  with it sorting and resizing by mouse. */
   void setHeaderHeight(float height) {
     headerHeight_ = height < 0.0f ? 0.0f : height;
     clampScroll();
     repaint();
   }
+  /** The header's height, in logical pixels. */
   float headerHeight() const { return headerHeight_; }
 
+  /** The selected row, 0-based, or -1 for none. */
   int selectedRow() const { return selected_; }
 
+  /** Select a row, clamped to the rows (a negative one selects none), and
+   *  scroll it into view. `notify` fires onSelectionChange if it changed. */
   void setSelectedRow(int row, bool notify = true) {
     const int clamped = numRows_ == 0 ? -1
                                       : (row < 0 ? -1 : (row >= numRows_ ? numRows_ - 1 : row));
@@ -120,8 +157,13 @@ public:
   /** Which column the user last asked to sort by, and which way. -1 for none.
    *  Kept so a caller restoring a saved view can put the arrow back. */
   int sortColumn() const { return sortColumn_; }
+  /** The direction of sortColumn(): true is forwards, drawn as an upward
+   *  arrow. */
   bool sortForwards() const { return sortForwards_; }
 
+  /** Put the sort arrow on a column (-1 for none) and, with `notify`, fire
+   *  onSortChanged. The column is not checked, and nothing is re-sorted:
+   *  that is the owner's job. */
   void setSort(int column, bool forwards, bool notify = true) {
     sortColumn_ = column;
     sortForwards_ = forwards;
@@ -129,13 +171,17 @@ public:
     if (notify && onSortChanged) onSortChanged(sortColumn_, sortForwards_);
   }
 
+  /** Every row's height together, in logical pixels, without the header. */
   float contentHeight() const { return (float) numRows_ * rowHeight_; }
 
+  /** Scroll so the rows start `y` logical pixels down, held between 0 and
+   *  the last screenful (a NaN goes to 0). */
   void setScrollPosition(float y) {
     scroll_ = y;
     clampScroll();
     repaint();
   }
+  /** How far the rows are scrolled, in logical pixels. */
   float scrollPosition() const { return scroll_; }
 
   /** Where a column starts, in this component's coordinates. */
@@ -145,8 +191,11 @@ public:
     return x;
   }
 
+  /** Holds the scroll inside the new height. */
   void resized() override { clampScroll(); }
 
+  /** The header -- titles, dividers, the sort arrow -- and only the rows on
+   *  screen, their cells from getCellText. */
   void paint(Graphics& g) override {
     LookAndFeel& lf = lookAndFeel();
     const Rect area = localBounds();
@@ -202,6 +251,10 @@ public:
     paintFocusRing(g);
   }
 
+  /** In the header, a press within kResizeGrab of a column's right edge
+   *  starts resizing it and a press elsewhere sorts by a sortable column --
+   *  the same column again reverses. In the rows it selects, and a double
+   *  click also fires onRowChosen. */
   void mouseDown(const MouseEvent& e) override {
     if (!isEnabled()) return;
 
@@ -231,14 +284,16 @@ public:
     if (e.clickCount >= 2 && onRowChosen) onRowChosen(row);
   }
 
+  /** Resizes the grabbed column, no narrower than its minWidth. */
   void mouseDrag(const MouseEvent& e) override {
-    if (draggingColumn_ < 0) return;
+    if (draggingColumn_ < 0 || draggingColumn_ >= (int) columns_.size()) return;
     TableColumn& column = columns_[(size_t) draggingColumn_];
     const float wanted = dragStartWidth_ + (e.position.x - e.downPosition.x);
     column.width = wanted < column.minWidth ? column.minWidth : wanted;
     repaint();
   }
 
+  /** Ends a column resize. */
   void mouseUp(const MouseEvent&) override { draggingColumn_ = -1; }
 
   bool mouseWheel(const MouseEvent&, float delta) override {
@@ -295,6 +350,7 @@ public:
     return info;
   }
 
+  /** The space either side of a cell's text, in logical pixels. */
   static constexpr float kCellPad = 6.0f;
   /** How close to a boundary counts as grabbing it. */
   static constexpr float kResizeGrab = 4.0f;
@@ -342,8 +398,10 @@ private:
 
   void clampScroll() {
     const float most = contentHeight() - (localBounds().h - headerHeight_);
-    if (scroll_ > most) scroll_ = most;
-    if (scroll_ < 0.0f) scroll_ = 0.0f;
+    // Written to catch a NaN too: one set as a scroll position failed both
+    // tests and reached the row arithmetic, and its conversion to int.
+    if (!(scroll_ <= most)) scroll_ = most;
+    if (!(scroll_ >= 0.0f)) scroll_ = 0.0f;
   }
 
   static void drawSortArrow(Graphics& g, const Rect& cell, bool forwards, LookAndFeel& lf) {

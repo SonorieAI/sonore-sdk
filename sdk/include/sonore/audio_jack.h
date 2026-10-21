@@ -39,6 +39,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -86,6 +87,11 @@ public:
    * every other client to change.
    */
   bool open(RenderFn render) {
+    // Whatever was open goes first, as the WASAPI and ASIO outputs' open()
+    // do: a second open() replaced render_ under a running client and leaked
+    // the first client and its ports. And the last failure is not this one's.
+    stop();
+    error_.clear();
     render_ = std::move(render);
     const Api& api_ = api();
     if (!api_.ok) {
@@ -123,18 +129,36 @@ public:
       close();
       return false;
     }
+    // Told when the server goes away -- killed, restarted, or the device
+    // under it unplugged -- so the standalone can reopen something rather
+    // than sit "open" and silent. Optional: a libjack without it still plays.
+    if (api_.on_shutdown) api_.on_shutdown(client_, &shutdownTrampoline, this);
+    // And when the graph's rate moves under it -- PipeWire changes it for
+    // whatever stream asks -- the DSP prepared at the old rate is told the
+    // same way, so the standalone reopens at the new one. It went on at the
+    // old rate, every filter and delay in the wrong place. Optional too.
+    if (api_.set_sample_rate_callback)
+      api_.set_sample_rate_callback(client_, &rateTrampoline, this);
 
     deviceName_ = "JACK";
-    // Sized once, here, so the callback never allocates. JACK may change the
-    // buffer size at runtime; the callback clamps to what it was given rather
-    // than reallocating on the audio thread.
-    scratch_.assign((size_t) bufferFrames_ * (size_t) channels_ * 4u, 0.0f);
+    // Sized once, here, so the callback never allocates -- for the largest
+    // period JACK and PipeWire use (8192 frames) as well as four of the
+    // current one. It was four of the current one only, and PipeWire changes
+    // its quantum often: a larger one was clamped, and part of every cycle
+    // came out silent.
+    const size_t frames =
+        (size_t) bufferFrames_ * 4u > (size_t) kLargestPeriod ? (size_t) bufferFrames_ * 4u : (size_t) kLargestPeriod;
+    scratch_.assign(frames * (size_t) channels_, 0.0f);
     return true;
   }
+
+  /** True once since the JACK server shut down under this client. */
+  bool takeDeviceLost() { return lost_.exchange(false, std::memory_order_acq_rel); }
 
   bool run() {
     const Api& api_ = api();
     if (!client_ || !api_.ok) return false;
+    lost_.store(false, std::memory_order_relaxed);
     if (api_.activate(client_) != 0) {
       error_ = "JACK refused to activate the client";
       return false;
@@ -172,6 +196,8 @@ private:
     const char** (*get_ports)(void*, const char*, const char*, unsigned long) = nullptr;
     int (*connect)(void*, const char*, const char*) = nullptr;
     void (*free_)(void*) = nullptr;
+    void (*on_shutdown)(void*, void (*)(void*), void*) = nullptr; // optional
+    int (*set_sample_rate_callback)(void*, int (*)(uint32_t, void*), void*) = nullptr; // optional
   };
 
   static const Api& api() {
@@ -204,6 +230,11 @@ private:
       bind("jack_connect", &a.connect);
       bind("jack_free", &a.free_);
       a.ok = all;
+      // Not required: a libjack without it is still a libjack that plays.
+      void* shutdown = dlsym(lib, "jack_on_shutdown");
+      std::memcpy(&a.on_shutdown, &shutdown, sizeof(shutdown));
+      void* rate = dlsym(lib, "jack_set_sample_rate_callback");
+      std::memcpy(&a.set_sample_rate_callback, &rate, sizeof(rate));
       return a;
     }();
     return resolved;
@@ -212,6 +243,20 @@ private:
   static int processTrampoline(uint32_t frames, void* userData) {
     return ((JackOutput*) userData)->process(frames);
   }
+  /** Called on a JACK thread when the server goes; it may do nothing but say
+   *  so. The client is a zombie from here, and is closed on stop(). */
+  static void shutdownTrampoline(void* userData) {
+    ((JackOutput*) userData)->lost_.store(true, std::memory_order_release);
+  }
+  /** JACK calls this once as it is registered, with the rate it already has,
+   *  and again on every change. Only a change is news. */
+  static int rateTrampoline(uint32_t rate, void* userData) {
+    auto* self = (JackOutput*) userData;
+    if (rate > 0 && std::fabs((double) rate - self->sampleRate_) > 0.5)
+      self->lost_.store(true, std::memory_order_release);
+    return 0;
+  }
+  static constexpr uint32_t kLargestPeriod = 8192;
 
   /**
    * [JACK's real-time thread] Fill every port.
@@ -290,6 +335,7 @@ private:
   std::string deviceName_;
   std::string error_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> lost_{false};
   double sampleRate_ = 48000.0;
   uint32_t channels_ = 2;
   uint32_t bufferFrames_ = 512;

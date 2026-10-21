@@ -16,76 +16,21 @@
 #pragma once
 
 #include "clap_wrapper.h" // the traits the layout is derived from
+#include "lv2_atom.h"     // the sequence walk, shared with the interface
 #include "plugin.h"
 
 namespace sonore {
 namespace lv2 {
 
-// ── Walking an atom sequence ───────────────────────────────────
-//
-// The plugin reads one and so does the interface, and they are separate
-// modules that must agree exactly about the layout -- so the walk lives here,
-// where both include it, rather than being written out on each side.
-//
-// The padding is the part worth centralising. An atom event is followed by
-// its body rounded UP to eight bytes, and a reader that forgets the rounding
-// walks into the middle of the next event and reads a size out of somebody's
-// payload. That arithmetic appeared six times before this.
-
-/** An atom body's size, padded to the alignment the spec requires. */
-inline uint32_t atomPad(uint32_t size) { return (size + 7u) & ~7u; }
-
-/** How far the next event is from this one. */
-inline uint32_t atomStep(const LV2_Atom_Event* ev) {
-  return (uint32_t) sizeof(LV2_Atom_Event) + atomPad(ev->body.size);
-}
-
-/**
- * Call `fn(const LV2_Atom_Event*)` for every event in a sequence.
- *
- * Tolerant of rubbish on purpose: a sequence is memory a HOST filled in, and
- * a plugin that trusts it crashes in somebody's session rather than in a
- * test. A size that runs past the buffer is where the walk stops rather than
- * where it reads.
- *
- * The copies this replaces each carried a `step == 0` guard against an
- * infinite loop. It could never fire -- a step is the event header plus a
- * padded body, so it is at least sixteen -- and it is gone rather than
- * carried forward, because a guard that cannot trigger reads as a hazard that
- * exists.
- */
-template <typename Fn>
-inline void forEachAtomEvent(const LV2_Atom_Sequence* seq, Fn&& fn) {
-  if (!seq) return;
-  const auto* body = (const uint8_t*) &seq->body;
-  uint32_t offset = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
-  while (offset + sizeof(LV2_Atom_Event) <= seq->atom.size) {
-    const auto* ev = (const LV2_Atom_Event*) (body + offset);
-    const uint32_t step = atomStep(ev);
-    // Checked BEFORE the body is handed over: an event claiming more bytes
-    // than the sequence holds is one whose payload is not all there.
-    //
-    // Written as a subtraction rather than `offset + step > size`, because
-    // that sum can wrap on a size an untrusted buffer supplied -- and a
-    // wrapped comparison passes. The loop condition guarantees offset is
-    // inside the sequence, so this subtraction cannot underflow.
-    if (step > seq->atom.size - offset) break;
-    fn(ev);
-    offset += step;
-  }
-}
-
 inline int numControlPorts() { return SONORE_NUM_PARAMS; }
 inline bool isInstrument() { return kDesc.isInstrument; }
-/** LV2 ports are STATIC, so the width is fixed at build time: stereo when the
- *  descriptor's range allows it, mono for a mono-only DSP. Surround stays a
- *  negotiated-format feature (CLAP/VST3/AU). */
 /** How wide the main bus is in this format.
  *
  *  LV2 ports are FIXED: there is no arrangement to negotiate the way CLAP and
  *  VST3 negotiate one, so the bundle has to commit to a width when its TTL is
  *  written. Stereo where the DSP allows it, and otherwise the nearest edge of
- *  the range it declared.
+ *  the range it declared -- mono for a mono-only DSP. Surround a host picks
+ *  stays a negotiated-format feature (CLAP/VST3/AU).
  *
  *  That last clause is the fix. This used to fall back to ONE channel whenever
  *  stereo was not allowed, which is right for a mono-only DSP and wrong for a
@@ -95,7 +40,10 @@ inline bool isInstrument() { return kDesc.isInstrument; }
  *  means. */
 inline int lv2Width() { return (int) clapwrap::defaultMainChannels(); }
 inline int audioInPorts() { return isInstrument() ? 0 : lv2Width(); }
-inline int midiPorts() { return isInstrument() ? 1 : 0; }
+/** A MIDI input for every plugin that reads MIDI, the same rule CLAP and
+ *  VST3 use (clapwrap::wantsMidiIn): an instrument, and an EFFECT whose DSP
+ *  takes MIDI. Instruments only, a MIDI-reading effect never heard a note. */
+inline int midiPorts() { return (isInstrument() || clapwrap::wantsMidiIn()) ? 1 : 0; }
 /** Host bypass, LV2's way: a designated lv2:enabled control port. Effects
  *  only -- an instrument has no dry signal for a bypass to pass. */
 inline int enabledPorts() { return isInstrument() ? 0 : 1; }
@@ -106,8 +54,9 @@ inline int latencyPorts() { return clapwrap::HasLatency<SonoreDsp>::value ? 1 : 
 // ── What an LV2 build is never told ─────────────────────────────
 //
 // A DSP that declares setHostInfo or setTrackInfo will hear from CLAP, from
-// VST3 and from the standalone. It will never hear from here, and that is the
-// format rather than an omission in this file:
+// VST3 and from the standalone (and setHostInfo from an Audio Unit whose host
+// names itself). It will never hear from here, and that is the format rather
+// than an omission in this file:
 //
 //   Host identity  LV2 gives a host no way to name itself. There is no
 //                  feature for it and no convention either -- the closest
@@ -144,11 +93,12 @@ inline int latencyPorts() { return clapwrap::HasLatency<SonoreDsp>::value ? 1 : 
 inline int scPorts() {
   return (!isInstrument() && clapwrap::TakesSidechain<SonoreDsp>::value) ? 2 : 0;
 }
-/** Aux output channels, flattened: LV2 has no bus concept, so each aux bus
- *  becomes its own run of audio output ports named after it. */
 /** An atom:Sequence OUTPUT port when the plugin emits MIDI. */
 inline int midiOutPorts() { return kDesc.producesMidi ? 1 : 0; }
 
+/** Aux output channels, flattened: LV2 has no bus concept,
+ *  so each aux bus becomes its own run of audio output ports
+ *  named after it. */
 inline int auxOutChannels() {
   int n = 0;
   for (uint32_t b = 0; b < clapwrap::numAuxOutputs(); ++b)
@@ -228,5 +178,10 @@ inline int portUiControl() { return portMeterRms() + 1; }
 /** Plugin -> UI: the answer, and anything that changes later. */
 inline int portUiNotify() { return portUiControl() + 1; }
 inline int portMidiIn() { return portFreeWheel() + freeWheelPorts(); }
+/** The host's timeline, for a DSP that takes the transport: an atom input
+ *  declaring time:Position, which is what makes a host send one. Last, so
+ *  no port before it moves for the plugins that have it. */
+inline int timePorts() { return clapwrap::WantsTransport<SonoreDsp>::value ? 1 : 0; }
+inline int portTimeIn() { return portUiNotify() + 1; }
 } // namespace lv2
 } // namespace sonore

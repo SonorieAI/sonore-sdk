@@ -165,11 +165,17 @@ export const AUDITED = {
     'OpenGLImageType', 'OpenGLPixelFormat', 'OpenGLRenderer', 'OpenGLShaderProgram',
     'OpenGLTexture', 'OpenGLVersion', 'OpenGLAppComponent',
   ],
+  'video': ['VideoComponent', 'CameraDevice'],
+  'analytics': ['Analytics', 'AnalyticsDestination', 'ThreadedAnalyticsDestination', 'ButtonTracker'],
+  'box2d': ['Box2DRenderer'],
   'animation': [
     'Animator', 'AnimatorSetBuilder', 'AnimatorUpdater', 'Easings', 'SpringEasingOptions',
     'StaticAnimationLimits', 'VBlankAnimatorUpdater', 'ValueAnimatorBuilder',
   ],
   'cryptography': ['BlowFish', 'Primes', 'RSAKey', 'MD5', 'SHA256', 'Whirlpool'],
+  // The module was out of scope and unindexed until javascript.h was built.
+  // DynamicObject and var are listed under core, where the reference keeps them.
+  'javascript': ['JavascriptEngine', 'JSCursor', 'JSObject'],
   'osc': [
     'OSCAddress', 'OSCAddressPattern', 'OSCArgument', 'OSCBundle', 'OSCColour',
     'OSCException', 'OSCMessage', 'OSCReceiver', 'OSCSender', 'OSCTimeTag', 'OSCTypes',
@@ -337,17 +343,9 @@ export const PENDING = [
   // class by class against the reference's own list before this file existed. It is
   // listed anyway, because "somebody did that once" is not a thing a check can
   // re-run, and that is the difference between an audit and a memory.
-  // Decided in the MODULE table with a reason, and their class lists are not
-  // indexed here. That is a deliberate stopping point rather than an oversight,
-  // and the difference from opengl -- which IS indexed, despite being
-  // equally out of scope -- is that these four have nothing whose absence could
-  // ever become a question. A plugin will not one day want a physics engine or
-  // an analytics client. OpenGL is indexed because "should this rasterise on
-  // the GPU" is a question somebody could reasonably reopen.
-  'video (module decided: out of scope, class list not indexed)',
-  'javascript (module decided: out of scope, class list not indexed)',
-  'analytics (module decided: out of scope, class list not indexed)',
-  'box2d (module decided: out of scope, class list not indexed)',
+  // video, analytics, box2d and javascript stood here once, modules decided
+  // out of scope with their class lists not indexed. All four are built now,
+  // and indexed above like every other module.
 ];
 
 /**

@@ -29,16 +29,36 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "passive_eq.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
 namespace sonore {
 
+/**
+ * A passive program equaliser in the EQP-1A pattern: low boost and low cut
+ * at one switched frequency (both at once give the dip-and-shelf "trick"),
+ * a high bell with a bandwidth control, and a high shelf cut. The control
+ * topology and curve family, not a component simulation of a unit (see the
+ * file comment).
+ *
+ * One channel, per sample. Call setSampleRate() in prepare(). The amounts
+ * are 0..1 of each section's full range; the frequencies snap to the front
+ * panel's switch positions. The setters and process() run on the audio
+ * thread, but every setter redesigns all four sections and nothing is
+ * smoothed: set a control when it changes rather than per sample, and smooth
+ * outside if it is automated.
+ */
 class PassiveEq {
 public:
+  /** The rate in Hz (1 or less means 48 kHz), and all four sections designed
+   *  for it from the current settings. Call it before process(). No
+   *  allocation. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
-    for (Biquad* f : {&lowBoost_, &lowCut_, &highBoost_, &highCut_}) f->setSampleRate(sr_);
+    for (IirSection* f : {&lowBoost_, &lowCut_, &highBoost_, &highCut_}) f->setSampleRate(sr_);
     update();
   }
   /** Low section frequency: snaps to 20 / 30 / 60 / 100 Hz. */
@@ -58,10 +78,13 @@ public:
   /** High cut, 0..1 (full is -16 dB). */
   void setHighCut(float amount) { highCut01_ = clampf(amount, 0.0f, 1.0f); update(); }
 
+  /** Clear the four sections' state; the settings are kept. */
   void reset() {
-    for (Biquad* f : {&lowBoost_, &lowCut_, &highBoost_, &highCut_}) f->reset();
+    for (IirSection* f : {&lowBoost_, &lowCut_, &highBoost_, &highCut_}) f->reset();
   }
 
+  /** [audio-thread] One sample through low boost, low cut, high bell and
+   *  high cut, in that order. No allocation. */
   inline float process(float x) {
     x = lowBoost_.process(x);
     x = lowCut_.process(x);
@@ -98,36 +121,42 @@ private:
     firstOrderHighShelf(highCut_, attenHz_ * 0.7f, -16.0f * highCut01_);
   }
 
-  void designShelf(Biquad& f, eqdetail::Shape shape, float hz, float q, float gainDb) {
-    float b0, b1, b2, a1, a2;
-    if (std::fabs(gainDb) < 0.01f || hz >= sr_ * 0.47f) { f.setCoefficients(1.0f, 0.0f, 0.0f, 0.0f, 0.0f); return; }
-    if (eqdetail::matched(shape, hz, q, gainDb, sr_, &b0, &b1, &b2, &a1, &a2))
-      f.setCoefficients(b0, b1, b2, a1, a2);
-    else
-      f.setCoefficients(1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  void designShelf(IirSection& f, eqdetail::Shape shape, float hz, float q, float gainDb) {
+    if (std::fabs(gainDb) < 0.01f || hz >= sr_ * 0.47f) { f.setCoefficients(1.0, 0.0, 0.0, 0.0, 0.0); return; }
+    // Where the matched design has no solution, the cookbook -- not unity,
+    // which is a boost the user dialled in and silently does not get.
+    eqdetail::designBand(f, shape, hz, q, gainDb, sr_);
   }
-  /** H(s) = (s + w*sqrt(G)) / (s + w/sqrt(G)): LF gain G, HF unity. */
-  void firstOrderLowShelf(Biquad& f, float hz, float gainDb) {
-    if (std::fabs(gainDb) < 0.01f) { f.setCoefficients(1.0f, 0.0f, 0.0f, 0.0f, 0.0f); return; }
-    const float g = std::sqrt(dbToGain(gainDb));
-    const float w = 2.0f * kPi * clampf(hz, 1.0f, sr_ * 0.45f);
-    const float c = 2.0f * sr_;
-    const float b0 = c + w * g, b1 = -c + w * g;
-    const float a0 = c + w / g, a1 = -c + w / g;
-    f.setCoefficients(b0 / a0, b1 / a0, 0.0f, a1 / a0, 0.0f);
+  /** The bilinear transform's s = c (z - 1) / (z + 1), with c chosen so the
+   *  corner w lands at w digitally too. The plain c = 2 fs squeezes the whole
+   *  analog axis into Nyquist and pulls every corner down -- the 20 kHz
+   *  atten's 14 kHz hinge sat near 11 kHz at 44.1 kHz, where the 96 kHz build
+   *  had it at 13. */
+  double bilinearConstant(double w) const { return w / std::tan(w / (2.0 * (double) sr_)); }
+  /** H(s) = (s + w*sqrt(G)) / (s + w/sqrt(G)): LF gain G, HF unity. In
+   *  double, like every section here: the low cut hinges at 80 Hz, and in
+   *  float c - w cancelled to a few digits at 192 kHz. */
+  void firstOrderLowShelf(IirSection& f, float hz, float gainDb) {
+    if (std::fabs(gainDb) < 0.01f) { f.setCoefficients(1.0, 0.0, 0.0, 0.0, 0.0); return; }
+    const double g = std::sqrt(std::pow(10.0, (double) gainDb / 20.0));
+    const double w = 2.0 * 3.14159265358979323846 * (double) clampf(hz, 1.0f, sr_ * 0.45f);
+    const double c = bilinearConstant(w);
+    const double b0 = c + w * g, b1 = -c + w * g;
+    const double a0 = c + w / g, a1 = -c + w / g;
+    f.setCoefficients(b0 / a0, b1 / a0, 0.0, a1 / a0, 0.0);
   }
   /** H(s) = (G s + w) / (s + w): HF gain G, LF unity. */
-  void firstOrderHighShelf(Biquad& f, float hz, float gainDb) {
-    if (std::fabs(gainDb) < 0.01f) { f.setCoefficients(1.0f, 0.0f, 0.0f, 0.0f, 0.0f); return; }
-    const float g = dbToGain(gainDb);
-    const float w = 2.0f * kPi * clampf(hz, 1.0f, sr_ * 0.45f);
-    const float c = 2.0f * sr_;
-    const float b0 = g * c + w, b1 = -g * c + w;
-    const float a0 = c + w, a1 = -c + w;
-    f.setCoefficients(b0 / a0, b1 / a0, 0.0f, a1 / a0, 0.0f);
+  void firstOrderHighShelf(IirSection& f, float hz, float gainDb) {
+    if (std::fabs(gainDb) < 0.01f) { f.setCoefficients(1.0, 0.0, 0.0, 0.0, 0.0); return; }
+    const double g = std::pow(10.0, (double) gainDb / 20.0);
+    const double w = 2.0 * 3.14159265358979323846 * (double) clampf(hz, 1.0f, sr_ * 0.45f);
+    const double c = bilinearConstant(w);
+    const double b0 = g * c + w, b1 = -g * c + w;
+    const double a0 = c + w, a1 = -c + w;
+    f.setCoefficients(b0 / a0, b1 / a0, 0.0, a1 / a0, 0.0);
   }
 
-  Biquad lowBoost_, lowCut_, highBoost_, highCut_;
+  IirSection lowBoost_, lowCut_, highBoost_, highCut_;
   float sr_ = 48000.0f;
   float lowHz_ = 60.0f, lowBoost01_ = 0.0f, lowCut01_ = 0.0f;
   float highHz_ = 8000.0f, highBoost01_ = 0.0f, sharp_ = 0.5f;

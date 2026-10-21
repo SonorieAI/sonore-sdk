@@ -44,8 +44,11 @@ const log = (s) => process.stdout.write(s + "\n");
 // table is a failure, exactly like a symbol that has gone.
 const MODULES = [
   // name, bucket of rows below, or null + why it is out of scope
-  ["analytics", null,
-   "telemetry. A generated plugin that phoned home would be a liability, not a feature"],
+  // Was out of scope as "telemetry. A generated plugin that phoned home would
+  // be a liability, not a feature". Still true, and it is now the design
+  // rather than the reason for absence: the module is built with nothing
+  // sent by default and no network code of its own (see the row).
+  ["analytics", "analytics", "nothing is sent by default: no destination ships, and the send is the plugin's own code"],
   // This said "the interface is a web page: CSS transitions and
   // requestAnimationFrame animate it", and was written off as out of scope on
   // that basis. True when the webview WAS the editor; false since the native
@@ -63,7 +66,10 @@ const MODULES = [
   ["audio_processors_headless", "processors",
    "the same wrappers: a plugin with no uihtml reports no GUI extension at all"],
   ["audio_utils", "utils", null],
-  ["box2d", null, "a 2D physics engine, shipped with the reference for historical reasons"],
+  // Was out of scope as "a 2D physics engine, shipped with the reference for
+  // historical reasons". The engine still is not shipped; the renderer is
+  // built against the plugin's own copy.
+  ["box2d", "box2d", "the renderer, against the plugin's own Box2D: nothing vendored"],
   ["core", "core", null],
   ["cryptography", "core", null],
   ["data_structures", "core", null],
@@ -72,41 +78,33 @@ const MODULES = [
   ["graphics", "graphics", null],
   ["gui_basics", "gui", null],
   ["gui_extra", "extras", null],
-  // Out of scope, and the REASON needed restating for the same cause as the
-  // two above: "the webview carries a JS engine" describes one of the two
-  // editors. The native one carries no interpreter at all, and should not --
-  // a plugin that could run scripts from a preset file is a plugin that runs
-  // whatever arrives in a preset file.
-  ["javascript", null,
-   "scripting inside a plugin: the native editor deliberately has no interpreter, because a " +
-   "preset that could carry code is a preset that can carry anything. A plugin that wants " +
-   "scripting has the webview editor and its engine"],
+  // This was out of scope, on the argument that a preset able to carry code
+  // is a preset able to carry anything. The argument was about a script with
+  // no limits, and it holds for one: so the engine that closes the module is
+  // built around the limits -- time, stack, memory, string and array length,
+  // stop() from another thread -- every one of which ends a hostile script in
+  // an error rather than a hang or a crash, and none of which a script can
+  // catch. It is opt-in: nothing in the SDK runs a script unless a plugin
+  // constructs a JavascriptEngine and hands it one.
+  ["javascript", "javascript", null],
   ["midi_ci", "extras", null],
   // The note here read "WebGL, in the same webview, without a second context to
-  // manage", and that was true when the webview WAS the editor. The default is
-  // the native toolkit now, and for that path this is a real decision rather
-  // than a redirection: everything is rasterised in software, on the CPU, into
-  // a bitmap the peer blits.
+  // manage", and then, when the native toolkit became the default, "software
+  // rasterisation, deliberately". The second note is still the answer for an
+  // editor of knobs and meters -- identical pixels on every machine, nothing
+  // to fail to initialise in a VM -- and it is still the default.
   //
-  // Which is the right trade for a plugin editor, and worth saying why. A
-  // software rasteriser produces the same pixels on every machine, which is
-  // what makes the rendering checks in sdk_tests possible at all -- a GPU path
-  // could only assert "approximately, on this driver". It needs no context,
-  // survives a host that recreates the window, and cannot fail to initialise on
-  // a remote desktop or in a VM, which is where a surprising number of plugin
-  // users are.
-  //
-  // The cost, stated rather than hidden: repainting a large editor is CPU work.
-  // Partial repaint is the answer -- damage is tracked per rectangle and
-  // measured at 200 pixels against 12,100 for one knob moving -- and a plugin
-  // that genuinely needs a shader still has the webview and WebGL.
-  ["opengl", null,
-   "software rasterisation, deliberately: identical pixels on every machine, no " +
-   "context to lose, nothing to fail to initialise in a VM. WebGL remains " +
-   "available through the webview editor for a plugin that needs a shader"],
+  // What it was not an answer for is a plugin whose editor IS a GPU picture: a
+  // 3D waterfall, a 60 fps scope, a shader visualiser. Those had only the
+  // webview's WebGL. The module is covered now, as an opt-in a component asks
+  // for, with its own bucket of rows; nothing else in the editor changes.
+  ["opengl", "opengl", null],
   ["osc", "osc", null],
   ["product_unlocking", "core", null],
-  ["video", null, "not an audio plugin concern; a page can carry a <video> if it must"],
+  // Was out of scope as "not an audio plugin concern; a page can carry a
+  // <video> if it must" -- true only of the webview editor, the same rot the
+  // opengl and animation notes had once the native toolkit became the default.
+  ["video", "video", "frames as Bitmaps through Graphics; Windows run, macOS compiled"],
 ];
 
 // module, the reference's name for the capability, ours, and the symbol that proves it.
@@ -142,8 +140,25 @@ const MAP = [
   ["basics", "AudioProcessLoadMeasurer", "LoadMeasurer, pushed to the editor", "class LoadMeasurer"],
   ["basics", "MidiRPNGenerator", "sendRpn + sendPitchBendRange", "inline void sendRpn"],
   ["basics", "AudioWorkgroup",
-   "not built: macOS realtime workgroups, which join a thread to the audio " +
-   "workgroup the OS schedules", null, "AudioWorkgroup|os_workgroup"],
+   "audio_workgroup.h: AudioWorkgroup holds a macOS 11 os_workgroup_t -- retained " +
+   "on copy, released on destruction, no allocation, so a copy is safe on the " +
+   "audio thread -- and join() makes the calling thread a member through a " +
+   "WorkgroupToken; maxParallelThreadCount() and isCancelled() ask the OS. Where " +
+   "one comes from: CoreAudioOutput::ioWorkgroup() reads " +
+   "kAudioDevicePropertyIOThreadOSWorkgroup, and the standalone hands it to the " +
+   "DSP before audio starts; an AU plugin offers " +
+   "kAudioUnitProperty_RenderContextObserver (au_wrapper.h, a block built by hand " +
+   "in apple_block.h) and the DSP's workgroupChanged() hook hears the render " +
+   "thread's group. CLAP, VST3 and LV2 give a plugin no way to learn its host's " +
+   "workgroup, so there the hook is never called, and the header says so.\n" +
+   "      Written blind, and built not to be silent about it: os_workgroup_* are " +
+   "found with dlsym, so an older macOS gets a workgroup that says why, and every " +
+   "failed join says which errno. COMPILED for macOS against tests/au_shim " +
+   "(mac_syntax_mac_host.cpp), NEVER RUN -- no Mac here; mac_host_selftest.cpp " +
+   "joins the default device's group from a real-time thread and prints each " +
+   "answer. Off macOS RUN on Windows (mac_host_test.cpp): every join fails, the " +
+   "token is inactive and describe() says why",
+   "class AudioWorkgroup"],
   ["basics", "MidiMessage system messages", "one policy: deliverableToDsp()", "inline bool deliverableToDsp"],
   ["basics", "(the reference has no MIDI clock follower)", "MidiClock: tempo from the wire", "class MidiClock"],
   ["basics", "MidiDataConcatenator (SysEx reassembly)", "SysexAssembler", "class SysexAssembler"],
@@ -151,7 +166,8 @@ const MAP = [
   ["client", "SysEx input (CLAP, VST3, LV2)", "copied, never referenced", "CLAP_EVENT_MIDI_SYSEX"],
   ["client", "SysEx input (the standalone's MIDI ports)",
    "winmm MIM_LONGDATA, ALSA byte stream, CoreMIDI packets -- all through one " +
-   "SysexAssembler",
+   "SysexAssembler. UNVERIFIED against hardware: there is no MIDI device on " +
+   "this machine, so the queue half is tested and the driver half is not",
    "midiInPrepareHeader"],
   ["client", "SysEx input (AU)",
    "MusicDeviceSysEx through the shared SysexAssembler. Compiled on macOS CI, " +
@@ -258,10 +274,33 @@ const MAP = [
   ["devices", "universal_midi_packets (MIDI 2.0 UMP)",
    "ump.h: sizing, MIDI 1.0 both ways, MIDI 2.0 narrowed, SysEx7", "namespace ump"],
   ["devices", "UMP Flex Data / Stream / SysEx8",
-   "not built: score metadata, endpoint discovery and 8-bit SysEx. A host " +
-   "translating a MIDI 2.0 stream sends channel voice and SysEx; the rest is " +
-   "stream configuration it settles before a plugin sees anything", null,
-   "flexDataFrom|sysex8Assemble|class UmpStream"],
+   "ump128.h: the 128-bit packets ump.h left out, each encoded and decoded " +
+   "to the bit positions of the UMP specification's field tables. Flex Data: " +
+   "setTempo in its ten-nanosecond units (tempoFromBpm), TimeSignature, " +
+   "Metronome, KeySignature and ChordName with its ChordAlteration fields, " +
+   "read back with their FlexHeader; metadata text and lyrics split by " +
+   "toFlexText and rejoined by FlexTextAssembler. UMP Stream: endpoint " +
+   "discovery, EndpointInfo, device identity (into MIDI-CI's own " +
+   "DeviceIdentity), StreamConfiguration request and notification, function " +
+   "block discovery and FunctionBlockInfo, start and end of clip, and the " +
+   "three names -- endpoint, product instance, function block -- rejoined by " +
+   "StreamTextAssembler. SysEx8 through toSysex8 and Sysex8Assembler, keyed " +
+   "by group AND stream ID, because letting streams interleave is what the " +
+   "stream ID is for; the Mixed Data Set through MixedDataSetHeader, " +
+   "toMixedDataSetChunk and MixedDataSetAssembler, delivered per chunk.\n" +
+   "      Every assembler refuses rather than guesses: a start inside an open " +
+   "message drops it, a continue or end with nothing open is an orphan, a " +
+   "message too long for its buffer is dropped and never truncated, and each " +
+   "is counted. Only the Mixed Data Set allocates -- a chunk can be 64 KB " +
+   "and 256 can be open at once -- so it is assembled off the audio thread. " +
+   "Tested in midi_osc_test against packets worked out by hand from the " +
+   "field tables (Set Tempo at 120 BPM is D0100000 02FAF080), and with " +
+   "interleaved, interrupted and malformed sequences; fuzz_midi_osc merges " +
+   "random messages, mutates the word stream, and requires every unmutated " +
+   "merge back exactly, 48,000 cases clean under ASan. Run on Windows (MSVC, " +
+   "x64); the headers have no platform code, and the test and fuzz programs " +
+   "were parsed as macOS (au_shim) and Linux (stub headers), not run there",
+   "class Sysex8Assembler"],
   ["devices", "MidiOutput", "midi_output.h", "namespace midiout"],
   ["devices", "ASIO driver enumeration", "audio_asio.h", "inline std::vector<DriverInfo> listDrivers"],
   ["devices", "ASIO output", "AsioOutput + standalone --asio", "class AsioOutput"],
@@ -279,23 +318,79 @@ const MAP = [
   ["processors", "AudioProcessorGraph", "PluginGraph", "class PluginGraph"],
   ["processors", "KnownPluginList", "PluginCache", "class PluginCache"],
   ["processors", "AudioPluginFormat (hosting)", "host.h", "class Vst3Plugin"],
+  ["processors", "PluginDirectoryScanner",
+   "host.h scanDirectory(); plugin_cache.h scanDirectoryCached() keeps what it found",
+   "std::vector<PluginDescription> scanDirectory("],
+  ["processors", "AudioUnitPluginFormat (hosting an Audio Unit)",
+   "host_au.h, included by host.h: AudioUnitPluginFormat scans the AU registry by " +
+   "type -- aufx, aumu, aumf, aumi, augn: .component bundles, Apple's own units and " +
+   "AUv3 extensions alike -- and describes a .component from its Info.plist, so " +
+   "scanDirectory() and PluginCache see AUs too; loadPlugin() takes format \"AU\" " +
+   "and returns an AuPlugin. AudioComponentInstanceNew for AUv2, " +
+   "AudioComponentInstantiate for AUv3 and units that require it (its completion " +
+   "through a hand-built block, the main run loop running while it waits); " +
+   "non-interleaved float formats negotiated against SupportedNumChannels; " +
+   "AudioUnitRender with an input render callback; MIDI in by MusicDeviceMIDIEvent " +
+   "and SysEx, out through the MIDI output callback; parameters with clumps and " +
+   "value strings, and the unit's own edits and gestures through an AUEventListener; " +
+   "state as ClassInfo written as an XML plist, which is an .aupreset; presets, " +
+   "latency, tail, bypass; the editor from kAudioUnitProperty_CocoaUI or an AUv3's " +
+   "requested view controller, in the caller's NSView. AudioToolbox, CoreFoundation " +
+   "and libobjc are opened, not linked, so no host gains a framework to name.\n" +
+   "      COMPILED for macOS against tests/au_shim, NEVER RUN: there is no Mac " +
+   "here. Every Apple call's status is checked and reported by name (lastError(), " +
+   "the loader's error string); mac_host_selftest.cpp loads Apple's AUDelay and " +
+   "DLSMusicDevice and is the run a Mac owes it. The portable half -- ids, the " +
+   "parameter mapping, channel negotiation, emitted MIDI, error names -- RUN on " +
+   "Windows by mac_host_test.cpp",
+   "class AudioUnitPluginFormat"],
   ["processors", "AudioProcessorEditor", "webview editor", "inline std::string bridgeScript"],
+  ["processors", "WebBrowserComponent's TypeScript interop (the reference's npm package)",
+   "sdk/include/sonore/sonore.d.ts: the types of window.sonore, installed with the headers, " +
+   "held to the bridge gui.h generates by verify:bridge-types", "interface Sonore {"],
   ["processors", "GenericAudioProcessorEditor", "gfx/plugin_editor.h, built from ParamInfo",
    "class GenericEditor"],
   ["processors", "SliderParameterAttachment", "gfx/plugin_editor.h", "class SliderAttachment"],
   ["processors", "ComboBoxParameterAttachment", "gfx/plugin_editor.h", "class ComboAttachment"],
   ["processors", "editor host context menu", "FileDialog + host menu", "showHostContextMenu"],
   ["processors", "AudioProcessorValueTreeState",
-   "no capability gap, and deliberately not one object. APVTS bundles four " +
-   "jobs -- the parameter list, non-parameter state, undo, and binding widgets " +
-   "to values -- and here they are four things: ParamInfo, StateBag, " +
-   "UndoHistory, and SliderAttachment/ComboAttachment for the native editor or " +
-   "sonore.params and sonore.set for the web one.\n" +
-   "      Four separable things rather than one is the point: a plugin that " +
-   "wants parameters without undo, or state without a GUI, takes what it needs. " +
-   "The reason on this row previously mentioned only the web interface, which " +
-   "stopped being the whole answer when the native editor gained attachments",
-   null, "AudioProcessorValueTreeState|class ValueTreeState"],
+   "value_tree_state.h: AudioProcessorValueTreeState, built from the four " +
+   "separate pieces that remain separate -- ParamInfo, StateBag, UndoHistory " +
+   "and the plugin_editor.h attachments -- so code ported from the reference has " +
+   "a direct target. A ParameterLayout of AudioParameterFloat (a " +
+   "NormalisableRange with interval and skew), AudioParameterInt, " +
+   "AudioParameterBool and AudioParameterChoice, nestable in an " +
+   "AudioProcessorParameterGroup, all RangedAudioParameter with ParameterID, " +
+   "attribute builders and text conversion. Each produces a ParamInfo; " +
+   "parameterInfos() is the table a PluginDescriptor points at, in layout " +
+   "order, so p[i] is entry i, and text defaults to formatParamValue and " +
+   "parseParamValue, the functions every wrapper uses. layoutProblem() names " +
+   "what ParamInfo cannot carry (a symmetric skew) instead of every host " +
+   "drawing it linear.\n" +
+   "      getRawParameterValue() is one std::atomic<float> per parameter; the " +
+   "audio thread reads it, and its one write, updateFromHost(p), is relaxed " +
+   "stores plus a bit in an atomic mask -- listeners run on the message thread " +
+   "from dispatchPendingChanges()/syncFromHost(), never on the audio thread as " +
+   "the reference's do. A HostLink (the four calls gfx::EditorHost carries) " +
+   "sends edits to the real parameter; gestures bracket them; UndoHistory " +
+   "records one snapshot per gesture, and only if something moved; undo goes " +
+   "back to the host inside gestures of its own. copyState()/replaceState() " +
+   "are a StateBag (\"param.<id>\" plus the free-form `state`), restored to " +
+   "defaults for anything a session lacks, and fit a DSP's saveState/" +
+   "loadState. gfx/value_tree_state_attachments.h: the nested " +
+   "SliderAttachment, ButtonAttachment and ComboBoxAttachment, each the SDK's " +
+   "own attachment over editorHostFor(apvts) plus a listener so code, undo and " +
+   "the host move the widget at once.\n" +
+   "      Tested in tests/plugin_state_test.cpp, RUN on Windows (MSVC /W4, and " +
+   "under ASan): the layout's table field by field, interval snapping, the " +
+   "raw atomics against setValue and against a concurrent audio thread, a real " +
+   "drag through MouseRouter reaching a host as one gesture and one undo step, " +
+   "undo/redo moving widgets and the host, and state round trips through a " +
+   "DSP shaped as the wrappers drive one; tests/fuzz_plugin_state.cpp feeds " +
+   "replaceState and the undo path 50,000 mutated states under ASan, each one " +
+   "that loads left in range, on its steps, and a fixed point. Linux and " +
+   "macOS: compiled only",
+   "class AudioProcessorValueTreeState"],
 
 
   // Added by the class-by-class pass over dsp's 52 classes. Everything
@@ -314,17 +409,53 @@ const MAP = [
   ["dsp", "dsp::LadderFilter", "LadderFilter", "LadderFilter"],
   ["dsp", "dsp::BallisticsFilter", "Ballistics", "Ballistics"],
   ["dsp", "dsp::DelayLineInterpolationTypes::Thiran",
-   "not built: an allpass fractional delay is flat in magnitude but disperses " +
-   "phase and rings on a fast sweep. The third-order read is the better " +
-   "default for the one thing this SDK modulates", null, "Thiran|thiran"],
+   "dsp.h: DelayLine::readThiran -- a first-order Thiran allpass read beside " +
+   "read() (linear) and readCubic(). Its magnitude is flat at every fraction " +
+   "(measured within 5e-8 of unity across the band, where a half-sample delay " +
+   "through the linear read is -16 dB at 21.6 kHz and through the cubic and " +
+   "Lagrange ones -12.7 dB) and its delay is exact at DC (to 4e-6 samples, " +
+   "float). The fraction is kept in [0.618, 1.618), so the pole is never " +
+   "nearer the unit circle than 0.236; each head's state is a ThiranState " +
+   "(the line keeps one and reset() clears it), and a delay that JUMPS a " +
+   "sample or more reseeds it at the new delay -- first outputs within 4e-5 " +
+   "of a settled head, against 0.2 if the old state were kept.\n" +
+   "      The trade is dispersion, measured: a 10.5-sample request is 10.33 " +
+   "samples at 5 kHz. So readCubic() stays the read for a swept delay, and " +
+   "this is the one for a fractional delay inside a feedback loop -- a " +
+   "waveguide, a tuned comb -- where a lowpass per pass would detune it. " +
+   "dsp_maths_test: impulse responses at ten delays against the analytic " +
+   "group delay, a swept sine, jumps, 400k samples of swept and hostile " +
+   "delays (NaN, negative, past the end), reset, zero allocations. RUN on " +
+   "Windows (MSVC /W4, and under ASan); standard C++ with no platform " +
+   "branch, not separately built on macOS or Linux",
+   "readThiran("],
   ["dsp", "dsp::Matrix",
-   "not built: general matrix arithmetic. The reference ships it for ambisonics and " +
-   "matrix mixing; nothing here needs one, and an unused numerics class is " +
-   "an untested one", null, "class\s+Matrix|struct\s+Matrix"],
+   "matrix.h: Matrix<T> -- dense, row-major, sized at construction: " +
+   "identity, toeplitz and hankel, row and column access, transpose, sum, " +
+   "difference, scalar and matrix products, the Hadamard product, compare; " +
+   "solve() by Gaussian elimination with partial pivoting (several " +
+   "right-hand sides at once), determinant() and inverse() by the same " +
+   "elimination. What returns a matrix allocates; multiply() into a sized " +
+   "result, solveInPlace() and the compound operators do not, and the test " +
+   "counts zero allocations through a thousand blocks of them -- which is " +
+   "the line between a prepare() tool and something usable per block.\n" +
+   "      Tested against the textbook 3x3 system, a zero and a 1e-20 pivot, " +
+   "Hilbert(3)'s exact integer inverse, the determinants of Hilbert(3) and " +
+   "(4), A inv(A) = I to 1e-14 for 60 random matrices up to 12x12, and " +
+   "Yule-Walker recovering an AR(2) model through toeplitz(). RUN on " +
+   "Windows (MSVC /W4, ASan); standard C++ only",
+   "class Matrix {"],
   ["dsp", "dsp::Polynomial",
-   "not built as a class: the polynomials here are inline where they are used " +
-   "-- the BLEP residual, the sine approximation, the dB curve -- and each is " +
-   "checked against the function it approximates", null, "class\s+Polynomial|struct\s+Polynomial"],
+   "polynomial.h: Polynomial<T> -- coefficients lowest power first, as the " +
+   "reference orders them; Horner evaluation, which does not allocate; " +
+   "withGain, getSumWith, getProductWith, getDerivative, getIntegral. The " +
+   "per-sample polynomials elsewhere (the BLEP residual, the sine, the dB " +
+   "curve) stay inline; this is for the ones a design BUILDS. Tested: " +
+   "(x-1)(x-2)(x-3) and (1+x)^10 against their expanded coefficients, Horner " +
+   "against the direct sum, products against products of values, and T7 " +
+   "built by the Chebyshev recurrence against cos 7t. RUN on Windows (MSVC " +
+   "/W4, ASan)",
+   "class Polynomial {"],
 
   // ── The 2026-08-29 round: what the reference never had ──
   //
@@ -526,8 +657,8 @@ const MAP = [
    "wall absorption per bounce, two listening points so the geometry pans",
    "class EarlyReflections"],
   ["dsp", "(the reference has no pitch correction)",
-   "pitch_correct.h: PitchCorrector -- YIN to the nearest allowed scale note in cents, phase " +
-   "vocoder moves it there, retune-speed glide", "class PitchCorrector"],
+   "pitch_correct.h: PitchCorrector -- YIN to the nearest allowed scale note in cents, PSOLA " +
+   "moves the voice there, every harmonic by the ratio, retune-speed glide", "class PitchCorrector"],
   ["dsp", "(the reference has no distortion object)",
    "distortion.h: Distortion -- the whole drive chain in one object: curve at 8x, DC blocker, " +
    "equal-RMS auto gain, tone, mix, latency reported", "class Distortion"],
@@ -552,7 +683,7 @@ const MAP = [
    "(or a sidechain key) drives a Vicanek matched bell through the Giannoulis gain computer; " +
    "downward and upward with a range cap, unity at rest", "class DynamicEq"],
   ["dsp", "(the reference limiter is sample-peak)",
-   "limiting.h: TruePeakLimiter -- the look-ahead limiter with BS.1770-4's 4x inter-sample " +
+   "limiting.h: TruePeakLimiter -- the look-ahead limiter with an 8x (64 taps a phase) inter-sample " +
    "peak estimator as its detector, so the ceiling is a dBTP ceiling; latency reported " +
    "including the interpolator's centre", "class TruePeakLimiter"],
   ["dsp", "(the reference has no plate)",
@@ -574,29 +705,91 @@ const MAP = [
   ["basics", "AudioData (sample format conversion)",
    "audiofile.h, audiostream.h, asio_format.h", "inline float readSample"],
   ["basics", "MixerAudioSource / channel remapping",
-   "graph.h: a processor graph does both, and does routing besides", "class PluginGraph"],
-  ["basics", "ToneGeneratorAudioSource", "the standalone's test source", "class TestSource"],
-  ["basics", "AudioTransportSource", "SampleStream + the standalone's transport",
-   "class SampleStreamer"],
+   "audio_source.h: MixerAudioSource (its list swapped by pointer, no lock in " +
+   "the callback) and ChannelRemappingAudioSource; graph.h's processor graph " +
+   "does both for plugins, and routing besides",
+   "class MixerAudioSource"],
+  ["basics", "ToneGeneratorAudioSource",
+   "audio_source.h: ToneGeneratorAudioSource; the standalone keeps its own " +
+   "TestSource", "class ToneGeneratorAudioSource"],
+  ["basics", "AudioTransportSource",
+   "audio_source.h: AudioTransportSource -- start, stop, seek and gain ramped, " +
+   "read-ahead and rate correction in its chain, waitForNextAudioBlockReady " +
+   "for a render that may block; SampleStreamer is the sampler's own streaming",
+   "class AudioTransportSource"],
   ["basics", "MemoryMappedAudioFormatReader / BufferingAudioReader",
    "SampleStream: a worker thread reads ahead, the audio thread never touches the file",
    "class SampleStreamer"],
   ["basics", "MidiMessageCollector",
-   "MessageQueue collects, but timestamps every event at offset 0 rather than " +
-   "at the frame it arrived. A USB keyboard's own jitter is already larger " +
-   "than a block, so the precision would be invented", null,
-   "collectorTimestamp|midiTimestampFrames"],
+   "midi_collector.h: MidiMessageCollector. Any thread queues a message " +
+   "stamped on one steady clock (addMessageToQueue, addSysexToQueue); the " +
+   "audio thread's removeNextBlockOfMessages puts each at the frame its " +
+   "stamp implies. The interval since the previous block maps onto this one: " +
+   "one-to-one when the callbacks keep time, laid against the END of the " +
+   "block when one comes early, so arrival-to-sound stays one constant " +
+   "block, and squeezed in order when one is late. Past 32 blocks of stall " +
+   "the oldest land on frame 0 -- KEPT, where the reference drops them, " +
+   "because one of them may be a note-off. samplePosition() is that mapping " +
+   "as a pure function.\n" +
+   "      The hand-over is a bounded multi-producer ring with a sequence number " +
+   "per slot: a producer claims a slot with one compare-and-swap and never " +
+   "waits, the audio thread never waits at all, nothing allocates, and an " +
+   "event a full block cannot take stays queued for the next. The reference " +
+   "takes a lock in the audio callback; this cannot. midiin::MessageQueue " +
+   "still feeds the standalone's device input at frame 0, as before. Tested: " +
+   "known positions for on-time, early, late and stalled callbacks; zero " +
+   "allocations counted around the drain; three producer threads racing the " +
+   "consumer with 60,000 messages, none lost or reordered; fuzzed with NaN, " +
+   "infinite and backward stamps. Run on Windows; parsed as macOS and Linux",
+   "class MidiMessageCollector"],
   ["devices", "SystemAudioVolume",
-   "not built: changing the machine's output volume is not a plugin's business, " +
-   "and a standalone that did it would be altering something the user set for " +
-   "everything else", null, "SystemAudioVolume|setSystemVolume"],
+   "system_volume.h: SystemAudioVolume -- getGain/setGain/isMuted/setMuted on the " +
+   "default output, all static as the reference's. Windows through the default " +
+   "render endpoint's IAudioEndpointVolume; macOS through the default output " +
+   "device's kAudioHardwareServiceDeviceProperty_VirtualMainVolume and " +
+   "kAudioDevicePropertyMute (by four-character code, so it builds against SDKs " +
+   "before and after the Master-to-Main rename); Linux through ALSA's Master " +
+   "(else PCM) simple-mixer control, libasound dlopened exactly as the ALSA " +
+   "backend does it, so a machine without ALSA reads isAvailable() == false.\n" +
+   "      Nothing in the SDK calls the setters: the volume is the user's, for " +
+   "everything on the machine, and is here for an application that is asked " +
+   "to change it. RUN on Windows: audio_io_test always reads it, and only with " +
+   "SONORE_TEST_SYSTEM_VOLUME=1 (never in CI) changes gain and mute, reads " +
+   "both back, and restores them exactly -- on every exit path. The macOS and " +
+   "Linux branches are COMPILED only (tests/mac_syntax_audio_io.cpp against " +
+   "au_shim; Linux against stubs) and have not been run",
+   "class SystemAudioVolume"],
 
   // ── audio_plugin_client ─────────────────────────────────────────────
   ["client", "clap.preset-discovery",
    "clap_wrapper.h: PresetProvider. How a CLAP host finds a plugin's factory " +
    "presets WITHOUT loading the plugin -- it reads them from an index the " +
    "plugin declares, so a browser can list ten thousand presets across forty " +
-   "plugins without instantiating any of them",
+   "plugins without instantiating any of them. Two FILE locations: the factory " +
+   "presets written out as files (syncFactoryPresetFiles, a cache the binary " +
+   "rebuilds) and the user's own folder; preset-load takes a factory index or " +
+   "any preset file.\n" +
+   "The user's presets themselves -- the reference has no single class for " +
+   "them; plugins built on it each write a \"preset manager\" over its program " +
+   "calls and its state -- are user_presets.h: PresetMetadata and " +
+   "PresetFileContents (a versioned, checksummed container around the plugin's " +
+   "state blob, the host save path's bytes exactly), UserPresetStore (one " +
+   "folder per plugin under Documents / ~/Library/Audio/Presets / " +
+   "$XDG_DATA_HOME, file names legal on every filesystem, atomic writes, save, " +
+   "overwrite, rename, delete to the Recycle Bin / Trash, duplicate, import " +
+   "including .vstpreset, export, rescan) and PresetManager (factory and user " +
+   "as one list, next and previous, a modified marker, the selection saved in " +
+   "the session as state v6); loads land through the host's own restore path " +
+   "in CLAP, VST3 and AU. gfx/preset_bar.h: PresetBar, in the generic native " +
+   "editor and the showcase, a load being one APVTS undo step. RUN on Windows: " +
+   "tests/user_presets_test.cpp (146 checks, ASan clean, the real Recycle Bin " +
+   "with SONORE_TEST_TRASH=1) and fuzz_user_presets (ASan, 50,000 iterations); " +
+   "clap-validator 0.4.1 on all ten examples with preset-discovery-crawl/load " +
+   "included -- on Windows under a //?/C:/ preset root, because the validator " +
+   "refuses a FILE location that does not begin with '/'. The macOS " +
+   "branch (Trash, Finder) is COMPILED only (au_shim), the Linux one " +
+   "(freedesktop trash, xdg-open) parsed against POSIX stubs here and run only " +
+   "where CI runs Linux",
    "PresetProvider"],
   ["client", "state dirty (the host's save prompt)",
    "clap_wrapper.h: a DSP that reports whether its state has changed since the " +
@@ -718,7 +911,9 @@ const MAP = [
    "it is doing",
    "class SpectrumAnalyser"],
   ["dsp", "ResamplingAudioSource (rate conversion)",
-   "resample.h: Resampler, plus PolyphaseIirHalfBand for the two-to-one steps. " +
+   "resample.h: Resampler, plus PolyphaseIirHalfBand for the two-to-one steps; " +
+   "audio_source.h's ResamplingAudioSource is the streaming form, its ratio " +
+   "changeable while it plays. " +
    "A sample recorded at 44.1 played in a 48 kHz session is the ordinary case, " +
    "and the alternative to converting it is playing it a semitone flat",
    "class Resampler"],
@@ -753,7 +948,8 @@ const MAP = [
    "from the streaming so a plugin can have one without the other",
    "class SampleVoice"],
   ["dsp", "white and pink noise, and TPDF dither",
-   "random.h. Pink is Voss-McCartney, flat to a tenth of a decibel per octave; " +
+   "random.h. Pink is Voss-McCartney with sixteen rows, every octave from " +
+   "20 Hz to 20 kHz within 0.6 dB; " +
    "dither is TRIANGULAR, which is the difference between a noise floor that " +
    "sits still and one that breathes with the music. Three types rather than " +
    "one function: WhiteNoise, PinkNoise and Dither each carry their own state, " +
@@ -943,7 +1139,8 @@ const MAP = [
    "mounts, where a library is most likely to live",
    "inline std::vector<FileEntry> listDirectory"],
   ["core", "MemoryInputStream / MemoryOutputStream",
-   "host.h: MemoryStream, which is what a plugin's state actually travels " +
+   "streams.h: MemoryInputStream and MemoryOutputStream; and host.h's " +
+   "MemoryStream, which is what a plugin's state actually travels " +
    "through -- every format hands over a blob and expects one back, and a " +
    "stream over a buffer is the shape that makes reading it back " +
    "version-tolerant rather than a struct cast",
@@ -966,7 +1163,12 @@ const MAP = [
    "plugin instead of a live input -- which is how a plugin is tested when the " +
    "machine has no interface attached",
    "DeviceHub"],
-  ["core", "InputStream / OutputStream", "AudioFileReader + writeWav", "class AudioFileReader"],
+  ["core", "InputStream / OutputStream",
+   "streams.h: InputStream and OutputStream with the reference's typed reads and " +
+   "writes, BufferedInputStream, SubregionStream and InputSource; " +
+   "file_types.h's FileInputStream and FileOutputStream. Audio still travels " +
+   "through AudioFileReader and writeWav, which stream a file in blocks",
+   "class InputStream"],
   ["core", "Thread + lock-free FIFO", "UiEventQueue, AudioRing", "class UiEventQueue"],
   ["core", "Atomic parameter value (the reference's parameters hold an atomic float)",
    "SharedParam, SharedFlag: relaxed atomics behind float/bool conversions, snapshotted " +
@@ -977,8 +1179,13 @@ const MAP = [
   ["core", "UndoManager", "UndoHistory (state snapshots, not commands)", "class UndoHistory"],
   ["core", "SHA-256", "hash.h, against the FIPS vectors", "class Sha256"],
   ["core", "MD5 / RSA / Blowfish",
-   "not built. SHA-256 covers the one job this SDK has for a hash -- naming a " +
-   "state blob -- and a cipher nobody uses is a cipher nobody has tested", null, "blowfish|Blowfish|rsaEncrypt|md5Hex"],
+   "hash.h: MD5 beside Sha256 (md5Hex, md5File); crypto.h: RSAKey and BlowFish, with " +
+   "Primes and bigint.h's BigInteger under them. One implementation, described " +
+   "in full -- vectors, caveats, platforms -- by the \"MD5 / Whirlpool\", " +
+   "\"BlowFish / RSAKey / Primes\" and \"BigInteger\" rows. SHA-256 is still the " +
+   "hash this SDK picks for itself; these are here so a format or a key that " +
+   "already names them can be read",
+   "class RSAKey"],
   ["core", "product unlocking",
    "not built, and not the SDK's job: licensing belongs to the service that " +
    "generates plugins, where a key can actually be checked against an account. " +
@@ -1000,14 +1207,48 @@ const MAP = [
   ["graphics", "LowLevelGraphicsSoftwareRenderer", "gfx/bitmap.h: 16 sub-rows, exact horizontal coverage", "class Rasteriser"],
   ["graphics", "Image / PixelARGB buffer", "gfx/bitmap.h", "class Bitmap"],
   ["graphics", "Graphics", "gfx/graphics.h: state stack, clip, transform", "class Graphics"],
+  ["graphics", "Graphics::reduceClipRegion (a Path)",
+   "gfx/graphics.h: clipToPath -- antialiased, the path's coverage per pixel " +
+   "multiplied into whatever is drawn under it, fills, strokes and images " +
+   "alike, until the next restore(). A rounded panel clipping an image keeps " +
+   "a smooth corner rather than a staircase", "void clipToPath"],
+  ["graphics", "Graphics::beginTransparencyLayer / endTransparencyLayer",
+   "gfx/graphics.h: beginLayer(opacity) / endLayer -- drawn into a layer the " +
+   "size of the clip, put down through the clip as one picture, so a faded " +
+   "group's overlaps do not show through each other. And beginMask / " +
+   "endMask, which make what was drawn into a clip -- by alpha or by " +
+   "luminance: an SVG's <mask>, a fade at the end of a list", "void beginLayer"],
+  ["graphics", "PathStrokeType::createDashedStroke",
+   "gfx/stroke.h: StrokeStyle::dashes and dashOffset, cut by Stroker::dash in " +
+   "device space after flattening, so dash lengths are exact along curves. " +
+   "SVG's rules: an odd list repeats, a negative or all-zero one is solid. A " +
+   "pattern too fine to show along the path draws solid rather than cutting " +
+   "a hundred million pieces", "static bool dash"],
   ["graphics", "PathStrokeType (joins, caps, miter limit)",
    "gfx/stroke.h: a quad per segment, unioned -- no self-intersecting outline",
    "class Stroker"],
   ["graphics", "ColourGradient",
    "gfx/gradient.h -- linear and radial, any number of stops, interpolated in " +
-   "STRAIGHT alpha so a fade to transparent does not pass through black",
+   "STRAIGHT alpha so a fade to transparent does not pass through black. Pad, " +
+   "reflect and repeat past the ends (GradientSpread); a radial gradient's " +
+   "focal point, a cone when it lies outside the circle as a canvas draws " +
+   "one; and any affine map, so a radial gradient squashed by its box is an " +
+   "ellipse rather than staying a circle",
    "class ColourGradient"],
-  ["graphics", "Typeface", "gfx/truetype.h: glyf outlines parsed to Paths", "class Typeface"],
+  ["graphics", "ColourGradient (spread past the ends)",
+   "gfx/gradient.h: GradientSpread -- Pad, Reflect, Repeat; what SVG's " +
+   "spreadMethod names", "enum class GradientSpread"],
+  ["graphics", "Typeface", "gfx/truetype.h: glyf and CFF outlines parsed to Paths -- .ttf, .otf " +
+   "and collections of either, CID-keyed CJK fonts included", "class Typeface"],
+  ["graphics", "Variable fonts (font axes: weight, width, slant, optical size)",
+   "gfx/truetype.h: fvar's axes, avar's bend, gvar's deltas -- listed and " +
+   "inferred along each contour -- with composite offsets and phantom " +
+   "points, and HVAR's advances; Font::withVariation(\"wght\", 650). " +
+   "Matched against fontTools on every glyph of Bahnschrift, Segoe UI " +
+   "Variable, Cascadia Code and Sitka at several locations, and checked on " +
+   "a fixture built by make_variable.py. CFF2 -- variable CFF outlines -- is " +
+   "not read, and GPOS kerning stays the default design's",
+   "struct FontAxis"],
   ["graphics", "Font", "gfx/font.h: metrics, kerning, UTF-8, justification", "class Font"],
   
 
@@ -1069,8 +1310,10 @@ const MAP = [
    "native window", "class NativeWindowX11"],
   ["gui", "ComponentPeer (macOS)",
    "gfx/window_cocoa.h: an NSView registered against the Objective-C runtime, " +
-   "so no .mm file and no mixed-language build. Compiled on macOS by CI since " +
-   "2026-09-01",
+   "so no .mm file and no mixed-language build. COMPILED on macOS by CI since " +
+   "2026-09-01, never RUN: no macOS test opens a window, and there is no Mac " +
+   "in this loop. The Win32 and X11 peers are checked against real windows; " +
+   "this one is not",
    "class NativeWindowCocoa"],
   ["gui", "the Cocoa files, read by a compiler",
    "tests/cocoa_syntax.cpp against an Objective-C runtime shim. webview_cocoa.h " +
@@ -1095,7 +1338,14 @@ const MAP = [
   // does not have to make.
   ["gui", "AudioProcessorEditor (the format-facing editor)",
    "gfx/native_editor.h: window, clock and content as one object each wrapper " +
-   "opens", "class NativeEditor"],
+   "opens. A plugin's OWN face derives from gfx::AudioProcessorEditor " +
+   "(plugin_editor.h: editorTick on the window's clock, openComboMenu) and its " +
+   "DSP's createEditor(host) hands it to the CLAP, VST3 and AU wrappers, which " +
+   "show it with the generic editor's tooltips, resize border and drop-downs; " +
+   "examples/showcase is one. Tested in native_window_test (RUN on Windows: a " +
+   "real window, its clock, a host resize, the drop-down, the fallback) and " +
+   "showcase_test (the example's editor rendered and driven headless)",
+   "class NativeEditor"],
   ["gui", "GenericAudioProcessorEditor",
    "gfx/plugin_editor.h -- a row per parameter, so no plugin is faceless",
    "class GenericEditor"],
@@ -1107,7 +1357,11 @@ const MAP = [
    "and a named reason whenever it is neither", "inline EditorChoice chooseEditorBackend"],
   ["gui", "Typeface::createSystemTypefaceFor",
    "gfx/system_font.h -- found on the machine, never shipped, so no font " +
-   "licence rides along in every generated plugin", "inline std::shared_ptr<Typeface> systemTypeface"],
+   "licence rides along in every generated plugin. A character the face lacks " +
+   "-- a preset named in Japanese, a folder in Korean -- is drawn from the " +
+   "faces the desktop falls back to (fallbackTypeface), each asked only about " +
+   "the scripts it is for and read the first time one of their characters " +
+   "needs it", "inline std::shared_ptr<Typeface> systemTypeface"],
 
   // ── gui_basics: the rows this map did not have ──────────────────────
   //
@@ -1126,6 +1380,15 @@ const MAP = [
    "gfx/text_editor.h: caret, selection, character filtering, length limit, " +
    "read-only. Stores UTF-32 because a caret moves over CHARACTERS, so an " +
    "accent is one backspace and not two", "class TextEditor"],
+  ["gui", "TextEditor::setMultiLine (a text field of several lines)",
+   "gfx/text_area.h: TextArea, a separate class, as text_editor.h argues a " +
+   "multi-line field must be: lines wrapped where Unicode's line breaking " +
+   "algorithm allows (Font::wrapLines, the WrappedLine positions wrapText " +
+   "copies from), up and down keeping the caret's x, Home and End by line, " +
+   "Ctrl+Home and Ctrl+End, Page Up and Down, a vertical scroll that follows " +
+   "the caret and the wheel, a selection across lines, a double click for a " +
+   "word and a triple for a paragraph; line breaks stored as LF whatever " +
+   "the clipboard brought", "class TextArea"],
   ["gui", "Viewport (scrolling)",
    "gfx/viewport.h. Scrolls by putting the content at a NEGATIVE position and " +
    "letting the tree's own translate-and-clip do the rest, so there is no " +
@@ -1155,7 +1418,7 @@ const MAP = [
    "Win32 WM_DROPFILES and X11 XDND, both routed to the same component " +
    "interface. XDND is a handshake -- the source waits for an answer BEFORE " +
    "the user may release -- so the X11 peer lights a target on hover where the " +
-   "Win32 one cannot",
+   "Win32 one cannot. macOS is written but never run",
    "isInterestedInFileDrag"],
   ["gui", "ResizableCornerComponent / ComponentBoundsConstrainer",
    "gfx/tooltip.h: a grip that ASKS for a size rather than taking one -- a " +
@@ -1194,8 +1457,9 @@ const MAP = [
    "gfx/png.h over gfx/inflate.h -- DEFLATE written rather than vendored, " +
    "because every length and distance in the stream is attacker-controlled and " +
    "the bounds checks are the point. All five row filters, palettes at 1/2/4/8 " +
-   "bits, 16-bit reduced to 8, tRNS, and multiple IDAT chunks. JPEG " +
-   "deliberately not: a plugin's artwork is flat colour and hard edges",
+   "bits, 16-bit reduced to 8, tRNS, and multiple IDAT chunks. JPEG and GIF " +
+   "are decoded beside it (gfx/jpeg.h, gfx/gif.h; see their row), and " +
+   "gfx/image_format.h tells the three apart by their first bytes",
    "class PngDecoder"],
   ["graphics", "Graphics::drawImageTransformed (rotation and shear)",
    "graphics.h. drawImage honours translation and scale and its own comment " +
@@ -1238,12 +1502,22 @@ const MAP = [
    "which is what a logo drawn square wants -- crisp, and cheap. The general " +
    "one is for when the transform actually turns", "void drawImage"],
   ["graphics", "Drawable / SVG",
-   "gfx/svg.h: paths, the six shape elements, groups with cascading fills and " +
-   "composed transforms, viewBox. The one piece of real geometry is the arc -- " +
-   "SVG states it endpoint-first and a renderer needs centre-first, including " +
-   "the spec's rule that radii too small to span the endpoints are scaled UP " +
-   "rather than producing a NaN. Text, gradients and filters are named as " +
-   "unsupported rather than silently dropped", "class Drawable"],
+   "gfx/svg.h: what Figma, Illustrator, Inkscape and the icon sets write -- " +
+   "the seven shapes, groups, nested viewports, <defs>, <symbol> and <use>; " +
+   "linear and radial gradients with every unit, transform, spread and focal " +
+   "attribute; clip-path and mask; group opacity as a layer; stroke caps, " +
+   "joins, miter limits and dashes; presentation attributes, style= and " +
+   "<style> sheets with type, class and id selectors; every CSS colour " +
+   "spelling and currentColor, which draw() can be handed so an icon takes " +
+   "its colour from the widget. The one piece of real geometry is the arc -- " +
+   "SVG states it endpoint-first and a renderer needs centre-first, " +
+   "including the spec's rule that radii too small to span the endpoints are " +
+   "scaled UP. Checked against resvg: 332 icons and logos found on a " +
+   "development machine, and a file per feature, agree to within a pixel's " +
+   "antialiasing. <text> and <tspan> are drawn too, as DrawableText runs, " +
+   "their faces matched by FontMatcher (see the DrawableText row). Images, " +
+   "patterns, markers, filters and blend modes are named as unsupported rather " +
+   "than silently dropped; a filter is skipped and the element drawn without it", "class Drawable"],
 
   // ── a fifth audit, of gui_basics again ───────────────────────────────────
   //
@@ -1484,18 +1758,61 @@ const MAP = [
    "reading \"-6.0 dB\" over a 0..1 range, slider \"Freq\" reading \"440 Hz\", " +
    "combo box \"Shape\" reading \"Saw\". If that passes a screen reader hears " +
    "it, because that IS what a screen reader does.\n" +
-   "      Not yet: UiaRaiseAutomationEvent, so a value moved by AUTOMATION " +
-   "rather than by the user is announced without being asked for. Named in the " +
-   "header rather than left to be discovered missing",
+   "      And it LISTENS: the focus moving to another control and the focused " +
+   "control's value changing are raised as UIA events from the editor's clock, " +
+   "so a value moved by the host's automation is said without being asked for " +
+   "-- at most four times a second, the last value always. native_window_test " +
+   "registers a client for both and hears the focus land on Gain and -12 then " +
+   "-18 dB as the host moves it",
    "class RootProvider"],
   ["gui", "the accessibility bridge, macOS (NSAccessibility)",
-   "NOT BUILT, and a REAL GAP. The description layer and the Windows bridge " +
-   "between them make this a mechanical mapping -- the same AccessibleInfo, " +
-   "through the Objective-C runtime the Cocoa peer already uses, onto " +
-   "NSAccessibility\'s roles. Not built yet: the Windows bridge was proved by " +
-   "driving it with a real UI Automation client, and the same standard is " +
-   "what this one is held to",
-   false, "NSAccessibilityElement|accessibilityLabel|NSAccessibilityRole"],
+   "gfx/accessibility_mac.h: MacAccessibilityRoot, the NSAccessibility bridge " +
+   "over the same model the UIA bridge reads (accessibility.h), written " +
+   "against the Objective-C runtime as window_cocoa.h is: one " +
+   "NSAccessibilityElement subclass registered with objc_allocateClassPair, " +
+   "one instance per accessible component, KEPT across rebuilds " +
+   "(detail::matchAccessibleNodes, by component and role) because VoiceOver " +
+   "identifies an element by the object -- and told AXUIElementDestroyed when " +
+   "its component goes. Each answers role and subrole, role description, " +
+   "label or title, value (a number for a slider with its text as " +
+   "AXValueDescription, 0 or 1 for a toggle, the text for a field or a " +
+   "choice) and its range, help, frame on the y-up screen, parent, children " +
+   "and window, focused, enabled and selected; and performs AXPress, " +
+   "AXIncrement, AXDecrement and AXShowMenu, takes a value and takes the " +
+   "focus -- through Component::performAccessibleAction, setAccessibleValue " +
+   "and setAccessibleText, i.e. through each control's own key path, one " +
+   "bracketed edit each. Which of those apply to which element is " +
+   "isAccessibilitySelectorAllowed:, read from the description " +
+   "(AccessibleInfo::actions, valueSettable). The roles come from " +
+   "accessibleRoleMapping (AccessibleRoleMapping): ONE table, which " +
+   "uia_win32.h now reads too -- a ComboBox is an AXPopUpButton, a Table an " +
+   "AXList (AXTable promises AXRows as DataGrid promises GridPattern), a " +
+   "ToggleButton AXCheckBox/AXToggle, a Dialog an AXGroup still described as " +
+   "a dialog. Announced on the view\'s clock while a reader is around " +
+   "(isVoiceOverEnabled, or asked in the last 5 s): focus changed, the " +
+   "focused value changed (at most four times a second, the last always), " +
+   "layout changed, element destroyed -- the UIA bridge\'s rules, in " +
+   "detail::AccessibilityAnnouncer. Hooked into window_cocoa.h as " +
+   "uia_win32.h is into window_win32.h: the view is an AXGroup named by " +
+   "setAccessibleWindowName whose children, hit test and focused element " +
+   "come from the bridge, created at open and detached before close. " +
+   "AxPoint, AxSize and AxRect mirror NSPoint, NSSize and NSRect; " +
+   "AppKitAccessibilityApi is the two AppKit C functions it calls, dlsym\'d.\n" +
+   "      RUN on Windows, the half that can be: tests/mac_input_test.cpp " +
+   "drives the role table (UIA\'s ids unchanged, the AX answers expected), " +
+   "every action through real widgets, the element matching, the " +
+   "announcer\'s rate limits and the flip with known numbers; " +
+   "native_window_test still reads Gain, Freq and Shape through a real UIA " +
+   "client with the table behind it. COMPILED, NOT RUN: the bridge itself, " +
+   "with MSVC /W4 and clang against tests/au_shim, for arm64 and x86_64 " +
+   "(tests/mac_syntax_mac_input.cpp). No Mac has executed a line of it. " +
+   "tests/mac_input_selftest.cpp, macOS only, is what a Mac developer runs: " +
+   "it asks AppKit through the attribute API -- the path the accessibility " +
+   "server takes for VoiceOver -- for the tree, performs AXIncrement and " +
+   "AXPress, sets AXValue and AXFocused, hit-tests, and checks every frame " +
+   "against AppKit\'s own conversion. Until somebody has, this is written, " +
+   "not known to work",
+   "class MacAccessibilityRoot"],
   ["gui", "AlertWindow / DialogWindow",
    "gfx/alert.h: AlertOverlay. A plugin had NO way to tell the user anything -- " +
    "a sample that failed to load, a preset from a newer version, an action " +
@@ -1621,7 +1938,8 @@ const MAP = [
    "gfx/effects2d.h: contain, cover, stretch and none, with alignment. " +
    "Drawable::draw uses it rather than its own copy", "struct RectanglePlacement"],
   ["graphics", "Colours (the named table)",
-   "gfx/effects2d.h, and the SVG parser uses it rather than its own thirteen. " +
+   "gfx/effects2d.h: all 148 CSS names and transparent, and the SVG parser " +
+   "uses it rather than its own thirteen. " +
    "Returns a bool, because \"not a name\" and \"the name for black\" are " +
    "different answers", "namespace colours"],
 
@@ -1733,42 +2051,77 @@ const MAP = [
    "never used the word the audit looks for",
    "class PngDecoder"],
   ["graphics", "JPEGImageFormat / GIFImageFormat",
-   "deliberately absent, and png.h has carried the reason since it was " +
-   "written: a plugin's artwork is flat colour and hard edges, which is what " +
-   "PNG is for and what JPEG is worst at -- ringing on every hard edge, and no " +
-   "alpha channel at all, so a knob cannot have a transparent surround. A JPEG " +
-   "decoder is a DCT and a Huffman decoder for a format that would make the " +
-   "art worse. GIF adds a 256-colour palette on top of that.\n" +
-   "      The reason was in the header and not in this map, so the audit " +
-   "counted it as undecided. It was decided; nobody had written it down where " +
-   "the count could see it",
-   null, "JPEGImageFormat|JpegDecoder|GIFImageFormat|GifDecoder"],
+   "gfx/jpeg.h, gfx/gif.h and gfx/image_format.h, written here rather than " +
+   "vendored, for the reason inflate.h was: every length in the file is the " +
+   "attacker's. The argument against was that a plugin's ART is flat colour; " +
+   "what it is handed is not -- a library's cover, a preset's photograph, a " +
+   "user's skin, a designer's animated spinner.\n" +
+   "      JpegDecoder (into JpegImage): baseline, extended and progressive " +
+   "Huffman DCT, any sampling factors 1-4 interleaved or one component per " +
+   "scan, restart markers, greyscale, YCbCr, RGB, Adobe CMYK and YCCK, the EXIF " +
+   "orientation applied or reported; arithmetic, lossless, hierarchical and " +
+   "12-bit refused by name. The arithmetic is libjpeg's -- jidctint's integer " +
+   "IDCT, its fancy 2:1 upsampling with the alternating biases, its fixed-point " +
+   "colour -- so the 26 fixtures (made by tests/data/images/make_images.py: " +
+   "Pillow for the usual files, a small encoder for 4:4:0, 4:1:1, 3x2, mixed " +
+   "sampling, separate scans, 16-bit tables and YCCK) decode to Pillow's " +
+   "libjpeg-turbo output with a max difference of 0. A cut file keeps what " +
+   "arrived and says so in `warning`; a header claiming more blocks than the " +
+   "file has bits is refused before allocating. JpegEncoder writes baseline " +
+   "JFIF at an IJG quality, 4:2:0 or 4:4:4, alpha flattened over a background; " +
+   "Pillow decodes its files to the same bytes this decoder does.\n" +
+   "      GifDecoder (into GifImage and GifFrame): 87a and 89a, global, local " +
+   "and absent colour tables, LZW at every code size including a full table " +
+   "carried on without a clear, interlacing, transparency, the NETSCAPE2.0 " +
+   "loop count, and every frame COMPOSITED with its delay and GifDisposal, " +
+   "disposal as the browsers do it. Six fixtures, fourteen frames, " +
+   "pixel-exact against Pillow's frames. ImageFileFormat sniffs PNG, JPEG and " +
+   "GIF by signature into one DecodedImage, and names WebP, BMP, TIFF, HEIC, " +
+   "AVIF and ICO in its refusal. tests/images_test.cpp; tests/fuzz_images.cpp " +
+   "ran 72,059 mutated cases of the 25 fixtures under ASan with a per-case " +
+   "deadline, none crashing or hanging. Run on Windows (MSVC, /W4 clean, " +
+   "after a bare windows.h too); macOS and Linux compiled only -- there is no " +
+   "platform code in them",
+   "class JpegDecoder"],
   ["graphics", "ImageType / NativeImageType / SoftwareImageType",
-   "out of scope, and it is the same decision the opengl row makes. The reference " +
-   "has these because an Image may live on the GPU or in main memory and the " +
-   "code drawing it must not care. Everything here is software-rasterised into " +
-   "one premultiplied RGBA Bitmap, on purpose -- identical pixels on every " +
-   "machine, no context to lose, nothing to fail to initialise in a VM. With " +
-   "one backing there is nothing for the abstraction to abstract",
-   null, "class ImageType|NativeImageType|SoftwareImageType"],
+   "gfx/image.h: ImageType with create, getTypeID and convert, and the two " +
+   "types the reference has, as thin types over Bitmap. Everything here is " +
+   "software-rasterised into one premultiplied RGBA Bitmap on purpose -- " +
+   "identical pixels on every machine, no context to lose -- and what a window " +
+   "peer blits IS that bitmap, so NativeImageType and SoftwareImageType make " +
+   "the same thing and say so by type ID. They exist so code written against " +
+   "the reference's Image(format, w, h, clear, type) has somewhere to land. " +
+   "create always clears: memory that held another plugin's pixels is not an " +
+   "optimisation. Tested in images_test (cleared, sized, convert is a copy); " +
+   "run on Windows, compiled only elsewhere",
+   "class SoftwareImageType"],
   ["graphics", "ImageCache",
-   "deliberately absent: the reference caches decoded images by file hash because its " +
-   "Image can be loaded from a path anywhere, repeatedly, by code that does not " +
-   "know it is repeating. Nothing here decodes during paint -- a plugin decodes " +
-   "its art once when the editor is built and holds the Bitmap -- so a cache " +
-   "would be a lookup on a thing already held.\n" +
-   "      It would become real if a plugin ever decoded per frame, which is a " +
-   "bug rather than a use case",
-   null, "class ImageCache"],
+   "gfx/image.h: shared pointers to decoded Bitmaps by file path (with its " +
+   "size and modification time, so an image edited on disk is decoded again), " +
+   "by an FNV-1a hash of encoded bytes, or by an id: getFromFile, " +
+   "getFromMemory, getFromHashCode, addImageToCache, setCacheTimeout, " +
+   "releaseUnusedImages, as the reference names them, plus a byte budget. The " +
+   "reason it is real now: an editor is opened and closed many times, and " +
+   "several instances show the same art, so the same decode was repeated per " +
+   "editor per instance. The reference's rule for letting go -- unheld, and " +
+   "neither held nor asked for within the timeout, five seconds by default -- " +
+   "and past the budget the least recently used unheld image goes; one still " +
+   "held is never evicted, because dropping the cache's pointer frees nothing. " +
+   "No timer thread: each call purges, and purge() is there for an editor's " +
+   "timer. Decoding happens outside the lock. images_test drives it on an " +
+   "injected clock: shared decodes, expiry only when unheld, the budget's " +
+   "eviction order. Run on Windows, compiled only elsewhere",
+   "class ImageCache"],
   ["graphics", "ScaledImage",
-   "deliberately absent as an object: an image bundled with the scale it was " +
-   "drawn for, so @2x art picks itself on a HiDPI screen. The pieces are here " +
-   "and are the honest ones -- Backing knows the device scale, drawImage and " +
-   "drawImageTransformed take arbitrary transforms -- and a plugin with two " +
-   "sizes of art chooses on Backing::scale.\n" +
-   "      Not wrapped up, because the wrapper's value is in the reference's ecosystem of " +
-   "components that accept one. Nothing here accepts one",
-   null, "class ScaledImage"],
+   "gfx/image.h: a Bitmap with the scale it was drawn for -- getImage, " +
+   "getScale, getScaledBounds as the reference has them -- drawn at the " +
+   "LOGICAL size the art means (drawAt, drawWithin), so @2x art is a device " +
+   "pixel per pixel on a 2x Backing and the right size on a 1x one. pickFor " +
+   "chooses among renditions for a density, as Backing::scale reports it: the " +
+   "smallest at least that dense, else the densest. images_test draws @2x art " +
+   "at 1x and under a 2x transform and checks the edges land on the logical " +
+   "size. Run on Windows, compiled only elsewhere",
+   "class ScaledImage"],
   ["graphics", "EdgeTable / PathFlatteningIterator",
    "gfx/graphics.h and gfx/path.h, as the rasteriser's own internals. Curves " +
    "are flattened to line segments with an error tolerance and scan-converted " +
@@ -1783,22 +2136,90 @@ const MAP = [
    "is where an inset is actually applied here, so the layout engine's word won",
    "struct Margin"],
   ["graphics", "Parallelogram",
-   "deliberately absent: the reference uses it to describe an image's destination under " +
-   "an affine transform, as three corners. drawImageTransformed takes the " +
-   "Transform itself, which says the same thing in the form the rasteriser " +
-   "already needs and cannot describe a shape the transform could not produce",
-   null, "class Parallelogram|struct Parallelogram"],
+   "gfx/parallelogram.h: three corners, the fourth derived, so it cannot be " +
+   "built as anything but a parallelogram. getBottomRight, getWidth, " +
+   "getHeight, getBoundingBox, getRelativePoint, transformedBy and isEmpty as " +
+   "the reference has them, and what the corners are for here: contains and " +
+   "toRelative (half-open, as Rect::contains), area, toPath, and " +
+   "transformFrom -- the Transform that puts a source rectangle's corners on " +
+   "these, which is how a picture is placed by where its corners LAND and " +
+   "handed to drawImageTransformed. DrawableText's box is one. images_test: a " +
+   "rotated box's bounds, a sheared one's containment following the lean, " +
+   "every corner landing through transformFrom, and an image drawn through it " +
+   "filling the shape and nothing else. Run on Windows, compiled only elsewhere",
+   "struct Parallelogram"],
   ["graphics", "GlyphArrangement / PositionedGlyph / TypefaceMetrics / FontOptions",
    "gfx/font.h, inside Font rather than beside it. A run of text is walked once " +
    "with kerning and advance widths accumulated, and each glyph appended to a " +
    "Path at its pen position -- which is a glyph arrangement, built and " +
    "consumed in one pass. The reference keeps the arrangement because its text can be " +
    "hit-tested, re-justified and edited in place after layout.\n" +
-   "      The one place that genuinely needs positions per glyph is the text " +
-   "editor's caret, and it asks Font for the width of a prefix, so measuring " +
-   "and drawing cannot disagree -- which is the failure an arrangement object " +
-   "exists to prevent and is prevented here by there being one code path",
+   "      The one place that genuinely needs positions per character is the " +
+   "text editor's caret, and Font::layoutCharacters gives them -- a " +
+   "CharacterLayout, each character's extent, direction and whether a caret " +
+   "may stand before it, from the same walk that draws -- so measuring and " +
+   "drawing cannot disagree, in shaped and right-to-left text as in the rest: " +
+   "the failure an arrangement object exists to prevent, prevented here by " +
+   "there being one code path",
    "class Font"],
+  ["graphics", "line breaking (the reference's word wrap, Unicode's UAX #14)",
+   "gfx/line_break.h: findLineBreaks gives each boundary of a text as LineBreak -- " +
+   "None, Allowed or Mandatory -- by the Unicode Line Breaking Algorithm, its " +
+   "rules LB1 to LB31 with UAX #14's number tailoring; Font::wrapText fills lines " +
+   "greedily at those breaks, spaces hanging past the end, and breaks a word " +
+   "too long for its line at its clusters. Checked against Unicode's " +
+   "LineBreakTest: all 7,654 cases. Thai, Lao, Khmer and Myanmar words are not " +
+   "split without a dictionary, which this has not got: they wrap at spaces, " +
+   "and a word too long at its clusters",
+   "inline std::vector<LineBreak> findLineBreaks"],
+  ["graphics", "bidirectional text (the reference's text layout, Unicode's UAX #9)",
+   "gfx/bidi.h: BidiParagraph -- the whole algorithm, explicit embeddings, " +
+   "overrides and isolates, the weak and neutral rules, bracket pairs, the " +
+   "line rules and mirroring. Checked against Unicode's BidiCharacterTest: all " +
+   "91,707 paragraphs. Font runs a string through it whenever it holds a " +
+   "right-to-left letter, so a preset named in Hebrew reads right to left with " +
+   "its numbers and Latin words where a reader expects them",
+   "class BidiParagraph"],
+  ["graphics", "complex-script shaping: Arabic, Hebrew, Thai, Lao, Hangul, and every script that needs no reordering",
+   "gfx/text_shaper.h: shapeRun into ShapedGlyph -- GSUB and GPOS with every " +
+   "lookup type, lookup flags, GDEF classes and mark filtering sets; " +
+   "HarfBuzz's feature stages, normalisation and mark ordering; Arabic " +
+   "joining; Thai and Lao SARA AM and the private-use marks of old Thai " +
+   "fonts; Hangul syllables composed where the font has them and jamo " +
+   "features where it has not; marks a font cannot place, placed by their " +
+   "class. Compared glyph by glyph with HarfBuzz on the system fonts of a " +
+   "Windows machine: all of 336,000 random Arabic, Hebrew, Latin, Greek and " +
+   "Cyrillic strings, 45,000 on fonts with no GPOS, and 31,500 Thai, Lao and " +
+   "Hangul, identical. Font shapes a string that needs it -- right-to-left " +
+   "letters, combining marks, joiners, SARA AM, jamo -- per run of one level, " +
+   "face and script; anything else is drawn a glyph per character as before",
+   "inline std::vector<ShapedGlyph> shapeRun"],
+  ["graphics", "complex-script shaping: the Indic, Khmer and Myanmar shapers",
+   "gfx/text_shaper.h: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, " +
+   "Telugu, Kannada and Malayalam, Khmer and Myanmar, as HarfBuzz shapes them -- " +
+   "the syllables found by its grammars, compiled to state machines by " +
+   "scripts/unicode/gen_syllables.py; broken clusters given a dotted circle; " +
+   "the base consonant, reph, half, below, post and pre-base forms found by " +
+   "asking the font's lookups, the syllable reordered, the basic features " +
+   "applied a stage each within it, the final reordering, the presentation " +
+   "forms. Both Indic specifications, 'dev2' and the old 'deva'. Compared glyph " +
+   "by glyph with HarfBuzz: 27,000 random syllables on Nirmala UI across the " +
+   "nine scripts, 20,000 Khmer and Myanmar on Leelawadee UI and Myanmar Text, " +
+   "all identical, and four fonts built for the tests -- old and new " +
+   "Devanagari, Khmer, Myanmar -- whose output sdk_tests checks",
+   "void indicInitialSyllable"],
+  ["graphics", "complex-script shaping: the Universal Shaping Engine",
+   "gfx/text_shaper.h: the eighty-odd scripts HarfBuzz sends to its Universal " +
+   "Shaping Engine -- Balinese, Javanese, Tibetan, Sinhala, Mongolian, N'Ko, " +
+   "Adlam and the rest -- with its categories (scripts/unicode/gen_use.py, from " +
+   "the UCD and Microsoft's additions), its syllables, the repha and pre-base " +
+   "forms recorded as the font makes them, its reordering, and the joining " +
+   "forms -- Arabic's analysis for the scripts that join, syllable by syllable " +
+   "for the rest. Compared glyph by glyph with HarfBuzz on the system fonts " +
+   "covering twenty-one of them: 48,000 random syllables identical but for " +
+   "Batak's two killers, which Unicode 17 made reordering killers and the UCD 15 " +
+   "tables here do not",
+   "void useReorderSyllable"],
   ["gui", "HostProvidedContextMenu (right-click a parameter)",
    "EditorHost::showContextMenu in gfx/plugin_editor.h, reaching " +
    "showHostContextMenu in both wrappers -- clap_host_context_menu, and " +
@@ -1824,7 +2245,8 @@ const MAP = [
    "right parameter and leaves its value alone, while a LEFT click at the very " +
    "same point moves it -- which is what makes \"did not move\" mean " +
    "\"declined\" instead of \"missed\". Control-click is the same gesture on a " +
-   "Mac and Cocoa routes it to rightMouseDown: for us",
+   "Mac and Cocoa routes it to rightMouseDown: for us, though that half is " +
+   "unverified like the rest of that file",
    "virtual void contextMenu"],
   ["gui", "ButtonParameterAttachment",
    "gfx/plugin_editor.h: ButtonAttachment, and GenericEditor builds a toggle " +
@@ -1855,33 +2277,107 @@ const MAP = [
    "plugin rather than assembled from the reference widgets",
    "sonore.params"],
   ["core", "PluginHostType",
-   "deliberately absent: the reference's way of asking WHICH host you are in, so a " +
-   "plugin can work around a named DAW's quirks. Deliberate because the " +
-   "workarounds are the problem -- a plugin branching on the host is a plugin " +
-   "with a code path per DAW, most of which nobody can test, and each one " +
-   "outliving the bug it was written for by years.\n" +
-   "      Where a host difference is real it belongs in the WRAPPER, behind a " +
-   "capability question rather than a name: does this host offer a context " +
-   "menu extension, does it answer gui_request_resize, did it give us a frame. " +
-   "Every one of those is asked here already, and each is true or false about " +
-   "the host in front of us rather than about a name we recognised",
-   null, "class PluginHostType|whichHost|isAbletonLive|isLogic"],
-  ["core", "Plugin HOSTING: KnownPluginList, PluginDirectoryScanner, PluginListComponent, " +
-           "AudioUnitPluginFormat, LADSPAPluginFormat, LV2PluginFormat, VSTPluginFormat",
-   "out of scope, and it is the largest single block of the reference that is. These " +
-   "are for an application that LOADS plugins -- scanning directories, keeping " +
-   "a list, showing the user a chooser, and implementing each format from the " +
-   "host's side. This SDK is the other end of that pipe: it makes the thing " +
-   "those classes load.\n" +
-   "      Worth naming rather than leaving unmentioned, because a count of " +
-   "audio_processors that treated these as missing capabilities would " +
-   "make the module look half covered when the half that applies is complete",
-   null, "class KnownPluginList|class PluginDirectoryScanner|class VSTPluginFormat"],
+   "plugin_host_type.h: PluginHostType -- which host loaded the plugin, and as " +
+   "which format. Capability questions in the wrappers remain the first answer " +
+   "to a host difference (does it offer a context menu, does it answer " +
+   "gui_request_resize); this exists for the differences that are not " +
+   "capabilities -- a host exceeding the block size it reported -- and for " +
+   "ported code that asks isReaper(). It classifies, in order, the macOS " +
+   "bundle identifier, the executable's name and path (the reference's method, " +
+   "and the only one an LV2 instance has, or an AU one whose host does not " +
+   "name itself; helper processes such as " +
+   "BitwigPluginHost and reaper_host64 still classify), and the name the host " +
+   "reported in HostInfo, which is how the SDK's own standalone is known. The " +
+   "reference's checks by its names -- isAbletonLive, isBitwigStudio, isCubase, " +
+   "isCubase7orLater, isCubaseBridged, isLogic, isProTools, isFruityLoops, " +
+   "isStudioOne, isReaper, isWavelabLegacy and the rest -- plus CLAP-era hosts " +
+   "it predates (clap-validator, Carla, Audacity, Zrythm). The version comes " +
+   "from the Windows version resource (ProductVersion, through version.dll " +
+   "loaded at run time, so nobody links version.lib), from " +
+   "CFBundleShortVersionString on macOS, else from what the host reported. " +
+   "getPluginLoadedAs() reads the format from the MODULE's own path (.clap, " +
+   ".vst3, .component, .appex, .lv2, or the executable itself for the " +
+   "standalone), because one binary of this SDK carries several entry points.\n" +
+   "      Logic's AUHostingService process is not Logic and is not called " +
+   "Logic: the AU wrapper reads kAudioUnitProperty_AUHostIdentifier, the name " +
+   "and version the host sets, into HostInfo and sendHostInfo(), so it " +
+   "classifies by the reported name; a host that never sets the property " +
+   "leaves it unknown rather than " +
+   "guessed. The wrapper's case is compiled only (au_shim); turning the " +
+   "name and NumVersion into HostInfo is RUN in sdk_tests. " +
+   "Tested in tests/plugin_state_test.cpp, RUN on Windows: 38 executables, " +
+   "bundles and reported names; module paths for every format; the installed " +
+   "REAPER's real version resource read (not launched); this process. macOS " +
+   "(against tests/au_shim) and Linux: compiled only",
+   "class PluginHostType"],
+  ["core", "PluginListComponent",
+   "gfx/plugin_list.h: PluginListComponent, a view of a PluginCache -- which " +
+   "already is the KnownPluginList, saved as a text file with its blacklist -- " +
+   "drawn as a gfx/table.h TableListBox of name, format, category and " +
+   "manufacturer, with Scan and Remove buttons. Sorting by any column keeps " +
+   "blacklisted files listed at the bottom; the category is the first word of " +
+   "a format's own vocabulary that is not plumbing (CLAP features, VST3 " +
+   "subcategories, LV2 classes). Removing a plugin drops its file's stamp " +
+   "(PluginCache::removePlugin) so a rescan finds it again; removing a " +
+   "blacklisted row forgives the file; every change is saved at once.\n" +
+   "      Scanning is in-process with plugin_cache.h's dead man's switch, now " +
+   "for any list of files (scanFilesCached), not only one folder: this SDK " +
+   "starts no scanner subprocess (see the ChildProcessCoordinator row), and a " +
+   "host that died inside a plugin blacklists it on the next start. Tested " +
+   "RUN on Windows: a crash mark left on disk blacklisting a library without " +
+   "opening it, save and restore, rendering into a bitmap, header clicks " +
+   "sorting both ways, remove/rescan/forgive/clear/removeMissing. macOS " +
+   "(against tests/au_shim, which gained dirent.h for it) and Linux: compiled " +
+   "only",
+   "class PluginListComponent"],
+  ["core", "LADSPAPluginFormat",
+   "host.h: LADSPAPluginFormat and LadspaPlugin, a HostedPlugin like the other " +
+   "three formats, so loadPlugin(), PluginGraph and PluginCache take LADSPA " +
+   "descriptions as they take the rest. ladspa_abi.h declares the ABI -- " +
+   "ladspa::Descriptor, ladspa::PortRangeHint, the port and hint flags, the " +
+   "ladspa_descriptor entry point -- written from the specification rather " +
+   "than taken from the LGPL header, with unsigned long kept where the ABI has " +
+   "it. Control inputs are parameters with the specification's default rules " +
+   "(the geometric low/middle/high under a logarithmic hint, bounds scaled by " +
+   "the sample rate, toggles and integers stepped); a control output called " +
+   "\"latency\" is the latency, as Linux hosts agree; state is the control " +
+   "values keyed by port index. Searched in LADSPA_PATH, else the usual Linux " +
+   "and macOS folders; Windows has no convention, so LADSPA_PATH or a folder " +
+   "the caller names.\n" +
+   "      RUN on Windows against a LADSPA library the test builds as a DLL " +
+   "(tests/ladspa_gain_plugin.cpp: a mono dB gain with an invert toggle, and a " +
+   "stereo plugin with a latency port, an integer control and rate-relative " +
+   "bounds): -6 dB measured through the plugin to 5e-8, a mono plugin heard on " +
+   "both sides of a stereo bus, state saved and restored into a second " +
+   "instance. The state decoder and the hint rules are fuzzed under ASan -- " +
+   "which found a one-sided bound of 1e30 giving an empty range, now treated " +
+   "as no bound. The test library builds as a .so too; Linux and macOS: " +
+   "compiled only here",
+   "class LADSPAPluginFormat"],
+  ["core", "VSTPluginFormat",
+   "deliberately never: hosting VST2 needs the VST2 SDK, which Steinberg " +
+   "stopped licensing in 2018, and a host built on a reconstruction of it " +
+   "carries the same risk a VST2 plugin would (see the VST2 wrapper row). The " +
+   "rest of plugin hosting is built -- host.h loads CLAP, VST3, LV2 " +
+   "(LV2PluginFormat), LADSPA and, on macOS, Audio Units (host_au.h, in its " +
+   "own row), scanDirectory() is the PluginDirectoryScanner, PluginCache the " +
+   "KnownPluginList, PluginGraph the AudioProcessorGraph",
+   null, "class VSTPluginFormat"],
   ["gui", "NSViewComponentWithParent",
-   "out of scope: the reference's workaround for hosting a plugin's NSView inside its " +
-   "own view hierarchy on macOS, which is a HOST's problem. Our Cocoa peer is " +
-   "the plugin end -- it is handed a parent NSView and puts one view in it",
-   null, "NSViewComponentWithParent"],
+   "gfx/nsview_component.h: a component holding any NSView -- a hosted plugin's " +
+   "editor, a system control -- inside a parent NSView of its own, which it places " +
+   "in the Cocoa peer's view at its root-relative bounds, hides with it, and moves " +
+   "to whichever open peer shows its tree (NativeWindowCocoa::viewShowing). The " +
+   "child fills the parent, and when the child resizes itself the component " +
+   "follows, which is the reference's reason for the class. Re-placed on every " +
+   "resize and by a 30 Hz timer, because the tree has no move or visibility " +
+   "listener. This row used to say a host's problem; host_au.h made this SDK a " +
+   "host whose plugins have NSView editors.\n" +
+   "      COMPILED for macOS against tests/au_shim, NEVER RUN: no Mac here; " +
+   "mac_host_selftest.cpp embeds a plain NSView in a peer and checks where it " +
+   "went. Off macOS the class exists and setView() refuses with a reason, and the " +
+   "placement arithmetic is RUN on Windows by mac_host_test.cpp",
+   "class NSViewComponentWithParent"],
   ["gui", "FocusTraverser / KeyboardFocusTraverser",
    "gfx/component.h: MouseRouter's tab order, which walks the tree in child " +
    "order and skips anything that does not want keyboard focus. The reference splits " +
@@ -1903,7 +2399,7 @@ const MAP = [
    "piece would be the thing that justified splitting them",
    "class TextEditor"],
   ["gui", "TextInputTarget (IME / composed text input)",
-   "PARTIAL, on purpose, and the split follows what can be run here.\n" +
+   "Built on all three platforms, run on one.\n" +
    "      Component::caretBounds is the portable half -- the reference calls the " +
    "equivalent TextInputTarget -- and TextEditor answers it with the SAME " +
    "arithmetic paint() draws the caret from, so a candidate list cannot end up " +
@@ -1915,11 +2411,12 @@ const MAP = [
    "already works. It positions and then FALLS THROUGH rather than returning: " +
    "DefWindowProc is what actually shows the candidate list, and swallowing " +
    "the message would leave the user with none at all.\n" +
-   "      X11 and macOS: still absent. No XOpenIM/XCreateIC, no " +
-   "NSTextInputClient. Same rule as the macOS accessibility bridge -- neither " +
-   "can be run from here, and IME is a feature whose entire behaviour is what " +
-   "a user sees while composing, so code for it that has never been typed into " +
-   "is code nobody has tested.\n" +
+   "      X11 and macOS: built, compiled and NOT run -- see the row \"IME on " +
+   "X11 and macOS\": the Cocoa view is an NSTextInputClient and the X11 peer " +
+   "opens an XIM input context, both feeding the TextInputSession composition " +
+   "model (gfx/text_input.h) that TextEditor and TextArea draw inline. IME is a " +
+   "feature whose behaviour is what a user sees while composing, so until " +
+   "someone has typed into it on those systems it is code nobody has tested.\n" +
    "      What is proved on Windows is the half that can be: the point handed " +
    "to imm32 is beside the caret of the focused field in device pixels, " +
    "asserted through a real window with a real focused editor -- because the " +
@@ -1929,13 +2426,60 @@ const MAP = [
    "composing",
    "compositionPoint"],
   ["gui", "IME on X11 and macOS",
-   "NOT BUILT, and a REAL GAP -- the remaining two thirds of TextInputTarget " +
-   "above. X11 needs XOpenIM and an XIC per window with the spot location set " +
-   "from the caret; macOS needs the view to implement NSTextInputClient, which " +
-   "is a protocol with a dozen methods and no shortcut.\n" +
-   "      Blocked on the same thing as the accessibility bridge and honest for " +
-   "the same reason: neither platform runs in this loop",
-   false, "XCreateIC|XOpenIM|NSTextInputClient"],
+   "gfx/text_input.h: TextInputTarget, TextComposition and TextInputSession, " +
+   "the composition model all three input-method paths share. A field " +
+   "(TextEditor, TextArea) shows an input method\'s composition underlined " +
+   "at its caret, the clause being converted heavier, and never in its value " +
+   "until it is committed; a click, a key or losing the focus commits it " +
+   "first. TextInputSession is NSTextInputClient\'s arithmetic over any " +
+   "target -- UTF-16 ranges (TextRange16, NSNotFound) against code points, " +
+   "an emoji never split, replacement ranges mapped out of the shown text, " +
+   "the first rect widened along one line -- and XIM\'s preedit edits (a " +
+   "change at a position, caret directions, the clause from feedback). " +
+   "focusedCaretInRoot is the caret conversion all three use; window_win32.h\'s " +
+   "compositionPoint now calls it.\n" +
+   "      macOS (window_cocoa.h): the view ADOPTS NSTextInputClient " +
+   "(class_addProtocol -- without it -[NSView inputContext] is nil) and " +
+   "implements insertText:replacementRange:, " +
+   "setMarkedText:selectedRange:replacementRange:, unmarkText, " +
+   "selectedRange, markedRange, hasMarkedText, " +
+   "attributedSubstringForProposedRange:actualRange:, " +
+   "validAttributesForMarkedText, firstRectForCharacterRange:actualRange: " +
+   "(the caret, on the y-up screen), characterIndexForPoint: and " +
+   "doCommandBySelector: (the key, as the KeyPress it always was). keyDown: " +
+   "goes through interpretKeyEvents: while a writable text field has the " +
+   "focus and no Command or Control shortcut is meant; a click " +
+   "mid-composition goes to the input context first; a focus change " +
+   "discards the input method\'s state. inputMethodStatus() says whether the " +
+   "protocol was adopted.\n" +
+   "      X11 (window_x11.h): XOpenIM after XSetLocaleModifiers(\"\"), lazily, " +
+   "when a text field first has the focus; XCreateIC preferring on-the-spot " +
+   "(XIMPreeditCallbacks, drawn through the model), then over-the-spot " +
+   "(XIMPreeditPosition at XNSpotLocation, the caret), then root-window -- " +
+   "over-the-spot first when the locale is not UTF-8, because Xlib converts " +
+   "the preedit into it; XFilterEvent on every event; Xutf8LookupString for " +
+   "committed text, a converted word committed whole in place of the " +
+   "preedit; XSetICFocus and XUnsetICFocus with the window\'s focus and a " +
+   "text field\'s; XNDestroyCallback and an instantiate callback for a server " +
+   "that dies or starts late; SONORE_XIM_STYLE and SONORE_X11_NO_IME to steer " +
+   "it. Every failure is in inputMethodStatus() and said once on stderr.\n" +
+   "      RUN on Windows: tests/mac_input_test.cpp drives the model against " +
+   "real TextEditor and TextArea instances -- marked and selected ranges, " +
+   "surrogate pairs, replacement ranges, rectangles on a TextArea\'s second " +
+   "line, the field\'s filter and length limit on commit, focus, click, key " +
+   "and setText interrupting a composition, XIM preedit draws and caret " +
+   "moves -- 113 checks with the accessibility ones, clean under " +
+   "AddressSanitizer; native_window_test still places the Windows " +
+   "composition point beside the caret. COMPILED, NOT RUN: the macOS half " +
+   "(au_shim, arm64 and x86_64, MSVC and clang) and the X11 half (the real " +
+   "Xlib.h, MSVC and clang). There is no Mac, no X server and no input " +
+   "method here, and the Xvfb x11_window_test runs under has no input " +
+   "method server. tests/mac_input_selftest.cpp drives NSTextInputClient " +
+   "through the view and a real keyDown:; tests/x11_input_selftest.cpp " +
+   "prints what was negotiated, checks the spot is the caret, and echoes " +
+   "every composition and commit while a developer types. Until somebody " +
+   "has typed into them, both are written, not known to work",
+   "class TextInputSession"],
   ["gui", "ModalComponentManager",
    "gfx/alert.h: Overlay and AlertOverlay, which are drawn INSIDE the editor " +
    "and take the mouse while they are up. The reference needs a manager because its " +
@@ -1944,23 +2488,55 @@ const MAP = [
    "running, and the transport keeps going while the DAW stops answering",
    "class AlertOverlay"],
   ["gui", "CachedComponentImage / ComponentPaintDiagnostics",
-   "deliberately absent. CachedComponentImage keeps a component's rendering in " +
-   "a bitmap so a repaint can blit instead of redraw -- worth it in the reference " +
-   "because a paint may go through a GPU context with real per-call cost. Here " +
-   "a repaint is a software rasteriser writing into one bitmap, and only the " +
-   "damaged region is touched: the cache would be a second copy of pixels to " +
-   "keep in step with the first.\n" +
-   "      ComponentPaintDiagnostics flashes repainted areas for debugging. The " +
-   "region test does the same job by assertion instead of by eye -- it checks " +
-   "WHICH rectangles were marked dirty, which is the thing the flashing is for " +
-   "working out",
-   null, "class CachedComponentImage|ComponentPaintDiagnostics"],
+   "gfx/component_listeners.h: CachedComponentImage, the interface a " +
+   "component's cache implements; gfx/cached_image.h: " +
+   "StandardCachedComponentImage, what Component::setBufferedToImage(true) " +
+   "installs. The subtree is rendered into a Bitmap at DEVICE resolution " +
+   "with the direct paint's own transform shifted by whole pixels, so its " +
+   "antialiasing is the direct paint's -- re-rendered when the scale or the " +
+   "sub-pixel phase changes, never stretched. repaint() of the component or " +
+   "anything inside it invalidates every cached ancestor, by rectangle, " +
+   "BEFORE the is-it-showing test (a change inside a hidden panel must not " +
+   "be served stale later); only the invalid rectangles are re-rendered, " +
+   "through the same damage walk the window uses; a move by whole device " +
+   "pixels keeps the cache.\n" +
+   "      Tested at 1x, 1.25x, 1.5x and 2x: an opaque buffered panel is " +
+   "pixel-identical to direct painting, translucent within one level (8-bit " +
+   "over is associative only up to rounding), a second paint does not call " +
+   "paint(), a child's repaint invalidates the parent, and the damage path " +
+   "through Backing at 1.25x matches the unbuffered tree.\n" +
+   "      gfx/paint_diagnostics.h: ComponentPaintDiagnostics, a " +
+   "ComponentPaintObserver (component_listeners.h, one pointer test per " +
+   "paint while none is installed) timing each component's own paint() on an " +
+   "injectable clock -- count, total, last, max, a text report -- and " +
+   "optionally flashing every repainted region with a translucent colour " +
+   "that changes each frame. Tested: exact timings on a fake clock; the " +
+   "flash tints exactly the damaged region and nothing else. " +
+   "Platform-independent; RUN on Windows",
+   "class StandardCachedComponentImage"],
   ["gui", "LookAndFeel_V1 / V2 / V3 / V4",
-   "out of scope: the reference carries four historical skins so old projects keep " +
-   "looking as they did. This SDK has one LookAndFeel and its first release " +
-   "has not happened, so there is no old appearance to preserve -- and a " +
-   "generated plugin that wanted a different look overrides the one there is",
-   null, "LookAndFeel_V1|LookAndFeel_V2|LookAndFeel_V3|LookAndFeel_V4"],
+   "gfx/lookandfeel_versions.h: the reference's four generations of default " +
+   "look as LookAndFeel subclasses, so a port keeps the face its users know. " +
+   "LookAndFeel_V1 grey, square and bevelled (light top-left, dark " +
+   "bottom-right, inverted when pressed; pie-segment knob, block thumb on a " +
+   "sunken groove); LookAndFeel_V2 glossy -- lavender 0xbbbbff glass lozenge " +
+   "buttons, sphere thumbs on a shadowed groove, ring-segment knob, white " +
+   "popups with the 0x991111aa highlight; LookAndFeel_V3 V2 with the gloss " +
+   "taken off; LookAndFeel_V4 drawn from a nine-colour ColourScheme with the " +
+   "reference's dark, midnight, grey and light tables verbatim, arc knobs " +
+   "swept +-0.8 pi, round thumbs on line tracks, pill scroll thumbs.\n" +
+   "      Every one draws only through the existing LookAndFeel virtuals -- " +
+   "sliders, bars, buttons, combo boxes, scroll bars, text fields, tabs, " +
+   "popups, tooltips, progress bars, range sliders, icon buttons -- so the " +
+   "widgets need nothing new. Shapes are faithful in form (bevel, gloss, " +
+   "flatness, arcs), drawn by this SDK's rasteriser rather than " +
+   "pixel-identical to a renderer it does not have. Tested: each of V1, V2, " +
+   "V3 and V4 in all four schemes renders a standard set of eighteen control " +
+   "drawings with tens of thousands of pixels of ink, all eight results " +
+   "(with the default) pairwise different; real Slider and Button widgets " +
+   "inherit each look from a parent. RUN on Windows; platform-independent " +
+   "drawing",
+   "class LookAndFeel_V4"],
   ["gui", "BubbleComponent",
    "gfx/alert.h: CallOutBox, which is the same thing -- content in a rounded " +
    "box with a tail pointing at whatever raised it. One name, because two " +
@@ -1980,21 +2556,53 @@ const MAP = [
    "widget makes it, which is what keeps the ring identical across controls",
    "paintFocusRing"],
   ["gui", "DrawableComponent / OwningDrawableComponent",
-   "deliberately absent as separate classes: a Component whose whole job is to " +
-   "draw a Drawable. gfx/svg.h's Drawable::draw takes a Graphics and a " +
-   "rectangle, so a component that shows one is two lines in its own paint() " +
-   "-- and a plugin's artwork is nearly always drawn as part of a background " +
-   "rather than as a component of its own. ImageComponent exists for the " +
-   "bitmap case because a bitmap also needs placement and scaling rules",
-   null, "class DrawableComponent|OwningDrawableComponent"],
+   "gfx/drawable_component.h: DrawableComponent shows a Drawable (gfx/svg.h) " +
+   "it REFERENCES, as ImageComponent references its Bitmap -- an icon set " +
+   "parsed once is drawn by many components; OwningDrawableComponent holds " +
+   "its own, set directly or parsed from an SVG string (setSvg, refusing one " +
+   "with nothing visible in it). Placement is RectanglePlacement " +
+   "(effects2d.h), the same rules ImageComponent uses, against the viewBox " +
+   "-- Contain, Cover, None and a real Stretch, drawn through a non-uniform " +
+   "scale so the file's own aspect rule cannot letterbox it -- or the SVG's " +
+   "own preserveAspectRatio. currentColor can be set. Clicks pass through, " +
+   "as for any picture.\n" +
+   "      Tested on a 100x50 red viewBox in a 200x200 component: Contain gives " +
+   "rows 50..150, Cover and Stretch fill, None is 100x50 centred, None " +
+   "aligned left/bottom lands at 0..100 x 150..200. RUN on Windows; " +
+   "platform-independent",
+   "class OwningDrawableComponent"],
   ["gui", "MouseInputSource / PenDetails",
-   "deliberately absent: the reference models several simultaneous pointers, and a " +
-   "stylus with pressure and tilt, because it targets tablets. A plugin editor " +
-   "has one pointer -- every host embeds it in a desktop window -- and a second " +
-   "one would need every control to decide what two simultaneous drags on it " +
-   "mean. Pressure would be worth having the day this targets a tablet, and " +
-   "that is a change of answer rather than a change of effort",
-   null, "class MouseInputSource|struct PenDetails"],
+   "gfx/component.h: MouseEvent gains, additively and defaulted to a plain " +
+   "mouse, sourceType (Mouse/Touch/Pen), sourceIndex, pressure (negative " +
+   "when unreported), orientation, PenDetails (rotation, tiltX, tiltY, " +
+   "eraser, barrel button) and eventComponent; a peer that knows sets them " +
+   "on the router with setPointerInput (a PointerInput) for the length of " +
+   "one call, so every existing caller and test still delivers mouse events " +
+   "unchanged. gfx/mouse_input.h: MouseInputSource per pointer and " +
+   "MouseInputSources, the process's list, which dispatches PointerSample " +
+   "reports -- the PRIMARY pointer through the router (capture, focus, " +
+   "hover, drag-and-drop all as before), each SECONDARY finger with its own " +
+   "capture, no focus, guarded against its component being destroyed; double " +
+   "taps counted.\n" +
+   "      Windows: WM_POINTERDOWN/UPDATE/UP/LEAVE/CAPTURECHANGED for pen and " +
+   "touch, handled in window_win32.h and returning 0 so Windows makes no " +
+   "legacy mouse messages from them; the mouse stays on the legacy path (no " +
+   "EnableMouseInPointer -- process-wide, the host's). The pointer functions " +
+   "are looked up from user32 at run time and can be substituted, so the " +
+   "test sends REAL WM_POINTER messages to a real window with synthesised " +
+   "POINTER_PEN_INFO/POINTER_TOUCH_INFO, through every line the window runs: " +
+   "512/1024 pressure arrives as 0.5, 45/-18 degree tilt as 0.5/-0.2, 90 " +
+   "degrees rotation as pi/2, the eraser flag; a pen drag keeps capture; two " +
+   "fingers hold two components and keep them when they cross; a finger on a " +
+   "destroyed component is forgotten. RUN on Windows as far as a mouse-only " +
+   "machine allows -- the OS query is the one thing substituted.\n" +
+   "      macOS: NSEvent subtype/pressure/tilt/rotation on the ordinary mouse " +
+   "events a tablet sends, and tabletProximity: for the eraser, wired into " +
+   "window_cocoa.h -- compiled against the shim, never run. X11: NOT " +
+   "available -- the X11 peer reads core ButtonPress/MotionNotify, which " +
+   "carry no pressure, and does not open XInput2; X11 events stay mouse " +
+   "events",
+   "struct PenDetails"],
   ["gui", "MouseWheelDetails",
    "gfx/component.h: MouseRouter::mouseWheel takes the delta directly. The reference " +
    "wraps it because its struct also carries smooth-scroll and inertia flags " +
@@ -2002,10 +2610,21 @@ const MAP = [
    "platform's wheel message into it",
    "mouseWheel"],
   ["gui", "MouseInactivityDetector",
-   "deliberately absent: hides the pointer after a period of stillness, which " +
-   "is for kiosks and full-screen players. A plugin editor is a panel in " +
-   "somebody else's window and must never hide the user's cursor",
-   null, "class MouseInactivityDetector"],
+   "gfx/mouse_input.h: MouseInactivityDetector watches a component and " +
+   "everything inside it through a MouseListener (component_listeners.h: " +
+   "listeners attached to a component, optionally hearing every nested " +
+   "child's events, told BEFORE the component so a handler destroying it " +
+   "cannot starve them) and tells a Listener, or " +
+   "onBecameActive/onBecameInactive, when the mouse has been still for " +
+   "setDelay milliseconds (1000 by default, as in the reference) and when it " +
+   "moves again past setMouseMoveTolerance (50); a click or a wheel wakes it " +
+   "at once. The clock is injectable and tick() belongs in the editor's own " +
+   "tick, as with every timed thing here -- and it is for dimming an " +
+   "overlay, never for hiding a host's cursor. Tested on a fake clock: " +
+   "inactive exactly at the delay, told once, a drift within tolerance does " +
+   "not wake it, a move past it does, a click restarts the wait, the wheel " +
+   "wakes it. Platform-independent; RUN on Windows",
+   "class MouseInactivityDetector"],
   ["gui", "SettableTooltipClient",
    "gfx/widgets.h: setTooltip on Widget, read by TooltipManager. The reference splits " +
    "the interface from the settable implementation so a component can compute " +
@@ -2014,37 +2633,97 @@ const MAP = [
    "test rather than a wait",
    "setTooltip"],
   ["gui", "TextDragAndDropTarget",
-   "deliberately absent: dropping selected TEXT onto a component. " +
-   "FileDragAndDropTarget is here because dropping a sample onto a plugin is " +
-   "the gesture people actually make; dragging text into an audio plugin is " +
-   "not a thing that happens, and a target for it would be a code path with no " +
-   "caller",
-   null, "class TextDragAndDropTarget"],
+   "gfx/component_listeners.h: TextDragAndDropTarget, which a component opts " +
+   "into by answering asTextDragAndDropTarget() (the asWidget pattern: no " +
+   "RTTI). Inside the editor a drag started with MouseRouter::startTextDrag " +
+   "rides the router's ordinary drag machinery, and Component's default " +
+   "item-drag handlers hand a text drag (DragSource::isText) to the target, " +
+   "with the position it ENTERED at. From outside, gfx/text_drag.h's " +
+   "TextDragDispatcher finds the target the same way and forgets one " +
+   "destroyed mid-drag.\n" +
+   "      Windows: window_win32.h now registers an OLE IDropTarget " +
+   "(detail::OleDropTarget) -- text arrives only as an IDataObject, and once " +
+   "a target is registered Windows stops sending WM_DROPFILES, so it reads " +
+   "CF_UNICODETEXT, CF_TEXT and CF_HDROP files, giving files live hover " +
+   "feedback too. It registers only on a thread the host has already made a " +
+   "single-threaded apartment -- every host that does drag and drop has -- " +
+   "where OleInitialize adds OLE without changing the apartment and is " +
+   "balanced at close; a thread with no apartment, or in the MTA, is left " +
+   "untouched and keeps WM_DROPFILES as before (making it an STA from inside " +
+   "a plugin re-routes UI Automation's calls through a message loop the host " +
+   "may not be pumping -- native_window_test's reader caught exactly that). " +
+   "ole32 is loaded at run time, not linked. performExternalDragDropOfText " +
+   "drags text OUT through DoDragDrop. Tested: an internal text drag " +
+   "delivers enter (with position), moves, exit and drop, a refusing target " +
+   "is skipped, an item drag is not mistaken for text; a UTF-8 string " +
+   "round-trips through OleTextDataObject, CF_HDROP files parse as UTF-8 " +
+   "paths, the IDropTarget gives copy/none feedback and drops text and " +
+   "files; opening a window leaves the thread's apartment alone, and on an " +
+   "OLE thread its registration is confirmed by OLE refusing a second. RUN " +
+   "on Windows.\n" +
+   "      macOS: the view registers public.utf8-plain-text beside the file types " +
+   "and hands a drag with no files to a TextDragDispatcher -- compiled, " +
+   "never run; dragging text OUT is not implemented there (it needs an " +
+   "NSDraggingSource and the mouse-down NSEvent). X11: the XDND peer does " +
+   "not yet hand text to the dispatcher",
+   "class TextDragAndDropTarget"],
   ["gui", "Relative positioning: MarkerList, RelativeCoordinate, RelativePoint, " +
           "RelativeRectangle, RelativePointPath, RelativeParallelogram, " +
           "RelativeCoordinatePositionerBase",
-   "out of scope, and the reference itself moved on from it: positions expressed as " +
-   "expressions against named markers and other components' edges, parsed from " +
-   "strings and re-evaluated when anything moves. FlexBox and Grid arrived " +
-   "later and are what the reference's own documentation now points at, and they are " +
-   "what this SDK has.\n" +
-   "      A layout language evaluated at runtime is also the thing this SDK " +
-   "deliberately does not do anywhere -- the same reason ComponentBuilder is " +
-   "out of scope. A generated plugin's layout is code, and the compiler checks " +
-   "it",
-   null, "class RelativeCoordinate|class RelativePoint|class MarkerList"],
+   "gfx/relative_position.h: RelativeCoordinate (an expression), " +
+   "RelativePoint (\"x, y\"), RelativeRectangle (\"left, top, right, bottom\", " +
+   "and applyToComponent), RelativeParallelogram (three corners, and the " +
+   "transform onto them), RelativePointPath (a Path of RelativePoints), " +
+   "MarkerList (named coordinates, themselves expressions) and " +
+   "RelativeCoordinatePositionerBase, which keeps a component where its " +
+   "expressions say by listening (ComponentListener) to its parent, every " +
+   "sibling named by Component::componentID, and its marker lists, " +
+   "re-applying when any changes -- a name that does not exist yet starts " +
+   "working when it is added. Names: " +
+   "parent.left/right/top/bottom/x/y/width/height/centreX/centreY, " +
+   "<id>.<edge>, this.<edge>, markers; + - * / parentheses and min, max, " +
+   "abs; evaluated in a RelativeScope.\n" +
+   "      Cycles are detected, not looped on: a marker defined through itself " +
+   "fails with the chain named (\"m1 -> m2 -> m3 -> m1\"), and a positioner " +
+   "re-entered while applying stops and flags every positioner in the loop " +
+   "(hasCycle) unless its answer has not changed -- so x from one component " +
+   "and y from the other converges and is not a cycle. The evaluator is " +
+   "detail::RelativeExpression, written here because the SDK has no general " +
+   "Expression class: a bounded recursive-descent parser (length and depth " +
+   "capped, numbers parsed without the C locale, non-finite ones refused) " +
+   "behind a parse/evaluate/toString/symbols seam a core Expression could " +
+   "later replace. Tested: precedence, functions, nine malformed expressions " +
+   "refused with reasons, division by zero, toString round trip, edges " +
+   "against parent and siblings following a parent resize, markers and a " +
+   "marker change, both cycle kinds, the converging pair, late-added " +
+   "siblings, a destroyed positioned component, points, parallelogram and " +
+   "path; fuzzed (fuzz_gui_infra, 18,000 expression cases per run under " +
+   "ASan). Platform-independent; RUN on Windows",
+   "class RelativeCoordinatePositionerBase"],
   ["gui", "File chooser components: FileChooserDialogBox, FileListComponent, " +
           "FileTreeComponent, FilenameComponent, FilePreviewComponent, " +
           "ImagePreviewComponent, FileSearchPathListComponent",
-   "gfx/file_browser.h has FileBrowser -- a list, navigation and a selection -- " +
-   "and file_dialog.h has the NATIVE chooser, which is what a plugin should " +
-   "use to load a sample: it is the dialog the user already knows, it can " +
-   "reach network volumes and permissions a drawn list cannot, and on macOS it " +
-   "is the only way to get a file out of the sandbox.\n" +
-   "      The rest are pieces of an application's file UI. A preview pane and " +
-   "a search-path editor belong to a program that manages a library; a plugin " +
-   "loads a file and gets on with it",
-   null, "class FileChooserDialogBox|class FilenameComponent|class ImagePreviewComponent"],
+   "gfx/file_chooser.h, beside file_browser.h's FileBrowser and file_dialog.h's " +
+   "native chooser -- still the right call for \"load an impulse response\": the " +
+   "user's places, network volumes, the macOS sandbox. FileListComponent shows " +
+   "one folder as a list (icon, name, size), walked into by a double click or " +
+   "Return and out by Backspace, with type-ahead; FileTreeComponent is " +
+   "FileBrowser rooted at a folder; both tell a FilePreviewComponent about the " +
+   "selection, and ImagePreviewComponent previews PNG and SVG files. " +
+   "FilenameComponent is a path field with a browse button, an enforced suffix, " +
+   "the recently used files behind a drop-down, and file drops. " +
+   "FileSearchPathListComponent edits an ordered list of folders (add, remove, " +
+   "change, move; joined with ';'). FileChooserDialogBox puts the list, a " +
+   "preview, a name field and the buttons in an in-editor dialog -- open, save " +
+   "(asking before it overwrites) or choose a folder -- keeps Tab inside it, and " +
+   "answers through a callback.\n" +
+   "      Nothing watches the disk: a folder is read when shown and on refresh(), as " +
+   "FileBrowser does. Tested over a folder the test writes (with a PNG it " +
+   "encodes itself) in gui_widgets_test and fuzz_gui_widgets; run on Windows " +
+   "(MSVC /W4, and the fuzz under AddressSanitizer); the macOS and Linux " +
+   "branches compiled, not run (macOS against an au_shim dirent.h, Linux against " +
+   "the X11 headers)",
+   "class FileChooserDialogBox"],
   ["gui", "ContentSharer",
    "out of scope: the iOS and Android share sheet. There is no mobile target " +
    "here -- AUv3 is listed as blocked for exactly that reason -- and no " +
@@ -2086,13 +2765,33 @@ const MAP = [
    "announcing all of it is the correct behaviour rather than a compromise",
    "class TextEditor"],
   ["core", "Application",
-   "out of scope for the plugin formats, which have no application object at " +
-   "all -- the host owns the process, the message loop and the lifetime, and a " +
-   "plugin that created an application singleton would be a second one inside " +
-   "somebody else's. The standalone genuinely needs the job done and does it " +
-   "in standalone.h's main(): parse the options, open the devices, run the " +
-   "loop, and shut down in the reverse order",
-   null, "class Application"],
+   "application.h: Application, the reference's application object for programs " +
+   "built on the SDK -- initialise(commandLine), shutdown, systemRequestedQuit, " +
+   "anotherInstanceStarted, getApplicationName/Version, moreThanOneInstanceAllowed, " +
+   "unhandledException, setApplicationReturnValue, quit -- and " +
+   "SONORE_START_APPLICATION, which writes main (and WinMain on Windows, where " +
+   "the command line is re-read as UTF-16). Application::run makes the calling " +
+   "thread the message thread and runs MessageManager's dispatch loop. The " +
+   "plugin formats still have no application object (the host owns the " +
+   "process), and the plugin standalone keeps its own main in standalone.h.\n" +
+   "      Single instance: a named mutex in the session's namespace on Windows, " +
+   "flock on a temporary file elsewhere -- both released by the kernel with the " +
+   "process, so a crash cannot leave the lock held. The first instance listens " +
+   "BEFORE it takes the lock; a second hands its command line over " +
+   "(broadcastMessage tagged with the name on Windows and macOS, an " +
+   "abstract-namespace Unix socket on Linux) and exits without initialising. " +
+   "The OS's quit requests reach systemRequestedQuit: WM_QUERYENDSESSION on a " +
+   "hidden top-level window, console Ctrl+C and close, AppKit's " +
+   "applicationShouldTerminate:, SIGINT/SIGTERM through a self-pipe the loop " +
+   "polls. An exception from a queued callback " +
+   "(MessageManager::setUnhandledExceptionHandler), a window procedure, " +
+   "initialise or shutdown reaches unhandledException and the loop goes on.\n" +
+   "      RUN on Windows, in child processes of tests/app_windows_test: the life " +
+   "cycle and return value, the lock and the forwarded command line (quoted, " +
+   "UTF-8), an exception thrown by a callback, the end-of-session query, and " +
+   "the lock gone with the process. macOS and Linux are compiled only " +
+   "(tests/mac_syntax_app_windows.cpp; Linux against the real Xlib headers)",
+   "class Application {"],
   ["gui", "ApplicationCommandInfo",
    "commands.h: CommandInfo, with the id, the name and the Shortcut that " +
    "invokes it -- named as the reference names it so the parity walk can find it. The " +
@@ -2143,47 +2842,137 @@ const MAP = [
    "sonore.set"],
   ["extras", "Native view embedding: HWNDComponent, NSViewComponent, UIViewComponent, " +
              "XEmbedComponent, ActiveXControlComponent, AndroidViewComponent",
-   "out of scope in the direction the reference means, and already solved in the " +
-   "direction that matters here. These put a platform CONTROL inside a framework " +
-   "component tree. This SDK is on the other side of that: the window_*.h " +
-   "peers are handed a parent HWND, NSView or X window by the host and put " +
-   "themselves inside IT, and webview.h does the one piece of embedding that " +
-   "goes the other way -- a browser control inside our own window.\n" +
-   "      A plugin that genuinely needed a third-party native control inside " +
-   "its editor would be reaching past this SDK, and that is a reasonable place " +
-   "for the boundary",
-   null, "class HWNDComponent|class NSViewComponent|class XEmbedComponent"],
+   "gfx/native_embed.h: HWNDComponent, ActiveXControlComponent, NSViewComponent " +
+   "and XEmbedComponent -- a platform control inside a component tree, the " +
+   "reverse of the window_*.h peers. Each keeps its native window at the " +
+   "component's place inside the peer's window of the TopLevelWindow it is in " +
+   "(or a parent given with setParentWindow, for a plugin editor), checked on " +
+   "resize, on paint (which every move causes) and on the window's tick (which " +
+   "catches an ancestor hidden, since a hidden subtree is not painted).\n" +
+   "      HWNDComponent makes a foreign HWND a child and gives it back, hidden " +
+   "and with its own style, on release. ActiveXControlComponent hosts a control " +
+   "by CLSID through IOleObject in-place activation in a site window, with its " +
+   "own IOleClientSite, IOleInPlaceSite and IOleInPlaceFrame; queryInterface " +
+   "reaches the control, setMouseEventsAllowed disables the site. " +
+   "NSViewComponent adds an NSView to the peer's flipped view " +
+   "(NSViewComponentWithParent, the reverse, is another row's). XEmbedComponent " +
+   "speaks XEmbed as the embedder: a socket window, the client reparented in " +
+   "and told XEMBED_EMBEDDED_NOTIFY, activation and focus, kept to the socket's " +
+   "size -- or a socket id handed to another process to embed into. " +
+   "UIViewComponent and AndroidViewComponent are not built: this SDK has no iOS " +
+   "or Android target.\n" +
+   "      RUN on Windows: a foreign HWND parented, moved, sized, hidden with an " +
+   "ancestor and released; the WebBrowser control created, in-place active, " +
+   "reached through IWebBrowser2, moved, mouse-disabled and deleted, and a " +
+   "CLSID naming nothing failing cleanly. NSViewComponent and XEmbedComponent " +
+   "are compiled only",
+   "class HWNDComponent"],
   ["extras", "CodeEditorComponent / CodeDocument / CPlusPlusCodeTokeniser / LuaTokeniser / " +
              "XmlTokeniser",
-   "out of scope: a syntax-highlighting source editor. The reference carries it because " +
-   "a framework's own project editor and demos are applications that edit code. An " +
-   "audio plugin's editor edits parameters, and shipping a code editor inside " +
-   "one would be shipping a text engine nobody asked for -- with the same " +
-   "objection the javascript row makes about a plugin that can run code",
-   null, "class CodeEditorComponent|class CodeDocument|Tokeniser"],
+   "gfx/code_editor.h, for the plugin that runs a user's script or lets a " +
+   "preset's XML be edited by hand. CodeDocument keeps text as lines of code " +
+   "points: CodeDocument::Position, maintained through every insert and " +
+   "delete as a caret is; offsets with a line break counted once whatever it " +
+   "is saved as, from line starts recounted only below an edit; each line's " +
+   "own ending kept (CR LF, LF, a lone CR) so a mixed file saves byte for " +
+   "byte, new breaks in the document's newline, normaliseLineEndings undoable; " +
+   "undo as recorded edits in transactions (newTransaction), typing merged, " +
+   "bounded by count and characters, with a save point; find forwards, back, " +
+   "round the end, across lines, ignoring case; word breaks; listeners; " +
+   "loadFromFile and saveToFile in UTF-8 or UTF-16 with their byte order " +
+   "marks; a maximum size that refuses an insert, replace or load whole.\n" +
+   "      CodeTokeniser reads a line at a time with a state carried between " +
+   "lines -- block comments, raw strings, strings and directives continued " +
+   "by a backslash, Lua long brackets and \\z, XML comments, CDATA, " +
+   "declarations and attribute values -- in CPlusPlusCodeTokeniser, " +
+   "LuaTokeniser and XmlTokeniser, each with the reference's token types and " +
+   "default ColourScheme, and a state-only scan for the lines above the " +
+   "screen. CodeEditorComponent: a monospaced grid (tabs to stops, wide " +
+   "characters in two columns, marks in none), a line-number gutter, caret " +
+   "and selection by mouse (word, line, gutter) and keys (words, Home to the " +
+   "indent, Page Up and Down, up and down keeping the column), the SDK's " +
+   "ScrollBars, the clipboard in the document's newline, undo and redo, Tab " +
+   "and Shift+Tab indenting lines, auto-indent with brackets, read-only, find " +
+   "and replace with Ctrl+F and Ctrl+H hooks for the plugin's own bar, font " +
+   "size, caretBounds for an input method, an accessible text field. It paints " +
+   "only the lines on screen and keeps each line's tokeniser state, reusing " +
+   "the ones below an edit once a re-scan agrees with them.\n" +
+   "      Tested by code_editor_test (thousands of random edits, undo and redo " +
+   "against a model; maintained positions; line endings and encodings; every " +
+   "tokeniser token by token; KeyPress-driven editing; gutter and token " +
+   "colours in a Bitmap; 100,000 lines opened, scrolled to the end and edited " +
+   "there, each action timed under 50 ms) and fuzz_code_editor, 20,000+ " +
+   "cases under ASan. RUN on Windows only; the macOS and Linux branches -- " +
+   "the monospaced font's paths and the in-process clipboard -- compiled, not " +
+   "run. Not built: bidirectional text and Arabic joining on the grid, a " +
+   "code-folding or completion layer, the reference's CodeDocument::Iterator",
+   "class CodeEditorComponent"],
   ["extras", "ColourSelector",
-   "deliberately absent: the reference's colour picker, a wheel with a brightness " +
-   "column and hex entry. Nothing generated by this SDK asks a user to choose " +
-   "a colour -- a plugin's appearance is designed by whoever built it, and " +
-   "user-theming would need a colour to persist in the session and to survive " +
-   "every future change to the interface's palette.\n" +
-   "      The pieces exist if a plugin wants one: Colour converts to and from " +
-   "HSV, gradient.h has the sweeps a wheel is drawn from, and ValueBox takes " +
-   "typed entry",
-   null, "class ColourSelector"],
+   "gfx/colour_selector.h: ColourSelector, laid out as the reference lays it out " +
+   "-- the colour across the top with an editable hex code (RRGGBB, or AARRGGBB " +
+   "with the alpha channel), a saturation/brightness square beside a hue strip, " +
+   "sliders for red, green, blue and alpha, and a row of swatches (click to use " +
+   "one, right-click to store the current colour in it). Flags turn each part " +
+   "off; onChange reports every change, and a colour set with notify false is " +
+   "not echoed back.\n" +
+   "      HUE IS KEPT, not recomputed from the colour: brightness dragged to black and " +
+   "back up comes out at the hue it started from, where deriving HSV from the " +
+   "colour snaps the strip to red. The square is two gradients composited -- " +
+   "white to the hue across, transparent to black down -- which is HSV exactly, " +
+   "so the test reads pixels back and compares them with the conversion the " +
+   "selector itself uses. Arrows work the square and the strip, the hex field " +
+   "takes typing, and a reader hears a group, a hue slider and a text field. " +
+   "Drawn through LookAndFeel::drawColourSwatch, drawColourSpaceMarker and " +
+   "drawHueStripThumb. Tested in gui_widgets_test (known HSV vectors, clicks and " +
+   "drags at computed points, hex entry, swatches) and fuzz_gui_widgets; run on " +
+   "Windows (MSVC /W4, and the fuzz under AddressSanitizer); the macOS and Linux " +
+   "branches compiled, not run",
+   "class ColourSelector"],
   ["extras", "SystemTrayIconComponent / SplashScreen / PreferencesPanel / " +
              "RecentlyOpenedFilesList / AppleRemoteDevice / PushNotifications / " +
              "AnimatedAppComponent",
-   "out of scope: application furniture. A tray icon, a splash screen, a " +
-   "preferences window, a recent-files menu, an Apple IR remote and mobile " +
-   "push notifications all belong to a program that owns its process. A plugin " +
-   "owns a rectangle inside somebody else's.\n" +
-   "      AnimatedAppComponent is the odd one and worth naming separately: it " +
-   "is a component with a timer built into it, which is exactly the shape this " +
-   "SDK avoids everywhere. Every timed thing here takes the elapsed time as an " +
-   "ARGUMENT, which is what makes an animation mid-transition an exact " +
-   "assertion instead of a sleep",
-   null, "class SystemTrayIconComponent|class SplashScreen|class PreferencesPanel|class AnimatedAppComponent"],
+   "application furniture, for programs that own their process.\n" +
+   "      gfx/system_tray.h: SystemTrayIconComponent -- on Windows " +
+   "Shell_NotifyIconW (version 4, the icon made from a Bitmap, tooltip, the " +
+   "balloon, clicks delivered as the Component's mouseDown and contextMenu and " +
+   "as callbacks, the icon re-added on TaskbarCreated); on macOS an " +
+   "NSStatusItem; on Linux UNAVAILABLE, because the tray there is " +
+   "StatusNotifierItem over D-Bus, a bus connection and object this SDK does " +
+   "not carry (isAvailable says so). PushNotifications, the LOCAL half: Windows " +
+   "through the tray balloon (a toast on 10 and 11), macOS " +
+   "UNUserNotificationCenter, Linux notify-send; REMOTE push is not here -- it " +
+   "needs APNs or FCM servers and credentials -- and getDeviceToken is empty.\n" +
+   "      gfx/splash_screen.h: SplashScreen -- borderless, centred, topmost, off " +
+   "the taskbar; deleteAfterDelay(minimum, removeOnMouseClick) fades it out " +
+   "through the window's alpha once it has been up long enough and it deletes " +
+   "itself from the queue, timed by advance(elapsedMs) from its window's clock.\n" +
+   "      gfx/preferences_panel.h: PreferencesPanel -- square page buttons along " +
+   "the top (an SVG icon above a label, on the LookAndFeel's icon-button plate) " +
+   "and the chosen page below. Each page's component is made on demand by " +
+   "createComponentForPage (or a createPage function) and destroyed when " +
+   "another is chosen, as the reference does; the arrow keys walk the pages. RUN " +
+   "on Windows: rendered to a Bitmap, with switching by click and by keyboard " +
+   "checked in pixels.\n" +
+   "      recent_files.h: RecentlyOpenedFilesList -- most recent first, 8 by " +
+   "default, re-opening moves a file to the top, paths compared the way the " +
+   "filesystem compares them, removeNonExistentFiles, toString/restoreFromString, " +
+   "and menu items numbered base + index into gfx::PopupMenu. Registered with " +
+   "the OS through SHAddToRecentDocs (RUN: the shortcut is checked by its " +
+   "target, then removed by forgetRecentFileNatively) and NSDocumentController " +
+   "(compiled only). Not registered on Linux, as in the reference.\n" +
+   "      Not built: AppleRemoteDevice, because Apple removed the IR remote API; " +
+   "and AnimatedAppComponent, deliberately -- it is a component with a timer " +
+   "built into it, the shape this SDK avoids everywhere: every timed thing here, " +
+   "SplashScreen included, takes the elapsed time as an ARGUMENT, which is what " +
+   "makes a fade mid-way an exact assertion instead of a sleep.\n" +
+   "      RUN on Windows (tests/app_windows_test): the tray icon added, modified, " +
+   "given a balloon and removed with every Shell_NotifyIcon result counted, " +
+   "clicks and the balloon's click as the shell sends them, Explorer's restart, " +
+   "a notification and its click reaching the listener; the splash's style, " +
+   "placement, timing at its edges, alpha read back from the window, the click " +
+   "and the self-deletion. NSStatusItem and UNUserNotificationCenter are " +
+   "compiled only",
+   "class SystemTrayIconComponent : public Component"],
   ["extras", "BubbleMessageComponent",
    "gfx/alert.h: CallOutBox with a caption, and TooltipManager for the fading " +
    "kind. the reference's version is a BubbleComponent that shows a message and removes " +
@@ -2192,20 +2981,39 @@ const MAP = [
    "rather than a wait",
    "class TooltipManager"],
   ["extras", "KeyMappingEditorComponent",
-   "deliberately absent: the UI for letting a user reassign shortcuts. " +
-   "commands.h has the CommandManager and the Shortcut table it maps, so the " +
-   "model is here; an editor for it needs the mapping to PERSIST, and a " +
-   "plugin's shortcut set is small, fixed, and shared with a host that owns " +
-   "most of the keyboard already",
-   null, "class KeyMappingEditorComponent"],
+   "gfx/key_mapping_editor.h over commands.h's CommandManager. The commands are " +
+   "listed under their categories with their keys drawn as keycaps; \"+\" (or " +
+   "Return on a row) waits for the next key -- Tab and Return included, Escape " +
+   "alone cancels -- and assigns it; a keycap offers Change and Remove; Delete " +
+   "removes a row's last key; Reset to defaults asks first. A key another " +
+   "command already has is a QUESTION naming that command, in an AlertOverlay: " +
+   "the manager would silently take it, which is right for code and wrong for a " +
+   "person. Hidden and read-only commands through two callbacks; " +
+   "onMappingsChanged is where an owner saves saveMappings(). KeyPress gained F1 " +
+   "to F12 for it, mapped in all three peers and named by Shortcut::describe.\n" +
+   "      Tested in gui_widgets_test -- reassign after the question, refuse, replace " +
+   "through the keycap menu, Tab captured as a key, reset, the JSON round trip " +
+   "-- and under fuzz_gui_widgets, which checks after every change that no key " +
+   "belongs to two commands; run on Windows (MSVC /W4, and the fuzz under " +
+   "AddressSanitizer); the macOS and Linux branches compiled, not run",
+   "class KeyMappingEditorComponent"],
   ["extras", "FileBasedDocument",
-   "deliberately absent as a class: open, save, save-as and a dirty flag, with " +
-   "the prompts that go around them. A plugin has exactly this problem and the " +
-   "host owns the answer -- state is saved and restored through the format's " +
-   "own state calls, into the session, and the dirty flag is reported through " +
-   "clap_host_state::mark_dirty rather than kept here. presets.h covers the " +
-   "part a plugin does own, which is named presets it can load",
-   null, "class FileBasedDocument"],
+   "file_document.h: FileBasedDocument, for the standalone and applications -- a plugin's " +
+   "document is still the host's session, its dirty flag reported through " +
+   "clap_host_state::mark_dirty. The reference's paths: load, load a chosen file, save, " +
+   "save as, save as interactively and the close-a-window question, each in a plain and an " +
+   "Async form, around the four things a subclass supplies (title, load, save, last " +
+   "document).\n" +
+   "      The questions are virtual hooks that answer through a callback: native by default " +
+   "(MessageBoxW, NSAlert, a GTK dialog, and FileDialog for the choosers), an AlertOverlay " +
+   "in the window when overridden. A failed save leaves the document on the file it had, " +
+   "still changed; a question answered after a plain form stopped waiting changes nothing; " +
+   "a document deleted before an answer is never called back. setLastDocumentOpened feeds a " +
+   "RecentlyOpenedFilesList.\n" +
+   "      RUN on Windows with the hooks scripted, and with a real AlertOverlay answered from " +
+   "the keyboard; the native boxes are written for all three platforms and compiled on " +
+   "macOS and Linux",
+   "class FileBasedDocument"],
   ["core", "Timer / TimedCallback",
    "multi_timer.h: MultiTimer, and the 33 ms tick every peer runs. Both take " +
    "the elapsed time as an ARGUMENT rather than reading a clock, which is the " +
@@ -2224,33 +3032,81 @@ const MAP = [
    "worth having -- so there is one, and it is the coalescing one",
    "class ChangeBroadcaster"],
   ["core", "MessageManager / MessageManagerLock / CallbackMessage / MessageListener",
-   "deliberately absent, and this is a rule rather than a preference. The reference " +
-   "owns a message loop and hands out a lock on it. A plugin does NOT own the " +
-   "loop -- the host does -- and a plugin that took a lock on the host's " +
-   "message thread from its audio thread would be a plugin that can deadlock a " +
-   "DAW.\n" +
-   "      The same job is done without a lock: UiEventQueue is single-producer " +
-   "single-consumer and lock-free, the audio thread pushes and the editor " +
-   "drains on the tick the host already gives us. That is the whole of it, and " +
-   "it is checked by the RT-safety gate rather than by inspection",
-   null, "class MessageManager|MessageManagerLock"],
+   "message_manager.h: MessageManager, MessageManagerLock, CallbackMessage, Message and " +
+   "MessageListener, with ThreadExitSignal as the lock's abort hook. callAsync; a blocking " +
+   "callFunctionOnMessageThread that runs at once on the message thread, or on a thread " +
+   "holding the lock, instead of waiting for itself; isThisTheMessageThread and " +
+   "setCurrentThreadAsMessageThread; runDispatchLoop, stopDispatchLoop and " +
+   "runDispatchLoopUntil for an application; and broadcastMessage to other processes.\n" +
+   "      One queue of our own, with the OS only as the alarm clock: a message-only window " +
+   "on Windows, a CFRunLoopSource in the common modes on macOS, an eventfd on Linux that " +
+   "runDispatchLoop polls and a host's fd support can be handed. One OS message per call " +
+   "is the obvious design and fails three ways -- Windows drops posted messages past " +
+   "10,000 per thread, a nested modal loop reorders them, and a lock request has to know " +
+   "whether it was ever delivered.\n" +
+   "      The lock parks the message thread inside a message, between two others, until it " +
+   "is released. Given a ThreadExitSignal or a ThreadPool job's stop flag, the wait gives " +
+   "up, so a worker stopped and joined from the message thread cannot deadlock against it. " +
+   "The old row's rule still stands for the AUDIO thread: none of this may be called from " +
+   "it, and UiEventQueue still carries the parameter traffic on the editor's tick.\n" +
+   "      RUN on Windows by app_infra_test, plain and under ASan: 20,000 calls from four " +
+   "threads, each thread's order kept; 10,000 lock acquisitions from four threads while the " +
+   "message thread pumps, with a counter touched only under the lock coming out exact (and " +
+   "the test failing when the message thread is not parked); 600 signal-against-grant " +
+   "races; a stop signal ending a wait the joining message thread could never grant; a listener deleted with messages in flight never called; a broadcast to a " +
+   "child process and its reply. macOS and Linux are compiled only, by MSVC and by clang, " +
+   "through tests/au_shim and POSIX stubs",
+   "class MessageManagerLock"],
   ["core", "LockingAsyncUpdater",
-   "deliberately absent: the reference's AsyncUpdater variant that may be triggered " +
-   "while the message thread is inside a callback, at the cost of a lock. " +
-   "There is no lock to take here for the reason above -- the queue is " +
-   "lock-free and drains on the host's tick, so triggering it from any thread " +
-   "is already safe and costs no lock at all",
-   null, "class LockingAsyncUpdater"],
+   "message_manager.h: LockingAsyncUpdater. Triggered from any thread and coalesced into " +
+   "one call on the message thread; the callback runs under the updater's lock and " +
+   "cancelPendingUpdate takes the same one, so once cancel returns a pending callback will " +
+   "not start and none is still running -- the guarantee an updater built on a bare flag " +
+   "cannot give. The lock is recursive, so the callback may re-trigger or cancel itself, and " +
+   "a copy of the callback runs, so it may delete its own updater.\n" +
+   "      RUN on Windows, under ASan too: 20,000 trigger/cancel rounds against the pumping " +
+   "message thread, about 17,000 callbacks and 1,600 cancels arriving mid-callback, none " +
+   "started after a cancel returned and none running when it returned. With the callback " +
+   "moved outside the lock the same test fails, 1,700 times",
+   "class LockingAsyncUpdater"],
   ["core", "Inter-process: ChildProcessCoordinator, ChildProcessWorker, " +
            "InterprocessConnection, NetworkServiceDiscovery, MountedVolumeListChangeDetector, " +
            "DeletedAtShutdown, ApplicationBase",
-   "out of scope: process and machine plumbing for an application. The reference has " +
-   "the child-process pair because it can run a plugin out-of-process during " +
-   "scanning, which is a HOST's problem; the connection and discovery classes " +
-   "are for programs that talk to other programs.\n" +
-   "      A plugin runs inside the host's process by definition. Spawning a " +
-   "child from one is a thing users find in a firewall log and do not forgive",
-   null, "class ChildProcessCoordinator|class InterprocessConnection|class NetworkServiceDiscovery|DeletedAtShutdown"],
+   "ipc.h and process.h. ChildProcessCoordinator launches a worker -- any " +
+   "executable, usually the program itself in a worker mode, found by a " +
+   "\"<id>:<pipe>\" argument -- and ChildProcessWorker connects back; both ping " +
+   "every quarter of the timeout, so a worker that crashes is noticed at once " +
+   "(its pipe ends) and one that hangs once it has been silent for the " +
+   "timeout. InterprocessConnection carries whole messages over a TCP socket " +
+   "or a NamedPipe in the reference's framing (a magic number and a " +
+   "little-endian length, so a peer built with the reference can talk to it " +
+   "over a socket), its callbacks on its own thread; " +
+   "InterprocessConnectionServer accepts socket clients into them. " +
+   "NetworkServiceDiscovery's Advertiser broadcasts a small text datagram and " +
+   "its AvailableServiceList listens and forgets what goes quiet. process.h " +
+   "also has ChildProcess (arguments as a list, never a shell; stdout and " +
+   "stderr drained by threads so a chatty child never blocks; killed with its " +
+   "object), InterProcessLock, DynamicLibrary, currentExecutablePath and " +
+   "currentModulePath, and DeletedAtShutdown (deleteAll, newest first). " +
+   "MountedVolumeListChangeDetector is in file_types.h, polling the volume " +
+   "list on its own thread. ApplicationBase is the Application row's answer: a " +
+   "plugin has no application object, and the standalone's lifecycle is its " +
+   "main().\n" +
+   "      Out of scope until now, on the grounds that a plugin runs inside the host. " +
+   "An out-of-process scanner, or a helper doing work a host would crash on, " +
+   "is honest work all the same -- and doing it wrong (a child inheriting the " +
+   "host's handles, a command line through a shell, a process left behind when " +
+   "the plugin is removed from the track) is worse than not doing it. So a " +
+   "child inherits exactly its three standard streams " +
+   "(PROC_THREAD_ATTRIBUTE_HANDLE_LIST on Windows; close-on-exec and " +
+   "POSIX_SPAWN_CLOEXEC_DEFAULT elsewhere) and dies with its object. RUN on " +
+   "Windows, also under ASan (sdk/tests/system_test relaunches itself: twelve " +
+   "awkward arguments round-tripped through CommandLineToArgvW, a worker that " +
+   "crashes and one that goes silent, pipes and sockets echoing messages up to " +
+   "a megabyte, a lock held by another process); the POSIX branches " +
+   "(posix_spawn, Unix-domain sockets, flock) are COMPILED for macOS and Linux " +
+   "through tests/au_shim by MSVC and clang, and have not run",
+   "class ChildProcessCoordinator"],
   ["core", "ValueTree / ValueTreeSynchroniser / ValueTreePropertyWithDefault / CachedValue",
    "state_bag.h: StateBag, a flat key/value store that saves and restores with " +
    "the parameters. the reference's ValueTree is a shared, reference-counted, " +
@@ -2274,12 +3130,25 @@ const MAP = [
    "commonest bug in undo systems",
    "class UndoHistory"],
   ["core", "ApplicationProperties",
-   "user_settings.h: PropertiesFile is there, and this is the layer above it " +
-   "-- the reference's pairing of a per-user file with a shared machine-wide one, and " +
-   "the logic for reading through from one to the other. A plugin has settings " +
-   "that belong to the person using it and none that belong to the machine, so " +
-   "the second file would never hold anything",
-   null, "class ApplicationProperties"],
+   "application_properties.h: ApplicationProperties over PropertiesFile, with the " +
+   "reference's Options -- application and folder name, suffix, the macOS library " +
+   "sub-folder, common to all users, case-insensitive keys, doNotSave, " +
+   "millisecondsBeforeSaving, storage format. A plugin still wants user_settings.h's " +
+   "UserSettings; this is for an application, which has a machine as well as a user.\n" +
+   "      The user's file in %APPDATA%, ~/Library/Application Support (or Preferences) or " +
+   "$XDG_CONFIG_HOME; the shared one in %ProgramData%, /Library or /etc/xdg. The user's " +
+   "reads through to the shared one, and getCommonSettings(true) hands back the user's when " +
+   "the shared one cannot be written. XML in the reference's own <PROPERTIES> of <VALUE " +
+   "name val> shape, so its files load, or the StateBag binary behind a magic -- either is " +
+   "read whatever the options say. The delayed save is debounced and driven by " +
+   "advance(elapsedMs), like every timed thing here. The shared file is read and written " +
+   "under an OS file lock (LockFileEx or flock, on a .lock beside it), which dies with its " +
+   "process; the write is user_settings.h's atomic one, now shared.\n" +
+   "      RUN on Windows: the paths, the debounced save, round trips of awkward text, the " +
+   "read-only fallback, both formats, a hand-written reference-style file, a held lock " +
+   "making a save give up; the readers fuzzed by fuzz_app_infra, under ASan. The macOS and " +
+   "Linux paths are compiled only",
+   "class ApplicationProperties"],
   ["basics", "MPENote / MPEValue / MPEChannelAssigner",
    "audio.h: NoteExpressionBuffer carries the per-note pitch, timbre and " +
    "pressure, and MpeDecoder turns MPE's channel-per-note MIDI into it. The reference " +
@@ -2303,18 +3172,47 @@ const MAP = [
   ["basics", "AudioSource family: BufferingAudioSource, ChannelRemappingAudioSource, " +
              "IIRFilterAudioSource, MemoryAudioSource, ReverbAudioSource, " +
              "ResamplingAudioSource, MixerAudioSource, ToneGeneratorAudioSource",
-   "out of scope: the reference's PULL model, where a source is asked for the next " +
-   "block and pulls from whatever it is chained to. A plugin is the other " +
-   "shape entirely -- the host PUSHES a block in and expects it filled, which " +
-   "is what every format's process call is.\n" +
-   "      The processing those classes wrap is all here and reachable in the " +
-   "push shape: shaping.h has ProcessorChain and ProcessorDuplicator for " +
-   "chaining, dsp.h has the filters and the reverb, interpolation.h has " +
-   "resampling, and channel remapping is what the bus negotiation does. " +
-   "BufferingAudioSource is the one with no equivalent, and deliberately: it " +
-   "reads ahead on a background thread, which is a disk-streaming design the " +
-   "sampler solves its own way",
-   null, "class AudioSource|class BufferingAudioSource|class MixerAudioSource"],
+   "audio_source.h: the reference's PULL model -- a source asked for its next " +
+   "block, pulling from whatever it is chained to -- as the target for code " +
+   "ported from it, built on the SDK's own parts. AudioSource and " +
+   "PositionableAudioSource with AudioSourceChannelInfo over an AudioBlock; " +
+   "MemoryAudioSource (WavData or planar channels, copied or borrowed, " +
+   "looping), AudioFormatReaderSource over AudioFileReader, " +
+   "ToneGeneratorAudioSource, ChannelRemappingAudioSource with the " +
+   "reference's input/output map semantics, IIRFilterAudioSource taking a " +
+   "Biquad's coefficients, ReverbAudioSource over Reverb, " +
+   "ResamplingAudioSource (WindowedSincKernel read from its table, an " +
+   "eighth-order SvfSection anti-alias lowpass crossfaded in above a ratio of " +
+   "1, ratio changes gliding per sample), MixerAudioSource, " +
+   "BufferingAudioSource reading ahead on a ReadAheadThread (the cooperative " +
+   "TimeSliceThread shape, since ThreadPool runs jobs to completion and " +
+   "read-ahead never completes), AudioTransportSource (start, stop, seek and " +
+   "gain all ramped, read-ahead and rate correction in its chain, " +
+   "ChangeBroadcaster on finish), and AudioSourcePlayer, which hands the " +
+   "backends' RenderFn shape (render, renderWithInput for ASIO) and the " +
+   "reference's planar callback to a source.\n" +
+   "      Where the reference takes a lock inside the callback -- mixer, " +
+   "transport, remapper, filter, reverb, player -- nothing here does: small " +
+   "settings cross by atomics or a seqlock the audio thread reads without " +
+   "waiting, and anything with a lifetime (the mixer's list, the transport's " +
+   "chain, the player's source, the read-ahead ring's slots) is swapped by " +
+   "pointer and freed only after the audio thread has provably left any block " +
+   "that saw it; the changing thread waits, the audio thread never does. " +
+   "Every [audio thread] body is read by audio-thread-rules.mjs for " +
+   "allocation, locks, waits and I/O. AudioFormatReaderSource reads a file and " +
+   "says so; behind a BufferingAudioSource it runs on the read-ahead thread.\n" +
+   "      Tested (sdk/tests/audio_sources_test.cpp, 86 checks): the IIR and " +
+   "reverb sources bit-exact against Biquad and Reverb run by hand; " +
+   "resampling at ratio 1 bit-exact, length and frequency at 44.1->48 k, " +
+   "within -89 dB of resample.h's Resampler, 30 kHz at ratio 2 down 39 dB, " +
+   "a 1->1.5 glide with no step; buffering identical to an unbuffered read " +
+   "behind a reader that sleeps, the slowest callback microseconds while the " +
+   "reader slept 100-200 ms; a mixer stressed with 200 000 adds and removes " +
+   "against 370 000 blocks with no torn sum; replaced operator new counting " +
+   "zero allocations inside every callback. RUN on Windows x64 (MSVC /W4, " +
+   "and under ASan); macOS and Linux only compiled (/Zs with _WIN32 " +
+   "undefined) -- the header has no platform code of its own",
+   "class BufferingAudioSource"],
   ["basics", "IIRCoefficients / GenericInterpolator",
    "dsp.h: Biquad carries its own coefficients and the designers that fill " +
    "them; interpolation.h has Interpolator with the kernels selectable. The reference " +
@@ -2324,18 +3222,23 @@ const MAP = [
    "object to reason about instead of two whose lifetimes must agree",
    "class Biquad"],
   ["basics", "AudioWorkgroup / WorkgroupToken",
-   "deliberately absent: Apple's audio workgroups, which let a plugin's own " +
-   "worker threads be scheduled with the same real-time priority as the audio " +
-   "thread. It is real and it matters for a plugin that farms work out to " +
-   "helper threads on macOS.\n" +
-   "      Absent for two reasons that hold together. Nothing here spawns a " +
-   "helper thread during processing -- ThreadPool exists for loading a sample, " +
-   "not for rendering a block, and the RT-safety gate would fail anything that " +
-   "did. And it is macOS-only API on the one platform this loop cannot run, " +
-   "so it would be written blind against a rule nothing here currently needs. " +
-   "The day a DSP genuinely renders across threads, this becomes required " +
-   "rather than optional",
-   null, "AudioWorkgroup|os_workgroup"],
+   "audio_workgroup.h: WorkgroupToken is one thread's membership -- " +
+   "os_workgroup_join fills it, leave() or the destructor ends it, on the joining " +
+   "thread only; a leave from another thread is refused and reported. The helper " +
+   "threads this row once said nothing here spawned exist now: a ThreadPool built " +
+   "with RealtimeThreadHints (thread_pool.h) makes each worker a Mach " +
+   "time-constraint thread -- period, computation and constraint from the block " +
+   "length and the rate, clamped to the kernel's 50 us to 50 ms -- and joins it to " +
+   "the workgroup it is given: setAudioWorkgroup() from the main thread, " +
+   "offerAudioWorkgroup() wait-free from the audio thread, where an AU's " +
+   "workgroupChanged() runs. The interval calls (os_workgroup_interval_*) belong " +
+   "to the group's owner, CoreAudio's IO thread, and a joiner does not make them.\n" +
+   "      COMPILED for macOS, NEVER RUN (mac_host_selftest.cpp is the run). Off " +
+   "macOS the token is inactive and describe() says audio workgroups are an Apple " +
+   "API, and a realtime pool runs its jobs and workgroupState() says nothing was " +
+   "joined and why -- RUN on Windows by mac_host_test.cpp, with the Mach tick " +
+   "arithmetic checked against known timebases (1/1 and 125/3)",
+   "class WorkgroupToken"],
   ["graphics", "ScopedBlendContext",
    "gfx/graphics.h: Graphics::ScopedState, which saves and restores the clip, " +
    "the transform and the colour together. The reference added a separate scoped BLEND " +
@@ -2345,26 +3248,43 @@ const MAP = [
    "scope",
    "class ScopedState"],
   ["extras", "AudioThumbnailCache",
-   "deliberately absent: the reference caches computed waveform peaks by file hash so a " +
-   "thumbnail does not have to be rebuilt every time a file is shown. " +
-   "audio_display.h computes peaks once, when a sample is loaded, and the " +
-   "sampler holds them for as long as it holds the sample -- so there is " +
-   "nothing to look up and nothing to invalidate.\n" +
-   "      A cache would be worth it for a browser that draws a hundred files " +
-   "the user is scrolling past, which is a library manager rather than a " +
-   "plugin",
-   null, "class AudioThumbnailCache"],
+   "thumbnail_cache.h: AudioThumbnailCache -- computed AudioThumbnails kept by a " +
+   "64-bit key: hashFile (path, length and modification time, so a file the " +
+   "user edits gets a NEW key and nothing has to be invalidated) or hashData " +
+   "(FNV-1a, for audio that never had a file). Bounded by BYTES rather than the " +
+   "reference's count -- a one-shot's thumbnail and an hour-long stem's differ " +
+   "a hundredfold -- with the least recently used evicted first and a lookup " +
+   "counting as a use. storeThumb/loadThumb/removeThumb/clear, and " +
+   "saveTo/loadFrom for the whole cache, most recent first, so a browser opens " +
+   "with the waveforms it showed last time; AudioThumbnail gained saveTo/" +
+   "loadFrom for one. Both loaders treat the bytes as untrusted: any damage " +
+   "refuses the lot and leaves what was there. Mutex-guarded, for a loader " +
+   "thread storing while the UI looks up.\n" +
+   "      Portable code, RUN here on Windows: audio_io_test (budget, LRU order, " +
+   "round trips, refusals, FNV-1a known answers, keys that change with the " +
+   "file, a two-thread soak) and fuzz_audio_io (150 000 mutants under ASan, " +
+   "every accepted load a save/load fixed point)",
+   "class AudioThumbnailCache"],
   ["extras", "MPEKeyboardComponent",
-   "deliberately absent: the reference's MPE keyboard draws each note's pitch bend and " +
-   "pressure as it is played, which needs the keyboard to be told about every " +
-   "expression event. gfx/midi_keyboard.h shows which notes are sounding, " +
-   "which is the question a user actually has in front of a plugin -- is it " +
-   "receiving MIDI at all.\n" +
-   "      A real MPE surface is a controller, not a mouse: the gestures it " +
-   "displays are slides and pressures that a mouse cannot produce, so the " +
-   "drawing would be showing the user something they cannot do with the " +
-   "control they are looking at",
-   null, "class MPEKeyboardComponent"],
+   "gfx/mpe_keyboard.h: MPEKeyboardComponent, MidiKeyboard's keys with every " +
+   "sounding note drawn over them as a circle -- across with its pitch (key, " +
+   "own bend and its zone's master bend, placed between key centres so a " +
+   "slide moves evenly over black and white keys), up with its timbre, " +
+   "larger with its pressure. Fed the DSP's own MIDI through MpeDecoder, so " +
+   "zones, RPN 0 bend ranges and master-channel bends are read by the code " +
+   "the DSP uses, or a host's NoteExpressionBuffer; each channel's last " +
+   "bend, pressure and timbre are kept, because MPE sends them BEFORE the " +
+   "note-on.\n" +
+   "      The old reason for its absence was that a mouse cannot slide and press. " +
+   "It has two axes, though: a press plays on the free member channel used " +
+   "longest ago, a sideways drag bends from where the button went down, and " +
+   "height sets pressure (or timbre, setVerticalGesture), sent as real MPE " +
+   "-- bend, CC 74 and pressure before the note-on, in the order the MPE " +
+   "specification gives. Tested by rendering a scripted MPE sequence to a " +
+   "Bitmap and finding each note where its pitch, timbre and pressure put " +
+   "it, and by driving the mouse through MouseRouter and checking every " +
+   "message it sent. Run on Windows; parsed as macOS and Linux",
+   "class MPEKeyboardComponent"],
   ["extras", "AudioProcessorPlayer / SoundPlayer / AudioAppComponent",
    "standalone.h does this job: it opens the device, prepares the DSP, pumps " +
    "blocks, and feeds MIDI in. the reference's classes are the glue between an " +
@@ -2373,19 +3293,42 @@ const MAP = [
    "set of components because there is exactly one plugin in it and no graph " +
    "to build",
    "SONORE_BUILD_STANDALONE"],
-  ["extras", "AudioCDReader / AudioCDBurner / BluetoothMidiDevicePairingDialogue / " +
-             "Box2DRenderer",
-   "out of scope, and these are the clearest cases in the whole audit. Reading " +
-   "and burning audio CDs is a thing the reference carries from an era when a DAW " +
-   "shipped a mastering step; Bluetooth MIDI pairing is an iOS system dialogue; " +
-   "Box2DRenderer draws a physics engine's debug output, which is in the reference " +
-   "because the reference ships a Box2D demo.\n" +
-   "      Named rather than skipped because the point of this audit is that " +
-   "nothing is passed over silently -- including the parts where the answer is " +
-   "obvious",
-   null, "class AudioCDReader|class AudioCDBurner|Box2DRenderer|BluetoothMidiDevicePairing"],
+  ["extras", "AudioCDReader / AudioCDBurner / BluetoothMidiDevicePairingDialogue",
+   "AudioCDReader and AudioCDBurner are BUILT, in audio_cd.h, for " +
+   "Windows. The reader opens a drive and reads its table of contents " +
+   "(IOCTL_CDROM_READ_TOC_EX, parsed from the raw bytes by CDToc::parse, which " +
+   "refuses a TOC that does not describe a disc) and its audio " +
+   "(IOCTL_CDROM_RAW_READ in CDDA mode, 588 stereo frames a sector, retried and " +
+   "then split per sector), with track offsets in samples, data tracks flagged " +
+   "and the CDDB id. The burner lists IMAPI2's recorders, reports the disc, its " +
+   "write speeds and free sectors, queues tracks as 16-bit stereo padded to " +
+   "whole sectors and the Red Book's four seconds, and burns them through " +
+   "IDiscFormat2TrackAtOnce on a thread of its own in the multithreaded " +
+   "apartment -- IMAPI2's progress events reported on the CALLER's thread, " +
+   "which can cancel. macOS and Linux report no drives.\n" +
+   "      What was exercised: this machine has NO optical drive. audio_io_test " +
+   "runs the TOC parser on a known six-track disc, an Enhanced CD and eight " +
+   "broken TOCs, the sector and sample arithmetic, the CDDB id (0x3404F606, " +
+   "worked by hand), the burner's track preparation and every no-drive path; " +
+   "fuzz_audio_io mutates TOCs under ASan. The DeviceIoControl and IMAPI2 calls " +
+   "compile at /W4 and have never read or burned a real disc.\n" +
+   "      BluetoothMidiDevicePairingDialogue: bluetooth_midi.h opens the " +
+   "system's own pairing dialogue without blocking. macOS: " +
+   "CABTLEMIDIWindowController (CoreAudioKit, 10.11+), modeless, onClosed when " +
+   "its window closes; COMPILED against au_shim, NOT RUN. Windows: Settings > " +
+   "Bluetooth (ms-settings:bluetooth through ShellExecuteW), available when " +
+   "ms-settings: is registered; RUN up to the launch " +
+   "(SONORE_BLUETOOTH_MIDI_NO_LAUNCH). BLE device enumeration through " +
+   "Windows.Devices.Enumeration is deliberately not built: MidiInput uses " +
+   "WinMM, which does not list BLE MIDI ports. Linux: isAvailable() is false " +
+   "and unavailableReason() names BlueZ/D-Bus and the bluetoothctl and ALSA " +
+   "sequencer route.\n" +
+   "      Box2DRenderer, once listed here, is built and has its own row under " +
+   "box2d: gfx/box2d_renderer.h draws the plugin's OWN Box2D and vendors " +
+   "nothing",
+   "class BluetoothMidiDevicePairingDialogue"],
   ["core", "The C++ standard library does it: Array, OwnedArray, ReferenceCountedArray, " +
-           "SortedSet, SparseSet, HashMap, Span, Optional, var, DynamicObject, " +
+           "SortedSet, SparseSet, HashMap, Span, Optional, " +
            "NamedValueSet, PropertySet, String, StringArray, StringPairArray, StringRef, " +
            "StringPool, Identifier, CharacterFunctions, NewLine, MemoryBlock, HeapBlock, " +
            "Atomic, ByteOrder, ReferenceCountedObject, SharedResourcePointer, WeakReference, " +
@@ -2408,7 +3351,9 @@ const MAP = [
    "is older than std::optional.\n" +
    "      Where a std type genuinely is not enough, there is a row for the " +
    "thing that replaced it: AbstractFifo, Range, NormalisableRange, and the " +
-   "file and JSON handling all have their own",
+   "file and JSON handling all have their own -- and var and DynamicObject, " +
+   "which are a scripting language's values and live with the interpreter, " +
+   "in the javascript rows",
    "std::vector"],
   ["core", "AbstractFifo / SingleThreadedAbstractFifo",
    "audio.h: UiEventQueue and the ring buffers, which are single-producer " +
@@ -2429,28 +3374,52 @@ const MAP = [
   ["core", "File handling: FileFilter, WildcardFileFilter, FileSearchPath, TemporaryFile, " +
            "MemoryMappedFile, FileInputStream, FileOutputStream, BufferedInputStream, " +
            "SubregionStream, InputSource",
-   "files.h and std::filesystem, plus audiofile.h for the one format that " +
-   "matters. the reference's stream hierarchy exists so any source -- a file, memory, a " +
-   "URL, a subregion of another stream -- can be read by the same code, which " +
-   "is what its ecosystem needs.\n" +
-   "      A plugin reads sample files and writes preset files. audiofile.h " +
-   "reads a WAV by parsing it directly, which is why there is no library and " +
-   "no licence to carry with it, and the rest is std::ifstream. " +
-   "MemoryMappedFile is the one with a real argument for it -- a large sample " +
-   "mapped rather than read -- and the sampler streams from disk on its own " +
-   "terms instead, so the mapping would be a second answer to a solved problem",
-   null, "class FileInputStream|class MemoryMappedFile|class WildcardFileFilter"],
+   "streams.h and file_types.h. InputStream and OutputStream with the " +
+   "reference's typed readers and writers (byte order named, values built from " +
+   "bytes), MemoryInputStream, MemoryOutputStream, BufferedInputStream, " +
+   "SubregionStream and InputSource; FileInputStream, FileOutputStream " +
+   "(opening an existing file at its end, as the reference's does) and " +
+   "FileInputSource, by UTF-8 path through path_io.h; TemporaryFile, which is " +
+   "written beside the target and renamed over it, so a save leaves the old " +
+   "file or the new one and never half of each; MemoryMappedFile, any range of " +
+   "a file, read-only or read-write (the general form of system_font.h's font " +
+   "mapping); WildcardFileFilter -- '*' and '?' by code point, case ignored on " +
+   "every platform, linear in its input, and built from file_dialog.h's " +
+   "FileFilter -- and FileSearchPath. files.h keeps the directory listing they " +
+   "stand on.\n" +
+   "      This was out of scope on the grounds that a plugin reads one kind of file. " +
+   "It reads from more than one kind of SOURCE -- a file, a slice of an " +
+   "archive, a download -- and code that takes an InputStream& reads them all; " +
+   "net.h's WebInputStream is one. RUN on Windows, also under ASan " +
+   "(sdk/tests/system_test: a path with accents and CJK, a range mapped at an " +
+   "unaligned offset, a temporary swapped in and one abandoned, a recursive " +
+   "search over a real tree); the POSIX branches (fseeko, mmap, flock, " +
+   "ftruncate) are COMPILED for macOS and Linux through tests/au_shim by MSVC " +
+   "and clang",
+   "class MemoryMappedFile"],
   ["core", "XmlElement / XmlDocument",
-   "deliberately absent: plugin state is a binary blob with a version header, " +
-   "and json.h covers the one place a human-readable format is genuinely " +
-   "wanted -- the bridge to the web editor, where the other end is JavaScript " +
-   "and JSON is its native form.\n" +
-   "      XML is here in the reference because VST2 presets and its own ValueTree " +
-   "serialise to it. Neither applies: VST2 is deliberately never, and the " +
-   "state model is a flat bag. An XML parser is a meaningful amount of code to " +
-   "carry and to keep safe against malformed input, for a format nothing here " +
-   "reads or writes",
-   null, "class XmlElement|class XmlDocument"],
+   "xml.h: XmlElement and XmlDocument in the reference's shape -- typed attribute " +
+   "getters (int, double, bool; whole-value, saturating, '.' as the point under a " +
+   "comma locale), getChildByName / getChildByAttribute, createNewChildElement, " +
+   "text elements and getAllSubText, iteration, deep copies, isEquivalentTo, and " +
+   "toString / writeToFile with escaping, pretty printing and attribute wrapping. " +
+   "It was absent while plugin state was the only thing to read; what changed is " +
+   "what a plugin has to READ -- a VST3 preset's metadata, an .aupreset, a " +
+   "DAWproject file, and users' presets saved by plugins ported from the reference.\n" +
+   "      UTF-8 XML 1.0: elements, attributes, text, CDATA, comments, processing " +
+   "instructions, the five entities and character references, Latin-1 transcoded, " +
+   "UTF-16 refused by name. A DOCTYPE is read past and never acted on -- nothing is " +
+   "fetched (no XXE) and no declared entity is expanded (no billion laughs); limits " +
+   "on size, depth and node count refuse hostile input, and nothing that walks a " +
+   "tree recurses, so 100,000 levels parse, copy, print and free without touching " +
+   "the stack. Errors give line and column.\n" +
+   "      Tested in tests/core_data_test.cpp (known documents both ways byte for " +
+   "byte, 4,500 random trees round-tripped, 38 malformed documents refused by name, " +
+   "XXE and billion laughs) and fuzzed in tests/fuzz_core_data.cpp with a " +
+   "write-and-reread property, under ASan. RUN on Windows (MSVC, and MSVC ASan); " +
+   "Linux and macOS only compiled (MSVC and clang, /U_WIN32), the code being " +
+   "platform-free",
+   "class XmlElement"],
   ["core", "GZIPCompressorOutputStream / GZIPDecompressorInputStream",
    "inflate.h: the DEFLATE decompressor, which is what zip.h reads entries " +
    "with. Decompression only, and on purpose -- a plugin READS compressed " +
@@ -2459,32 +3428,70 @@ const MAP = [
    "somebody downloaded",
    "class Inflate"],
   ["core", "StatisticsAccumulator",
-   "deliberately absent: a running mean, variance, min and max. Genuinely " +
-   "small and genuinely useful, and the reason it is not here is that nothing " +
-   "asks for it -- LoadMeasurer keeps the one running average this SDK needs " +
-   "and keeps it the way an audio thread requires, which is without a division " +
-   "per block. The test harness measures with explicit arithmetic where it " +
-   "measures at all.\n" +
-   "      Listed rather than quietly built, because a utility added on the " +
-   "grounds that it is small and might be handy is how a framework grows a " +
-   "surface nobody uses and everybody has to keep working",
-   null, "class StatisticsAccumulator"],
+   "statistics.h: StatisticsAccumulator<FloatType> -- count, mean, population and " +
+   "sample variance, standard deviations, RMS, minimum and maximum, and += to merge " +
+   "two (per-block statistics summed into per-second ones). Welford's update, not a " +
+   "sum of squares: for a DC offset of 1e9 with a ripple of one -- what a meter " +
+   "measures -- the sum-of-squares variance comes out NEGATIVE (-14208 in the test, " +
+   "for a true 0.332) and Welford's matches a two-pass computation. float is accumulated in double. Allocation-free " +
+   "and noexcept, so usable on the audio thread at one division per value.\n" +
+   "      Tested in tests/core_data_test.cpp against a two-pass computation over " +
+   "100,000 values, merging, empty, NaN and long double. RUN on Windows (MSVC, and " +
+   "MSVC ASan); Linux and macOS only compiled",
+   "class StatisticsAccumulator"],
   ["core", "BigInteger",
-   "deliberately absent: arbitrary-precision integers, which the reference needs " +
-   "because product_unlocking verifies RSA signatures in-process. " +
-   "Licensing here is not done that way -- it is a SaaS, the entitlement is " +
-   "checked by the service that issued it, and a plugin verifying its own " +
-   "licence offline is a plugin whose verification is on the attacker's " +
-   "machine.\n" +
-   "      No other part of an audio plugin needs numbers wider than 64 bits",
-   null, "class BigInteger"],
+   "bigint.h: BigInteger, signed integers of any size -- sign and magnitude over " +
+   "32-bit limbs, built so RSAKey and Primes have something to stand on and named " +
+   "as the reference names it. From any machine integer (INT64_MIN included), from " +
+   "text in bases 2, 8, 10 and 16, and from little-endian bytes as the reference's " +
+   "loadFromMemoryBlock reads them; back out through toString in the same bases and " +
+   "toMemoryBlock. + - * / % with truncating division, divideBy, " +
+   "findGreatestCommonDivisor, exponentModulo (negative exponents through the " +
+   "inverse), inverseModulo; setBit, clearBit, getHighestBit, findNextSetBit, " +
+   "getBitRange, & | ^ << >> on the magnitude; every comparison.\n" +
+   "      Schoolbook multiplication and Knuth's Algorithm D, written with unsigned " +
+   "borrows rather than the textbook's signed shifts; exponentModulo normalises " +
+   "the modulus once and reduces into reused buffers. No Karatsuba: its crossover " +
+   "is in the tens of limbs, so at RSA sizes it would earn little and cost a second " +
+   "multiplier to keep right. " +
+   "Where it parts from the reference it says so: parseString REFUSES a stray " +
+   "character instead of skipping it, so a key file with a typo fails to load " +
+   "rather than loading as a different key.\n" +
+   "      Not the licence check's integer. license.h keeps its own minimal one for " +
+   "the single signature it verifies, so what a licence accepts cannot move with " +
+   "this class; the test cross-checks the two on random inputs and changes " +
+   "neither.\n" +
+   "      Tested (tests/core_crypto_test.cpp) against sums, products, quotients, " +
+   "gcds, powers and inverses computed by Python's integers up to 6,144 bits; " +
+   "against the identities a == q*b + r, (a*b)/b == a, distributivity and the " +
+   "shifts on 2,500 random signed pairs; against int64 on 20,000 small pairs; " +
+   "against repeated multiplication for 3,000 small powers; against license.h's " +
+   "BigInt on random 64- to 1024-bit exponentiations; and by round trips through " +
+   "every base and through bytes. tests/fuzz_core_crypto.cpp feeds mutated text " +
+   "to the parser and checks it against an independent canonicaliser: 25,000 " +
+   "cases under ASan, clean. RUN on Windows x64 (MSVC, /W4, ASan); the code is " +
+   "portable C++ with no platform branch, compiled but not run elsewhere",
+   "class BigInteger"],
   ["core", "Expression",
-   "out of scope: a parsed arithmetic expression with named symbols, evaluated " +
-   "at runtime. Same answer as ComponentBuilder and the relative-positioning " +
-   "family, and the same reason -- a generated plugin's arithmetic is code, " +
-   "which the compiler checks, and an expression parsed from a string moves " +
-   "every mistake in it from build time to load time",
-   null, "class Expression"],
+   "expression.h: Expression -- + - * / and unary minus, parentheses, numbers, " +
+   "symbols (dotted ones included) resolved through a Scope at evaluation, and " +
+   "sin cos tan asin acos atan sqrt abs exp log log10 floor ceil round pow atan2 " +
+   "fmod min max; a Scope may add functions. Expression::VariableScope gives symbols " +
+   "values, which may themselves be expressions. Also the reference's introspection " +
+   "(getType, getInput, getSymbolOrFunction), operators to build one in code, " +
+   "withRenamedSymbol, findReferencedSymbols, simplified() and a toString that " +
+   "parses back to the same tree.\n" +
+   "      A plugin's own arithmetic is still code; this is for what a USER types -- " +
+   "a value box taking \"440 * 2\", a modulation amount as a formula, a tuning as " +
+   "ratios. Hostile text is bounded: length, depth and term limits when parsing, a " +
+   "step budget and symbol-cycle detection when evaluating, errors as messages with " +
+   "a column, never exceptions, and no recursion outside the depth-limited parser -- " +
+   "a sum 300,000 terms deep evaluates and frees without touching the stack.\n" +
+   "      Tested in tests/core_data_test.cpp against the same formulas compiled as " +
+   "C++ (3,000 evaluations), errors, limits and printing; fuzzed in " +
+   "tests/fuzz_core_data.cpp with a print-and-reparse property, under ASan. RUN on " +
+   "Windows (MSVC, and MSVC ASan); Linux and macOS only compiled",
+   "class Expression"],
   ["core", "HighResolutionTimer / PerformanceCounter / ScopedTimeMeasurement",
    "dsp.h: LoadMeasurer reports what fraction of the block budget a DSP " +
    "actually used, pushed to the editor, which is the measurement a plugin " +
@@ -2495,66 +3502,113 @@ const MAP = [
    "class LoadMeasurer"],
   ["core", "Process / ChildProcess / DynamicLibrary / InterProcessLock / RuntimePermissions / " +
            "ConsoleApplication / ArgumentList / WindowsRegistry",
-   "out of scope with one exception that is already here. A plugin does not " +
-   "spawn processes, take machine-wide locks, or ask for OS permissions -- and " +
-   "the standalone parses its own arguments in standalone.h rather than " +
-   "through a command-line framework.\n" +
-   "      DynamicLibrary is the exception and it is load-bearing: every " +
+   "process.h: ChildProcess (launched without a shell, the three standard " +
+   "streams and nothing else inherited, killed with its object), " +
+   "InterProcessLock and DynamicLibrary, built for the applications and tools " +
+   "made on this SDK (see the Inter-process row). RuntimePermissions " +
+   "(Android's and iOS's), ConsoleApplication, ArgumentList and WindowsRegistry " +
+   "remain out of scope: a plugin asks for no OS permission, and the " +
+   "standalone parses its own arguments in standalone.h.\n" +
+   "      DynamicLibrary was the one already here, and it is load-bearing: every " +
    "optional backend is reached by dlopen/LoadLibrary at RUNTIME, which is what " +
    "lets one build run on a machine without WebKitGTK, without X11 or without " +
    "an ASIO driver and say exactly which library was missing rather than " +
    "failing to load at all",
-   "dlopen"],
+   "class ChildProcess"],
   ["core", "Networking: URL, WebInputStream, StreamingSocket, DatagramSocket, IPAddress, " +
            "MACAddress, NamedPipe",
-   "deliberately absent, and this one is a position rather than a scope call. " +
-   "An audio plugin that opens a socket is doing something its user did not " +
-   "ask for, in a process the user did not start, on a machine that may be in " +
-   "a studio with no business talking to the internet. Several well-known " +
-   "plugins have been caught at it and the reaction was not forgiving.\n" +
-   "      Where a network genuinely is wanted -- checking an entitlement -- it " +
-   "belongs to the application around the plugin, which is where this SDK " +
-   "leaves it. The OSC support is the one thing here that touches UDP, and it " +
-   "is opt-in, local, and asked for by name",
-   null, "class StreamingSocket|class DatagramSocket|class WebInputStream|class NamedPipe"],
+   "net.h and ipc.h. IPAddress (IPv4 and IPv6, RFC 5952 text, this machine's " +
+   "addresses and their broadcast addresses), MACAddress, StreamingSocket " +
+   "(TCP: connect with a timeout across every address a name resolves to, " +
+   "listen, accept) and DatagramSocket (UDP, broadcast, multicast); URL (RFC " +
+   "3986 components, percent-encoding, parameters, child paths, and relative " +
+   "resolution that passes all 42 of the RFC's examples); and WebInputStream: " +
+   "HTTP and HTTPS with headers, a POST body, a timeout kept by a deadline of " +
+   "its own, progress, cancellation from any thread, and redirects followed by " +
+   "one set of rules on every platform -- with URL::downloadToFile, which " +
+   "replaces its target only with a whole 2xx body. NamedPipe is in ipc.h: a " +
+   "named pipe on Windows, and on macOS and Linux a Unix-domain socket rather " +
+   "than the reference's pair of FIFOs, which can neither tell a reader that " +
+   "the writer died nor be written without risking SIGPIPE in the host.\n" +
+   "      The position this row stood for is kept as defaults rather than as a " +
+   "missing header: nothing in the SDK opens a socket by itself, and a " +
+   "listener binds the loopback unless told otherwise, so a helper channel a " +
+   "plugin opens is not reachable from the network the laptop is on. Windows " +
+   "is reached through WinHTTP, Winsock and iphlpapi LOADED at run time, their " +
+   "few structures declared here and checked against the Windows SDK's at " +
+   "compile time, so the header compiles after any <windows.h>; macOS through " +
+   "NSURLSession by the Objective-C runtime; Linux through libcurl opened with " +
+   "dlopen, so no link dependency. RUN on Windows (sdk/tests/system_test " +
+   "against an HTTP server it starts: GET, POST, headers, a redirect chain, " +
+   "the 303 and 307 rules, a 404, a timeout, cancellation before the response " +
+   "and in the middle of a body, a chunked body, a megabyte with progress, " +
+   "IPv6, and one real HTTPS request when online; TCP and UDP on the loopback; " +
+   "the parsers fuzzed under ASan, 45,000 cases); the macOS and Linux backends " +
+   "are COMPILED through tests/au_shim by MSVC and clang, and have not run",
+   "class WebInputStream"],
   ["core", "LocalisedStrings",
-   "deliberately absent: the reference's translation table, looked up by the English " +
-   "string. A plugin's interface is a handful of parameter names that come " +
-   "from the DESCRIPTOR, and a generated plugin can be generated with them in " +
-   "any language -- the translation belongs upstream, where the plugin is " +
-   "described, not in a lookup table shipped inside it.\n" +
-   "      What this SDK does owe is that the interface can DRAW those " +
-   "languages, and that is a font and text-shaping question rather than a " +
-   "string-table one. See the IME row for the part of it that is a real gap",
-   null, "class LocalisedStrings"],
+   "localisation.h: LocalisedStrings reads the reference's translation file format " +
+   "unchanged (language:, countries:, \"original\" = \"translation\", anything else a " +
+   "comment) with escapes, CR/LF/CRLF and a BOM; malformed mappings are skipped and " +
+   "their line numbers kept for the translator. Lookup falls back through a chain " +
+   "of tables (fr-CA on fr) and then to the original; ignoreCase folds ASCII. " +
+   "setCurrentMappings installs a process-wide table, translate() and " +
+   "SONORE_TRANS(\"...\") read it, SONORE_NEEDS_TRANS marks text translated later.\n" +
+   "      The descriptor still carries parameter names; this is for the rest of an " +
+   "editor's text, and for switching language at runtime. The current table is an " +
+   "immutable snapshot behind a shared_ptr, so reads are thread-safe while the " +
+   "language changes: tested with four threads translating through 2,000 changes, " +
+   "plus the file format, fallbacks and copies, in tests/core_data_test.cpp. RUN on " +
+   "Windows (MSVC, and MSVC ASan); Linux and macOS only compiled",
+   "class LocalisedStrings"],
   ["core", "LeakedObjectDetector / UnitTest / UnitTestRunner",
-   "sdk/tests: 2600-odd checks in one harness that prints what it measured, " +
-   "and the gate runs the whole suite a second time under ASan -- which " +
-   "catches leaks, use-after-free and buffer overruns rather than only the " +
-   "leaked-instance count the reference's macro tracks.\n" +
-   "      the reference ships a test framework because it is a library used by " +
-   "applications that need one. This is verified by its own gate, and a second " +
-   "framework inside the thing being tested would be a dependency the tests " +
-   "share with the code under test",
-   null, "class LeakedObjectDetector"],
+   "leak_detector.h: LeakedObjectDetector and SONORE_LEAK_DETECTOR(Class) -- an " +
+   "atomic count of a class's live instances, reported by name when the module " +
+   "unloads (stderr, the debugger's output on Windows, or a handler), and a double " +
+   "delete reported when it happens. On in debug builds and nothing at all in " +
+   "release; SONORE_CHECK_MEMORY_LEAKS chooses. ASan finds leaks better, but a " +
+   "plugin's leaks show up in a HOST, which is not an ASan build -- this works in " +
+   "an ordinary debug build inside any DAW.\n" +
+   "      unit_test.h: UnitTest (name, category, initialise / runTest / shutdown, " +
+   "beginTest, expect, expectEquals and the comparisons, expectWithinAbsoluteError, " +
+   "expectThrows, logMessage, a reproducible getRandom) registering itself in a " +
+   "global list, and UnitTestRunner running all of them or one category, logging " +
+   "the seed and keeping each section's passes, failures and messages. The SDK's own " +
+   "2600-odd checks stay standalone programs -- a framework inside the thing being " +
+   "tested would be a dependency shared with the code under test -- so this is the " +
+   "public API for plugin authors' tests.\n" +
+   "      Tested in tests/core_data_test.cpp: live counts through copies and moves, a " +
+   "child process that leaks and is reported at exit, and sample tests that pass, " +
+   "fail and throw. RUN on Windows (MSVC, and MSVC ASan); Linux and macOS only " +
+   "compiled",
+   "class LeakedObjectDetector"],
   ["core", "TimeSliceThread",
    "thread_pool.h: ThreadPool, which runs queued work on a small fixed set of " +
-   "threads. the reference's TimeSliceThread is the cooperative version -- clients are " +
-   "polled in turn and each returns how long to wait before it wants the next " +
-   "slice -- which suits background jobs that must not be interrupted. The " +
-   "background work a plugin has is loading a sample, and a pool that runs it " +
-   "to completion is the simpler shape",
-   "class ThreadPool"],
+   "threads, and audio_source.h's ReadAheadThread, the cooperative shape the " +
+   "reference calls TimeSliceThread -- clients polled in turn, each saying how " +
+   "long until it wants the next slice -- which read-ahead needs, because " +
+   "read-ahead never completes",
+   "class ReadAheadThread"],
   ["core", "AndroidDocument / AndroidDocumentInfo / AndroidDocumentIterator",
    "out of scope: Android's scoped storage API, which the reference wraps because it " +
    "targets Android. There is no Android target here -- the same reason " +
    "PushNotifications and ContentSharer are out",
    null, "class AndroidDocument"],
   ["core", "TextDiff",
-   "out of scope: a minimal edit script between two strings, which the reference uses " +
-   "to send incremental ValueTree changes over a wire. There is no ValueTree " +
-   "here and nothing sends text over a wire",
-   null, "class TextDiff"],
+   "text_diff.h: TextDiff -- the changes (at a byte offset, remove so many bytes, " +
+   "insert this text) that turn one string into another, applied in order by " +
+   "appliedTo. Myers' O(ND) algorithm in linear space, by UTF-8 character so no " +
+   "change splits one (invalid UTF-8 compared byte by byte, so any string round-" +
+   "trips). The reference uses it for ValueTree changes over a wire; here it is for " +
+   "undo in a text field and showing what an edit changed.\n" +
+   "      Both strings may come from outside, so the search runs on a work budget and " +
+   "a size guard: past either, the unresolved part becomes one replacement -- still " +
+   "exact, and isMinimal() says it is no longer the fewest characters. Tested in " +
+   "tests/core_data_test.cpp: 3,000 random pairs checked MINIMAL against a " +
+   "dynamic-programming LCS, invalid UTF-8, a 200,000-character text, the budget and " +
+   "the guard; fuzzed in tests/fuzz_core_data.cpp, under ASan. RUN on Windows (MSVC, " +
+   "and MSVC ASan); Linux and macOS only compiled",
+   "class TextDiff"],
   ["graphics", "DropShadowEffect / GlowEffect",
    "gfx/effects2d.h: DropShadow, and a glow is the same operation with the " +
    "offset at zero and a bright colour -- which is exactly what the reference's " +
@@ -2575,8 +3629,9 @@ const MAP = [
   ["graphics", "DrawableComposite / DrawablePath / DrawableRectangle / DrawableImage / " +
                "DrawableShape",
    "gfx/svg.h: Drawable holds a flat list of SvgShape -- a path, a fill, a " +
-   "stroke -- because the parse FLATTENS groups and their transforms into " +
-   "absolute paths at load. The reference keeps the tree so a drawable can be " +
+   "stroke -- and the clips, masks and layers between them, because the parse " +
+   "FLATTENS groups, their styles and their transforms into absolute paths " +
+   "with resolved paints at load. The reference keeps the tree so a drawable can be " +
    "manipulated afterwards: a composite reparented, a path's points animated, " +
    "a rectangle's corner radius bound to something.\n" +
    "      Flattening is the right trade for the use this has. An editor " +
@@ -2586,17 +3641,40 @@ const MAP = [
    "after loading, which nothing here does",
    "struct SvgShape"],
   ["graphics", "DrawableText",
-   "deliberately absent, and svg.h has said so since it was written: text in " +
-   "an SVG is not rendered. It would need font matching against whatever " +
-   "typefaces the machine happens to have, and an SVG whose text depends on " +
-   "that is one that looks different on every machine -- which is the opposite " +
-   "of what a logo is for.\n" +
-   "      The answer for anybody exporting art is to convert text to paths " +
-   "before export, which every drawing tool does on request and which makes " +
-   "the file say exactly what it means. Text that must be TEXT -- a label, a " +
-   "readout -- goes through Font and Label, where the typeface is chosen at " +
-   "runtime deliberately",
-   null, "class DrawableText|renderSvgText"],
+   "gfx/svg.h and gfx/font_match.h. <text>, and the <tspan>s and <a>s in it, " +
+   "are laid out as SVG lays out horizontal text -- x, y, dx and dy singly or " +
+   "per character, text-anchor per chunk, font-family, -size, -weight and " +
+   "-style, letter- and word-spacing, xml:space -- and turned to glyph " +
+   "outlines at parse time, so fill and stroke with every paint, opacity, " +
+   "transforms, clips, masks and a clipPath made of text treat a letter as a " +
+   "path. Each run is kept as a DrawableText -- its words, its Font, colour, " +
+   "justification and a Parallelogram box, with toPath and draw -- which is " +
+   "also usable on its own, as the reference's is.\n" +
+   "      Which face: FontMatcher, into a FontMatch. A CSS family list in " +
+   "order; faces the plugin REGISTERED before the machine's, which are indexed " +
+   "once from the name, OS/2 and fvar tables of every file in the system font " +
+   "folders (full and PostScript names too, so Illustrator's Arial-BoldMT " +
+   "finds that face); generic families per platform; the style, then CSS's " +
+   "weight rule; a variable face's wght axis set to the weight when it reaches " +
+   "it. No bold or italic is synthesised, as resvg synthesises none. The old " +
+   "objection is now a stated fact rather than a reason: a family list matched " +
+   "against a machine's fonts gives that machine's answer. A plugin whose art " +
+   "must draw the same everywhere registers the face it was designed with and " +
+   "parses with FontMatcher(EmbeddedOnly): every family resolves to a " +
+   "registered face and no character falls back to a system face -- or it " +
+   "converts the text to outlines before export.\n" +
+   "      images_test draws eight SVGs with four fonts built by " +
+   "tests/data/svgtext/make_svgtext.py (static regular, bold and italic, and a " +
+   "variable weight axis) against resvg 0.48 given the same fonts: ink bounds " +
+   "within a pixel, total coverage within 5% of resvg's, mean alpha difference " +
+   "under 1.1 levels; plus the matcher's CSS order, whitespace, anchors, " +
+   "18pt as 24px, the character limit. 815 of 834 SVGs found on this machine " +
+   "draw byte-identically to before the change and the 19 with text now draw " +
+   "it, matching resvg with the same system fonts at a white-ink IoU of 0.98. " +
+   "fuzz_images ran 17,691 mutations of the eight SVGs under ASan, none crashing " +
+   "or hanging. Run on Windows; macOS and " +
+   "Linux compiled only, font folders and directory walk written for both",
+   "class DrawableText"],
   ["graphics", "StrokeOptions",
    "gfx/stroke.h: StrokeStyle, with LineJoin and LineCap beside it, and " +
    "PathStrokeType is claimed by the same file. The reference 8 split the options out " +
@@ -2614,27 +3692,31 @@ const MAP = [
    "vertical centring is how they end up disagreeing",
    "enum class Justify"],
   ["graphics", "FontFeatureSetting / FontVariableSetting / FontFeatureTag",
-   "deliberately absent: OpenType feature tags -- ligatures, tabular figures, " +
-   "stylistic sets -- and variable-font axes. gfx/truetype.h reads glyf and " +
-   "cmap and kerns from kern/GPOS, which is what drawing a label needs.\n" +
-   "      One of these has a real argument behind it and is worth naming: " +
-   "TABULAR FIGURES stop a numeric readout from jittering as its digits " +
-   "change, which is exactly what a plugin's value boxes do while a knob " +
-   "moves. It is not free -- it means reading GSUB and applying a feature " +
-   "substitution -- and the jitter is currently avoided by giving the readout " +
-   "a fixed width instead, which solves the visible problem without a shaping " +
-   "engine",
-   null, "FontFeatureSetting|FontVariableSetting|hb_feature"],
+   "gfx/font.h: Font::withFeature(tag, value) for OpenType features and " +
+   "Font::withVariation(axis, value) for a variable font's axes. A feature " +
+   "the caller gives goes into the shaper's plan as HarfBuzz merges a user's " +
+   "-- one already there keeps its stage and takes the value, 0 turning it " +
+   "off; a new one goes last; a value above 1 picks an alternate -- and a " +
+   "font with features shapes all its text. TABULAR FIGURES are the case a " +
+   "plugin has: withFeature(\"tnum\") keeps a readout from jittering as its " +
+   "digits change while a knob moves. Fractions are automatic, as in " +
+   "HarfBuzz: digits around U+2044 take numr, frac and dnom. Compared with " +
+   "HarfBuzz on twelve system fonts under random sets of thirty-five " +
+   "features: all of 24,000 strings identical",
+   "Font withFeature("],
   ["graphics", "ColourLayer / GlyphLayer / ImageLayer",
-   "deliberately absent: the reference 8's layered glyph rendering, which is how a " +
-   "COLOUR font is drawn -- emoji, and multi-coloured icon fonts, where one " +
-   "glyph is several coloured layers stacked. Glyphs here are cached as PATHS " +
-   "and filled with one colour, which is what a plugin's labels and numbers " +
-   "are.\n" +
-   "      An interface that wanted colour emoji would need the whole layered " +
-   "path, and an interface that wants a coloured icon uses an SVG, which this " +
-   "already draws",
-   null, "class GlyphLayer|class ColourLayer|COLR"],
+   "gfx/truetype.h: Typeface::colourLayers reads COLR version 0 and CPAL -- " +
+   "each layer an outline and its palette colour, or the text's own -- and " +
+   "Typeface::colourImage the PNG pictures of sbix and CBDT, from the strike " +
+   "HarfBuzz takes, placed where HarfBuzz places them. Font::draw draws them " +
+   "in colour: Windows' Segoe UI Emoji, macOS's Apple Color Emoji, Linux's " +
+   "Noto Color Emoji, and a plugin's own colour icon font. An emoji asked for " +
+   "as one -- by default, or with VS16 -- comes from emojiTypeface(), the " +
+   "system's colour face, as a browser chooses it; the picture comes from " +
+   "the strike suited to the size on the screen, through the transform. " +
+   "COLR version 1's gradients are not drawn: a font with only those is " +
+   "passed over",
+   "struct ColourLayer"],
   ["extras", "AudioFormat / AudioFormatManager",
    "audiofile.h: one loadAudioFile that sniffs the header and dispatches. The reference " +
    "has a registry because an application lets the USER add formats and then " +
@@ -2643,24 +3725,62 @@ const MAP = [
    "first four bytes and there is no registry to populate or to get wrong.\n" +
    "      A fixed set is also the honest one for a plugin: what it can open is " +
    "a property of the plugin, not of the machine it is running on, so a sample " +
-   "that loads on one user's system loads on every user's",
+   "that loads on one user's system loads on every user's. An application that " +
+   "wants the machine's codecs as well opts in: enableSystemAudioFormats() " +
+   "(system_audio_format.h, see the CoreAudioFormat row) puts them behind the " +
+   "fixed set, through setAudioFileFallback",
    "readAudioFile"],
   ["extras", "CoreAudioFormat / WindowsMediaAudioFormat",
-   "deliberately absent: the OS's own decoders, which the reference wraps to open " +
-   "whatever the platform happens to support -- m4a on a Mac, wma on Windows. " +
-   "Every decoder here is our own or a permissively-licensed one compiled IN, " +
-   "which is what makes a sample open identically on all three platforms.\n" +
-   "      A format that works on the user's Mac and silently fails on their " +
-   "collaborator's PC is worse than one that never worked: the project opens, " +
-   "the sampler is empty, and nothing says why",
-   null, "CoreAudioFormat|WindowsMediaAudioFormat|MFCreateSourceReader"],
+   "system_audio_format.h: WindowsMediaAudioFormat decodes through Media " +
+   "Foundation -- a source reader over a FILE byte stream (MFCreateFile, so an " +
+   "http:// path is never fetched) asked for float PCM: AAC in M4A/MP4/ADTS, " +
+   "MP3, WMA, ALAC, AC-3, whatever decoders the machine has. CoreAudioFormat " +
+   "does the same on macOS through ExtAudioFile. Both fill the WavData every " +
+   "reader here fills, under the same kMaxDecodedSamples ceiling.\n" +
+   "      Opt-in, because the old argument still holds for the DEFAULT -- a " +
+   "format that opens on one machine and not the next is a project that loads " +
+   "with an empty sampler: readAudioFile keeps its fixed set until " +
+   "enableSystemAudioFormats() puts the system decoders behind it, and even " +
+   "then the built-in WAV/AIFF/FLAC/MP3/Ogg decoders go first and the system " +
+   "only sees what they refuse (an M4A; ADTS AAC, which shares MP3's sync; MP3 " +
+   "inside a RIFF). mfplat is loaded at runtime from System32, so a Windows N " +
+   "edition without Media Foundation gets isAvailable() == false rather than a " +
+   "plugin that will not load; COM is initialised only on a thread that has " +
+   "none, and a caller's apartment is never changed.\n" +
+   "      RUN on Windows (audio_io_test): Media Foundation's own encoder makes " +
+   "AAC in M4A and ADTS, MP3 and WMA of a 1 kHz sine, and each decodes to the " +
+   "right rate, length, tone and both channel levels within 0.5 dB; float WAV " +
+   "comes back bit-exact; the one MP3 decoded by Media Foundation and by " +
+   "minimp3 agrees to 87 dB; the dispatcher's choices are counted; a caller's " +
+   "single-threaded apartment survives a decode; 1200 truncated and " +
+   "byte-flipped files under ASan decode or refuse without a crash. " +
+   "CoreAudioFormat is COMPILED only (tests/mac_syntax_audio_io.cpp against " +
+   "au_shim, now with ExtAudioFile); its round-trip test runs when macOS CI " +
+   "does. Linux has no system codec API, and says so",
+   "class WindowsMediaAudioFormat"],
   ["extras", "LAMEEncoderAudioFormat",
-   "out of scope: the reference shells out to a LAME BINARY the user must supply to " +
-   "write MP3. Nothing here writes audio files except the standalone's WAV " +
-   "render, and MP3 encoding is not something a plugin does -- the host " +
-   "renders the mix. Spawning an external encoder from inside a plugin is also " +
-   "the process-spawning objection from the core walk",
-   null, "LAMEEncoder|lame_encode"],
+   "lame_encoder.h: LAMEEncoderAudioFormat, the way the reference does it -- the " +
+   "audio to a temporary 16-bit WAV, the user's own lame executable run on it " +
+   "(VBR -V, CBR -b, ABR, -q, ID3 tags), and the MP3 it writes read back as " +
+   "bytes or written to a UTF-8 path. A separate program keeps LAME's LGPL the " +
+   "user's rather than every plugin's, and the path is always the caller's: " +
+   "nothing searches PATH.\n" +
+   "      Launched without a shell -- CreateProcessW naming the program " +
+   "exactly, posix_spawn elsewhere -- with no inherited handles, no console " +
+   "window and stdio going nowhere; Windows arguments quoted as the exact " +
+   "inverse of the C runtime's splitting rules; a timeout after which the " +
+   "child is killed and reaped; temporary files created exclusively under " +
+   "random names and removed on every path out.\n" +
+   "      No LAME is installed here, so the launching path was RUN on Windows " +
+   "with a fake encoder: audio_io_test launches ITSELF as lame (an environment " +
+   "variable picks copy, fail, hang, empty or echo). Sixteen arguments -- " +
+   "spaces, quotes, backslash runs, empty, UTF-8, shell metacharacters -- " +
+   "arrive in the child byte for byte; the copied MP3 is the 16-bit WAV of the " +
+   "input; exit codes are reported, a hang is killed at 0.5 s, and no " +
+   "temporary file is left behind on any path. The posix_spawn branch is " +
+   "COMPILED only (macOS against au_shim, Linux against stubs). It blocks for " +
+   "as long as the encoder runs: never from the audio thread",
+   "class LAMEEncoderAudioFormat"],
   ["extras", "AudioSubsectionReader / BufferingAudioReader / MemoryMappedAudioFormatReader",
    "audiofile.h and the sampler: a region of a file, read-ahead, and mapping. " +
    "BufferingAudioReader and MemoryMappedAudioFormatReader are already claimed " +
@@ -2687,13 +3807,11 @@ const MAP = [
    "hierarchy for them to fit into",
    "ARA"],
   ["extras", "AudioSourcePlayer",
-   "standalone.h: the device callback that fills a block from the DSP. the reference's " +
-   "class is the adapter between an AudioSource and an AudioIODeviceCallback, " +
-   "which exists because its device layer and its processing layer are " +
-   "separate hierarchies. Here the callback IS the DSP call -- the standalone " +
-   "prepares once and pushes blocks -- and an adapter between two things that " +
-   "are already the same shape would be a layer with nothing in it",
-   "SONORE_BUILD_STANDALONE"],
+   "audio_source.h: AudioSourcePlayer hands a pull-model AudioSource to the " +
+   "device backends -- their RenderFn, renderWithInput for ASIO, and the " +
+   "reference's planar callback. The plugin standalone does not need it: its " +
+   "callback IS the DSP call",
+   "class AudioSourcePlayer"],
   ["dsp", "FastMathApproximations",
    "fast_math.h: fastTanh, fastExp, fastSin, fastCos and fastLog, each with " +
    "its measured worst-case error stated in the header rather than described " +
@@ -2725,17 +3843,27 @@ const MAP = [
    "SDK does through ParamInfo and the attachments instead",
    "class ProcessorChain"],
   ["dsp", "Phase / Polynomial / SpecialFunctions / Matrix",
-   "deliberately absent as separate types, except where they are already " +
-   "inside something. A phase accumulator is two lines inside every oscillator " +
-   "here and wrapping it would be a class to construct per voice; Polynomial " +
-   "and SpecialFunctions (Bessel functions, for window design) are used by " +
-   "the reference's FilterDesign, and the filter designs here compute their " +
-   "coefficients directly.\n" +
-   "      Matrix is the one worth naming: the reference has it for state-space filters " +
-   "and for its own ambisonic code. Nothing here does either, and a general " +
-   "matrix type in an audio SDK is an invitation to allocate one on the audio " +
-   "thread",
-   null, "class Polynomial|class SpecialFunctions|class Matrix"],
+   "phase.h: Phase -- a phase accumulator in turns held as a 64-bit fixed " +
+   "point number, so the add is exact and the wrap is integer overflow: 440 " +
+   "Hz at 48 kHz stays within 5e-12 of a cycle of the exact rational phase " +
+   "over 10^8 samples, where the same accumulator in float drifts half a " +
+   "cycle. advance() returns the phase before the step, as the reference's " +
+   "does; turns() in [0, 1) and radians() in [0, 2pi) cannot round up onto " +
+   "the far end; wrapped() marks the sample a sync acts on. The oscillators " +
+   "keep their float phase -- a note is not long enough to drift -- and this " +
+   "is for what must stay in step for minutes.\n" +
+   "      special.h: SpecialFunctions -- besselI0 (whose series was cut off " +
+   "at 64 terms and read 0.4% low at x = 100; now good to overflow), " +
+   "ellipticIntegralK by the AGM, and the Jacobi cde, sne and asne in " +
+   "quarter-period units by the descending Landen transformation: the " +
+   "reference's set for elliptic filter design, as free functions in " +
+   "sonore::special with the struct forwarding to them. Checked against the " +
+   "published I0 and K(m) tables, their integral representations by " +
+   "quadrature, sn as the inverse of the incomplete integral, the imaginary " +
+   "transformation, both periods, and asne round trips on the real line, " +
+   "the stopband and off-axis. Polynomial and Matrix have their own rows " +
+   "above. RUN on Windows (MSVC /W4, ASan); standard C++ only",
+   "class Phase {"],
   ["osc", "OSCMessage / OSCArgument / OSCAddress",
    "osc.h: Message, Argument and the address string on it. An Argument carries " +
    "the four types every OSC implementation agrees on -- int32, float32, " +
@@ -2756,19 +3884,32 @@ const MAP = [
    "promise that instant",
    "decodePacket"],
   ["osc", "OSCAddressPattern",
-   "deliberately absent: OSC's wildcard matching, where a sender addresses " +
-   "/synth/*/cutoff and every matching receiver responds. That is for a " +
-   "controller talking to a rack of devices it did not configure. A plugin " +
-   "receives OSC that somebody aimed at it, and the address is compared " +
-   "exactly -- which is also the version with no surprises about which " +
-   "parameter just moved",
-   null, "class OSCAddressPattern|matchesPattern"],
+   "osc.h: OSCAddressPattern and matchesPattern, OSC 1.0's rules -- ? and *, " +
+   "[abc] with ranges and a leading ! to negate, {foo,bar} -- part by part " +
+   "and never across a slash. Matched by carrying the set of reachable " +
+   "positions rather than by backtracking, so a pattern from the network " +
+   "cannot make it spin: *a*a*...*b against 400 characters takes " +
+   "microseconds. A malformed pattern matches nothing.\n" +
+   "      This row used to say exact matching only, because a plugin receives OSC " +
+   "somebody aimed at it. Both now: Dispatcher hands a message to every " +
+   "listener its pattern reaches (Receiver::pollAndDispatch), and a message " +
+   "with no wildcard in it -- nearly all of them -- is still one map lookup. " +
+   "Listeners register at plain addresses (isValidAddress), because in OSC " +
+   "it is the sender that writes the pattern. Tested against a 44-case table " +
+   "drawn from the OSC 1.0 rules, over a UDP loopback, and fuzzed against a " +
+   "separately written naive matcher. Run on Windows; parsed as macOS and " +
+   "Linux. OSC 1.1's double-slash wildcard is not here",
+   "class OSCAddressPattern"],
   ["osc", "OSCColour",
-   "deliberately absent: OSC's 32-bit RGBA argument type, which the reference supports " +
-   "because the spec lists it. It is used by lighting desks. Nothing in an " +
-   "audio plugin has a colour that another machine sets, and an argument type " +
-   "the four common ones do not include is one most receivers reject anyway",
-   null, "OSCColour|class Colour32"],
+   "osc.h: OSCColour, the 'r' argument -- red in the high byte and alpha in " +
+   "the low, big-endian like every OSC word -- with fromInt32RGBA and " +
+   "toInt32, Argument::makeColour, and isColour and getColour to read one " +
+   "back as a colour rather than an int taken apart by hand. That is where " +
+   "it goes wrong: ARGB habits put alpha on top, and a lighting desk sent a " +
+   "colour read that way shows a different one. Tested bit-exactly on the " +
+   "wire, between a string and a float in one message, and an int is not " +
+   "read as a colour. Run on Windows; parsed as macOS and Linux",
+   "struct OSCColour"],
   ["gui", "AnimatorUpdater / VBlankAnimatorUpdater / ValueAnimatorBuilder / " +
           "StaticAnimationLimits",
    "gfx/animator.h: ValueAnimator::tick takes the time and returns whether " +
@@ -2778,47 +3919,91 @@ const MAP = [
    "      There is one driver here and it is the window's own 33 ms tick, " +
    "which the editor already has for following automation. A second driver " +
    "would be a second clock, and the whole design of every timed thing in this " +
-   "SDK is that there is one and it is passed in as an argument. See the " +
-   "VBlankAttachment row for why the vblank one specifically is absent.\n" +
+   "SDK is that there is one and it is passed in as an argument. A display's " +
+   "own refresh is there for whoever wants to drive it from that instead: " +
+   "gfx/vblank.h's VBlankAttachment calls back once a refresh (see its row), " +
+   "and tick() takes whatever time it is handed.\n" +
    "      The builders are the reference 8's fluent construction API over the same " +
    "animations; animate() takes its arguments directly",
    "class ValueAnimator"],
   ["gui", "SpringEasingOptions",
-   "deliberately absent: a spring solved from stiffness, damping and mass, " +
-   "which is a physical model rather than a curve. CubicBezierEasing covers " +
-   "what a designer actually hands over -- every design tool exports " +
-   "cubic-bezier -- and Elastic is here for the overshooting case.\n" +
-   "      A real spring's value is that its duration falls OUT of the physics " +
-   "rather than being set, which matters when an animation is interrupted and " +
-   "must continue from wherever it was with its current velocity. Nothing here " +
-   "interrupts an animation mid-flight: a section opens or closes, and " +
-   "re-triggering cancels and re-aims",
-   null, "SpringEasing|stiffness"],
+   "gfx/animator.h: SpringEasingOptions, a spring as an easing curve -- the " +
+   "exact step response of a damped harmonic oscillator starting at rest -- " +
+   "with the reference's withFrequency, withAttenuation and " +
+   "withExtraAttenuationRange (defaults 3, 3, 0.25; the last stretch blended " +
+   "onto the target so a duration-based animation lands when its time is " +
+   "up), and the physical forms fromPhysical(mass, stiffness, damping, " +
+   "seconds) and fromResponse(response, bounce, seconds), with settlingTime " +
+   "for the duration that falls out of the physics; under-, critically and " +
+   "over-damped all exact. ValueAnimator::animateWithSpring and an " +
+   "Animator::animateBounds overload take one.\n" +
+   "      Tested against the formulae: the default curve peaks at t = 1/6 at 1 + " +
+   "e^-0.5; m 1, k 100, c 4 is zeta 0.2 and the sampled curve's peak matches " +
+   "exp(-pi zeta / sqrt(1 - zeta^2)) = 0.5266 to 1e-6 at the predicted time; " +
+   "settlingTime is ln(1000)/2; critical damping is monotonic; a " +
+   "ValueAnimator overshoots within the formula and lands exactly on its " +
+   "target. Platform-independent; RUN on Windows",
+   "class SpringEasingOptions"],
   ["core", "SHA256",
    "hash.h: Sha256, with sha256Hex and sha256File beside it. Named here as " +
    "the reference names it so the walk can find it -- the row that existed described " +
    "the hashing and never used the word",
    "class Sha256"],
   ["core", "MD5 / Whirlpool",
-   "deliberately absent. MD5 is broken for anything that matters and its " +
-   "remaining honest use is a checksum, which crc32 in zip.h already covers " +
-   "where a zip entry needs one. Whirlpool is a fine hash almost nothing " +
-   "speaks, so a digest in it is one no other tool can check.\n" +
-   "      Offering three hashes invites a caller to pick the wrong one. There " +
-   "is one, it is SHA-256, and it is the one every other system in this " +
-   "project already speaks",
-   null, "class MD5|class Whirlpool"],
+   "hash.h: MD5 and Whirlpool beside Sha256, the same shape as it -- streaming " +
+   "update, finish to bytes or hex() to text, and finishing works on a copy so " +
+   "the state can keep growing -- with md5Hex / md5File and whirlpoolHex / " +
+   "whirlpoolFile. The file forms stream 64 KB at a time through pathio, so a " +
+   "4 GB sample costs what a 4 KB preset does and a UTF-8 path opens on Windows; " +
+   "a read error mid-file gives an empty string, not the digest of the part read " +
+   "(sha256File now goes the same way). Whirlpool is the final ISO/IEC 10118-3 " +
+   "version, its S-box and round tables BUILT at first use from the " +
+   "specification's mini-boxes and circulant matrix rather than pasted.\n" +
+   "      SHA-256 is still the one this SDK picks. MD5 is broken as a security " +
+   "hash and is here for the manifests and catalogues that name it; Whirlpool is " +
+   "here so a digest the reference made can be checked.\n" +
+   "      Tested (tests/core_crypto_test.cpp): the whole RFC 1321 suite and a " +
+   "million 'a's; the ISO/NESSIE vectors including a million 'a's; digests at " +
+   "every padding boundary from 31 to 129 bytes against Python's hashlib (MD5) " +
+   "and OpenSSL (Whirlpool); a 100,003-byte message whole, in random pieces, and " +
+   "as a file under an accented and CJK name. RUN on Windows x64 (MSVC, /W4, " +
+   "ASan); no platform code beyond pathio",
+   "class Whirlpool"],
   ["core", "BlowFish / RSAKey / Primes",
-   "deliberately absent: a block cipher, a public-key implementation, and " +
-   "prime generation for it. The reference ships them because product_unlocking " +
-   "verifies licence keys in-process -- see the BigInteger row for why " +
-   "licensing here is not done that way.\n" +
-   "      Hand-rolled cryptography in an audio SDK is also the wrong place for " +
-   "it on its own merits: it is the one kind of code where a subtle mistake is " +
-   "invisible until somebody exploits it, and where the correct answer is " +
-   "always to use the platform's own audited implementation rather than to " +
-   "carry a copy",
-   null, "class BlowFish|class RSAKey|class Primes"],
+   "crypto.h: BlowFish, RSAKey and Primes as the reference names them, built on " +
+   "bigint.h, plus secureRandomBytes from the operating system's CSPRNG -- " +
+   "BCryptGenRandom looked up in bcrypt.dll at first use (no link line to " +
+   "change), arc4random_buf on macOS and the BSDs, getrandom on Linux with " +
+   "/dev/urandom under kernels older than 3.17. Key generation FAILS when the " +
+   "OS refuses rather than falling back to anything guessable.\n" +
+   "      BlowFish: keys of 1 to 72 bytes, the two-word encrypt/decrypt, 8-byte " +
+   "blocks, and the reference's buffer form (ECB, PKCS#7) -- in big-endian words, " +
+   "where the reference reads native ones, so a buffer interoperates with every " +
+   "other Blowfish including `openssl enc -bf-ecb`. A refused decryption leaves " +
+   "the buffer as it was. RSAKey: createKeyPair(public, private, bits, seeds), " +
+   "applyToValue with the reference's digit-by-digit handling of values wider " +
+   "than the modulus (digits reversed, a zero low digit lost -- inherited and " +
+   "documented), toString / fromString in its \"exponent,modulus\" hex. The " +
+   "public exponent is 65537 where the reference starts at 3. Seeds make a pair " +
+   "a deterministic function of them, as the reference's do. Primes: " +
+   "isProbablyPrime -- trial division below 2000, then Miller-Rabin with the " +
+   "twelve bases that are a proof below 2^64 and fresh OS-chosen bases above -- " +
+   "and createProbablePrime by a sieved incremental search.\n" +
+   "      Compatibility, not modern cryptography: textbook RSA with no padding, " +
+   "unauthenticated ECB, nothing constant-time. The header says so first; secrecy " +
+   "that matters belongs to the platform's audited implementation.\n" +
+   "      Tested (tests/core_crypto_test.cpp): Schneier's 33 ECB vectors and the " +
+   "24 variable-key ones; an OpenSSL-encrypted buffer; all 1,042 pi words " +
+   "recomputed from Machin's formula; RSA pairs at 512 and 1024 bits round-trip " +
+   "both ways, and a signature made with one verifies through license.h's " +
+   "verifier; a sieve below 50,000, 2,000 numbers across 2^32, Mersenne primes " +
+   "to 2^607-1, 28 Carmichael numbers and strong pseudoprimes built to pass " +
+   "fixed bases all rejected. tests/fuzz_core_crypto.cpp: random keys and " +
+   "garbage through BlowFish, mutated key strings through RSAKey, 25,000 cases " +
+   "with the BigInteger targets, ASan clean. RUN on Windows x64 (MSVC, /W4, " +
+   "ASan); the macOS and Linux branches of secureRandomBytes are COMPILED only " +
+   "-- macOS through tests/au_shim, Linux against stub headers -- never run",
+   "class BlowFish"],
   ["client", "StandaloneFilterWindow / StandalonePluginHolder",
    "standalone.h: the whole standalone application, from one #define. the reference's " +
    "two classes are the same idea -- wrap the plugin in a window and an audio " +
@@ -2831,23 +4016,76 @@ const MAP = [
    "input, and the offline modes that make it testable in CI on all three " +
    "platforms without a device or a display",
    "SONORE_BUILD_STANDALONE"],
-  ["gui", "OpenGL: OpenGLContext, OpenGLRenderer, OpenGLShaderProgram, OpenGLTexture, " +
-          "OpenGLFrameBuffer, OpenGLPixelFormat, OpenGLImageType, OpenGLHelpers, " +
-          "OpenGLVersion, OpenGLAppComponent, OpenGLGraphicsContextCustomShader, " +
-          "Matrix3D, Quaternion, Vector3D, Draggable3DOrientation",
-   "out of scope, and this is the one out-of-scope module whose classes are " +
-   "indexed by name -- because \"should this rasterise on the GPU\" is a " +
-   "question somebody could reasonably reopen, and it should be reopened " +
-   "against the actual list rather than a memory of it.\n" +
-   "      The answer today: software rasterisation gives identical pixels on " +
-   "every machine, no context to lose when a laptop switches GPU, and nothing " +
-   "to fail to initialise in a VM or over remote desktop -- which is where a " +
-   "lot of plugin support tickets come from. A plugin editor is knobs and " +
-   "meters, and the region-based repaint already keeps that cheap.\n" +
-   "      The 3D maths classes come with the module and would go with it. " +
-   "WebGL remains available through the webview editor for a plugin that " +
-   "genuinely wants a shader",
-   null, "class OpenGLContext|OpenGLShaderProgram|opengl"],
+  // ── opengl ──────────────────────────────────────────────────────────
+  //
+  // This was ONE row, out of scope, with every class named so the decision
+  // could be reopened against the real list. It was reopened: the software
+  // rasteriser stays the default for knobs and meters, and GL is now an opt-in
+  // a component asks for when it is drawing something a CPU cannot afford --
+  // a 3D waterfall, a 60 fps scope, a shader visualiser.
+  ["opengl", "OpenGLContext / OpenGLRenderer / OpenGLPixelFormat / OpenGLVersion",
+   "gfx/opengl.h + gfx/opengl_api.h: OpenGLContext attached to a component inside a native " +
+   "editor window (attachTo(component, NativeWindow::handle())). It makes a child surface " +
+   "over the component -- WGL on Windows, NSOpenGLContext on macOS, GLX on X11 -- that " +
+   "follows its position, size, visibility and ancestor clip, and is transparent to the " +
+   "mouse so the component tree still gets every event. The three OpenGLRenderer callbacks " +
+   "arrive on one thread, in order: a render thread of its own by default (paced by " +
+   "setSwapInterval, setContinuousRepainting or triggerRepaint), or the message thread. " +
+   "OpenGLPixelFormat (colour/depth/stencil bits, multisamplingLevel), OpenGLVersion " +
+   "(compatibility, or 3.2 / 4.1 / 4.3 core), a shared context, executeOnGLThread, and the " +
+   "component's own software painting composited over the GL picture.\n" +
+   "      No GLEW, no glad, nothing linked: opengl32 / OpenGL.framework / libGL are opened at " +
+   "runtime and each context owns an OpenGLFunctions table, so a host's own loader cannot " +
+   "collide with it. Teardown is the part plugins get wrong: closing runs on the GL thread " +
+   "while the surface still exists, including when the HOST destroys the editor window under " +
+   "a running render thread (the surface hears its own WM_DESTROY), and nothing touches GL " +
+   "after. A context that cannot be created -- no driver, or the GDI 1.1 renderer over " +
+   "remote desktop -- makes attachTo return false with the reason, and the component keeps " +
+   "its software painting.\n" +
+   "      RUN on Windows (sdk/tests/opengl_test.cpp, AMD Radeon, GL 4.6 compatibility and 3.2 " +
+   "core, 4x MSAA): pixels read back from shaders, textures and the composited component, " +
+   "and 200 attach/detach cycles with GDI, USER and kernel handles flat. macOS and X11 are " +
+   "COMPILED ONLY -- against tests/au_shim (tests/mac_syntax_opengl.cpp) and real Xlib " +
+   "headers, by MSVC and clang -- and have not run on any machine. X11 has no surface clock: " +
+   "the editor's own tick must call OpenGLContext::tick()",
+   "class OpenGLContext"],
+  ["opengl", "OpenGLShaderProgram / OpenGLTexture / OpenGLFrameBuffer / OpenGLHelpers",
+   "gfx/opengl.h. OpenGLShaderProgram compiles and links with the driver's own log on " +
+   "failure, and sets uniforms by name or through a cached Uniform (setMatrix4 takes a " +
+   "Matrix3D, column-major as GL wants). OpenGLTexture uploads a Bitmap's premultiplied " +
+   "RGBA as it is, so it composites exactly as the software painter does. OpenGLFrameBuffer " +
+   "is render-to-texture with optional depth and stencil, and readPixels / writePixels move " +
+   "pixels to and from a Bitmap the right way UP -- the row flip happens once, there. " +
+   "OpenGLHelpers: clear, a top-left enableScissorTest, isExtensionSupported (glGetStringi " +
+   "on a core profile, which has no GL_EXTENSIONS string), resetErrorState, and the GLSL " +
+   "1.10 -> 1.50 translation a core profile needs.\n" +
+   "      Every helper that draws puts back the GL state it touched, so a renderer's second " +
+   "frame sees what its first one left. Tested on Windows with real pixels in both a " +
+   "compatibility and a core context",
+   "class OpenGLShaderProgram"],
+  ["opengl", "OpenGLImageType / OpenGLGraphicsContextCustomShader / OpenGLAppComponent",
+   "gfx/opengl.h. OpenGLImageType makes GPU images (an OpenGLFrameBuffer) from a Bitmap and " +
+   "back, and paint() lets the SDK's ordinary Graphics draw on one -- in software, with a " +
+   "readback and an upload, because there is one rasteriser here and it is the software " +
+   "one; the reference's GL-backed Graphics has no equivalent to be. " +
+   "OpenGLGraphicsContextCustomShader fills a rectangle with a fragment shader written " +
+   "against pixelPos, screenBounds and pixelAlpha, translated for a core profile " +
+   "automatically. OpenGLAppComponent is a Component that owns its context and turns the " +
+   "callbacks into initialise / render / shutdown.\n" +
+   "      Tested on Windows: a custom shader's ramp read back pixel by pixel, a GPU image " +
+   "painted with Graphics, an OpenGLAppComponent initialised and shut down exactly once",
+   "class OpenGLGraphicsContextCustomShader"],
+  ["opengl", "Matrix3D / Quaternion / Vector3D / Draggable3DOrientation",
+   "gfx/maths3d.h, no GL needed. Vector3D (dot, cross, and the reference's * and ^), " +
+   "Matrix3D column-major with frustum, perspective, orthographic, lookAt, axis-angle and " +
+   "Euler rotations, transform, transpose, determinant and inverse; Quaternion with the " +
+   "Hamilton product, rotate, rotationMatrix, inverse and shortest-path slerp; and " +
+   "Draggable3DOrientation, an arcball that keeps the point under the pointer under the " +
+   "pointer and renormalises as it accumulates.\n" +
+   "      Tested against known results on every platform: rotations composed, Euler order, " +
+   "inverses multiplied back to the identity, projections taking known points to known " +
+   "corners, slerp halfway and the short way round",
+   "class Draggable3DOrientation"],
   // ── The rows below close a walk of the reference's own class index ────────────────
   //
   // scripts/reference-index.mjs holds the class NAMES from six gui_basics
@@ -2935,85 +4173,222 @@ const MAP = [
    "a second, weaker way to edit the same things",
    "class ValueBox"],
   ["gui", "Toolbar / ToolbarItemComponent / ToolbarItemPalette / ToolbarButton",
-   "out of scope: a Toolbar in the reference is a bar the USER rearranges, with a " +
-   "palette to drag items from and a saved layout string. That is an " +
-   "application affordance. A plugin's interface is designed by whoever built " +
-   "the plugin and is the same for everybody who loads it -- a user-arranged " +
-   "toolbar inside one would be a second layout to persist in the session and " +
-   "to migrate whenever the plugin gains a control",
-   null, "class Toolbar|ToolbarItemFactory|ToolbarItemPalette"],
+   "gfx/toolbar.h: Toolbar, ToolbarItemComponent, ToolbarButton (an SVG icon, a " +
+   "label or both, by ToolbarItemStyle: iconsOnly, iconsWithText, textOnly), " +
+   "ToolbarItemFactory with the separator, spacer and flexible-spacer ids, and " +
+   "ToolbarItemPalette. Horizontal or vertical; flexible spacers share the room " +
+   "left over; items that do not fit are hidden, not squashed, behind a chevron " +
+   "that opens them as a menu (a PopupMenuOverlay, so the keyboard works it " +
+   "too). toString() and restoreFromString() write the reference's \"TB:\" form, " +
+   "skipping an id the factory no longer makes rather than failing the load.\n" +
+   "      Customising is drag and drop inside the toolkit: showCustomisationDialog " +
+   "puts the palette in an in-editor dialog that leaves a hole over the toolbar, " +
+   "and items are dragged from the palette onto it, along it and back off it. " +
+   "While editing, a transparent handle over each item takes the press, so Save " +
+   "is moved rather than pressed and a slider item is rearranged like a button. " +
+   "The toolbar OWNS its items, unlike every other container here, because the " +
+   "user creates and destroys them. Tested (layout arithmetic, overflow by mouse " +
+   "and keyboard, the drag round trip, the string round trip) in " +
+   "gui_widgets_test and fuzz_gui_widgets; run on Windows (MSVC /W4, and the " +
+   "fuzz under AddressSanitizer); the macOS and Linux branches compiled, not run",
+   "class ToolbarItemPalette"],
   ["gui", "MenuBarComponent / MenuBarModel / BurgerMenuComponent",
-   "out of scope: a plugin editor has no menu bar. It is a child window inside " +
-   "a host that owns the frame, the title and the menus -- a bar along the top " +
-   "of a plugin would be a second menu system inside somebody else's " +
-   "application. PopupMenu exists and is what a plugin actually needs: a " +
-   "right-click on a control, and the drop-down behind a ComboBox",
-   null, "class MenuBarComponent|class BurgerMenuComponent"],
+   "gfx/menu_bar.h: MenuBarModel (getMenuBarNames; getMenuForIndex, which builds " +
+   "a PopupMenu when the menu opens so its ticks are current; menuItemSelected; " +
+   "menuBarActivated; menuItemsChanged), MenuBarComponent, and " +
+   "BurgerMenuComponent, which lists the same model as headings and items for an " +
+   "editor too narrow for a bar. The menus open in gfx/popup_overlay.h's " +
+   "PopupMenuOverlay -- a PopupMenu drawn inside the editor over an Overlay -- " +
+   "which is what lets the bar hear Left and Right with a menu open and switch " +
+   "menus as the mouse moves along it; press, drag and release over an item " +
+   "chooses it, as on every desktop.\n" +
+   "      The keyboard is the desktop's: F10 enters the bar, the arrows walk it, Down, " +
+   "Return or a letter opens a menu, Left and Right move between open menus, and " +
+   "Escape steps back to the bar and then out, handing the keyboard back to " +
+   "whoever had it. Alt with a menu's '&' letter opens it from anywhere through " +
+   "handleShortcutKey, offered from MouseRouter::onUnhandledKey. A bare tap of " +
+   "Alt is not a key event on any platform the peers drive, so that route is not " +
+   "here. A model destroyed first is forgotten rather than called. Tested in " +
+   "gui_widgets_test (clicks, sliding, press-drag-release, the F10 walk, Alt+F, " +
+   "type-ahead, the burger's keyboard) and fuzz_gui_widgets; run on Windows " +
+   "(MSVC /W4, and the fuzz under AddressSanitizer); the macOS and Linux " +
+   "branches compiled, not run",
+   "class MenuBarComponent"],
   ["gui", "SidePanel",
-   "out of scope: a drawer that slides in from the edge, which is a phone " +
-   "pattern the reference carries because it targets iOS and Android. A plugin editor " +
-   "is a fixed rectangle on a desktop; ConcertinaPanel is the same idea in the " +
-   "shape this actually has",
-   null, "class SidePanel"],
+   "gfx/side_panel.h: a drawer from the left or the right, over the editor " +
+   "rather than pushing it aside, with a title bar, a close button and the " +
+   "content (not owned). It covers its parent and dims it in proportion to how " +
+   "far in it is. A press on the dimmed part, Escape, the close button, or the " +
+   "title bar dragged a third of its width back towards the edge closes it; a " +
+   "shorter drag springs back. Opening moves the keyboard into the content, and " +
+   "closing hands it back to the component that had it, if that is still in the " +
+   "tree.\n" +
+   "      The slide is gfx/animator.h's Animator and, like every timed thing here, " +
+   "moves only on tick(now) -- with setInputClock(now) for a slide a click " +
+   "starts -- so \"halfway through, ease-out has it three quarters in\" is an " +
+   "exact assertion. Tested in gui_widgets_test (positions and dimmed pixels " +
+   "mid-slide, every way of closing, both sides) and fuzz_gui_widgets; run on " +
+   "Windows (MSVC /W4, and the fuzz under AddressSanitizer); the macOS and Linux " +
+   "branches compiled, not run",
+   "class SidePanel"],
   ["gui", "MultiDocumentPanel / MultiDocumentPanelWindow",
-   "out of scope: MDI, for an application holding several open documents. A " +
-   "plugin instance is one plugin",
-   null, "class MultiDocumentPanel"],
+   "gfx/multi_document.h: MultiDocumentPanel holds documents, owned or not, as " +
+   "tabs -- one filling the area under a strip with a close cross on each tab -- " +
+   "or as MultiDocumentPanelWindow frames floating inside the panel: moved by " +
+   "the title bar and never out of reach, resized by a corner grip, maximised by " +
+   "a double click, raised by a click. An inactive window takes its first click " +
+   "to come forward and nothing else, so a click never presses a button in a " +
+   "document the user has not yet seen. Ctrl+Tab walks the documents and takes " +
+   "the keyboard along; Ctrl+F4 closes one.\n" +
+   "      Closing asks tryToCloseDocument, which answers through a callback -- at once " +
+   "or after an alert -- and close-all stops at the first no; the document used " +
+   "before a closed one comes forward. A maximum count and fullscreen-when-one, " +
+   "as the reference has them. Windows and owned documents are freed at the next " +
+   "paint, never inside the click that closed them. Tested in gui_widgets_test " +
+   "(tabs, activation order, deferred answers, dragging, resizing and raising " +
+   "windows) and fuzz_gui_widgets, which adds and closes documents with answers " +
+   "arriving late; run on Windows (MSVC /W4, and the fuzz under " +
+   "AddressSanitizer); the macOS and Linux branches compiled, not run",
+   "class MultiDocumentPanel "],
   ["gui", "DocumentWindow / ResizableWindow / TopLevelWindow",
-   "out of scope as the reference means them, which is desktop application windows with " +
-   "title bars, menus and close boxes. The two windows this SDK really has are " +
-   "elsewhere and are not these: a plugin editor is a CHILD window the host " +
-   "owns, made by the window_*.h peers, and the standalone's own frame is made " +
-   "in standalone.h -- where it answers WM_GETMINMAXINFO from the same " +
-   "declared limits every format is told",
-   null, "class DocumentWindow|class ResizableWindow|class TopLevelWindow"],
+   "gfx/document_window.h: TopLevelWindow, ResizableWindow and DocumentWindow -- " +
+   "an application's own desktop windows, built the way a host builds a " +
+   "plugin's: a frame of ours (an HWND; an NSWindow with a delegate; an X window " +
+   "managed through ICCCM and EWMH) with the SDK's existing peer opened inside " +
+   "it, so the TopLevelWindow is the root component the peer paints and every " +
+   "fix to a peer reaches both. A plugin editor is still the host's CHILD window " +
+   "and the plugin standalone keeps its frame in standalone.h.\n" +
+   "      The native title bar by default -- the platform's close, minimise and " +
+   "maximise boxes, with the limits answered in WM_GETMINMAXINFO, WM_SIZING " +
+   "(the aspect ratio too) and WM_WINDOWPOSCHANGING, contentMin/MaxSize, " +
+   "WM_NORMAL_HINTS -- or a DRAWN title bar: minimise, maximise and close " +
+   "buttons, drag to move, double-click to zoom, and a resize border measured " +
+   "in desktop coordinates (the window moves under a left-edge drag). Content " +
+   "owned or not, setResizable with a corner grip, setResizeLimits, " +
+   "setFixedAspectRatio, setFullScreen (zoomed, as the reference means it), " +
+   "setKioskMode (the whole monitor), setMinimised, setAlwaysOnTop, " +
+   "setWindowAlpha, setIcon, the getTopLevelWindow list and " +
+   "findTopLevelWindowFor, and closeButtonPressed -- reached by the close box, " +
+   "Alt+F4 and the drawn button, which reports through the queue so a window " +
+   "may delete itself. setMenuBar(MenuBarModel*) is the hook for " +
+   "gfx/menu_bar.h: createMenuBarComponent(model) makes the bar, the content is " +
+   "laid out under it.\n" +
+   "      RUN on Windows (tests/app_windows_test, hidden windows, every action a " +
+   "real message): sizes and positions, every limit by message, the corner and " +
+   "edge drags, the drawn buttons and the bar's drag, zoom, minimise, kiosk, " +
+   "topmost and alpha, keys reaching the tree through the frame, the menu-bar " +
+   "hook with a stand-in component, windows deleting themselves from their own " +
+   "close. The NSWindow and X11 frames are compiled only",
+   "class DocumentWindow : public ResizableWindow"],
   ["gui", "NativeMessageBox / MessageBoxOptions / ScopedMessageBox",
-   "deliberately absent, and this one is a rule rather than a scope call. An OS " +
-   "modal dialog from inside a plugin blocks the HOST's message loop: the " +
-   "transport keeps running, the audio thread keeps calling process, and the " +
-   "user cannot reach the DAW to stop it. gfx/alert.h has AlertOverlay and " +
-   "CallOutBox, which are drawn inside the editor and block nothing",
-   null, "NativeMessageBox|class MessageBoxOptions"],
+   "gfx/message_box.h: NativeMessageBox (show, showAsync, showScopedAsync and the " +
+   "reference's showMessageBox / showOkCancelBox / showYesNoBox / " +
+   "showYesNoCancelBox forms), MessageBoxOptions, MessageBoxIconType and " +
+   "ScopedMessageBox -- for APPLICATIONS. A plugin still asks with " +
+   "gfx/alert.h's AlertOverlay: an OS modal from inside a plugin blocks the " +
+   "host's message loop.\n" +
+   "      Windows: TaskDialogIndirect with the buttons' own labels, through an " +
+   "activation context made from shell32's Common Controls 6 manifest when the " +
+   "program has none, else MessageBoxW; macOS NSAlert; Linux zenity, else " +
+   "kdialog; and a DRAWN box (a DocumentWindow holding an AlertOverlay) wherever " +
+   "none of those can show it. The async forms run the box on a thread of its " +
+   "own (Windows, Linux) and answer on the message thread; destroying a " +
+   "ScopedMessageBox takes the box down and its callback is never called.\n" +
+   "      RUN on Windows: TaskDialog, MessageBoxW and the drawn box, each async " +
+   "with a posted click and closed from code; the sync form answered from " +
+   "another thread; the owner window. A box a person answers runs only with " +
+   "SONORE_INTERACTIVE_TESTS=1. NSAlert and zenity/kdialog are compiled only",
+   "class NativeMessageBox"],
   ["gui", "ThreadWithProgressWindow",
-   "deliberately absent as one object: it is a thread, a modal window and a " +
-   "cancel button welded together, and the modal window half is the part a " +
-   "plugin must not have (see NativeMessageBox above). The pieces are here -- " +
-   "ThreadPool in thread_pool.h, Overlay in gfx/alert.h, ProgressBar in " +
-   "gfx/containers.h -- and a sampler loading a large file composes them into " +
-   "something that does not freeze the host",
-   null, "class ThreadWithProgressWindow"],
+   "gfx/progress_window.h: ThreadWithProgressWindow -- run() on a std::thread while " +
+   "a DocumentWindow shows a status line, a ProgressBar and Cancel. " +
+   "setProgress and setStatusMessage only store; the window copies them out on " +
+   "its own clock. Cancel raises the job's ThreadExitSignal, which a " +
+   "MessageManagerLock taken by the job also gives up on. runThread waits " +
+   "pumping the loop, launchThread returns at once, and " +
+   "threadComplete(userPressedCancel) comes from the queue so it may delete the " +
+   "object; a job that ignores Cancel past the time-out is given up on, not " +
+   "killed (a std::thread cannot safely be). For applications: a plugin still " +
+   "composes ThreadPool, Overlay and ProgressBar inside its editor.\n" +
+   "      RUN on Windows: runThread to the end, the bar checked in the window's " +
+   "own pixels, Cancel clicked, the time-out, threadComplete deleting the " +
+   "object. Compiled for macOS and X11",
+   "class ThreadWithProgressWindow"],
   ["gui", "ComponentBuilder",
-   "out of scope: builds a component tree from a ValueTree at runtime, which " +
-   "is the reference's layout-from-data path. A generated plugin's interface is " +
-   "generated as CODE, which is checked by the compiler; describing it as data " +
-   "instead would move every mistake from build time to load time",
-   null, "class ComponentBuilder"],
+   "gfx/component_builder.h: ComponentBuilder builds a component tree from a " +
+   "JsonValue tree (json.h, the SDK's data tree) through registered " +
+   "TypeHandlers -- \"type\" picks the handler, \"id\" becomes " +
+   "Component::componentID and matches nodes across edits, \"bounds\" is [x, " +
+   "y, w, h] or a live RelativeRectangle string, \"children\" nest -- and owns " +
+   "what it builds. JsonValue is a value with no listeners, so a change is a " +
+   "new tree given to setState(), and the builder RECONCILES: a node with " +
+   "the same id and type keeps its component and is told only if its own " +
+   "state changed, a new node is created, a removed one destroyed, a changed " +
+   "type rebuilt, the z-order made to match; an unknown type is reported " +
+   "through onError and skipped. Tested: the built tree, a relative bounds " +
+   "string applied live, then an edit that changes one label, keeps one " +
+   "untouched, removes one, adds one and reorders -- exactly two updates, " +
+   "the components kept, the removed one destroyed -- then a type change " +
+   "rebuilt and an unknown type reported. Platform-independent; RUN on " +
+   "Windows",
+   "class ComponentBuilder"],
   ["gui", "ComponentMovementWatcher",
-   "out of scope: notifies when a component's position or its peer changes, " +
-   "which the reference needs because it embeds native subviews that have to be moved " +
-   "in lockstep. Nothing here embeds one -- the whole tree is drawn into a " +
-   "single bitmap by the software rasteriser, so a moved component is drawn in " +
-   "its new place and there is nothing to keep in step with it",
-   null, "class ComponentMovementWatcher"],
+   "gfx/movement_watcher.h: ComponentMovementWatcher listens to a component " +
+   "AND every ancestor (re-attaching whenever the chain changes) and reports " +
+   "componentMovedOrResized when its place in the window or its size changes " +
+   "-- a parent sliding counts, a parent resized around it does not -- " +
+   "componentVisibilityChanged when it may have been shown or hidden, and " +
+   "componentPeerChanged when the window it is in (its MouseRouter, which " +
+   "now announces itself to the tree on arrival and departure) appears or " +
+   "goes. Built on ComponentListener (component_listeners.h), the " +
+   "notification half the tree did not have: moved/resized, visibility, " +
+   "parent hierarchy, children and being-deleted, with either side free to " +
+   "be destroyed first. Tested: parent moved, parent resized, own resize, " +
+   "root moved, ancestor hidden and shown, router created and destroyed, " +
+   "re-parented, old chain released, the watched component destroyed. " +
+   "Platform-independent; RUN on Windows",
+   "class ComponentMovementWatcher"],
   ["gui", "VBlankAttachment",
-   "deliberately absent: repaint driven by the display's refresh. The peers " +
-   "tick at 33 ms and repaint only what is dirty, which is what an editor of " +
-   "knobs and meters needs. Tying repaint to vblank would matter for something " +
-   "animating continuously at the refresh rate, and would mean a per-platform " +
-   "display-link on three platforms -- two of which cannot be tested from " +
-   "here. Named rather than left out so the trade is somebody's decision and " +
-   "not an oversight",
-   null, "class VBlankAttachment|CVDisplayLink"],
+   "gfx/vblank.h: VBlankAttachment calls back once per display refresh, on " +
+   "the UI thread, while its component is in a window, with the refresh's " +
+   "timestamp; one process-wide source serves every attachment, started with " +
+   "the first and stopped with the last, and an attachment may destroy " +
+   "itself from its own callback. Windows: a worker thread waits on " +
+   "IDXGIOutput::WaitForVBlank (the primary output), else DwmFlush, else a " +
+   "sleep at the monitor's rate, and posts ONE message at a time to a " +
+   "message-only window -- a UI thread behind sees one late frame, not a " +
+   "queue; dxgi and dwmapi loaded at run time. MEASURED on this machine (60 " +
+   "Hz display, DXGI): 59.98 callbacks a second through a blocking message " +
+   "loop; the test requires the display's rate within 40 % and runs.\n" +
+   "      macOS: CVDisplayLink hopping to the main queue with dispatch_async_f, " +
+   "both looked up at run time -- compiled against the shim, never run. X11: " +
+   "no display link -- a timer at XRandR's current rate (60 Hz if " +
+   "unreadable), checked on every pump of the X11 peer, so the rate is the " +
+   "lower of the monitor's and the host's pumping; compiled against the real " +
+   "Xlib headers, not run",
+   "class VBlankAttachment"],
   ["gui", "AnimatedPosition (momentum scrolling)",
-   "deliberately absent: the reference's inertial scroller, with a momentum behaviour " +
-   "and a snap-to-page one. Our Viewport scrolls from wheel events, and on " +
-   "both platforms this SDK is tested on a precision trackpad already delivers " +
-   "those smoothed and decelerating -- so the flywheel would be a second one " +
-   "running on top of the OS's. It becomes a real gap the day this targets " +
-   "TOUCH, where there is no OS smoothing and a flick has to be integrated by " +
-   "the application. Said plainly because that day is a change of answer, not " +
-   "a change of effort",
-   null, "class AnimatedPosition"],
+   "gfx/animated_position.h: AnimatedPosition<Behaviour> follows a drag " +
+   "(beginDrag, drag, endDrag, nudge), measures the release velocity, and " +
+   "then lets the behaviour move it under update(now) within setLimits; the " +
+   "reference's two behaviours in AnimatedPositionBehaviours -- " +
+   "ContinuousWithMomentum (friction 0.08 per 60th of a second, minimum " +
+   "velocity 0.05, integrated EXACTLY over elapsed time so a flick goes the " +
+   "same distance at 30, 60 or 144 Hz, which the reference's per-tick " +
+   "multiply does not) and SnapToPageBoundaries (nearest page, or the next " +
+   "one for a flick over a page a second). ViewportDragScroller drives a " +
+   "Viewport by dragging its content, the reference's setScrollOnDragMode " +
+   "(never, nonHover -- fingers and pens only -- or all): a MouseListener " +
+   "over the viewed component, a few pixels' threshold so a tap stays a tap, " +
+   "the bars and any setIgnoresDragsFrom component left alone, and the coast " +
+   "ticked from a VBlankAttachment.\n" +
+   "      Tested on a fake clock: 1000 units/s measured, the first frame and the " +
+   "whole coast (v0 / lambda) to the unit, 30 Hz and 144 Hz coasting within " +
+   "0.02 of each other, a coast stopped by its limit, snapping back, forward " +
+   "and to the nearest page, and a Viewport dragged 100 px by a finger then " +
+   "coasting on and stopping -- while a mouse drag does not scroll in " +
+   "nonHover mode. Platform-independent; RUN on Windows",
+   "class AnimatedPosition"],
   ["gui", "ConcertinaPanel",
    "gfx/concertina.h. Stacked sections that open and close, which is what a " +
    "plain list of forty parameters needs to stop being a wall the user reads " +
@@ -3086,9 +4461,140 @@ const MAP = [
    "many devices at once. One plugin answering for itself does not",
    "namespace midici"],
 
+  // ── javascript ──────────────────────────────────────────────────────
+  ["javascript", "JavascriptEngine",
+   "javascript.h: JavascriptEngine, a tree-walking interpreter of a JavaScript " +
+   "subset, written for this SDK -- no third-party engine, no JIT. var/let/const " +
+   "with block scope and the temporal dead zone, closures, recursion, arrow " +
+   "functions, default and rest parameters, spread, template literals, " +
+   "optional chaining and ??, for / for-in / for-of / while / do / switch, " +
+   "try/catch/finally, new and prototypes, the whole operator table with " +
+   "ECMAScript's coercions; Object, Array, String, Number, Math, JSON, the " +
+   "Error family, parseInt/parseFloat, eval at global scope and console.log " +
+   "through a hook; plus the reference's own Math.sqr/range/randInt, " +
+   "Array.contains/remove and trace(). Not here, deliberately: regular " +
+   "expressions, classes, getters/setters, destructuring, generators, Map/Set, " +
+   "Date, labels, sparse arrays.\n" +
+   "      registerNativeObject / registerNativeFunction, evaluate(code, &result), " +
+   "execute(code), callFunction(name, args), callFunctionObject, stop() from " +
+   "any thread. Every failure is a Result with the message and line -- " +
+   "nothing is thrown to the caller -- and every way a script could take the " +
+   "host down ends in one: maximumExecutionTime (\"Execution timed-out\"), " +
+   "stop() (\"Interrupted\"), maximumRecursionDepth plus a measured native-" +
+   "stack budget under every recursive path, clipped to what the thread " +
+   "really has, maximumMemoryBytes (everything allocated is metered and " +
+   "refunded; garbage cycles are collected by trial deletion), and string " +
+   "and array length checked before allocating. A script cannot catch any of " +
+   "them.\n" +
+   "      Tested by sdk/tests/javascript_test.cpp: 140 scripts whose expected " +
+   "values were each checked against node, the reference's additions, 17 " +
+   "errors at their lines, native objects both ways, the limits (six endless " +
+   "loops, recursion a million deep, 200,000 nested brackets, an array nested " +
+   "300,000 deep built and freed, memory hogs, 400,000 garbage cycles in 16 MB, " +
+   "stop() from a thread) -- and outside the repository, 40,000 generated " +
+   "programs run in node and here with identical output, the last 10,000 " +
+   "against this exact header. " +
+   "sdk/tests/fuzz_javascript.cpp: 25,229 mutated scripts under ASan, no " +
+   "report, no hang. RUN on Windows (MSVC, optimised and ASan); the macOS and " +
+   "Linux stack-bounds branches are COMPILED only (MSVC with tests/au_shim, " +
+   "and clang's front end)",
+   "class JavascriptEngine"],
+  ["javascript", "var / DynamicObject / NativeFunctionArgs",
+   "javascript.h: JsVar is the reference's var -- undefined, null, boolean, " +
+   "number, string, array, object, function -- with one numeric kind, because " +
+   "ECMAScript has one (isInt() asks about the value; the reference's separate " +
+   "int, int64 and double make 1 and 1.0 a question). Strings are UTF-16 to " +
+   "the script (\"é\".length is 1, an emoji's 2) and UTF-8 to C++. " +
+   "DynamicObject holds properties in ECMAScript's order (integer keys " +
+   "ascending, then insertion order), with setMethod for native methods, " +
+   "invokeMethod, getPropertyNames and a deep clone() that keeps shared " +
+   "structure shared and cycles cycles. JsVar bridges to json.h's JsonValue " +
+   "both ways, and parseJson/toJsonString keep property order, which " +
+   "JsonValue's sorted keys cannot. Values are reference counted, so a JsVar " +
+   "a plugin keeps outlives the engine that made it, and freeing a structure " +
+   "nested a million deep is iterative rather than a stack overflow in a " +
+   "destructor",
+   "class DynamicObject"],
+  ["javascript", "JSObject / JSCursor",
+   "javascript.h: the reference's newer engine hands C++ a JSObject or a " +
+   "JSCursor to walk what a script built, because its values live in a " +
+   "separate engine's heap. Here a script's values ARE JsVar and " +
+   "DynamicObject: evaluate() returns one, getRootObject() is the global " +
+   "scope, and a callback a script passes to C++ is a JsVar that " +
+   "callFunctionObject calls later -- there is no second representation to " +
+   "navigate",
+   "getRootObject"],
+
   // ── osc ─────────────────────────────────────────────────────────────
   ["osc", "OSCSender / OSCReceiver", "osc.h: Sender, Receiver, and an Argument that " +
    "carries the four types every OSC implementation agrees on", "class Receiver"],
+
+  // ── video ───────────────────────────────────────────────────────────
+  ["video", "VideoComponent / CameraDevice",
+   "gfx/video.h: VideoComponent plays a file inside an editor -- load, play, pause, stop, " +
+   "position, duration, speed, volume -- with each frame copied into a Bitmap and drawn " +
+   "through Graphics (letterboxed, clipped and scrolled like any image) rather than a native " +
+   "child view, which an editor rasterised into one bitmap could not composite. update(), " +
+   "called from the editor's tick, takes the newest frame and fires the callbacks, so all of " +
+   "them run on the message thread. VideoReader underneath decodes frame by frame, with exact " +
+   "(not keyframe) seeks and the soundtrack as float at a requested rate. CameraDevice lists " +
+   "cameras, opens one, hands frames to listeners on the capture thread, and takes a still.\n" +
+   "      The soundtrack is MUTED until setAudioEnabled(true): a plugin's sound belongs to " +
+   "the host's mix, and a second output plays beside the session, not in it. Enabled, it plays " +
+   "through the SDK's own WASAPI output on Windows (the device stays open; play, pause and seek " +
+   "move a gate and refill a ring, 30 ms measured; silent at speeds other than 1x) and through " +
+   "AVPlayer on macOS.\n" +
+   "      Windows (Media Foundation) RUN by modules_test: a 160x120 H.264 + AAC file written " +
+   "by Media Foundation's own encoder decodes back to 30 frames of the colours written, the " +
+   "right way up, cropped from the codec's 128 rows, with exact seeks and a 440 Hz soundtrack " +
+   "(also resampled to 44.1 kHz mono); VideoComponent plays it at 4x on its own clock; a real " +
+   "webcam is listed, opened and delivers frames and a still. fuzz_modules decodes 300 mutated " +
+   "files under ASan. macOS (AVPlayer + AVPlayerItemVideoOutput, AVAssetReader, " +
+   "AVCaptureSession -- through the Objective-C runtime, every C function by dlsym, and a " +
+   "refusal rather than a TCC kill when the host declares no camera use) COMPILED against " +
+   "tests/au_shim by MSVC and clang, never run. Linux: every entry point reports \"not " +
+   "available on this platform\" (compiled)",
+   "class VideoComponent"],
+
+  // ── analytics ───────────────────────────────────────────────────────
+  ["analytics", "Analytics / AnalyticsDestination / ThreadedAnalyticsDestination / ButtonTracker",
+   "analytics.h: Analytics (a shared instance or a private one; user id and properties; " +
+   "logEvent with parameters and a type; suspend for an opt-out), AnalyticsEvent, the " +
+   "AnalyticsDestination interface, and ThreadedAnalyticsDestination, which batches on a " +
+   "thread of its own, retries a failed or throwing send with doubling backoff to a ceiling, " +
+   "rate-limits with a token bucket, bounds its queue (oldest dropped, counted), and saves " +
+   "unsent events to a JSON file at shutdown and restores them at start -- including the .tmp " +
+   "a crash leaves. gfx/button_tracker.h: ButtonTracker logs an event per click of a Button or " +
+   "IconButton, with the reference's ButtonState On/Off for a toggle.\n" +
+   "      NOTHING IS SENT BY DEFAULT, and the header opens by saying so: Analytics starts with " +
+   "no destination, and the SDK ships none that touches a network. The send is a virtual the " +
+   "plugin writes, so what leaves a user's machine is code in the plugin where a reviewer can " +
+   "read it. This module was out of scope for exactly that reason; the shape is the " +
+   "reference's, the policy the opposite of on-by-default.\n" +
+   "      RUN on Windows by modules_test (batching, backoff, rate limit, queue bound and the " +
+   "file, all on a fake clock; a real thread through Analytics; ButtonTracker, including a " +
+   "handler that deletes its own button, under ASan) and by fuzz_modules (27,000 mutated event " +
+   "files under ASan, every accepted file re-written and re-read identically). Plain C++, " +
+   "compiled for macOS and Linux",
+   "class ThreadedAnalyticsDestination"],
+
+  // ── box2d ───────────────────────────────────────────────────────────
+  ["box2d", "Box2DRenderer",
+   "gfx/box2d_renderer.h: draws a Box2D world through Graphics -- polygons, circles with a " +
+   "spoke, edges, chains, capsules, rounded polygons, and joints -- mapping a rectangle of the " +
+   "world onto one of the component (y up or down; lines in pixels whatever the zoom), " +
+   "coloured from a replaceable Palette by body type and state: static, kinematic, awake, " +
+   "asleep, disabled, sensor.\n" +
+   "      Against the PLUGIN'S OWN Box2D, found with __has_include: 3.1 and later through " +
+   "b2World_Draw (its named colours mapped back to the palette), 2.4 and 2.3 by walking bodies, " +
+   "fixtures and joints without touching the world's own debug draw. Nothing is vendored -- " +
+   "the reference ships the engine itself, which is how a project ends up with two copies of " +
+   "every b2 symbol -- and with no Box2D on the include path the header declares nothing.\n" +
+   "      RUN on Windows by box2d_renderer_test, built only when SONORE_BOX2D_DIR names a Box2D " +
+   "tree, against Box2D 3.1.1 AND 2.4.2: a scene rendered to a Bitmap has each body's colour " +
+   "where the body is, and a box that fell and went to sleep is drawn in the sleeping colour " +
+   "where it landed. No platform code",
+   "class Box2DRenderer"],
 ];
 
 // One read of every header, so a hundred rows cost one pass.
@@ -3102,7 +4608,10 @@ function readTree(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) readTree(full);
-    else if (entry.name.endsWith(".h")) blob += readFileSync(full, "utf8") + "\n";
+    // And the TypeScript declarations installed beside them: sonore.d.ts is
+    // as much the SDK's surface as a header is.
+    else if (entry.name.endsWith(".h") || entry.name.endsWith(".d.ts"))
+      blob += readFileSync(full, "utf8") + "\n";
   }
 }
 readTree(inc);

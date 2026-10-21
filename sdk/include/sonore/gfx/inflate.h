@@ -42,13 +42,19 @@ namespace gfx {
  */
 class HuffmanTable {
 public:
+  /** The longest code DEFLATE allows. build() refuses a longer one. */
   static constexpr int kMaxBits = 15;
 
   /** False for a malformed set of lengths -- over-subscribed, meaning the code
    *  lengths describe more codes than a binary tree of that depth can hold. A
    *  stream saying that is corrupt or hostile, and building a table from it
-   *  would decode garbage forever rather than stopping. */
+   *  would decode garbage forever rather than stopping. False too for a
+   *  length above kMaxBits or a negative count: no stream gets either here,
+   *  a direct call can, and a length of 16 was counted one past the table. */
   bool build(const uint8_t* lengths, int count) {
+    if (count < 0) return false;
+    for (int i = 0; i < count; ++i)
+      if (lengths[i] > kMaxBits) return false;
     counts_.assign(kMaxBits + 1, 0);
     symbols_.assign((size_t) count, 0);
     for (int i = 0; i < count; ++i) counts_[lengths[i]]++;
@@ -70,7 +76,12 @@ public:
     return true;
   }
 
+  /** How many symbols have a code of each length, indexed 0 to kMaxBits;
+   *  index 0 is always 0. Empty before build(). */
   const std::vector<int>& counts() const { return counts_; }
+  /** One entry per symbol build() was given: first the used symbols in
+   *  canonical order -- by code length, then by value, the order a decoder
+   *  walks the codes in -- then zeros for the unused ones. */
   const std::vector<int>& symbols() const { return symbols_; }
 
 private:
@@ -116,6 +127,8 @@ public:
     return adler32(out.data(), out.size()) == expected;
   }
 
+  /** The RFC 1950 Adler-32 checksum of `size` bytes, starting from 1: 1 for
+   *  no bytes. */
   static uint32_t adler32(const uint8_t* data, size_t size) {
     uint32_t a = 1, b = 0;
     for (size_t i = 0; i < size; ++i) {
@@ -186,24 +199,31 @@ private:
 
   bool fixed() {
     // The lengths are fixed by the spec, so both tables are built from
-    // constants rather than read from the stream.
-    static HuffmanTable* literals = nullptr;
-    static HuffmanTable* distances = nullptr;
-    if (!literals) {
-      static HuffmanTable lit, dist;
-      uint8_t lengths[288];
-      for (int i = 0; i < 144; ++i) lengths[i] = 8;
-      for (int i = 144; i < 256; ++i) lengths[i] = 9;
-      for (int i = 256; i < 280; ++i) lengths[i] = 7;
-      for (int i = 280; i < 288; ++i) lengths[i] = 8;
-      lit.build(lengths, 288);
-      uint8_t distLengths[30];
-      for (int i = 0; i < 30; ++i) distLengths[i] = 5;
-      dist.build(distLengths, 30);
-      literals = &lit;
-      distances = &dist;
-    }
-    return block(*literals, *distances);
+    // constants rather than read from the stream -- once per process, in the
+    // INITIALISER of a function-local static, which C++11 guarantees runs
+    // exactly once even when two threads arrive together.
+    //
+    // It used to be a plain `if (!literals)` around two builds. Two threads
+    // decoding their first fixed-Huffman block at the same moment -- a PNG on
+    // the UI thread, a zip on a worker -- both saw null and both rebuilt the
+    // same vectors, one of them while the other was already decoding with
+    // them: a torn table, or a heap corrupted by two concurrent assigns.
+    struct FixedTables {
+      HuffmanTable literals, distances;
+      FixedTables() {
+        uint8_t lengths[288];
+        for (int i = 0; i < 144; ++i) lengths[i] = 8;
+        for (int i = 144; i < 256; ++i) lengths[i] = 9;
+        for (int i = 256; i < 280; ++i) lengths[i] = 7;
+        for (int i = 280; i < 288; ++i) lengths[i] = 8;
+        literals.build(lengths, 288);
+        uint8_t distLengths[30];
+        for (int i = 0; i < 30; ++i) distLengths[i] = 5;
+        distances.build(distLengths, 30);
+      }
+    };
+    static const FixedTables tables;
+    return block(tables.literals, tables.distances);
   }
 
   bool dynamic() {

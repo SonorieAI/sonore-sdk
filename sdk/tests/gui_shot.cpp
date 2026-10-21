@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
   gui->get_size(plugin, &w, &h);
 
   // A real top-level window sized to the plugin's CLIENT area, like a host's
-  // editor frame: otherwise the shot would include the title bar's margins.
+  // editor frame. Otherwise the shot would include the title bar's margins.
   RECT want{0, 0, (LONG) w, (LONG) h};
   AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW, FALSE);
   HWND parent = CreateWindowExW(0, L"STATIC", L"Sonore plugin", WS_OVERLAPPEDWINDOW, 80, 80,

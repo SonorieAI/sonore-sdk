@@ -39,6 +39,29 @@ namespace standalone {
  *  caller in this file has always written. */
 using AudioRing = sonore::AudioRing;
 
+namespace detail {
+
+/** Where a device chosen by name is in a device list NOW: at the place it
+ *  had, if that place still holds it, else the first place that does, else
+ *  -1. Every device list here is numbered by position, and a device that
+ *  goes away takes its place with it -- each one after it moves up, and a
+ *  number kept from before names its neighbour. */
+inline int findListedDevice(const std::vector<std::string>& list, int was,
+                            const std::string& name) {
+  if (name.empty()) return -1;
+  if (was >= 0 && (size_t) was < list.size() && list[(size_t) was] == name) return was;
+  for (size_t i = 0; i < list.size(); ++i)
+    if (list[i] == name) return (int) i;
+  return -1;
+}
+
+/** The name at a place in a device list, or nothing. */
+inline std::string listedDevice(const std::vector<std::string>& list, int index) {
+  return index >= 0 && (size_t) index < list.size() ? list[(size_t) index] : std::string();
+}
+
+} // namespace detail
+
 } // namespace standalone
 } // namespace sonore
 
@@ -62,12 +85,14 @@ public:
   }
   bool run() { return false; }
   void stop() {}
+  bool takeDeviceLost() { return false; } // nothing open, nothing to lose
   void read(float* left, float* right, uint32_t frames) {
     for (uint32_t i = 0; i < frames; ++i) left[i] = right[i] = 0.0f;
   }
   double sampleRate() const { return 0.0; }
   uint64_t droppedFrames() const { return 0; }
   uint64_t starvedFrames() const { return 0; }
+  size_t availableFrames() const { return 0; } // nothing is ever captured
   const std::string& deviceName() const { return name_; }
   const std::string& error() const { return error_; }
 

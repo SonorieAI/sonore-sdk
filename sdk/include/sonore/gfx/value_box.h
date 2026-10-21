@@ -30,7 +30,9 @@
 // And a value it cannot parse must NOT be silently thrown away. Reverting to
 // the old number looks identical to the plugin ignoring the keyboard; staying
 // in the field with the text selected says "that is not a number I can use"
-// without a dialog.
+// without a dialog. That is Return's answer. Clicking away from the field
+// takes the keyboard with it, and a field left open without one is stuck --
+// so there the field closes on the old value, as the reference's does.
 #pragma once
 
 #include <functional>
@@ -43,8 +45,23 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A parameter's value as text, which a double click turns into a field to
+ * type a new value into. See the file comment for the three things it must
+ * get right.
+ *
+ * The owner feeds it with setText() every UI tick -- a field being typed in
+ * is never overwritten -- and decides what typed text means in
+ * onTextEntered: return true once the value is applied (inside one gesture,
+ * so the host records one edit), false to refuse it. Return and focus loss
+ * both commit; Escape cancels. Refused on Return, the field stays open with
+ * the text selected; refused as the focus leaves, it closes as Escape
+ * closes it. Unset, onTextEntered refuses everything. Message thread only.
+ */
 class ValueBox : public Widget {
 public:
+  /** An editable readout with no text. Takes no keyboard focus itself; the
+   *  field inside it does, while it is up. */
   ValueBox() {
     // The box itself never takes the keyboard. Only the field inside it does,
     // and only while it is up -- otherwise Tab traversal would stop on every
@@ -61,13 +78,13 @@ public:
     setAccessibilityIgnored(true);
 
     editor_.setVisible(false);
-    editor_.onReturn = [this](const std::string& typed) { commit(typed); };
+    editor_.onReturn = [this](const std::string& typed) { commit(typed, false); };
     // Focus lost is a COMMIT, not a cancel. Clicking away from a field you have
     // just typed into means you are done with it; asking for Return as well is
     // the behaviour that makes people type a value, look at it, click the next
     // control and find the first one unchanged.
     editor_.onFocusLost = [this](const std::string& typed) {
-      if (editing_) commit(typed);
+      if (editing_) commit(typed, true);
     };
     addChild(&editor_);
   }
@@ -82,8 +99,10 @@ public:
     if (!editing_) repaint();
   }
 
+  /** The text shown when not being edited. */
   const std::string& text() const { return text_; }
 
+  /** Where the text sits across the box. */
   void setJustify(Justify j) {
     justify_ = j;
     repaint();
@@ -97,17 +116,25 @@ public:
     if (!editable && editing_) cancel();
   }
 
+  /** Whether a double click opens the field; true unless setEditable(false). */
   bool isEditable() const { return editable_; }
+  /** Whether the field is up and being typed in. */
   bool isEditing() const { return editing_; }
 
   /**
    * What to do with typed text. Return false when it cannot be used.
    *
-   * False keeps the field open with the text selected rather than reverting,
-   * because reverting is indistinguishable from the keyboard being ignored.
+   * False on Return keeps the field open with the text selected rather than
+   * reverting, because reverting is indistinguishable from the keyboard
+   * being ignored. False as the focus leaves reverts: the keyboard has gone
+   * elsewhere, and a field without it cannot be typed into to put it right.
+   * May destroy the box.
    */
   std::function<bool(const std::string&)> onTextEntered;
 
+  /** Open the field over the box with the current text selected, and give it
+   *  the keyboard -- what a double click does. Ignored when not editable or
+   *  already editing. */
   void beginEditing() {
     if (!editable_ || editing_) return;
     editing_ = true;
@@ -157,15 +184,29 @@ public:
   }
 
 private:
-  void commit(const std::string& typed) {
+  /** `focusGone` when the field has lost the keyboard: the edit ends whatever
+   *  the owner says. */
+  void commit(const std::string& typed, bool focusGone) {
     if (!editing_) return;
-    // Accepted or not, the DECISION belongs to whoever owns the parameter.
-    const bool accepted = onTextEntered ? onTextEntered(typed) : false;
-    if (!accepted) {
+    // Accepted or not, the DECISION belongs to whoever owns the parameter --
+    // and it is the owner's code, which may destroy this box with the editor
+    // around it.
+    bool accepted = false;
+    if (onTextEntered) {
+      detail::DeletionWatch alive(this);
+      accepted = onTextEntered(typed);
+      if (alive.deleted) return;
+    }
+    if (!accepted && !focusGone) {
       // Stay, and select what was typed so the next keystroke replaces it.
       editor_.selectAll();
       return;
     }
+    // Refused as the focus left, the field closes all the same, the
+    // parameter untouched and the readout showing its value, as Escape
+    // leaves it. Kept open it had no keyboard -- nothing typed reached it --
+    // and it hid the readout, which stopped following automation until
+    // somebody clicked back into a field they had left.
     editing_ = false;
     editor_.setVisible(false);
     if (MouseRouter* r = routerFor(this))

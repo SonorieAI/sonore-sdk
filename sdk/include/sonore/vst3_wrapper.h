@@ -8,8 +8,8 @@
 // GPLv3/proprietary terms this SDK exists to avoid.
 //
 // Include it AFTER clap_wrapper.h in the same translation unit. The CLAP wrapper
-// owns the machinery both formats share: the DSP instance, parameters, state,
-// the webview bridge, and this file adapts it to VST3's shape, so one source
+// owns the machinery both formats share (the DSP instance, parameters, state,
+// the webview bridge), and this file adapts it to VST3's shape, so one source
 // file builds a .clap and a .vst3 that cannot drift apart.
 //
 // Three differences drive everything here:
@@ -22,9 +22,10 @@
 //      "single component effect"), which is what modern hosts expect and which
 //      halves the state that would otherwise need syncing.
 //   3. UI edits must reach the host through IComponentHandler on the MAIN
-//      thread: unlike CLAP, where the plugin emits them from the audio thread.
+//      thread, unlike CLAP, where the plugin emits them from the audio thread.
 #pragma once
 
+#include <atomic>
 #include <vst3_c_api.h>
 
 #include <cmath>
@@ -38,6 +39,7 @@
 #include "gui.h"
 #include "plugin.h"
 #include "presets.h"
+#include "vst3_uid.h"
 
 #ifndef SONORE_NUM_PARAMS
 #error "Define SONORE_NUM_PARAMS (and struct SonoreDsp) before including vst3_wrapper.h"
@@ -55,7 +57,10 @@ using clapwrap::Instance;
 /** VST3 identifies classes by a 16-byte UID. Ours is DERIVED from the plugin's
  *  reverse-URI id (FNV-1a, twice, with a salt), so it is stable across builds
  *  and unique per product without anyone generating and pasting a GUID: a step
- *  a generator would get wrong exactly once and then ship forever. */
+ *  a generator would get wrong exactly once and then ship forever. The hashes
+ *  make the GUID in its own order; it is stored the way the VST3 SDK stores
+ *  one on this platform (vst3_uid.h), so its text -- what a session carries
+ *  between Windows and macOS -- is the same on both. */
 inline void deriveUid(const char* id, const char* salt, Steinberg_TUID out) {
   uint64_t h1 = 0xcbf29ce484222325ULL;
   uint64_t h2 = 0x9e3779b97f4a7c15ULL;
@@ -65,10 +70,12 @@ inline void deriveUid(const char* id, const char* salt, Steinberg_TUID out) {
     h2 = (h2 << 7) | (h2 >> 57);
   }
   for (const char* p = salt; p && *p; ++p) h2 = (h2 ^ (uint64_t) (uint8_t) *p) * 0x100000001b3ULL;
+  uint8_t canonical[16];
   for (int i = 0; i < 8; ++i) {
-    out[i] = (Steinberg_int8) ((h1 >> (56 - i * 8)) & 0xff);
-    out[i + 8] = (Steinberg_int8) ((h2 >> (56 - i * 8)) & 0xff);
+    canonical[i] = (uint8_t) ((h1 >> (56 - i * 8)) & 0xff);
+    canonical[i + 8] = (uint8_t) ((h2 >> (56 - i * 8)) & 0xff);
   }
+  vst3uid::canonicalToNative(canonical, reinterpret_cast<uint8_t*>(out));
 }
 
 inline const Steinberg_int8* componentUid() {
@@ -197,10 +204,12 @@ inline double toPlain(const ParamInfo& p, double normalised) {
 }
 
 /** VST3 spells host bypass as one extra automatable parameter carrying the
- *  kIsBypass flag, with id == SONORE_NUM_PARAMS so the real parameters keep
- *  index==id. Effects only: an instrument has no dry signal to pass, and
- *  hosts treat instrument bypass as their own mute. */
-constexpr Steinberg_Vst_ParamID kBypassParamId = (Steinberg_Vst_ParamID) SONORE_NUM_PARAMS;
+ *  kIsBypass flag. Its id is FIXED ('byps', as CLAP's is), so the real
+ *  parameters keep index==id and appending one moves nothing: it was
+ *  SONORE_NUM_PARAMS, and a session's bypass automation followed the number
+ *  onto the parameter a new version added. Effects only: an instrument has no
+ *  dry signal to pass, and hosts treat instrument bypass as their own mute. */
+constexpr Steinberg_Vst_ParamID kBypassParamId = 0x62797073u;
 
 // ── Factory presets, which VST3 calls programs ───────────────────────────────
 //
@@ -213,8 +222,7 @@ constexpr Steinberg_Vst_ParamID kBypassParamId = (Steinberg_Vst_ParamID) SONORE_
 // parameter the plugin flags kIsProgramChange. So there are two halves: the
 // list, which is metadata, and the parameter, which is how a host actually
 // changes one.
-constexpr Steinberg_Vst_ParamID kProgramParamId =
-    (Steinberg_Vst_ParamID) SONORE_NUM_PARAMS + 1;
+constexpr Steinberg_Vst_ParamID kProgramParamId = 0x7072676Du; // 'prgm', fixed for the same reason
 constexpr Steinberg_Vst_ProgramListID kProgramListId = 1;
 
 inline bool hasPrograms() { return kDesc.presets != nullptr && kDesc.numPresets > 0; }
@@ -251,15 +259,67 @@ inline int programIndexFromNormalised(double normalised) {
 constexpr Steinberg_Vst_ParamID kMidiCcParamBase = 0x10000000u;
 constexpr int kMidiCcCount = 130; // 0..127 CC, 128 aftertouch, 129 pitch bend
 constexpr int kMidiChannels = 16;
+// Program change is VST3's controller 130, and reaches a plugin the same way:
+// as a parameter. It was refused, so a VST3 build never heard one while the
+// CLAP, AU and LV2 builds of the same plugin did. Its sixteen ids come after
+// the controllers' rather than among them: numbering it 130 inside each
+// channel's block would have moved every id from channel 2 on, and a host
+// that saved automation on one would have lost it.
+constexpr int kMidiProgramSlot = Steinberg_Vst_ControllerNumbers_kCtrlProgramChange;
+constexpr int kMidiSlots = kMidiCcCount + 1; // every controller, then program change
+constexpr Steinberg_Vst_ParamID kMidiProgramParamBase =
+    kMidiCcParamBase + (Steinberg_Vst_ParamID) (kMidiChannels * kMidiCcCount);
+static_assert(kMidiProgramSlot == kMidiCcCount, "program change is the slot after the controllers");
+// Four id ranges that must never meet: the table's indices, the MIDI
+// controllers and program changes above 0x10000000, and the bypass and
+// program ids above those.
+static_assert((Steinberg_Vst_ParamID) kMaxParams < kMidiCcParamBase &&
+                  kMidiProgramParamBase + (Steinberg_Vst_ParamID) kMidiChannels < kBypassParamId &&
+                  kBypassParamId < kProgramParamId,
+              "the VST3 parameter id ranges overlap");
 
 inline bool wantsMidiMapping() { return clapwrap::wantsMidiIn(); }
-inline int midiCcParamCount() { return wantsMidiMapping() ? kMidiChannels * kMidiCcCount : 0; }
+inline int midiCcParamCount() { return wantsMidiMapping() ? kMidiChannels * kMidiSlots : 0; }
 inline Steinberg_Vst_ParamID midiCcParamId(int channel, int cc) {
+  if (cc == kMidiProgramSlot) return kMidiProgramParamBase + (Steinberg_Vst_ParamID) channel;
   return kMidiCcParamBase + (Steinberg_Vst_ParamID) (channel * kMidiCcCount + cc);
 }
+/** The (channel, controller) a hidden MIDI parameter stands for -- controller
+ *  kMidiProgramSlot being program change -- or false for any other id. */
+inline bool midiParamSlot(Steinberg_Vst_ParamID id, int* channel, int* cc) {
+  if (!wantsMidiMapping()) return false;
+  if (id >= kMidiCcParamBase && id < kMidiProgramParamBase) {
+    const int n = (int) (id - kMidiCcParamBase);
+    *channel = n / kMidiCcCount;
+    *cc = n % kMidiCcCount;
+    return true;
+  }
+  if (id >= kMidiProgramParamBase && id < kMidiProgramParamBase + (Steinberg_Vst_ParamID) kMidiChannels) {
+    *channel = (int) (id - kMidiProgramParamBase);
+    *cc = kMidiProgramSlot;
+    return true;
+  }
+  return false;
+}
+/** The same for the n-th hidden MIDI parameter in getParameterInfo's order:
+ *  every channel's controllers, then the sixteen program changes. */
+inline void midiParamAt(int n, int* channel, int* cc) {
+  if (n < kMidiChannels * kMidiCcCount) {
+    *channel = n / kMidiCcCount;
+    *cc = n % kMidiCcCount;
+  } else {
+    *channel = n - kMidiChannels * kMidiCcCount;
+    *cc = kMidiProgramSlot;
+  }
+}
 inline bool isMidiCcParam(Steinberg_Vst_ParamID id) {
-  return wantsMidiMapping() && id >= kMidiCcParamBase &&
-         id < kMidiCcParamBase + (Steinberg_Vst_ParamID) midiCcParamCount();
+  int channel = 0, cc = 0;
+  return midiParamSlot(id, &channel, &cc);
+}
+/** What a hidden MIDI parameter's normalised 1.0 is in MIDI: 14-bit pitch
+ *  bend, 7-bit everything else (a program number included). */
+inline double midiSpan(int cc) {
+  return cc == Steinberg_Vst_ControllerNumbers_kPitchBend ? 16383.0 : 127.0;
 }
 /** Pitch bend rests at CENTRE, not at zero: a host restoring defaults would
  *  otherwise bend every voice to the bottom of its range. */
@@ -281,9 +341,44 @@ inline uint32_t speakerCount(Steinberg_Vst_SpeakerArrangement arr) {
   return n;
 }
 
+/**
+ * Our role mask for a VST3 arrangement, one role per channel, in the same
+ * order.
+ *
+ * The first eighteen speaker bits ARE our roles, value for value (both come
+ * from WAVE_FORMAT_EXTENSIBLE). Past them they part: VST3's bit 18 is a
+ * second LFE and bit 19 is MONO, where ours are the top side pair -- which
+ * VST3 keeps at bits 24 and 25. The mask was the arrangement copied, so a
+ * mono track (kMono, bit 19) told the DSP its one channel was top side
+ * right, and a mono-to-stereo matrix built from that sent it nowhere.
+ * Speakers with no role of ours still get a bit each, above the named ones,
+ * so the role count always matches the channel count.
+ */
+inline uint64_t roleMaskFromArrangement(Steinberg_Vst_SpeakerArrangement arr) {
+  uint64_t mask = (uint64_t) arr & 0x3FFFFull; // bits 0..17: identical
+  uint32_t spare = 20;
+  for (uint32_t b = 18; b < 64; ++b) {
+    if (!((uint64_t) arr & ((uint64_t) 1 << b))) continue;
+    int role = -1;
+    if (b == 19) role = kChannelFC;       // kSpeakerM: mono is the centre
+    else if (b == 18) role = kChannelLFE; // kSpeakerLfe2, if the first is absent
+    else if (b == 24) role = kChannelTSL; // kSpeakerTsl
+    else if (b == 25) role = kChannelTSR; // kSpeakerTsr
+    if (role >= 0 && !(mask & ((uint64_t) 1 << role))) {
+      mask |= (uint64_t) 1 << role;
+      continue;
+    }
+    while (spare < 64 && (mask & ((uint64_t) 1 << spare))) ++spare;
+    if (spare < 64) mask |= (uint64_t) 1 << spare++;
+  }
+  return mask;
+}
+
 inline Steinberg_Vst_SpeakerArrangement defaultArrangementFor(uint32_t channels) {
   switch (channels) {
-    case 1: return Steinberg_Vst_kSpeakerC;
+    // kMono, the speaker a mono track is: what Cubase proposes, and what a
+    // host checks a mono bus against.
+    case 1: return Steinberg_Vst_kSpeakerM;
     case 2: return Steinberg_Vst_kSpeakerL | Steinberg_Vst_kSpeakerR;
     default:
       // The industry-standard layout for this width, in the shared vocabulary:
@@ -310,36 +405,55 @@ struct UnitInfoIface {
   Steinberg_Vst_IUnitInfoVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** IMidiMapping: which parameter a MIDI controller, channel aftertouch or
+ *  pitch bend drives, since VST3 delivers those as parameter changes rather
+ *  than MIDI. Only handed out when wantsMidiMapping() says the plugin reads
+ *  MIDI. */
 struct MidiMappingIface {
   Steinberg_Vst_IMidiMappingVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** INoteExpressionController: the per-note expression types this plugin
+ *  accepts (see NoteExpressionSpec). A host sends none until it has asked. */
 struct NoteExpressionIface {
   Steinberg_Vst_INoteExpressionControllerVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** IProcessContextRequirements: the process-context fields the plugin reads,
+ *  which are exactly the ones readTransport() uses. */
 struct ContextRequirementsIface {
   Steinberg_Vst_IProcessContextRequirementsVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** ChannelContext::IInfoListener: the host telling the plugin about its track
+ *  (name, colour), passed on to the DSP as TrackInfo. */
 struct InfoListenerIface {
   Steinberg_Vst_ChannelContext_IInfoListenerVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
 struct View;
 
+/** IComponent: the plugin's bus layout, activation and state, as the host
+ *  sees the processing half. */
 struct ComponentIface {
   Steinberg_Vst_IComponentVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** IAudioProcessor: setup, speaker arrangements, latency and tail, and
+ *  process(), which is the call that arrives on the audio thread. */
 struct ProcessorIface {
   Steinberg_Vst_IAudioProcessorVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** IEditController: parameters, their text, the controller's copy of the
+ *  state, and the editor. The same Plugin answers it as answers the processor,
+ *  so both halves read one set of values. */
 struct ControllerIface {
   Steinberg_Vst_IEditControllerVtbl* lpVtbl = nullptr;
   Plugin* owner = nullptr;
 };
+/** IPlugView: the editor window as the host drives it. Points at the View,
+ *  not the Plugin, because a view can outlive the plugin it came from. */
 struct ViewIface {
   Steinberg_IPlugViewVtbl* lpVtbl = nullptr;
   View* owner = nullptr;
@@ -361,7 +475,9 @@ struct ViewScaleIface {
 struct View {
   ViewIface iface;
   ViewScaleIface scaleIface;
-  Steinberg_uint32 refs = 1;
+  /** Atomic: a host adds and drops references from its audio and UI threads
+   *  at once, and a lost update frees an object still in use. */
+  std::atomic<Steinberg_uint32> refs{1};
   Plugin* plugin = nullptr;
   Steinberg_IPlugFrame* frame = nullptr;
   /** LOGICAL size: what the page is laid out in, whatever the monitor does. */
@@ -401,25 +517,40 @@ struct Plugin {
   // The selected preset lives in the SHARED state, not here: it is saved with
   // everything else, and a copy in the VST3 half would be a second answer to
   // the same question that the state format does not know about.
-  Steinberg_int32 currentProgram() const { return (Steinberg_int32) shared.selectedPreset; }
-  void setCurrentProgram(Steinberg_int32 index) { shared.selectedPreset = (int32_t) index; }
-  Steinberg_uint32 refs = 1;
+  Steinberg_int32 currentProgram() const {
+    return (Steinberg_int32) shared.selectedPreset.load(std::memory_order_relaxed);
+  }
+  void setCurrentProgram(Steinberg_int32 index) {
+    shared.selectedPreset.store((int32_t) index, std::memory_order_relaxed);
+  }
+  /** Atomic: a host adds and drops references from its audio and UI threads
+   *  at once, and a lost update frees an object still in use. */
+  std::atomic<Steinberg_uint32> refs{1};
   /** Set when the DSP reports its own state moved; cleared once the host has
-   *  been told. Written on the audio thread and read on the main one, which
-   *  for a single bool that only ever goes one way is the one case where that
-   *  is not a race worth an atomic. */
+   *  been told. Set on the audio thread and read and cleared on the main one,
+   *  so it IS an atomic: a SharedFlag, a relaxed std::atomic<bool> that reads
+   *  and assigns like a plain bool. Relaxed is enough because nothing is
+   *  published through it: it only says the host should be told, and the
+   *  host then asks for the state the usual way. */
   clapwrap::SharedFlag stateDirty; // set on the audio thread, cleared on the main one
+  /** The last state blob applied, as a hash, so the controller's copy of the
+   *  same restore is recognised rather than loaded a second time. */
+  uint64_t lastStateHash = 0;
+  bool haveLastState = false;
   /** Last value the host set for each (channel, controller). Kept because a
    *  host reads parameters back for display and for its own automation lanes,
    *  and a parameter that forgets what it was told is a parameter that
    *  pluginval fails. Held here rather than in the shared DSP state: it is
    *  this format's private plumbing, not something the DSP or the other
    *  wrappers should carry. */
+  // Atomic, relaxed: process() writes the value a host's block carried, the
+  // controller writes what the host set and reads it back -- two threads on
+  // one float, which is a data race however small the float.
   struct MidiCcValues {
-    float v[kMidiChannels][kMidiCcCount];
+    std::atomic<float> v[kMidiChannels][kMidiSlots];
     MidiCcValues() {
       for (int c = 0; c < kMidiChannels; ++c)
-        for (int n = 0; n < kMidiCcCount; ++n) v[c][n] = (float) midiCcDefault(n);
+        for (int n = 0; n < kMidiSlots; ++n) v[c][n] = (float) midiCcDefault(n);
     }
   };
   MidiCcValues midiCc;
@@ -557,7 +688,7 @@ inline Steinberg_uint32 releasePlugin(Plugin* self) {
 
 /** Units: one per declared group, plus the mandatory root. */
 inline int unitCount() { // NOLINT: forward-declared above
-  const GroupTable groups = collectGroups(kDesc.params, kDesc.numParams);
+  const GroupTable& groups = clapwrap::descriptorGroups();
   if (groups.count > 0) return groups.count + 1; // root plus one per group
   // A plugin with no groups still needs a ROOT unit when it has programs: a
   // program list belongs to a unit, and a host looks for it by asking a unit
@@ -567,7 +698,7 @@ inline int unitCount() { // NOLINT: forward-declared above
 }
 
 inline Steinberg_Vst_UnitID unitIdFor(const ParamInfo& p) {
-  const GroupTable groups = collectGroups(kDesc.params, kDesc.numParams);
+  const GroupTable& groups = clapwrap::descriptorGroups();
   const int g = groups.indexOf(p.group);
   return g >= 0 ? (Steinberg_Vst_UnitID) (g + 1) : 0; // 0 is the root unit
 }
@@ -618,18 +749,53 @@ inline Steinberg_tresult writeState(Plugin* self, Steinberg_IBStream* stream) {
              : Steinberg_kResultFalse;
 }
 
+/** The whole stream, read to its end. A state blob is small; holding it is
+ *  what lets the same restore be recognised when it arrives twice.
+ *
+ *  What a read returned is kept whatever the call answered. IBStream does
+ *  not say what a short read returns, and the VST3 SDK's own FileStream
+ *  answers one with the bytes it had and kResultFalse, which a host's
+ *  stream built the same way does too. That piece was dropped and the read
+ *  stopped: for a state under 4 KB, the whole of it, so the session
+ *  reopened at its defaults and the host was told the load had failed. */
+inline void readWholeStream(Steinberg_IBStream* stream, std::vector<uint8_t>& out) {
+  out.clear();
+  uint8_t chunk[4096];
+  constexpr Steinberg_int32 kChunk = (Steinberg_int32) sizeof(chunk);
+  for (;;) {
+    Steinberg_int32 got = 0;
+    const Steinberg_tresult result = stream->lpVtbl->read(stream, chunk, kChunk, &got);
+    if (got > 0) out.insert(out.end(), chunk, chunk + (got < kChunk ? got : kChunk));
+    if (result != Steinberg_kResultOk || got <= 0) break;
+    if (out.size() > ((size_t) 256 << 20)) break; // no state is this big; stop reading junk
+  }
+}
+
+inline uint64_t stateHash(const std::vector<uint8_t>& bytes) {
+  uint64_t h = 1469598103934665603ull; // FNV-1a
+  for (uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+  return h ^ (uint64_t) bytes.size();
+}
+
+inline Steinberg_tresult applyStateBytes(Plugin* self, const std::vector<uint8_t>& bytes) {
+  size_t pos = 0;
+  const bool ok = clapwrap::loadStateBody(&self->shared, [&](void* data, size_t size) -> size_t {
+    const size_t take = size < bytes.size() - pos ? size : bytes.size() - pos;
+    if (take) std::memcpy(data, bytes.data() + pos, take);
+    pos += take;
+    return take;
+  });
+  if (!ok) return Steinberg_kResultFalse;
+  self->lastStateHash = stateHash(bytes);
+  self->haveLastState = true;
+  return Steinberg_kResultOk;
+}
+
 inline Steinberg_tresult readState(Plugin* self, Steinberg_IBStream* stream) {
   if (!stream) return Steinberg_kInvalidArgument;
-  return clapwrap::loadStateBody(&self->shared,
-                                 [stream](void* data, size_t size) -> size_t {
-                                   Steinberg_int32 got = 0;
-                                   if (stream->lpVtbl->read(stream, data, (Steinberg_int32) size,
-                                                            &got) != Steinberg_kResultOk)
-                                     return 0;
-                                   return got > 0 ? (size_t) got : 0;
-                                 })
-             ? Steinberg_kResultOk
-             : Steinberg_kResultFalse;
+  std::vector<uint8_t> bytes;
+  readWholeStream(stream, bytes);
+  return applyStateBytes(self, bytes);
 }
 
 // ── IComponent ───────────────────────────────────────────────────────────────
@@ -661,14 +827,29 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE componentInitialize(
 
   plugin->shared.mainChannels = clapwrap::defaultMainChannels();
   plugin->mainArr = defaultArrangementFor(plugin->shared.mainChannels);
-  plugin->shared.mainChannelMask = (uint64_t) plugin->mainArr;
+  plugin->shared.mainChannelMask = roleMaskFromArrangement(plugin->mainArr);
   plugin->scArr = defaultArrangementFor(2);
   for (int i = 0; i < SONORE_NUM_PARAMS && i < kDesc.numParams; ++i)
     plugin->shared.params[i] = kDesc.params[i].defaultValue;
   return Steinberg_kResultOk;
 }
 
-static Steinberg_tresult SMTG_STDMETHODCALLTYPE componentTerminate(void*) {
+/** Keep the host's component handler as COM says: a reference held while it
+ *  is kept, given back when it is replaced or the controller terminates. A
+ *  bare pointer left the plugin calling performEdit into whatever a host had
+ *  freed after letting go of its own reference. */
+inline void keepHandler(Plugin* plugin, Steinberg_Vst_IComponentHandler* handler) {
+  if (handler == plugin->handler) return;
+  if (handler) handler->lpVtbl->addRef(handler);
+  Steinberg_Vst_IComponentHandler* previous = plugin->handler;
+  plugin->handler = handler;
+  if (previous) previous->lpVtbl->release(previous);
+}
+
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE componentTerminate(void* self) {
+  // One object is both component and controller, and a host terminates it
+  // once, through either: both let the handler go.
+  keepHandler(ownerOfComponent(self), nullptr);
   return Steinberg_kResultOk;
 }
 
@@ -735,7 +916,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE componentGetBusInfo(
                 : (dir == Steinberg_Vst_BusDirections_kInput ? "Input" : "Output"),
                 bus->name);
   } else {
-    bus->channelCount = 1;
+    // An event bus's channelCount is its number of MIDI CHANNELS. It said 1,
+    // and hosts take that at its word: some route or map only channel 1, which
+    // is the end of the 16-channel IMidiMapping below and of MPE, whose whole
+    // design is one channel per note.
+    bus->channelCount = 16;
     toString128(dir == Steinberg_Vst_BusDirections_kInput ? "MIDI In" : "MIDI Out", bus->name);
   }
   return Steinberg_kResultOk;
@@ -758,18 +943,34 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE componentSetActive(void* self,
                                                                    Steinberg_TBool state) {
   Plugin* plugin = ownerOfComponent(self);
   plugin->active = state != 0;
+  // A main-thread call every host makes, for one that never polls a
+  // parameter: the output guard's report, if one is still owed.
+  clapwrap::reportOutputGuard(&plugin->shared);
   if (plugin->active) {
-    ProcessSpec spec;
-    spec.sampleRate = plugin->sampleRate;
-    spec.maximumBlockSize = (uint32_t) plugin->maxBlock;
-    spec.numChannels = plugin->shared.mainChannels;
-    spec.offline = plugin->shared.offline; // set by setupProcessing, just above
-    plugin->shared.dsp.prepare(spec); // the one place allocation is allowed
-    plugin->shared.bypass.prepare(plugin->sampleRate, (uint32_t) plugin->maxBlock,
+    // Through the shared prepare, not around it: it also releases every key
+    // the editor's keyboard shows held (the DSP is about to forget its voices)
+    // and gives a licensed build's gate the real rate. This wrapper called
+    // dsp.prepare itself and got neither. The maximum block is setup's, with
+    // the same fallback setupProcessing applied, rather than a raw zero.
+    plugin->shared.sampleRate = plugin->sampleRate;
+    // Whatever was queued for a block before this activation is not for one
+    // after it.
+    clapwrap::discardEvents(&plugin->shared);
+    clapwrap::prepareDsp(&plugin->shared); // the one place allocation is allowed
+    // The host reads getLatencySamples after activating, so whatever the DSP
+    // says now is what the host already knows. Unseeded, the first parameter
+    // poll compared it with zero and sent restartComponent(kLatencyChanged)
+    // for every plugin with latency -- an engine restart per instance at
+    // project load, for nothing.
+    plugin->shared.reportedLatency = clapwrap::dspLatency(plugin->shared.dsp);
+    // Sized to the block the DSP was prepared for, which is the most process()
+    // hands it. A host that set up with no maximum got a one-sample silence
+    // here and a 128-frame DSP.
+    plugin->shared.bypass.prepare(plugin->sampleRate, plugin->shared.maxFrames,
                                   clapwrap::dspLatency(plugin->shared.dsp),
                                   plugin->shared.mainChannels);
     if (clapwrap::TakesSidechain<SonoreDsp>::value) {
-      const size_t n = (size_t) (plugin->maxBlock > 0 ? plugin->maxBlock : 1);
+      const size_t n = (size_t) plugin->shared.maxFrames;
       plugin->shared.scSilence.assign(n, 0.0f);
       if (clapwrap::supportsDouble()) plugin->shared.scSilence64.assign(n, 0.0);
     }
@@ -815,10 +1016,9 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorSetBusArrangements(
   }
   plugin->mainArr = outputs[0];
   plugin->shared.mainChannels = outCount;
-  // VST3's speaker bit positions match our role numbering value for value
-  // (both descend from WAVE_FORMAT_EXTENSIBLE), so the arrangement IS the
-  // role mask -- no lookup table, and no chance of the two drifting.
-  plugin->shared.mainChannelMask = (uint64_t) outputs[0];
+  // Translated, not copied: the speaker bits match our roles only up to 17,
+  // and a mono track's kMono is bit 19 -- our top side right.
+  plugin->shared.mainChannelMask = roleMaskFromArrangement(outputs[0]);
   return Steinberg_kResultOk;
 }
 
@@ -920,12 +1120,24 @@ inline TransportInfo readTransport(const Steinberg_Vst_ProcessContext* ctx) {
     info.timeSigNumerator = ctx->timeSigNumerator;
     info.timeSigDenominator = ctx->timeSigDenominator;
   }
+  // VST3 gives where the bar began but not which bar it is: counted from the
+  // song's start in bars of the current signature. It was left at 0, so a
+  // DSP counting bars saw the first bar for ever.
+  if (ctx->state & Steinberg_Vst_ProcessContext_StatesAndFlags_kBarPositionValid)
+    info.barNumber = (int32_t) std::floor(ctx->barPositionMusic / info.beatsPerBar() + 0.5);
+  // The cycle's ends, which a DSP never saw.
+  if (ctx->state & Steinberg_Vst_ProcessContext_StatesAndFlags_kCycleValid) {
+    info.loopStartBeats = ctx->cycleStartMusic;
+    info.loopEndBeats = ctx->cycleEndMusic;
+    info.hasLoop = info.loopEndBeats > info.loopStartBeats;
+  }
   return info;
 }
 
 /** Apply what the user did to the interface. Values were already sent to the
- *  host from the main thread (see viewOnMessage), so here they only have to
- *  land on the DSP: this must not call back into the host. */
+ *  host from the main thread (viewOnMessage for the page, makeVst3EditorHost
+ *  for the native editor), so here they only have to land on the DSP; this
+ *  must not call back into the host. */
 inline void drainUiEvents(Plugin* plugin) {
   UiEventQueue::Event e;
   while (plugin->shared.uiEvents.pop(&e)) {
@@ -962,60 +1174,131 @@ inline void drainUiEvents(Plugin* plugin) {
 static void emitVst3MidiOut(Plugin* plugin, struct Steinberg_Vst_ProcessData* data,
                             Steinberg_int32 frames) {
   if (!kDesc.producesMidi || !data->outputEvents) return;
-  for (const auto& e : plugin->shared.midiOut) {
-    Steinberg_Vst_Event ev{};
+  const MidiBuffer& out = plugin->shared.midiOut;
+  auto stamp = [&](Steinberg_Vst_Event& ev, int position) {
     ev.busIndex = 0;
-    ev.sampleOffset = e.samplePosition < 0 ? 0 : e.samplePosition;
+    ev.sampleOffset = position < 0 ? 0 : position;
     if (ev.sampleOffset >= frames) ev.sampleOffset = frames - 1;
     ev.flags = Steinberg_Vst_Event_EventFlags_kIsLive;
-    const MidiMessage& m = e.message;
+  };
+  // Short messages and SysEx MERGED by time: an event list is read in
+  // order, and every SysEx used to be appended after every short message.
+  const auto* e = out.begin();
+  const auto* x = out.sysexBegin();
+  while (e != out.end() || x != out.sysexEnd()) {
+    Steinberg_Vst_Event ev{};
+    if (x != out.sysexEnd() && (e == out.end() || x->samplePosition < e->samplePosition)) {
+      stamp(ev, x->samplePosition);
+      ev.type = Steinberg_Vst_Event_EventTypes_kDataEvent;
+      ev.Steinberg_Vst_Event_data.type = Steinberg_Vst_DataEvent_DataTypes_kMidiSysEx;
+      ev.Steinberg_Vst_Event_data.size = x->length;
+      ev.Steinberg_Vst_Event_data.bytes = out.sysexData(*x);
+      ++x;
+      data->outputEvents->lpVtbl->addEvent(data->outputEvents, &ev);
+      continue;
+    }
+    const MidiMessage& m = e->message;
+    stamp(ev, e->samplePosition);
+    ++e;
+    const int kind = m.getRawStatus() & 0xF0;
+    const Steinberg_int16 channel = (Steinberg_int16) (m.getChannel() - 1);
     if (m.isNoteOn()) {
       ev.type = Steinberg_Vst_Event_EventTypes_kNoteOnEvent;
-      ev.Steinberg_Vst_Event_noteOn.channel = (Steinberg_int16) (m.getChannel() - 1);
+      ev.Steinberg_Vst_Event_noteOn.channel = channel;
       ev.Steinberg_Vst_Event_noteOn.pitch = (Steinberg_int16) m.getNoteNumber();
       ev.Steinberg_Vst_Event_noteOn.velocity = m.getFloatVelocity();
       ev.Steinberg_Vst_Event_noteOn.noteId = -1;
     } else if (m.isNoteOff()) {
       ev.type = Steinberg_Vst_Event_EventTypes_kNoteOffEvent;
-      ev.Steinberg_Vst_Event_noteOff.channel = (Steinberg_int16) (m.getChannel() - 1);
+      ev.Steinberg_Vst_Event_noteOff.channel = channel;
       ev.Steinberg_Vst_Event_noteOff.pitch = (Steinberg_int16) m.getNoteNumber();
       ev.Steinberg_Vst_Event_noteOff.velocity = m.getFloatVelocity();
       ev.Steinberg_Vst_Event_noteOff.noteId = -1;
+    } else if (kind == 0xA0) {
+      ev.type = Steinberg_Vst_Event_EventTypes_kPolyPressureEvent;
+      ev.Steinberg_Vst_Event_polyPressure.channel = channel;
+      ev.Steinberg_Vst_Event_polyPressure.pitch = (Steinberg_int16) m.getRawData1();
+      ev.Steinberg_Vst_Event_polyPressure.pressure = (float) m.getRawData2() / 127.0f;
+      ev.Steinberg_Vst_Event_polyPressure.noteId = -1;
+    } else if (kind == 0xB0 || kind == 0xC0 || kind == 0xD0 || kind == 0xE0) {
+      // kLegacyMIDICCOutEvent: the type VST3 defines for exactly these.
+      // Controllers by number, and the three that are not controllers by the
+      // numbers ControllerNumbers reserves for them. These were dropped, on
+      // the belief that they had no VST3 event equivalent.
+      ev.type = Steinberg_Vst_Event_EventTypes_kLegacyMIDICCOutEvent;
+      auto& cc = ev.Steinberg_Vst_Event_midiCCOut;
+      cc.channel = (Steinberg_int8) channel;
+      if (kind == 0xB0) {
+        cc.controlNumber = (Steinberg_uint8) m.getRawData1();
+        cc.value = (Steinberg_int8) m.getRawData2();
+      } else if (kind == 0xC0) {
+        cc.controlNumber = (Steinberg_uint8) Steinberg_Vst_ControllerNumbers_kCtrlProgramChange;
+        cc.value = (Steinberg_int8) m.getRawData1();
+      } else if (kind == 0xD0) {
+        cc.controlNumber = (Steinberg_uint8) Steinberg_Vst_ControllerNumbers_kAfterTouch;
+        cc.value = (Steinberg_int8) m.getRawData1();
+      } else {
+        cc.controlNumber = (Steinberg_uint8) Steinberg_Vst_ControllerNumbers_kPitchBend;
+        cc.value = (Steinberg_int8) m.getRawData1();  // LSB
+        cc.value2 = (Steinberg_int8) m.getRawData2(); // MSB
+      }
     } else {
-      continue;
+      continue; // system messages have no VST3 event
     }
-    data->outputEvents->lpVtbl->addEvent(data->outputEvents, &ev);
-  }
-  for (auto it = plugin->shared.midiOut.sysexBegin();
-       it != plugin->shared.midiOut.sysexEnd(); ++it) {
-    Steinberg_Vst_Event ev{};
-    ev.busIndex = 0;
-    ev.sampleOffset = it->samplePosition < 0 ? 0 : it->samplePosition;
-    if (ev.sampleOffset >= frames) ev.sampleOffset = frames - 1;
-    ev.flags = Steinberg_Vst_Event_EventFlags_kIsLive;
-    ev.type = Steinberg_Vst_Event_EventTypes_kDataEvent;
-    ev.Steinberg_Vst_Event_data.type = Steinberg_Vst_DataEvent_DataTypes_kMidiSysEx;
-    ev.Steinberg_Vst_Event_data.size = it->length;
-    ev.Steinberg_Vst_Event_data.bytes = plugin->shared.midiOut.sysexData(*it);
     data->outputEvents->lpVtbl->addEvent(data->outputEvents, &ev);
   }
 }
 
-static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
-    void* self, Steinberg_Vst_ProcessData* data) {
-  Plugin* plugin = ownerOfProcessor(self);
-  if (!data) return Steinberg_kInvalidArgument;
+/** What every block owes at its end, in either precision: no output claims
+ *  to be silent, and a state change the DSP reported marks the session dirty.
+ *  One function because the 64-bit path returned before reaching the lines
+ *  the float path ended with, and a 64-bit host's session was never marked. */
+static inline void finishVst3Block(Plugin* plugin, Steinberg_Vst_ProcessData* data, uint32_t nAux) {
+  // The DSP has had this block's events.
+  clapwrap::discardEvents(&plugin->shared);
+  if (data->outputs && data->numOutputs > 0) data->outputs[0].silenceFlags = 0;
+  for (uint32_t b = 0; b < nAux; ++b) {
+    const Steinberg_int32 busIndex = (Steinberg_int32) (1 + b);
+    if (busIndex < data->numOutputs && data->outputs) data->outputs[busIndex].silenceFlags = 0;
+  }
+  // The DSP may have changed state the host has no other way to learn about.
+  // Recorded, not announced: setDirty is a main-thread call and this is not,
+  // and VST3 offers no way to ask to be called there. The parameter poll
+  // delivers it, same as the latency.
+  if (clapwrap::dspConsumeStateDirty(plugin->shared.dsp)) plugin->stateDirty = true;
+}
 
-  // Notes are cleared BEFORE the parameter loop, because in VST3 some of the
-  // MIDI arrives as parameters: clearing after would throw away every
-  // controller the host just sent. MidiBuffer::addEvent inserts by sample
-  // offset, so the note events added further down still land in order.
-  plugin->shared.midi.clear();
-  plugin->shared.expression.clear();
+/** A host's sample offset, clamped into a block of `frames`: at or past the
+ *  end a note-off was never reached and the note hung (see
+ *  clapwrap::eventTime). */
+static inline int offsetInBlock(Steinberg_int32 offset, Steinberg_int32 frames) {
+  if (frames <= 0 || offset < 0) return 0;
+  return offset < frames ? (int) offset : (int) frames - 1;
+}
+
+/** One block of at most maxFrames: the whole of process() for a host that
+ *  keeps to setupProcessing, and one piece of it otherwise (see
+ *  processorProcess). */
+static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessData* data) {
+  const Steinberg_int32 frames = data->numSamples;
+  // The load meter's clock, from the top as in CLAP: parameter and event
+  // handling is part of what the block costs.
+  const auto blockStart = std::chrono::steady_clock::now();
+
+  // The MIDI and expression below are ADDED to what is already waiting, and
+  // cleared once a DSP has had them (finishVst3Block). They were cleared
+  // here, and a zero-sample call -- a host flushing parameters with the
+  // transport stopped -- decodes notes and controllers and returns: the next
+  // call threw them away unplayed, and a note-off among them left the note
+  // sounding. Nothing may be cleared between the parameter loop and the note
+  // events either, since some of the MIDI arrives as parameters;
+  // MidiBuffer::addEvent inserts by sample offset, so it all lands in order.
 
   // Parameter automation. VST3 delivers a queue per parameter with points at
   // sample offsets; we take the LAST point of each, which is block-granular:
-  // what the smoothers in the toolkit exist to make inaudible.
+  // what the smoothers in the toolkit exist to make inaudible. The MIDI
+  // controllers VST3 sends as parameters are the exception: each point is a
+  // message, and every one is passed on.
   if (data->inputParameterChanges) {
     auto* changes = data->inputParameterChanges;
     const Steinberg_int32 count = changes->lpVtbl->getParameterCount(changes);
@@ -1025,6 +1308,36 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
       const Steinberg_Vst_ParamID id = queue->lpVtbl->getParameterId(queue);
       const Steinberg_int32 points = queue->lpVtbl->getPointCount(queue);
       if (points <= 0) continue;
+      int channel = 0, cc = 0;
+      if (midiParamSlot(id, &channel, &cc)) {
+        // Back into the MIDI the DSP expects -- EVERY point, each at its own
+        // offset, because a host puts one point in the queue per message it
+        // received. A controller is not a value that settles: a sustain pedal
+        // lifted and pressed again within one block (a pedal change, how a
+        // piano part lets go of what it held) was handed over as its last
+        // point alone, so the DSP saw the pedal go down while already down,
+        // never up, and every note it held rang on. CLAP, LV2 and AU hand
+        // over each message. One point per block was chosen when the buffer
+        // held 64 events; it holds 1024, and a full one gives a controller's
+        // slot to a note-off (MidiBuffer::addEvent).
+        for (Steinberg_int32 p = 0; p < points; ++p) {
+          Steinberg_int32 offset = 0;
+          Steinberg_Vst_ParamValue value = 0.0;
+          if (queue->lpVtbl->getPoint(queue, p, &offset, &value) != Steinberg_kResultOk) continue;
+          const double v = value < 0.0 ? 0.0 : (value > 1.0 ? 1.0 : value);
+          plugin->midiCc.v[channel][cc].store((float) v, std::memory_order_relaxed);
+          const int at = offsetInBlock(offset, frames);
+          if (cc == kMidiProgramSlot)
+            plugin->shared.midi.addEvent(MidiMessage(0xC0 | channel, (int) (v * 127.0 + 0.5), 0), at);
+          else if (cc == Steinberg_Vst_ControllerNumbers_kPitchBend)
+            plugin->shared.midi.addEvent(MidiMessage::pitchBend(channel, (int) (v * 16383.0 + 0.5)), at);
+          else if (cc == Steinberg_Vst_ControllerNumbers_kAfterTouch)
+            plugin->shared.midi.addEvent(MidiMessage::channelPressure(channel, (int) (v * 127.0 + 0.5)), at);
+          else
+            plugin->shared.midi.addEvent(MidiMessage::controlChange(channel, cc, (int) (v * 127.0 + 0.5)), at);
+        }
+        continue;
+      }
       Steinberg_int32 offset = 0;
       Steinberg_Vst_ParamValue value = 0.0;
       if (queue->lpVtbl->getPoint(queue, points - 1, &offset, &value) != Steinberg_kResultOk)
@@ -1033,37 +1346,17 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
         const int index = programIndexFromNormalised(value);
         plugin->setCurrentProgram((Steinberg_int32) index);
         float presetValues[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1];
-        if (applyPreset(kDesc.presets[index], kDesc.params, kDesc.numParams, presetValues))
-          for (int i = 0; i < kDesc.numParams; ++i) plugin->shared.params[i] = presetValues[i];
+        // Bounded by the array, not only by the descriptor: see
+        // clapwrap::factoryPresetValues.
+        if (clapwrap::factoryPresetValues(kDesc, index, presetValues, SONORE_NUM_PARAMS))
+          for (int p = 0; p < kDesc.numParams; ++p) plugin->shared.params[p] = presetValues[p];
         continue;
       }
-      if (isMidiCcParam(id)) {
-        // Back into the MIDI the DSP expects. Block-granular like every other
-        // parameter here: taking every point instead would let one sweeping
-        // mod wheel fill a 64-event buffer and starve the notes out of it,
-        // which is a worse failure than a controller that updates per block.
-        const int n = (int) (id - kMidiCcParamBase);
-        const int channel = n / kMidiCcCount, cc = n % kMidiCcCount;
-        const double v = value < 0.0 ? 0.0 : (value > 1.0 ? 1.0 : value);
-        plugin->midiCc.v[channel][cc] = (float) v;
-        const int at = offset < 0 ? 0 : offset;
-        if (cc == Steinberg_Vst_ControllerNumbers_kPitchBend)
-          plugin->shared.midi.addEvent(MidiMessage::pitchBend(channel, (int) (v * 16383.0 + 0.5)),
-                                       at);
-        else if (cc == Steinberg_Vst_ControllerNumbers_kAfterTouch)
-          plugin->shared.midi.addEvent(
-              MidiMessage::channelPressure(channel, (int) (v * 127.0 + 0.5)), at);
-        else
-          plugin->shared.midi.addEvent(
-              MidiMessage::controlChange(channel, cc, (int) (v * 127.0 + 0.5)), at);
-        continue;
-      }
-      if (id > kBypassParamId) continue;
       if (id == kBypassParamId) {
         if (hasBypassParam()) plugin->shared.bypass.engaged = value >= 0.5;
-      } else {
+      } else if (id < (Steinberg_Vst_ParamID) SONORE_NUM_PARAMS) {
         plugin->shared.params[id] = (float) toPlain(kDesc.params[id], value);
-      }
+      } // anything else is not ours
     }
   }
 
@@ -1074,7 +1367,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
     for (Steinberg_int32 i = 0; i < count; ++i) {
       Steinberg_Vst_Event e{};
       if (events->lpVtbl->getEvent(events, i, &e) != Steinberg_kResultOk) continue;
-      const int offset = e.sampleOffset < 0 ? 0 : e.sampleOffset;
+      const int offset = offsetInBlock(e.sampleOffset, frames);
       if (e.type == Steinberg_Vst_Event_EventTypes_kNoteOnEvent) {
         const auto& on = e.Steinberg_Vst_Event_noteOn;
         int vel = (int) (on.velocity * 127.0f + 0.5f);
@@ -1082,6 +1375,23 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
         plugin->shared.midi.addEvent(
             MidiMessage::noteOn(on.channel < 0 ? 0 : on.channel, on.pitch, vel), offset);
         plugin->noteIds.add(on.noteId, on.pitch, on.channel);
+        // The note's own TUNING, in cents: how a microtonal host, or Cubase's
+        // per-note expression, says "this C, a quarter tone sharp" in one
+        // event. It was dropped, and every such note played at its twelve-
+        // tone pitch. A DSP that plays per-note expression gets it as a
+        // tuning expression at the note's own frame, which DSPs apply after
+        // the note-on at that frame (the synth example does). Plain MIDI has
+        // no way to say it.
+        if (kDesc.supportsMpe && on.tuning != 0.0f && std::isfinite(on.tuning)) {
+          NoteExpressionBuffer::Entry entry;
+          entry.noteId = on.noteId;
+          entry.key = (int16_t) on.pitch;
+          entry.channel = (int16_t) (on.channel < 0 ? 0 : (on.channel > 15 ? 15 : on.channel));
+          entry.samplePosition = offset;
+          entry.expression = kExprTuning;
+          entry.value = on.tuning / 100.0f;
+          plugin->shared.expression.addEvent(entry);
+        }
       } else if (e.type == Steinberg_Vst_Event_EventTypes_kDataEvent &&
                  e.Steinberg_Vst_Event_data.type ==
                      Steinberg_Vst_DataEvent_DataTypes_kMidiSysEx) {
@@ -1096,6 +1406,30 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
         plugin->shared.midi.addEvent(
             MidiMessage::noteOff(off.channel < 0 ? 0 : off.channel, off.pitch), offset);
         plugin->noteIds.remove(off.noteId);
+      } else if (e.type == Steinberg_Vst_Event_EventTypes_kPolyPressureEvent) {
+        // Per-note pressure is a TYPED event in VST3, not raw MIDI. There was
+        // no case for it -- the comment in the expression switch below said
+        // it would arrive as MIDI and be decoded there, and it never did -- so
+        // every MPE controller's pressure was dropped on the floor.
+        //
+        // Both forms, as every other wrapper gives them: poly aftertouch for a
+        // DSP that reads MIDI, and a pressure expression for one that plays
+        // per-note expression -- keyed by the event's own key and channel.
+        const auto& pp = e.Steinberg_Vst_Event_polyPressure;
+        const int ch = pp.channel < 0 ? 0 : (pp.channel > 15 ? 15 : pp.channel);
+        const float pressure = pp.pressure < 0.0f ? 0.0f : (pp.pressure > 1.0f ? 1.0f : pp.pressure);
+        plugin->shared.midi.addEvent(
+            MidiMessage::polyPressure(ch, pp.pitch, (int) (pressure * 127.0f + 0.5f)), offset);
+        if (kDesc.supportsMpe) {
+          NoteExpressionBuffer::Entry entry;
+          entry.noteId = pp.noteId;
+          entry.key = (int16_t) pp.pitch;
+          entry.channel = (int16_t) ch;
+          entry.samplePosition = offset;
+          entry.expression = kExprPressure;
+          entry.value = pressure;
+          plugin->shared.expression.addEvent(entry);
+        }
       } else if (kDesc.supportsMpe &&
                  e.type == Steinberg_Vst_Event_EventTypes_kNoteExpressionValueEvent) {
         // VST3's own per-note expression. Its ids and RANGES differ from
@@ -1156,9 +1490,9 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
             entry.value = (float) ne.value;
             break;
           default:
-            // VST3 has no standard PRESSURE id -- it carries pressure as poly
-            // aftertouch, which reaches us as raw MIDI and is decoded there.
-            // An id we do not model is dropped rather than guessed at.
+            // VST3 has no standard PRESSURE expression id -- it carries
+            // pressure as a kPolyPressureEvent, handled above. An id we do
+            // not model is dropped rather than guessed at.
             continue;
         }
         plugin->shared.expression.addEvent(entry);
@@ -1166,12 +1500,20 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
     }
   }
 
+  // No block to play them in: they wait, at offset 0, for the next one.
+  if (frames <= 0) return Steinberg_kResultOk;
+
   if (kDesc.supportsMpe) plugin->shared.mpe.process(plugin->shared.midi, plugin->shared.expression);
 
-  drainUiEvents(plugin);
+  if (data->numOutputs < 1 || !data->outputs) {
+    clapwrap::discardEvents(&plugin->shared);
+    return Steinberg_kResultOk;
+  }
 
-  const Steinberg_int32 frames = data->numSamples;
-  if (frames <= 0 || data->numOutputs < 1 || !data->outputs) return Steinberg_kResultOk;
+  // After the early returns: the editor's notes play in the block they are
+  // drained into, and its values lose nothing by waiting -- the main thread
+  // already wrote them.
+  drainUiEvents(plugin);
 
   auto& out = data->outputs[0];
 
@@ -1185,11 +1527,14 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
       double* chans64[clapwrap::kMaxAudioChannels];
       for (uint32_t c = 0; c < nch64; ++c)
         chans64[c] = out.Steinberg_Vst_AudioBusBuffers_channelBuffers64[c];
+      for (Steinberg_int32 c = (Steinberg_int32) nch64; c < out.numChannels; ++c)
+        if (double* extra = out.Steinberg_Vst_AudioBusBuffers_channelBuffers64[c])
+          std::memset(extra, 0, sizeof(double) * frames);
 
       if (kDesc.isInstrument) {
         for (uint32_t c = 0; c < nch64; ++c)
           std::memset(chans64[c], 0, sizeof(double) * frames);
-      } else if (data->numInputs > 0 && data->inputs &&
+      } else if (data->numInputs > 0 && data->inputs && data->inputs[0].numChannels > 0 &&
                  data->inputs[0].Steinberg_Vst_AudioBusBuffers_channelBuffers64) {
         const auto& in = data->inputs[0];
         for (uint32_t c = 0; c < nch64; ++c) {
@@ -1197,6 +1542,10 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
               [(Steinberg_int32) c < in.numChannels ? c : (uint32_t) in.numChannels - 1];
           if (src && src != chans64[c]) std::memcpy(chans64[c], src, sizeof(double) * frames);
         }
+      } else {
+        // No input this block (see the float path): silence in.
+        for (uint32_t c = 0; c < nch64; ++c)
+          std::memset(chans64[c], 0, sizeof(double) * frames);
       }
 
       clapwrap::sendTransport(plugin->shared.dsp, readTransport(data->processContext));
@@ -1220,10 +1569,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
       }
       AudioBlock<double> scBlock64(scChans64, 2, scChans64[0] ? (size_t) frames : 0);
 
-      AudioBlock<double> auxBlocks64[clapwrap::kMaxAuxOutputs] = {};
-      double* auxPtrs64[clapwrap::kMaxAuxOutputs][clapwrap::kMaxAudioChannels] = {};
+      // Held in the instance (clapwrap::processdetail::AuxScratch).
+      AudioBlock<double>* const auxBlocks64 = plugin->shared.aux64.blocks;
       const uint32_t nAux64 = clapwrap::numAuxOutputs();
       for (uint32_t b = 0; b < nAux64; ++b) {
+        double** const auxRow = plugin->shared.aux64.row(b);
         uint32_t width = 0;
         const Steinberg_int32 busIndex = (Steinberg_int32) (1 + b);
         if (busIndex < data->numOutputs && data->outputs) {
@@ -1234,10 +1584,10 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
             if (width > want) width = want;
             if (width > clapwrap::kMaxAudioChannels) width = clapwrap::kMaxAudioChannels;
             for (uint32_t c = 0; c < width; ++c)
-              auxPtrs64[b][c] = ab.Steinberg_Vst_AudioBusBuffers_channelBuffers64[c];
+              auxRow[c] = ab.Steinberg_Vst_AudioBusBuffers_channelBuffers64[c];
           }
         }
-        auxBlocks64[b] = AudioBlock<double>(auxPtrs64[b], width, width ? (size_t) frames : 0);
+        auxBlocks64[b] = AudioBlock<double>(auxRow, width, width ? (size_t) frames : 0);
       }
 
       uint8_t roles64[clapwrap::kMaxAudioChannels];
@@ -1256,29 +1606,33 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
                                     nullptr, // VST3 has no per-port activation
                                     true,
                                     plugin->shared.offline};
-      clapwrap::bypassCapture(plugin->shared.bypass, chans64, (uint32_t) frames);
+      clapwrap::bypassCapture(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
       trackNotes(plugin->shared.notes, ctx64.midi);
       clapwrap::snapshotParams(&plugin->shared);
       clapwrap::runDspCtx64(plugin->shared.dsp, ctx64, plugin->shared.paramsBlock);
       emitVst3MidiOut(plugin, data, frames);
-      clapwrap::bypassApply(plugin->shared.bypass, chans64, (uint32_t) frames);
+      clapwrap::bypassApply(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
+      // Before the meters, as in CLAP. The report comes from the parameter
+      // poll: VST3 has no way to ask for the main thread.
+      clapwrap::guardOutputs(&plugin->shared, chans64, nch64, auxBlocks64, nAux64,
+                             (uint32_t) frames);
 
-      float peak = 0.0f;
-      double sum = 0.0;
-      for (Steinberg_int32 i = 0; i < frames; ++i) {
-        const double v = chans64[0][i];
-        const float a = (float) (v < 0 ? -v : v);
-        if (a > peak) peak = a;
-        sum += v * v;
-      }
-      plugin->shared.meter.push(peak, (float) std::sqrt(sum / (double) frames));
-      out.silenceFlags = 0;
+      // measureBlock, as every other path: this was a copy of its 64-bit loop.
+      plugin->shared.meter.push(measureBlock(chans64[0], (size_t) frames));
+      // The scope and the load meter, as on the float path below.
+      plugin->shared.scope.push(chans64, 1, (uint32_t) frames);
+      plugin->shared.load.record(
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - blockStart).count(),
+          (uint32_t) frames);
+      finishVst3Block(plugin, data, nAux64);
       return Steinberg_kResultOk;
     }
   }
 
-  if (!out.Steinberg_Vst_AudioBusBuffers_channelBuffers32 || out.numChannels < 1)
+  if (!out.Steinberg_Vst_AudioBusBuffers_channelBuffers32 || out.numChannels < 1) {
+    clapwrap::discardEvents(&plugin->shared);
     return Steinberg_kResultOk;
+  }
 
   uint32_t nch = plugin->shared.mainChannels;
   if ((uint32_t) out.numChannels < nch) nch = (uint32_t) out.numChannels;
@@ -1286,10 +1640,16 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
   float* chans[clapwrap::kMaxAudioChannels];
   for (uint32_t c = 0; c < nch; ++c)
     chans[c] = out.Steinberg_Vst_AudioBusBuffers_channelBuffers32[c];
+  // Channels past the ones the DSP writes are the host's and undefined on
+  // entry. Silence, not whatever the buffer held: a stereo plugin on a
+  // four-channel bus played the host's stale memory on the other two.
+  for (Steinberg_int32 c = (Steinberg_int32) nch; c < out.numChannels; ++c)
+    if (float* extra = out.Steinberg_Vst_AudioBusBuffers_channelBuffers32[c])
+      std::memset(extra, 0, sizeof(float) * frames);
 
   if (kDesc.isInstrument) {
     for (uint32_t c = 0; c < nch; ++c) std::memset(chans[c], 0, sizeof(float) * frames);
-  } else if (data->numInputs > 0 && data->inputs &&
+  } else if (data->numInputs > 0 && data->inputs && data->inputs[0].numChannels > 0 &&
              data->inputs[0].Steinberg_Vst_AudioBusBuffers_channelBuffers32) {
     const auto& in = data->inputs[0];
     for (uint32_t c = 0; c < nch; ++c) {
@@ -1297,6 +1657,12 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
           [(Steinberg_int32) c < in.numChannels ? c : (uint32_t) in.numChannels - 1];
       if (src && src != chans[c]) std::memcpy(chans[c], src, sizeof(float) * frames);
     }
+  } else {
+    // No input this block: the bus is switched off, or the host passed it with
+    // no channels. Silence in, rather than whatever the host's output buffer
+    // held -- and never the "last channel" of a zero-channel bus, which was
+    // channelBuffers32[0xFFFFFFFF] with the pointer array still set.
+    for (uint32_t c = 0; c < nch; ++c) std::memset(chans[c], 0, sizeof(float) * frames);
   }
 
   clapwrap::sendTransport(plugin->shared.dsp, readTransport(data->processContext));
@@ -1313,10 +1679,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
   AudioBlock<float> scBlock(scChans, 2, scChans[0] ? (size_t) frames : 0);
 
   // Aux output buses; a bus the host left unconnected arrives zero-width.
-  AudioBlock<float> auxBlocks[clapwrap::kMaxAuxOutputs] = {};
-  float* auxPtrs[clapwrap::kMaxAuxOutputs][clapwrap::kMaxAudioChannels] = {};
+  // Held in the instance (clapwrap::processdetail::AuxScratch).
+  AudioBlock<float>* const auxBlocks = plugin->shared.aux32.blocks;
   const uint32_t nAux = clapwrap::numAuxOutputs();
   for (uint32_t b = 0; b < nAux; ++b) {
+    float** const auxRow = plugin->shared.aux32.row(b);
     uint32_t width = 0;
     const Steinberg_int32 busIndex = (Steinberg_int32) (1 + b);
     if (busIndex < data->numOutputs && data->outputs) {
@@ -1327,13 +1694,13 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
         if (width > want) width = want;
         if (width > clapwrap::kMaxAudioChannels) width = clapwrap::kMaxAudioChannels;
         for (uint32_t c = 0; c < width; ++c)
-          auxPtrs[b][c] = ab.Steinberg_Vst_AudioBusBuffers_channelBuffers32[c];
+          auxRow[c] = ab.Steinberg_Vst_AudioBusBuffers_channelBuffers32[c];
       }
     }
-    auxBlocks[b] = AudioBlock<float>(auxPtrs[b], width, width ? (size_t) frames : 0);
+    auxBlocks[b] = AudioBlock<float>(auxRow, width, width ? (size_t) frames : 0);
   }
 
-  clapwrap::bypassCapture(plugin->shared.bypass, chans, (uint32_t) frames);
+  clapwrap::bypassCapture(plugin->shared.bypass, chans, nch, (uint32_t) frames);
   AudioBlock<float> block(chans, nch, (size_t) frames);
   plugin->shared.midiOut.clear();
   uint8_t roles[clapwrap::kMaxAudioChannels];
@@ -1355,29 +1722,290 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
   clapwrap::runDspCtx(plugin->shared.dsp, ctx, plugin->shared.paramsBlock);
 
   emitVst3MidiOut(plugin, data, frames);
-  clapwrap::bypassApply(plugin->shared.bypass, chans, (uint32_t) frames);
+  clapwrap::bypassApply(plugin->shared.bypass, chans, nch, (uint32_t) frames);
+  // NaN or infinity on any port leaves as silence (output_guard.h). A block
+  // past the promised maximum comes through here piece by piece, so it is
+  // guarded too.
+  clapwrap::guardOutputs(&plugin->shared, chans, nch, auxBlocks, nAux, (uint32_t) frames);
 
   // Meters for the editor: two atomic stores, the same as every other format.
   {
-    // Vectorised: one pass each for peak and energy. Measured 1.7x native
-    // and 1.4x in WebAssembly over the hand-rolled loop, and the meters run
-    // on every block whether or not an editor is open.
-    const float peak = simd::peakAbs(chans[0], (size_t) frames);
-    const double sum = simd::sumSquares(chans[0], (size_t) frames);
-    plugin->shared.meter.push(peak, (float) std::sqrt(sum / (double) frames));
+    // Vectorised, peak and energy in one pass (measureBlock), and the meters
+    // run on every block whether or not an editor is open.
+    plugin->shared.meter.push(measureBlock(chans[0], (size_t) frames));
+    // The scope and the load meter the editor shows. CLAP fed both and this
+    // fed neither, so a VST3 editor's scope never moved and its CPU read 0.
+    plugin->shared.scope.push(chans, 1, (uint32_t) frames);
+    plugin->shared.load.record(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - blockStart).count(),
+        (uint32_t) frames);
   }
 
-  out.silenceFlags = 0;
-  for (uint32_t b = 0; b < nAux; ++b) {
-    const Steinberg_int32 busIndex = (Steinberg_int32) (1 + b);
-    if (busIndex < data->numOutputs && data->outputs) data->outputs[busIndex].silenceFlags = 0;
-  }
-  // The DSP may have changed state the host has no other way to learn about.
-  // Recorded, not announced: setDirty is a main-thread call and this is not,
-  // and VST3 offers no way to ask to be called there. The parameter poll
-  // delivers it, same as the latency.
-  if (clapwrap::dspConsumeStateDirty(plugin->shared.dsp)) plugin->stateDirty = true;
+  finishVst3Block(plugin, data, nAux);
+  return Steinberg_kResultOk;
+}
 
+// ── A block longer than setupProcessing allowed ─────────────────────────────
+//
+// maxSamplesPerBlock is the host's promise, and the DSP was prepared to it,
+// as were the sidechain's silence and the bypass ring. A host that broke it
+// had the wrapper and the DSP write past the end of each. Such a block is run
+// as several that keep it, as in CLAP: each with the events and parameter
+// points that fall in it at offsets within it, the host's buffers from where
+// it starts, and the transport moved on to there.
+
+/** An event list seen from one piece of a block: the host's events that fall
+ *  in it, at offsets within it -- and, as the output list, what the DSP sends
+ *  back, moved from the piece's time to the host's. */
+struct SliceEventList {
+  Steinberg_Vst_IEventListVtbl* lpVtbl = nullptr;
+  Steinberg_Vst_IEventList* host = nullptr;
+  Steinberg_int32 first = 0, count = 0, offset = 0;
+};
+
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE sliceNoInterface(void*, const Steinberg_TUID,
+                                                                 void** obj) {
+  if (obj) *obj = nullptr;
+  return Steinberg_kNoInterface;
+}
+static Steinberg_uint32 SMTG_STDMETHODCALLTYPE sliceRef(void*) { return 1; }
+
+static Steinberg_int32 SMTG_STDMETHODCALLTYPE sliceEventCount(void* self) {
+  return static_cast<SliceEventList*>(self)->count;
+}
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE sliceEventGet(void* self, Steinberg_int32 index,
+                                                              Steinberg_Vst_Event* e) {
+  auto* s = static_cast<SliceEventList*>(self);
+  if (index < 0 || index >= s->count || !e) return Steinberg_kInvalidArgument;
+  const Steinberg_tresult result = s->host->lpVtbl->getEvent(s->host, s->first + index, e);
+  if (result == Steinberg_kResultOk)
+    e->sampleOffset = e->sampleOffset > s->offset ? e->sampleOffset - s->offset : 0;
+  return result;
+}
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE sliceEventAdd(void* self, Steinberg_Vst_Event* e) {
+  auto* s = static_cast<SliceEventList*>(self);
+  if (!e) return Steinberg_kInvalidArgument;
+  Steinberg_Vst_Event moved = *e;
+  moved.sampleOffset += s->offset;
+  return s->host->lpVtbl->addEvent(s->host, &moved);
+}
+inline Steinberg_Vst_IEventListVtbl& sliceEventListVtbl() {
+  static Steinberg_Vst_IEventListVtbl v = {sliceNoInterface, sliceRef,      sliceRef,
+                                           sliceEventCount,  sliceEventGet, sliceEventAdd};
+  return v;
+}
+
+/** One parameter's points as one piece of the block sees them: `count` of
+ *  the host's, from its point `first` on. */
+struct SliceParamQueue {
+  Steinberg_Vst_IParamValueQueueVtbl* lpVtbl = nullptr;
+  Steinberg_Vst_IParamValueQueue* host = nullptr;
+  Steinberg_int32 first = 0, count = 0, offset = 0;
+};
+
+static Steinberg_Vst_ParamID SMTG_STDMETHODCALLTYPE sliceQueueId(void* self) {
+  auto* q = static_cast<SliceParamQueue*>(self);
+  return q->host->lpVtbl->getParameterId(q->host);
+}
+static Steinberg_int32 SMTG_STDMETHODCALLTYPE sliceQueueCount(void* self) {
+  return static_cast<SliceParamQueue*>(self)->count;
+}
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE sliceQueueGet(void* self, Steinberg_int32 index,
+                                                              Steinberg_int32* sampleOffset,
+                                                              Steinberg_Vst_ParamValue* value) {
+  auto* q = static_cast<SliceParamQueue*>(self);
+  if (index < 0 || index >= q->count) return Steinberg_kInvalidArgument;
+  const Steinberg_tresult result = q->host->lpVtbl->getPoint(q->host, q->first + index, sampleOffset, value);
+  if (result == Steinberg_kResultOk && sampleOffset)
+    *sampleOffset = *sampleOffset > q->offset ? *sampleOffset - q->offset : 0;
+  return result;
+}
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE sliceQueueAdd(void*, Steinberg_int32,
+                                                              Steinberg_Vst_ParamValue,
+                                                              Steinberg_int32*) {
+  return Steinberg_kResultFalse;
+}
+inline Steinberg_Vst_IParamValueQueueVtbl& sliceParamQueueVtbl() {
+  static Steinberg_Vst_IParamValueQueueVtbl v = {sliceNoInterface, sliceRef,        sliceRef,
+                                                 sliceQueueId,     sliceQueueCount, sliceQueueGet,
+                                                 sliceQueueAdd};
+  return v;
+}
+
+/** The host's parameter changes as one piece of the block sees them: each
+ *  queue's points that fall in the piece, so the last of them -- the one
+ *  process() applies -- is the value at that point of the block, and a queue
+ *  with none there shows none (an earlier piece applied its value). Only
+ *  those: a MIDI controller's every point is a message, and a point an
+ *  earlier piece already played, shown again at a later piece's frame 0, was
+ *  a second message. One queue object serves every index: process() reads
+ *  each queue through before it asks for the next. */
+struct SliceParamChanges {
+  Steinberg_Vst_IParameterChangesVtbl* lpVtbl = nullptr;
+  Steinberg_Vst_IParameterChanges* host = nullptr;
+  Steinberg_int32 start = 0, end = 0;
+  bool last = false;
+  SliceParamQueue queue;
+};
+
+static Steinberg_int32 SMTG_STDMETHODCALLTYPE sliceChangesCount(void* self) {
+  auto* s = static_cast<SliceParamChanges*>(self);
+  return s->host->lpVtbl->getParameterCount(s->host);
+}
+static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE sliceChangesGet(void* self,
+                                                                             Steinberg_int32 index) {
+  auto* s = static_cast<SliceParamChanges*>(self);
+  Steinberg_Vst_IParamValueQueue* q = s->host->lpVtbl->getParameterData(s->host, index);
+  if (!q) return nullptr;
+  const Steinberg_int32 points = q->lpVtbl->getPointCount(q);
+  Steinberg_int32 first = 0, n = 0;
+  for (Steinberg_int32 i = 0; i < points; ++i) {
+    Steinberg_int32 at = 0;
+    Steinberg_Vst_ParamValue value = 0.0;
+    if (q->lpVtbl->getPoint(q, i, &at, &value) != Steinberg_kResultOk) break;
+    if (!s->last && at >= s->end) break;
+    if (at < s->start) first = i + 1; // an earlier piece's
+    n = i + 1;
+  }
+  s->queue.host = q;
+  s->queue.first = first;
+  s->queue.count = n > first ? n - first : 0;
+  s->queue.offset = s->start;
+  return reinterpret_cast<Steinberg_Vst_IParamValueQueue*>(&s->queue);
+}
+static Steinberg_Vst_IParamValueQueue* SMTG_STDMETHODCALLTYPE sliceChangesAdd(
+    void* self, const Steinberg_Vst_ParamID* id, Steinberg_int32* index) {
+  auto* s = static_cast<SliceParamChanges*>(self);
+  return s->host->lpVtbl->addParameterData(s->host, id, index);
+}
+inline Steinberg_Vst_IParameterChangesVtbl& sliceParamChangesVtbl() {
+  static Steinberg_Vst_IParameterChangesVtbl v = {sliceNoInterface,  sliceRef,        sliceRef,
+                                                  sliceChangesCount, sliceChangesGet, sliceChangesAdd};
+  return v;
+}
+
+/** One of the host's buses, from frame `offset` on. The channel pointers live
+ *  in `p32` / `p64`, which hold kMaxAudioChannels: no more is ever read. */
+static void sliceBus(const Steinberg_Vst_AudioBusBuffers& from, Steinberg_int32 offset, bool doubles,
+                     Steinberg_Vst_AudioBusBuffers& to, float** p32, double** p64) {
+  to = from;
+  const Steinberg_int32 most = (Steinberg_int32) clapwrap::kMaxAudioChannels;
+  to.numChannels = from.numChannels < 0 ? 0 : (from.numChannels < most ? from.numChannels : most);
+  if (doubles) {
+    if (Steinberg_Vst_Sample64** src64 = from.Steinberg_Vst_AudioBusBuffers_channelBuffers64) {
+      for (Steinberg_int32 c = 0; c < to.numChannels; ++c)
+        p64[c] = src64[c] ? src64[c] + offset : nullptr;
+      to.Steinberg_Vst_AudioBusBuffers_channelBuffers64 = p64;
+    }
+  } else if (Steinberg_Vst_Sample32** src32 = from.Steinberg_Vst_AudioBusBuffers_channelBuffers32) {
+    for (Steinberg_int32 c = 0; c < to.numChannels; ++c)
+      p32[c] = src32[c] ? src32[c] + offset : nullptr;
+    to.Steinberg_Vst_AudioBusBuffers_channelBuffers32 = p32;
+  }
+}
+
+/** The process context `frames` later: the clocks always, and while the
+ *  transport plays the song position and the bar it is in. Not a cycle's
+ *  wrap -- a host that loops ends the block there itself. */
+static void advanceContext(Steinberg_Vst_ProcessContext& ctx, Steinberg_int32 frames, double sampleRate) {
+  ctx.continousTimeSamples += frames;
+  if (sampleRate <= 0.0) return;
+  const double seconds = (double) frames / sampleRate;
+  if (ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kSystemTimeValid)
+    ctx.systemTime += (Steinberg_int64) (seconds * 1e9 + 0.5);
+  if (!(ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kPlaying)) return;
+  ctx.projectTimeSamples += frames;
+  if ((ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kProjectTimeMusicValid) &&
+      (ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kTempoValid)) {
+    ctx.projectTimeMusic += seconds * ctx.tempo / 60.0;
+    if ((ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kBarPositionValid) &&
+        (ctx.state & Steinberg_Vst_ProcessContext_StatesAndFlags_kTimeSigValid) &&
+        ctx.timeSigNumerator > 0 && ctx.timeSigDenominator > 0) {
+      const double bar = ctx.timeSigNumerator * 4.0 / ctx.timeSigDenominator;
+      while (ctx.projectTimeMusic >= ctx.barPositionMusic + bar) ctx.barPositionMusic += bar;
+    }
+  }
+}
+
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
+    void* self, Steinberg_Vst_ProcessData* data) {
+  Plugin* plugin = ownerOfProcessor(self);
+  if (!data) return Steinberg_kInvalidArgument;
+  const Steinberg_int32 frames = data->numSamples;
+  const auto most = (Steinberg_int32) plugin->shared.maxFrames;
+  if (most <= 0 || frames <= most) return processVst3Block(plugin, data);
+
+  const bool doubles = data->symbolicSampleSize == Steinberg_Vst_SymbolicSampleSizes_kSample64;
+  constexpr Steinberg_int32 kOuts = 1 + (Steinberg_int32) clapwrap::kMaxAuxOutputs;
+  const Steinberg_int32 nIns = data->inputs ? (data->numInputs < 2 ? data->numInputs : 2) : 0;
+  const Steinberg_int32 nOuts =
+      data->outputs ? (data->numOutputs < kOuts ? data->numOutputs : kOuts) : 0;
+  Steinberg_Vst_AudioBusBuffers ins[2];
+  Steinberg_Vst_AudioBusBuffers outs[kOuts];
+  float* in32[2][clapwrap::kMaxAudioChannels];
+  double* in64[2][clapwrap::kMaxAudioChannels];
+  float* out32[kOuts][clapwrap::kMaxAudioChannels];
+  double* out64[kOuts][clapwrap::kMaxAudioChannels];
+
+  SliceEventList inEvents, outEvents;
+  inEvents.lpVtbl = outEvents.lpVtbl = &sliceEventListVtbl();
+  inEvents.host = data->inputEvents;
+  outEvents.host = data->outputEvents;
+  SliceParamChanges changes;
+  changes.lpVtbl = &sliceParamChangesVtbl();
+  changes.queue.lpVtbl = &sliceParamQueueVtbl();
+  changes.host = data->inputParameterChanges;
+
+  Steinberg_Vst_ProcessData piece = *data;
+  piece.inputEvents = data->inputEvents ? reinterpret_cast<Steinberg_Vst_IEventList*>(&inEvents) : nullptr;
+  piece.outputEvents =
+      data->outputEvents ? reinterpret_cast<Steinberg_Vst_IEventList*>(&outEvents) : nullptr;
+  piece.inputParameterChanges =
+      data->inputParameterChanges ? reinterpret_cast<Steinberg_Vst_IParameterChanges*>(&changes)
+                                  : nullptr;
+  piece.inputs = nIns > 0 ? ins : nullptr;
+  piece.numInputs = nIns > 0 ? nIns : 0;
+  piece.outputs = nOuts > 0 ? outs : nullptr;
+  piece.numOutputs = nOuts > 0 ? nOuts : 0;
+  Steinberg_Vst_ProcessContext context{};
+
+  const Steinberg_int32 total =
+      data->inputEvents ? data->inputEvents->lpVtbl->getEventCount(data->inputEvents) : 0;
+  Steinberg_int32 next = 0;
+  for (Steinberg_int32 start = 0; start < frames; start += most) {
+    const Steinberg_int32 len = frames - start < most ? frames - start : most;
+    const bool last = start + len >= frames;
+    // The events before this piece's end -- in a host's offset-ordered list,
+    // the next run of them. The last piece takes whatever is left.
+    inEvents.first = next;
+    inEvents.offset = start;
+    while (next < total) {
+      Steinberg_Vst_Event e{};
+      if (!last &&
+          data->inputEvents->lpVtbl->getEvent(data->inputEvents, next, &e) == Steinberg_kResultOk &&
+          e.sampleOffset >= start + len)
+        break;
+      ++next;
+    }
+    inEvents.count = next - inEvents.first;
+    outEvents.offset = start;
+    changes.start = start;
+    changes.end = start + len;
+    changes.last = last;
+    for (Steinberg_int32 b = 0; b < nIns; ++b)
+      sliceBus(data->inputs[b], start, doubles, ins[b], in32[b], in64[b]);
+    for (Steinberg_int32 b = 0; b < nOuts; ++b)
+      sliceBus(data->outputs[b], start, doubles, outs[b], out32[b], out64[b]);
+    piece.numSamples = len;
+    if (data->processContext) {
+      context = *data->processContext;
+      advanceContext(context, start,
+                     context.sampleRate > 0.0 ? context.sampleRate : plugin->sampleRate);
+      piece.processContext = &context;
+    }
+    processVst3Block(plugin, &piece);
+  }
+  for (Steinberg_int32 b = 0; b < nOuts; ++b) data->outputs[b].silenceFlags = 0;
   return Steinberg_kResultOk;
 }
 
@@ -1407,7 +2035,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE unitsGetUnitInfo(
     if (hasPrograms()) info->programListId = kProgramListId;
     return Steinberg_kResultOk;
   }
-  const GroupTable groups = collectGroups(kDesc.params, kDesc.numParams);
+  const GroupTable& groups = clapwrap::descriptorGroups();
   info->id = unitIndex;
   info->parentUnitId = 0;
   toString128(groups.names[unitIndex - 1], info->name);
@@ -1496,15 +2124,26 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerInitialize(void*, Stei
   return Steinberg_kResultOk;
 }
 
-static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerTerminate(void*) {
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerTerminate(void* self) {
+  keepHandler(ownerOfController(self), nullptr);
   return Steinberg_kResultOk;
 }
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetComponentState(
     void* self, Steinberg_IBStream* stream) {
-  // Single component: the controller shares the processor's state, so this is
-  // the same read rather than a second copy that could drift.
-  return readState(ownerOfController(self), stream);
+  // Single component: the controller shares the processor's state. A host
+  // restoring a session calls the component's setState and then hands the
+  // SAME bytes here so a separate controller can catch up -- and this used to
+  // load them all over again: the DSP's bag restored twice, a sampler's file
+  // read from disk twice, on every project open. The same bytes are now
+  // recognised and skipped; different ones are still applied.
+  if (!stream) return Steinberg_kInvalidArgument;
+  Plugin* plugin = ownerOfController(self);
+  std::vector<uint8_t> bytes;
+  readWholeStream(stream, bytes);
+  if (plugin->haveLastState && stateHash(bytes) == plugin->lastStateHash)
+    return Steinberg_kResultOk;
+  return applyStateBytes(plugin, bytes);
 }
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetState(void*, Steinberg_IBStream*) {
@@ -1544,6 +2183,7 @@ inline void midiCcName(int channel, int cc, char* out, size_t capacity) {
     case 74: named = "Brightness"; break;
     case Steinberg_Vst_ControllerNumbers_kAfterTouch: named = "Aftertouch"; break;
     case Steinberg_Vst_ControllerNumbers_kPitchBend: named = "Pitch Bend"; break;
+    case kMidiProgramSlot: named = "Program"; break;
     default: break;
   }
   if (named) std::snprintf(out, capacity, "%s Ch%d", named, channel + 1);
@@ -1584,8 +2224,8 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerGetParameterInfo(
     return Steinberg_kResultOk;
   }
   if (index >= firstMidiCcIndex() && index < firstMidiCcIndex() + (Steinberg_int32) midiCcParamCount()) {
-    const int n = (int) (index - firstMidiCcIndex());
-    const int channel = n / kMidiCcCount, cc = n % kMidiCcCount;
+    int channel = 0, cc = 0;
+    midiParamAt((int) (index - firstMidiCcIndex()), &channel, &cc);
     std::memset(info, 0, sizeof(*info));
     info->id = midiCcParamId(channel, cc);
     char name[64];
@@ -1593,7 +2233,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerGetParameterInfo(
     toString128(name, info->title);
     toString128(name, info->shortTitle);
     toString128("", info->units);
-    info->stepCount = 0;
+    info->stepCount = cc == kMidiProgramSlot ? 127 : 0;
     info->defaultNormalizedValue = midiCcDefault(cc);
     info->unitId = 0;
     // Automatable so the host will actually send values, hidden so it does not
@@ -1638,12 +2278,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerGetParamStringByValue(
     toString128(kDesc.presets[index].name, string);
     return Steinberg_kResultOk;
   }
-  if (isMidiCcParam(id)) {
-    const int n = (int) (id - kMidiCcParamBase), cc = n % kMidiCcCount;
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc)) {
     char text[32];
     // Pitch bend is 14-bit on the wire; everything else is 7.
-    const int span = cc == Steinberg_Vst_ControllerNumbers_kPitchBend ? 16383 : 127;
-    std::snprintf(text, sizeof(text), "%d", (int) (valueNormalized * span + 0.5));
+    std::snprintf(text, sizeof(text), "%d", (int) (valueNormalized * midiSpan(cc) + 0.5));
     toString128(text, string);
     return Steinberg_kResultOk;
   }
@@ -1659,17 +2298,32 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerGetParamValueByString(
     void*, Steinberg_Vst_ParamID id, Steinberg_Vst_TChar* string,
     Steinberg_Vst_ParamValue* valueNormalized) {
   if (!string || !valueNormalized) return Steinberg_kInvalidArgument;
-  char text[64];
-  fromString128(string, text, sizeof(text));
+  // Whole, as UTF-8. It was narrowed to ASCII, anything else to '?', on the
+  // belief that only a number is read out of it; but the unit after the
+  // number is checked and a step is matched by its name, so a unit or a name
+  // that is not ASCII -- "90 °", "Groß", "5 µs" -- was refused, the plugin's
+  // own text included, which a host hands back after printing it.
+  const std::string utf8 = utf16ToUtf8(string, 128);
+  const char* text = utf8.c_str();
   if (id == kBypassParamId && hasBypassParam()) {
-    const bool on = (text[0] == 'O' || text[0] == 'o') && (text[1] == 'n' || text[1] == 'N');
-    *valueNormalized = (on || text[0] == '1') ? 1.0 : 0.0;
+    bool on = false;
+    if (!parseSwitchText(text, &on)) return Steinberg_kResultFalse;
+    *valueNormalized = on ? 1.0 : 0.0;
     return Steinberg_kResultOk;
   }
-  if (isMidiCcParam(id)) {
-    const int n = (int) (id - kMidiCcParamBase), cc = n % kMidiCcCount;
-    const double span = cc == Steinberg_Vst_ControllerNumbers_kPitchBend ? 16383.0 : 127.0;
-    const double v = std::atof(text) / span;
+  if (hasPrograms() && id == kProgramParamId) {
+    // A preset by the name getParamStringByValue prints for it. This id had
+    // no case and was refused as unknown.
+    for (int i = 0; i < kDesc.numPresets; ++i) {
+      if (!looseEquals(kDesc.presets[i].name, text)) continue;
+      *valueNormalized = kDesc.numPresets > 1 ? (double) i / (double) (kDesc.numPresets - 1) : 0.0;
+      return Steinberg_kResultOk;
+    }
+    return Steinberg_kResultFalse;
+  }
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc)) {
+    const double v = std::atof(text) / midiSpan(cc);
     *valueNormalized = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
     return Steinberg_kResultOk;
   }
@@ -1685,11 +2339,8 @@ static Steinberg_Vst_ParamValue SMTG_STDMETHODCALLTYPE controllerNormalizedParam
   if (hasPrograms() && id == kProgramParamId)
     return (Steinberg_Vst_ParamValue) programIndexFromNormalised(valueNormalized);
   if (id == kBypassParamId && hasBypassParam()) return valueNormalized; // 0..1 IS plain
-  if (isMidiCcParam(id)) {
-    const int cc = (int) (id - kMidiCcParamBase) % kMidiCcCount;
-    return valueNormalized *
-           (cc == Steinberg_Vst_ControllerNumbers_kPitchBend ? 16383.0 : 127.0);
-  }
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc)) return valueNormalized * midiSpan(cc);
   if (id >= (Steinberg_Vst_ParamID) kDesc.numParams) return 0.0;
   return toPlain(kDesc.params[id], valueNormalized);
 }
@@ -1702,10 +2353,9 @@ static Steinberg_Vst_ParamValue SMTG_STDMETHODCALLTYPE controllerPlainParamToNor
     return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
   }
   if (id == kBypassParamId && hasBypassParam()) return plainValue >= 0.5 ? 1.0 : 0.0;
-  if (isMidiCcParam(id)) {
-    const int cc = (int) (id - kMidiCcParamBase) % kMidiCcCount;
-    const double span = cc == Steinberg_Vst_ControllerNumbers_kPitchBend ? 16383.0 : 127.0;
-    const double v = plainValue / span;
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc)) {
+    const double v = plainValue / midiSpan(cc);
     return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
   }
   if (id >= (Steinberg_Vst_ParamID) kDesc.numParams) return 0.0;
@@ -1765,6 +2415,26 @@ inline void notifyLatencyIfChanged(Plugin* plugin) {
                                             Steinberg_Vst_RestartFlags_kLatencyChanged);
 }
 
+/**
+ * [main-thread] The plugin changed its own state -- a preset loaded from its
+ * editor's preset bar, an undo -- and the host has to hear it, the VST3 way.
+ *
+ * restartComponent(kParamValuesChanged), as for a program change: the host
+ * re-reads every value, its generic editor and automation lanes follow, and
+ * nothing is recorded as automation. performEdit for each parameter would be
+ * the other answer, and the wrong one here: with a track in write or touch
+ * mode it records the preset load as a burst of automation, which is exactly
+ * what CLAP's rescan exists to avoid. Then setDirty, because the user changed
+ * the session, and the latency, which a preset is a likely way to move.
+ */
+inline void announceOwnStateLoad(Plugin* plugin) {
+  if (plugin->handler)
+    plugin->handler->lpVtbl->restartComponent(plugin->handler, Steinberg_Vst_RestartFlags_kParamValuesChanged);
+  plugin->stateDirty = true;
+  markDirtyIfNeeded(plugin);
+  notifyLatencyIfChanged(plugin);
+}
+
 static Steinberg_Vst_ParamValue SMTG_STDMETHODCALLTYPE controllerGetParamNormalized(
     void* self, Steinberg_Vst_ParamID id) {
   Plugin* plugin = ownerOfController(self);
@@ -1781,17 +2451,18 @@ static Steinberg_Vst_ParamValue SMTG_STDMETHODCALLTYPE controllerGetParamNormali
   // differ, so a host polling sixty times a second pays nothing for it.
   notifyLatencyIfChanged(plugin);
   // Same hook, same reason: VST3 gives a plugin no way to ask to be called on
-  // the main thread, and setDirty must not be called from process().
+  // the main thread, and setDirty must not be called from process(). The
+  // output guard's report too; VST3 has no host log, so it goes to stderr.
   markDirtyIfNeeded(plugin);
+  clapwrap::reportOutputGuard(&plugin->shared);
   if (hasPrograms() && id == kProgramParamId) {
     const double steps = kDesc.numPresets > 1 ? (double) (kDesc.numPresets - 1) : 1.0;
     return (double) plugin->currentProgram() / steps;
   }
   if (id == kBypassParamId && hasBypassParam()) return plugin->shared.bypass.engaged ? 1.0 : 0.0;
-  if (isMidiCcParam(id)) {
-    const int n = (int) (id - kMidiCcParamBase);
-    return plugin->midiCc.v[n / kMidiCcCount][n % kMidiCcCount];
-  }
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc))
+    return plugin->midiCc.v[channel][cc].load(std::memory_order_relaxed);
   if (id >= (Steinberg_Vst_ParamID) SONORE_NUM_PARAMS) return 0.0;
   return toNormalised(kDesc.params[id], plugin->shared.params[id]);
 }
@@ -1809,8 +2480,14 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetParamNormalized(
     // Through applyPreset, like every other path that loads one: the rule
     // about a stale preset lives in one place and this is not a second copy.
     float values[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1];
-    if (applyPreset(kDesc.presets[index], kDesc.params, kDesc.numParams, values))
-      for (int i = 0; i < kDesc.numParams; ++i) plugin->shared.params[i] = values[i];
+    // Bounded by the array as well: see clapwrap::factoryPresetValues.
+    if (clapwrap::factoryPresetValues(kDesc, index, values, SONORE_NUM_PARAMS)) {
+      clapwrap::writeParamsTogether(&plugin->shared, [&] {
+        for (int i = 0; i < kDesc.numParams; ++i) plugin->shared.params[i] = values[i];
+      });
+      // The editor's preset bar names what the host chose.
+      clapwrap::presetsOf(&plugin->shared).noteFactoryPresetApplied(index);
+    }
     // Every other parameter just moved, and the host did not write any of
     // them. kParamValuesChanged is the only way VST3 has of saying so, and
     // without it a host keeps drawing the values from before the program --
@@ -1829,10 +2506,10 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetParamNormalized(
     notifyLatencyIfChanged(plugin);
     return Steinberg_kResultOk;
   }
-  if (isMidiCcParam(id)) {
-    const int n = (int) (id - kMidiCcParamBase);
+  int channel = 0, cc = 0;
+  if (midiParamSlot(id, &channel, &cc)) {
     const double v = value < 0.0 ? 0.0 : (value > 1.0 ? 1.0 : value);
-    plugin->midiCc.v[n / kMidiCcCount][n % kMidiCcCount] = (float) v;
+    plugin->midiCc.v[channel][cc].store((float) v, std::memory_order_relaxed);
     return Steinberg_kResultOk;
   }
   if (id >= (Steinberg_Vst_ParamID) SONORE_NUM_PARAMS) return Steinberg_kInvalidArgument;
@@ -1860,14 +2537,20 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetParamNormalized(
 static Steinberg_uint32 SMTG_STDMETHODCALLTYPE contextReqGet(void*) {
   // Matched one for one against readTransport(): playing/recording/cycle come
   // from the transport state, then tempo, the musical position, the bar the
-  // position sits in, and the time signature. projectTimeSamples needs no
-  // flag -- VST3 always provides it.
+  // position sits in, the time signature, and the cycle's two ends.
+  // projectTimeSamples needs no flag -- VST3 always provides it.
+  //
+  // The cycle was read and never asked for: readTransport learned the loop
+  // after this list was written, and a host that fills only what is asked
+  // for -- the reason the interface exists -- left it out, so the DSP saw the
+  // transport looping and no loop.
   return (Steinberg_uint32) (
       Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTransportState |
       Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTempo |
       Steinberg_Vst_IProcessContextRequirements_Flags_kNeedProjectTimeMusic |
       Steinberg_Vst_IProcessContextRequirements_Flags_kNeedBarPositionMusic |
-      Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTimeSignature);
+      Steinberg_Vst_IProcessContextRequirements_Flags_kNeedTimeSignature |
+      Steinberg_Vst_IProcessContextRequirements_Flags_kNeedCycleMusic);
 }
 
 inline Steinberg_Vst_IProcessContextRequirementsVtbl* contextReqVtbl() {
@@ -1957,6 +2640,9 @@ inline Steinberg_Vst_ChannelContext_IInfoListenerVtbl* infoListenerVtbl() {
 // happen. VST3 has no standard PRESSURE id -- it carries pressure as poly
 // aftertouch, which arrives as raw MIDI and is decoded there instead.
 
+/** One note expression type as INoteExpressionController reports it: the
+ *  VST3 type id, the names a host shows, and the default and polarity in
+ *  VST3's normalised 0..1 domain. One row of noteExpressionTable(). */
 struct NoteExpressionSpec {
   Steinberg_Vst_NoteExpressionTypeID id;
   const char* title;
@@ -2068,7 +2754,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE midiMappingGetAssignment(
   // outside that is answered honestly with "no assignment" rather than with a
   // parameter id that would then never behave.
   if (busIndex != 0 || channel < 0 || channel >= kMidiChannels) return Steinberg_kResultFalse;
-  if (midiControllerNumber < 0 || midiControllerNumber >= kMidiCcCount)
+  if (midiControllerNumber < 0 || midiControllerNumber > kMidiProgramSlot)
     return Steinberg_kResultFalse;
   *id = midiCcParamId((int) channel, (int) midiControllerNumber);
   return Steinberg_kResultOk;
@@ -2084,7 +2770,7 @@ inline Steinberg_Vst_IMidiMappingVtbl* midiMappingVtbl() {
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE controllerSetComponentHandler(
     void* self, Steinberg_Vst_IComponentHandler* handler) {
-  ownerOfController(self)->handler = handler;
+  keepHandler(ownerOfController(self), handler);
   return Steinberg_kResultOk;
 }
 
@@ -2149,6 +2835,10 @@ inline Plugin* createPlugin() {
   plugin->infoListener.owner = plugin;
   for (int i = 0; i < SONORE_NUM_PARAMS && i < kDesc.numParams; ++i)
     plugin->shared.params[i] = kDesc.params[i].defaultValue;
+  // A preset loaded from the editor reaches the host through IComponentHandler,
+  // not through the clap host the shared instance would otherwise look for.
+  plugin->shared.formatContext = plugin;
+  plugin->shared.onOwnStateLoad = [](void* context) { announceOwnStateLoad(static_cast<Plugin*>(context)); };
   return plugin;
 }
 
@@ -2222,14 +2912,6 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewIsPlatformTypeSupported(
 }
 
 /**
- * A message from the page. Unlike CLAP: where the plugin emits parameter
- * events from the audio thread: VST3 requires the host to be told through
- * IComponentHandler on THIS (main) thread. So an edit goes two ways at once:
- * to the host for automation and undo, and into the lock-free queue for the
- * DSP. Sending only one of the two is how a knob either moves the sound
- * without being recorded, or gets recorded without being heard.
- */
-/**
  * Ask the host to show ITS menu for one parameter.
  *
  * MIDI learn, "remove automation", "show automation lane" -- a plugin cannot
@@ -2287,7 +2969,11 @@ inline void chooseFileForPage(Plugin* plugin, const BridgeMessage& message) {
   // no parameter and called nothing. Without this the DAW closes without
   // offering to save, and the user loses the sample they just picked.
   if (!path.empty()) {
-    plugin->shared.stateDirty = true;
+    // THIS wrapper's flag -- the one markDirtyIfNeeded reads. It used to set
+    // plugin->shared.stateDirty, the CLAP instance's, which nothing in VST3
+    // reads: the call below then found nothing to do, and a sample picked in
+    // a VST3 was lost when the DAW closed without asking to save.
+    plugin->stateDirty = true;
     markDirtyIfNeeded(plugin);
   }
 
@@ -2298,10 +2984,27 @@ inline void chooseFileForPage(Plugin* plugin, const BridgeMessage& message) {
 #endif
 }
 
+/**
+ * A message from the page. Unlike CLAP (where the plugin emits parameter
+ * events from the audio thread), VST3 requires the host to be told through
+ * IComponentHandler on THIS (main) thread. So an edit goes two ways at once:
+ * to the host for automation and undo, and into the lock-free queue for the
+ * DSP. Sending only one of the two is how a knob either moves the sound
+ * without being recorded, or gets recorded without being heard.
+ */
 inline void viewOnMessage(Plugin* plugin, const BridgeMessage& message) {
   if (!plugin) return;
+  // Nothing an interface may not write: out of range, or a parameter the
+  // plugin REPORTS (readOnly). See uiMayWrite.
+  if ((message.kind == BridgeMessage::Kind::Set || message.kind == BridgeMessage::Kind::GestureBegin ||
+       message.kind == BridgeMessage::Kind::GestureEnd) &&
+      !uiMayWrite(kDesc, message.index))
+    return;
   UiEventQueue::Event e;
   switch (message.kind) {
+    case BridgeMessage::Kind::Ready:
+      clapwrap::pageReady(&plugin->shared);
+      return;
     case BridgeMessage::Kind::CaptureKeys:
       // Straight onto the webview. Nothing crosses to audio: this decides who
       // receives a keystroke, which is a question only the UI thread has.
@@ -2322,6 +3025,13 @@ inline void viewOnMessage(Plugin* plugin, const BridgeMessage& message) {
       e.kind = UiEventQueue::Event::Kind::ParamSet;
       e.index = message.index;
       e.value = plain;
+      // Written HERE as well as queued, as the native editor's host does.
+      // Only uiEcho was, so the next 33 ms tick saw uiEcho differ from params
+      // and pushed the OLD value back to the page (the knob flickered back),
+      // and with processing suspended -- a deactivated plugin, a host that
+      // stops silent tracks -- it stayed back, and getParamNormalized and
+      // getState went on reporting the old value.
+      plugin->shared.params[message.index] = plain;
       plugin->shared.uiEcho[message.index] = plain;
       if (plugin->handler)
         plugin->handler->lpVtbl->performEdit(plugin->handler, (Steinberg_Vst_ParamID) message.index,
@@ -2342,29 +3052,21 @@ inline void viewOnMessage(Plugin* plugin, const BridgeMessage& message) {
       }
       return; // nothing for the DSP to do
     }
-    case BridgeMessage::Kind::LoadPreset: {
-      if (message.index < 0 || message.index >= kDesc.numPresets || !kDesc.presets) return;
-      // The same guard the CLAP wrapper uses, and now literally the same code:
-      // one rule in presets.h with one test, rather than three copies of it
-      // where the tested one was the copy nothing called.
-      float presetValues[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1];
-      if (!applyPreset(kDesc.presets[message.index], kDesc.params, kDesc.numParams,
-                       presetValues))
-        return;
-      for (int i = 0; i < kDesc.numParams; ++i) {
-        const float plain = presetValues[i];
-        UiEventQueue::Event pe;
-        pe.kind = UiEventQueue::Event::Kind::ParamSet;
-        pe.index = i;
-        pe.value = plain;
-        plugin->shared.uiEvents.push(pe);
-        plugin->shared.uiEcho[i] = plain;
-        if (plugin->handler)
-          plugin->handler->lpVtbl->performEdit(plugin->handler, (Steinberg_Vst_ParamID) i,
-                                               toNormalised(kDesc.params[i], plain));
-      }
+    case BridgeMessage::Kind::LoadPreset:
+      // Through the state path, as the CLAP page and the preset bar load one
+      // (clapwrap::loadPresetByIndex): the whole set in one step, so a block
+      // runs on all of the preset or none of it; the preset becomes the
+      // current program and the selection; and the host is told it was a
+      // LOAD -- announceOwnStateLoad's kParamValuesChanged, setDirty and the
+      // latency -- for which it re-reads the values and records nothing.
+      // This told it through beginEdit, performEdit and endEdit for every
+      // parameter and then the program, which a host with automation in
+      // write, latch or touch mode records: a point on every parameter's
+      // lane for choosing a preset, the burst CLAP's rescan and this format's
+      // own preset bar exist to avoid. Bounded as every factory load is
+      // (clapwrap::factoryPresetValues).
+      clapwrap::loadPresetByIndex(&plugin->shared, message.index);
       return;
-    }
     case BridgeMessage::Kind::NoteOn:
       if (message.note < 0 || message.note > 127) return;
       e.kind = UiEventQueue::Event::Kind::NoteOn;
@@ -2433,7 +3135,42 @@ static void requestViewResize(View* view, int width, int height) {
 static gfx::EditorHost makeVst3EditorHost(Plugin* plugin) {
   gfx::EditorHost host = clapwrap::makeEditorHost(&plugin->shared);
   host.showContextMenu = [plugin](int index, int x, int y) {
-    showHostContextMenu(plugin, index, x, y);
+    // The editor works in LOGICAL pixels and the menu is placed in the view's
+    // own coordinates, which carry the content scale -- the conversion the
+    // CLAP side has always made and this one did not, so at 150% the host's
+    // menu opened two thirds of the way to where the user clicked.
+    const float s = plugin->view && plugin->view->contentScale > 0.0f
+                        ? plugin->view->contentScale
+                        : 1.0f;
+    showHostContextMenu(plugin, index, (int) ((float) x * s), (int) ((float) y * s));
+  };
+
+  // The edits, to the HOST and not only to the DSP. The shared versions just
+  // queue them for the audio thread, which is the whole job in CLAP: the
+  // audio thread reports each one back as a param event, and that is how a
+  // CLAP host hears about it. VST3 has no such path. An edit the host is not
+  // told through IComponentHandler records no automation, makes no undo
+  // step, never marks the project changed, and is overwritten by the next
+  // automation read -- which is what every knob on the native editor did,
+  // since only the webview's page (viewOnMessage) ever called performEdit.
+  // Here on the main thread, where the editor calls these and where
+  // IComponentHandler expects to be called.
+  host.setParameter = [plugin, queue = host.setParameter](int index, float plain) {
+    queue(index, plain);
+    if (!uiMayWrite(kDesc, index) || !plugin->handler) return;
+    const ParamInfo& p = kDesc.params[index];
+    plugin->handler->lpVtbl->performEdit(plugin->handler, (Steinberg_Vst_ParamID) index,
+                                         toNormalised(p, clampToRange(p, plain)));
+  };
+  host.beginGesture = [plugin, queue = host.beginGesture](int index) {
+    queue(index);
+    if (!uiMayWrite(kDesc, index) || !plugin->handler) return;
+    plugin->handler->lpVtbl->beginEdit(plugin->handler, (Steinberg_Vst_ParamID) index);
+  };
+  host.endGesture = [plugin, queue = host.endGesture](int index) {
+    queue(index);
+    if (!uiMayWrite(kDesc, index) || !plugin->handler) return;
+    plugin->handler->lpVtbl->endEdit(plugin->handler, (Steinberg_Vst_ParamID) index);
   };
   return host;
 }
@@ -2444,6 +3181,7 @@ static void prepareNativeEditor(View* view, Plugin* plugin) {
   plugin->shared.nativeEditor.onRequestResize = [view](int w, int h) {
     requestViewResize(view, w, h);
   };
+  plugin->shared.nativeEditor.setContentFactory(clapwrap::customEditorFactory(plugin->shared.dsp));
 }
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewAttached(void* self, void* parent,
@@ -2488,15 +3226,17 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewAttached(void* self, void* p
   // page and nothing else.
   const bool ok = plugin->shared.webview.create(
       (HWND) parent, scaled(view->width, view->contentScale),
-      scaled(view->height, view->contentScale), clapwrap::uiHtml(), bridgeScript(kDesc), kDesc.id);
+      scaled(view->height, view->contentScale), clapwrap::uiHtml(),
+      clapwrap::bridgeScriptFor(plugin->shared), kDesc.id);
 #elif defined(__APPLE__)
   const bool ok = plugin->shared.webview.create(parent, view->width, view->height,
-                                                clapwrap::uiHtml(), bridgeScript(kDesc), kDesc.id);
+                                                clapwrap::uiHtml(),
+                                                clapwrap::bridgeScriptFor(plugin->shared), kDesc.id);
 #else
   // X11EmbedWindowID hands the window id THROUGH the pointer, not as one.
   const bool ok = plugin->shared.webview.create((unsigned long) (uintptr_t) parent, view->width,
                                                 view->height, clapwrap::uiHtml(),
-                                                bridgeScript(kDesc), kDesc.id);
+                                                clapwrap::bridgeScriptFor(plugin->shared), kDesc.id);
 #endif
   if (!ok) {
     // The webview did not start -- no WebView2 runtime, no WebKitGTK. The
@@ -2687,17 +3427,27 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewCanResize(void*) {
              : Steinberg_kResultFalse;
 }
 
-static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewCheckSizeConstraint(void*,
+static Steinberg_tresult SMTG_STDMETHODCALLTYPE viewCheckSizeConstraint(void* self,
                                                                         Steinberg_ViewRect* rect) {
   if (!rect) return Steinberg_kInvalidArgument;
   // The same clamp CLAP's adjust_size uses. It was written out twice with
   // the numbers repeated, which is how the state restore ended up with a
   // third set that disagreed.
-  uint32_t w = (uint32_t) (rect->right - rect->left);
-  uint32_t h = (uint32_t) (rect->bottom - rect->top);
+  //
+  // In LOGICAL units, as onSize clamps: the rect is device pixels and the
+  // limits are not. Clamping the device numbers halved the effective limits
+  // at 200% -- the maximum allowed half the size, and a drag to the minimum
+  // left the host's window smaller than the editor onSize then produced. A
+  // dimension the clamp did not move comes back exactly as asked.
+  View* view = ownerOfView(self);
+  const double sc = view && view->contentScale > 0.0f ? (double) view->contentScale : 1.0;
+  const Steinberg_int32 askedW = rect->right - rect->left, askedH = rect->bottom - rect->top;
+  const uint32_t logicalW = (uint32_t) ((double) (askedW > 0 ? askedW : 0) / sc + 0.5);
+  const uint32_t logicalH = (uint32_t) ((double) (askedH > 0 ? askedH : 0) / sc + 0.5);
+  uint32_t w = logicalW, h = logicalH;
   clapwrap::clampEditorSize(&w, &h);
-  rect->right = rect->left + (Steinberg_int32) w;
-  rect->bottom = rect->top + (Steinberg_int32) h;
+  if (w != logicalW) rect->right = rect->left + (Steinberg_int32) scaled(w, (float) sc);
+  if (h != logicalH) rect->bottom = rect->top + (Steinberg_int32) scaled(h, (float) sc);
   return Steinberg_kResultTrue;
 }
 
@@ -2740,6 +3490,11 @@ static Steinberg_uint32 SMTG_STDMETHODCALLTYPE viewScaleRelease(void* self) {
 }
 
 inline void destroyView(View* view) {
+  // Released while still attached -- a host that skipped removed(). The
+  // editor stayed in the host's window with nothing owning it, and its resize
+  // callback kept this view, about to be freed. Detached here first, exactly
+  // as removed() would have.
+  if (view->attached) viewRemoved(&view->iface);
   if (view->plugin && view->plugin->view == view) view->plugin->view = nullptr;
   view->~View();
   std::free(view);
@@ -2777,9 +3532,16 @@ inline const char* audioModuleCategory() { return "Audio Module Class"; }
  *  by it, so an instrument that says "Fx" lands in the wrong folder forever. */
 inline const char* subCategories() { return kDesc.isInstrument ? "Instrument|Synth" : "Fx"; }
 
+/** The module's IPluginFactory2, the object GetPluginFactory() hands a host.
+ *  One per module, a function-local static built on first use (factory());
+ *  it is never freed, so its reference count only keeps a host's bookkeeping
+ *  honest. It describes the one class this module has and creates Plugin
+ *  instances of it. */
 struct Factory {
   Steinberg_IPluginFactory2Vtbl* lpVtbl = nullptr;
-  Steinberg_uint32 refs = 1;
+  /** Atomic: a host adds and drops references from its audio and UI threads
+   *  at once, and a lost update frees an object still in use. */
+  std::atomic<Steinberg_uint32> refs{1};
 };
 
 inline Factory& factory();
@@ -2803,7 +3565,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE factoryQueryInterface(void* self
 static Steinberg_uint32 SMTG_STDMETHODCALLTYPE factoryAddRef(void*) { return ++factory().refs; }
 static Steinberg_uint32 SMTG_STDMETHODCALLTYPE factoryRelease(void*) {
   Factory& f = factory();
-  return f.refs > 0 ? --f.refs : 0;
+  // Never below zero, and the check and the decrement as one step.
+  Steinberg_uint32 current = f.refs.load();
+  while (current > 0 && !f.refs.compare_exchange_weak(current, current - 1)) {
+  }
+  return current > 0 ? current - 1 : 0;
 }
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE factoryGetFactoryInfo(
@@ -2874,11 +3640,10 @@ inline Steinberg_IPluginFactory2Vtbl& factoryVtbl() {
 }
 
 inline Factory& factory() {
-  static Factory f = [] {
-    Factory made;
-    made.lpVtbl = &factoryVtbl();
-    return made;
-  }();
+  // Built in place: the atomic count makes Factory non-copyable.
+  static Factory f;
+  static const bool wired = (f.lpVtbl = &factoryVtbl(), true);
+  (void) wired;
   return f;
 }
 

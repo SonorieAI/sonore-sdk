@@ -31,8 +31,8 @@ namespace sonore {
 
 /** One bucket's vertical extent, in the sample range [-1, 1]. */
 struct WaveformBucket {
-  float minimum = 0.0f;
-  float maximum = 0.0f;
+  float minimum = 0.0f; ///< The lowest sample in the bucket.
+  float maximum = 0.0f; ///< The highest sample in the bucket.
 };
 
 /**
@@ -65,6 +65,10 @@ public:
     if (begin > numFrames) begin = numFrames;
   }
 
+  /** Summarise `numFrames` frames of `numChannels` interleaved channels in
+   *  memory into `numBuckets` buckets per channel, replacing what was held.
+   *  A count of 0 is taken as 1; null or empty audio leaves every bucket at
+   *  zero. Allocates: not for the audio thread. */
   void build(const float* interleaved, size_t numFrames, size_t numChannels,
              size_t numBuckets) {
     channels_ = numChannels > 0 ? numChannels : 1;
@@ -137,6 +141,18 @@ public:
     }
     size_t cursor = 0;
 
+    // Whether the spans tile the file -- each bucket's starting where the one
+    // before it ended, none empty -- which they do whenever there are no
+    // more buckets than frames. Then every frame belongs to one bucket, the
+    // one the walk below would find for it, and a bucket's frames are a run:
+    // each run is scanned channel by channel without asking, frame by frame,
+    // which buckets the frame is in and whether each had begun. Each bucket
+    // still sees its frames in order, so its minimum and maximum -- a NaN's
+    // place among them included -- are what the walk gives.
+    bool tiled = spanBegin[0] == 0 && spanEnd[buckets_ - 1] == frames;
+    for (size_t b = 0; tiled && b < buckets_; ++b)
+      tiled = spanBegin[b] < spanEnd[b] && (b + 1 == buckets_ || spanEnd[b] == spanBegin[b + 1]);
+
     constexpr size_t kBlock = 8192;
     std::vector<float> block(kBlock * channels_);
     uint64_t position = 0;
@@ -144,6 +160,37 @@ public:
       const size_t want = (frames - position) < kBlock ? (size_t) (frames - position) : kBlock;
       const size_t got = reader.read(position, block.data(), want);
       if (got == 0) break;
+
+      if (tiled) {
+        for (size_t i = 0; i < got;) {
+          const uint64_t at = position + i;
+          while (spanEnd[cursor] <= at) ++cursor;
+          const uint64_t endOfRun = spanEnd[cursor] - position;
+          const size_t end = endOfRun < (uint64_t) got ? (size_t) endOfRun : got;
+          size_t from = i;
+          if (at == spanBegin[cursor]) { // the bucket's first frame
+            for (size_t c = 0; c < channels_; ++c) {
+              const float v = block[i * channels_ + c];
+              data_[c * buckets_ + cursor] = {v, v};
+            }
+            ++from;
+          }
+          for (size_t c = 0; c < channels_; ++c) {
+            WaveformBucket& slot = data_[c * buckets_ + cursor];
+            float lo = slot.minimum, hi = slot.maximum;
+            for (size_t j = from; j < end; ++j) {
+              const float v = block[j * channels_ + c];
+              if (v < lo) lo = v;
+              if (v > hi) hi = v;
+            }
+            slot.minimum = lo;
+            slot.maximum = hi;
+          }
+          i = end;
+        }
+        position += got;
+        continue;
+      }
 
       for (size_t i = 0; i < got; ++i) {
         const uint64_t at = position + i;
@@ -219,7 +266,13 @@ public:
     const uint32_t buckets = get32(12);
     if (channels == 0 || buckets == 0) return false;
     // Checked BEFORE allocating: a header claiming four billion buckets is a
-    // corrupt file, not a reason to ask for sixty-four gigabytes.
+    // corrupt file, not a reason to ask for sixty-four gigabytes. And checked
+    // by division, not by multiplying: channels x buckets x 8 overflows 64
+    // bits for counts a 32-bit field can hold (2^31 x 2^30 x 8 is 2^64, which
+    // is zero), and a 16-byte file then passed and asked for 2^61 buckets.
+    // No audio file has more channels than the readers accept either.
+    if (channels > 64) return false;
+    if (buckets > (size - 16) / 8 / channels) return false;
     const uint64_t needed = (uint64_t) channels * buckets * 8 + 16;
     if (needed != (uint64_t) size) return false;
 
@@ -235,9 +288,14 @@ public:
     return true;
   }
 
+  /** Channels summarised; 0 before a build. */
   size_t numChannels() const { return channels_; }
+  /** Buckets per channel; 0 before a build. */
   size_t numBuckets() const { return buckets_; }
 
+  /** Bucket `index` of `channel`, both 0-based. Out of range answers a
+   *  silent bucket rather than reading past the end. The reference lasts
+   *  until the next build or load. */
   const WaveformBucket& bucket(size_t channel, size_t index) const {
     static const WaveformBucket empty{};
     if (channel >= channels_ || index >= buckets_) return empty;

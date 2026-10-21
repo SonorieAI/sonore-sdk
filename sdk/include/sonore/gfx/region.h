@@ -34,6 +34,18 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A small set of float rectangles that grows by union: what a component
+ * tree's damage is kept in. Named after the reference's RectangleList, but
+ * deliberately less -- add, intersect-tests and a bounding box, no subtraction
+ * -- for the reasons the file comment gives.
+ *
+ * Rectangles that overlap, or come within a unit of each other, are merged as
+ * they are added, so the list never holds two that do; past kMaxRectangles it
+ * becomes one bounding box.
+ * The units are whatever the caller adds -- logical units for a component's
+ * damage. A plain value, used on the message thread with the tree.
+ */
 class RectangleList {
 public:
   /**
@@ -47,11 +59,17 @@ public:
    */
   static constexpr int kMaxRectangles = 8;
 
+  /** Whether nothing has been added since the last clear(). */
   bool isEmpty() const { return rects_.empty(); }
+  /** How many separate rectangles it holds after merging, at most
+   *  kMaxRectangles. */
   int size() const { return (int) rects_.size(); }
+  /** Rectangle `i`; `i` must be in range, as it is not checked. */
   const Rect& at(int i) const { return rects_[(size_t) i]; }
+  /** Every rectangle, none of which overlaps or touches another. */
   const std::vector<Rect>& rects() const { return rects_; }
 
+  /** Remove everything. */
   void clear() { rects_.clear(); }
 
   /**
@@ -86,6 +104,7 @@ public:
     if ((int) rects_.size() > kMaxRectangles) collapse();
   }
 
+  /** Add each of `other`'s rectangles, merging as add(Rect) does. */
   void add(const RectangleList& other) {
     for (const Rect& r : other.rects_) add(r);
   }
@@ -107,6 +126,7 @@ public:
     return false;
   }
 
+  /** The rectangles' areas summed: no double counting, since none overlap. */
   float totalArea() const {
     float sum = 0.0f;
     for (const Rect& r : rects_) sum += r.w * r.h;

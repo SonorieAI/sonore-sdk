@@ -26,6 +26,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "hilbert.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -73,6 +76,8 @@ class HilbertTransformer {
   static_assert(Sections >= 2 && Sections <= 32, "2..32 sections");
 
 public:
+  /** Designed for a transition of 0.005 of the sample rate: 240 Hz at
+   *  48 kHz. */
   HilbertTransformer() { design(0.005); }
 
   /** Half-width of the region at each end of the band where the pair is
@@ -84,11 +89,12 @@ public:
     // an allpass with coefficient -a and a sign. The sections alternate.
     nA_ = nB_ = 0;
     for (int i = 0; i < Sections; ++i) {
-      if (i % 2 == 0) a_[nA_++] = -c[i];
-      else b_[nB_++] = -c[i];
+      if (i % 2 == 0) a_[nA_++] = (float) -c[i];
+      else b_[nB_++] = (float) -c[i];
     }
     reset();
   }
+  /** Clear both cascades' state; the design is kept. No allocation. */
   void reset() {
     for (int i = 0; i < Sections; ++i) { ax1_[i] = ax2_[i] = ay1_[i] = ay2_[i] = 0.0f; bx1_[i] = bx2_[i] = by1_[i] = by2_[i] = 0.0f; }
     delay_ = 0.0f;
@@ -128,25 +134,42 @@ private:
  * exponential, real part out. Positive shifts move everything up; the
  * sideband that would fold to the other side is what the Hilbert pair
  * suppresses, and its residue is the image rejection the test measures.
- * `setMix` blends the shifted signal with the dry; feedback is the caller's,
- * and this is the effect that makes a feedback loop safe to build.
+ * There is no dry/wet mix, and that is deliberate: both outputs of the
+ * Hilbert pair are phase-shifted copies of the input, so the input itself
+ * summed with the shifted signal combs. Feedback is the caller's, and this
+ * is the effect that makes a feedback loop safe to build.
  */
 class FrequencyShifter {
 public:
+  /** The rate in Hz (1 or less means 48 kHz). The Hilbert pair is designed
+   *  again for a band edge at 240 Hz whatever the rate, which clears its
+   *  state; the shift is kept in Hz. Without a call the shifter runs as at
+   *  48 kHz. No allocation. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
+    // The pair's band in hertz, not as a fraction of the rate: a fixed
+    // 0.005 of fs is 240 Hz at 48 kHz but 960 Hz at 192, where the image of
+    // a 500 Hz tone came back at -19 dB. At a 240 Hz edge twelve sections
+    // hold the angle to 1.6 degrees at 300 Hz even at 192 kHz.
+    hilbert_.design(240.0 / (double) sr_);
     setShift(shiftHz_);
   }
   /** Hertz, either sign. */
   void setShift(float hz) {
-    shiftHz_ = hz;
-    inc_ = hz / sr_;
+    // A shift that is not finite is no shift: a NaN or an infinite
+    // increment left the carrier's phase NaN for good.
+    shiftHz_ = std::isfinite(hz) ? hz : 0.0f;
+    inc_ = shiftHz_ / sr_;
   }
+  /** Clear the filters and the carrier's phase; the shift is kept. */
   void reset() {
     hilbert_.reset();
     phase_ = 0.0f;
   }
 
+  /** [audio-thread] One sample in, the shifted sample out. Below the pair's
+   *  240 Hz band edge the mirror image is no longer held down. No
+   *  allocation, no lock. */
   inline float process(float x) {
     float i, q;
     hilbert_.process(x, i, q);

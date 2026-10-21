@@ -9,7 +9,7 @@ public type is accounted for**.
 - **Open an issue first for anything large.** A new DSP class or a new plugin
   format is a conversation, not a surprise pull request.
 - **Small fixes need no ceremony.** A wrong constant, a missing `<cstddef>`, a
-  comment that lies. Just send it.
+  comment that lies: just send it.
 
 ## The two hard rules
 
@@ -20,7 +20,7 @@ header says a filter is −3 dB at its cutoff, a test asserts −3.01 dB at that
 cutoff. If it says the latency is 24 samples, a test reads 24 back.
 
 "It sounds right" is not a measurement, and neither is agreeing with your own
-reference implementation. The K-weighting meter in this project agreed with
+reference implementation: the K-weighting meter in this project agreed with
 its own port perfectly and was 0.26 LU away from the published ITU table. Grade
 against the standard, the paper, or the analytic result.
 
@@ -33,7 +33,7 @@ structural rather than component-level, the header must say so plainly (see
 
 `scripts/feature-map.mjs` names every public class and what it is for;
 `npm run verify:unclaimed` fails if a public type has no row. This is not
-paperwork; it is what stops the library from growing capabilities nobody can
+paperwork: it is what stops the library from growing capabilities nobody can
 discover.
 
 ## The gate
@@ -45,7 +45,7 @@ npm run verify:sdk
 Configures, builds the examples, runs the DSP measurements, drives the built
 binaries as a real host, runs the industry validators when they are present,
 and compiles the whole thing to WebAssembly. On Windows it also cross-builds
-and runs the suite under WSL, because building on one OS hides real bugs. MSVC
+and runs the suite under WSL, because building on one OS hides real bugs: MSVC
 leaks `<cstddef>` through other headers where gcc does not, and a Windows-only
 run once let a platform guard return `"win32"` on Linux.
 
@@ -67,7 +67,7 @@ npm run verify:sanitize     # every wrapper, the suites and the parser fuzzer un
                             # ASan+UBSan; the sampler handover under TSan (~1 h)
 ```
 
-It runs under gcc, natively on Linux and through WSL on Windows, and CI runs
+It runs under gcc -- natively on Linux, through WSL on Windows -- and CI runs
 it on every push as its own job. `verify:sdk` already runs the quick passes
 of the same fuzzer, the sampler stress and the two-thread plugin probe
 through ctest; the sanitizers are what turn "did not crash" into "did not
@@ -80,13 +80,31 @@ says: cast a CLAP event through `eventAs<T>()`, never a bare
 `reinterpret_cast`, or a short header reads past the host's storage. Every
 process() shape the native wrappers accept must also dispatch in
 `wasm_abi.h`, and the wasm test compiles every example to prove it. And
-anything that changes a process path is worth a `verify:daw-render` run: it
-is the one check that compares our render to a host we did not write.
+anything that changes a process path, state, parameters, presets or latency
+is worth a `verify:reaper` run: it is the one check with a host we did not
+write on both ends -- REAPER renders, automates, saves and reopens the
+examples, and its renders must equal our own host's.
+
+MSVC accepts code that gcc and clang refuse. On Windows, `verify:clang` runs
+clang's front end (Visual Studio's own clang-tidy, no clang install needed)
+over every translation unit and fails on any error or any warning in a public
+header; `verify:sdk` runs it when clang-cl is not installed. Its first run found
+a nested `Options` default argument that would have broken every Linux and
+macOS build.
 
 A pull request is expected to be green on `verify:sdk`. If a leg of it cannot
-run on your machine (no WSL, no emscripten, no validators), say so in the PR;
+run on your machine (no WSL, no emscripten, no validators), say so in the PR:
 those legs skip loudly rather than pretending to pass, and CI runs all three
 platforms anyway.
+
+## Changing the public API
+
+The SDK follows Semantic Versioning (sdk/README.md, "Versions and compatibility"). Adding is a
+minor version. Removing or changing something a caller uses is not done in a 1.x release: mark it
+`SONORE_DEPRECATED("<version>: use <replacement>")`, keep it working, list it in the CHANGELOG,
+and remove it in the next major, no sooner than one minor release later. A change to what a plugin
+sounds like or how a saved session restores goes under "Changes that can affect an existing
+plugin" in the CHANGELOG, and saved state from any 1.x build must keep loading.
 
 ## House style
 
@@ -100,7 +118,7 @@ platforms anyway.
 - **Comments explain *why*, and record what bit you.** The headers in this
   repository read like a lab notebook on purpose: when a measurement corrected
   an assumption, the correction is written down where the next person will
-  look. That is the most valuable thing in the codebase, so please add to it.
+  look. That is the most valuable thing in the codebase. Please add to it.
 - **Report latency.** Anything that delays its signal declares
   `latencySamples()`, or every parallel mix it sits in is silently smeared.
 

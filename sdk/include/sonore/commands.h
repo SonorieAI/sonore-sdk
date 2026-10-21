@@ -2,6 +2,11 @@
 //
 // Named actions, and the keys that reach them.
 //
+// NOT part of the generated-interface protocol. A page the studio writes never
+// calls these -- the protocol does not know them, and the review gate would
+// reject a page that did. They exist for interfaces written by hand against
+// this SDK, and for the fallback panel.
+//
 // ── What it is for ──────────────────────────────────────────────────────────
 //
 // Undo. Save preset. Next preset. Bypass. A plugin has a handful of things it
@@ -55,10 +60,21 @@ namespace sonore {
  * and describing it twice invites the two halves to disagree.
  */
 struct Shortcut {
+  /** The key as a Unicode code point, ASCII letters lowercase; 0 when this
+   *  is a key-code shortcut. */
   uint32_t character = 0;
+  /** A gfx::KeyPress code (Return, F5, Left...); None when this is a
+   *  character shortcut. */
   int keyCode = gfx::KeyPress::None;
+  ///@{
+  /** The modifiers that must be down -- and the ones not set must be up:
+   *  Ctrl+S does not fire on Ctrl+Alt+S. */
   bool shift = false, ctrl = false, alt = false;
+  ///@}
 
+  /** A character shortcut, Ctrl+`c` unless told otherwise. An ASCII capital
+   *  is lowercased, so 'S' and 's' make the same shortcut; Shift is only
+   *  what `withShift` says. */
   static Shortcut fromCharacter(uint32_t c, bool withCtrl = true, bool withShift = false,
                                 bool withAlt = false) {
     Shortcut out;
@@ -71,6 +87,7 @@ struct Shortcut {
     return out;
   }
 
+  /** A named key, with no modifier unless told otherwise. */
   static Shortcut fromKeyCode(int code, bool withCtrl = false, bool withShift = false,
                               bool withAlt = false) {
     Shortcut out;
@@ -81,14 +98,19 @@ struct Shortcut {
     return out;
   }
 
+  /** False for the default-constructed shortcut, which names no key. */
   bool isValid() const { return character != 0 || keyCode != gfx::KeyPress::None; }
 
+  /** Same key and same modifiers. */
   bool operator==(const Shortcut& other) const {
     return character == other.character && keyCode == other.keyCode && shift == other.shift &&
            ctrl == other.ctrl && alt == other.alt;
   }
+  /** Not operator==. */
   bool operator!=(const Shortcut& other) const { return !(*this == other); }
 
+  /** Whether a key press is this shortcut: the same key, case ignored for
+   *  ASCII letters, and exactly the same Shift, Ctrl and Alt. */
   bool matches(const gfx::KeyPress& key) const {
     if (ctrl != key.ctrlDown || alt != key.altDown) return false;
     if (keyCode != gfx::KeyPress::None) return key.keyCode == keyCode && shift == key.shiftDown;
@@ -123,7 +145,12 @@ struct Shortcut {
         case gfx::KeyPress::End: out += "End"; break;
         case gfx::KeyPress::PageUp: out += "PageUp"; break;
         case gfx::KeyPress::PageDown: out += "PageDown"; break;
-        default: out += "Key"; break;
+        default:
+          if (keyCode >= gfx::KeyPress::F1 && keyCode <= gfx::KeyPress::F12)
+            out += "F" + std::to_string(keyCode - gfx::KeyPress::F1 + 1);
+          else
+            out += "Key";
+          break;
       }
     } else if (character != 0) {
       // Shown in UPPER case, which is how every application prints a shortcut
@@ -136,40 +163,67 @@ struct Shortcut {
   }
 };
 
+/** What a command is called and where it is listed. `id` is the plugin's own
+ *  number for it, non-zero (registerCommand ignores 0, which is also what
+ *  "no command" means elsewhere), and it is what saved mappings refer to --
+ *  so it must stay the same from one version to the next. */
 struct CommandInfo {
+  /** The command's number: non-zero, stable across versions. */
   int id = 0;
   /** What a menu item says. */
   std::string name;
-  /** For grouping in a mapping editor -- "Presets", "Edit". */
-  std::string category;
-  std::string description;
+  /** For grouping in a mapping editor -- "Presets", "Edit". Braced, like
+   *  description, so {id, name} and {id, name, category} are complete
+   *  initialisers to gcc and clang's -Wextra, not missing fields. */
+  std::string category{};
+  /** A sentence for a tooltip or a mapping editor. */
+  std::string description{};
 };
 
+/**
+ * The plugin's commands, their enabled and ticked state, and the shortcuts
+ * that reach them -- the part the reference's application command manager
+ * plays, with one onInvoke handler in place of command targets. See the file
+ * comment for the rules about shortcuts and disabled commands.
+ *
+ * UI THREAD, all of it: keyPressed() is fed the keys the component tree did
+ * not take (MouseRouter::onUnhandledKey), and onInvoke runs on whichever
+ * thread called invoke() or keyPressed(). Commands are registered in code
+ * each time the plugin loads; only the user's mappings are saved
+ * (saveMappings / loadMappings). A pointer from commandInfo() lasts until the
+ * next registerCommand of a new id.
+ */
 class CommandManager {
 public:
   /** `defaults` are what resetToDefaults() restores, and are applied now unless
-   *  the key is already taken by something registered earlier. */
+   *  the key is already taken by something registered earlier. Registering an
+   *  id again updates its description and its defaults and leaves its current
+   *  shortcuts alone: those may be the user's. */
   void registerCommand(CommandInfo info, std::vector<Shortcut> defaults = {}) {
     if (info.id == 0) return;
-    Entry* existing = find(info.id);
-    if (existing) {
+    if (Entry* existing = find(info.id)) {
       existing->info = std::move(info);
       existing->defaults = std::move(defaults);
-    } else {
-      Entry entry;
-      entry.info = std::move(info);
-      entry.defaults = std::move(defaults);
-      entries_.push_back(std::move(entry));
-      existing = &entries_.back();
+      return;
     }
-    for (const Shortcut& s : existing->defaults) addShortcut(existing->info.id, s);
+    Entry entry;
+    entry.info = std::move(info);
+    entry.defaults = std::move(defaults);
+    entries_.push_back(std::move(entry));
+    const Entry& added = entries_.back();
+    const int id = added.info.id;
+    const std::vector<Shortcut> wanted = added.defaults;
+    for (const Shortcut& s : wanted) applyDefault(id, s);
   }
 
+  /** What `id` was registered with, or null for an unknown id. See the class
+   *  comment for how long the pointer lasts. */
   const CommandInfo* commandInfo(int id) const {
     const Entry* entry = find(id);
     return entry ? &entry->info : nullptr;
   }
 
+  /** Every registered id, in the order they were registered. */
   std::vector<int> commandIds() const {
     std::vector<int> out;
     out.reserve(entries_.size());
@@ -177,14 +231,19 @@ public:
     return out;
   }
 
+  /** How many commands are registered. */
   int numCommands() const { return (int) entries_.size(); }
 
   // ── State ────────────────────────────────────────────────────────────────
 
+  /** Greys a command out, or back in. A disabled command does not run and
+   *  does not take its keys. Commands start enabled; an unknown id does
+   *  nothing. */
   void setEnabled(int id, bool enabled) {
     if (Entry* entry = find(id)) entry->enabled = enabled;
   }
 
+  /** False for a disabled command, and for an unknown id. */
   bool isEnabled(int id) const {
     const Entry* entry = find(id);
     return entry && entry->enabled;
@@ -195,6 +254,8 @@ public:
     if (Entry* entry = find(id)) entry->ticked = ticked;
   }
 
+  /** The checkmark set by setTicked(); false for an unknown id. Only shown,
+   *  never acted on here. */
   bool isTicked(int id) const {
     const Entry* entry = find(id);
     return entry && entry->ticked;
@@ -260,6 +321,16 @@ public:
     if (target) target->shortcuts.push_back(shortcut);
   }
 
+  /** A DEFAULT takes a key only if nobody has it: the first command
+   *  registered with it keeps it. addShortcut() is the user's choice and
+   *  moves a key; this is the plugin's suggestion and does not. A later
+   *  command defaulting to Ctrl+Z took it from Undo. */
+  void applyDefault(int id, const Shortcut& shortcut) {
+    const int owner = commandForShortcut(shortcut);
+    if (owner == 0) addShortcut(id, shortcut);
+  }
+
+  /** Takes one shortcut from a command, leaving the key unbound. */
   void removeShortcut(int id, const Shortcut& shortcut) {
     if (Entry* entry = find(id))
       entry->shortcuts.erase(
@@ -267,10 +338,14 @@ public:
           entry->shortcuts.end());
   }
 
+  /** Takes every shortcut from a command. Its defaults are kept for
+   *  resetToDefaults(). */
   void clearShortcuts(int id) {
     if (Entry* entry = find(id)) entry->shortcuts.clear();
   }
 
+  /** A command's shortcuts now, in the order they were given; empty for an
+   *  unknown id. */
   std::vector<Shortcut> shortcutsFor(int id) const {
     const Entry* entry = find(id);
     return entry ? entry->shortcuts : std::vector<Shortcut>();
@@ -285,12 +360,15 @@ public:
     return 0;
   }
 
+  /** Throws away every mapping and applies each command's defaults again,
+   *  in registration order: where two defaults name one key, the command
+   *  registered first gets it. */
   void resetToDefaults() {
     for (Entry& entry : entries_) entry.shortcuts.clear();
     for (Entry& entry : entries_) {
       const std::vector<Shortcut> defaults = entry.defaults;
       const int id = entry.info.id;
-      for (const Shortcut& s : defaults) addShortcut(id, s);
+      for (const Shortcut& s : defaults) applyDefault(id, s);
     }
   }
 
@@ -354,6 +432,9 @@ public:
   }
 
 private:
+  /** One registered command: what it is, the shortcuts it has now (the
+   *  user's, once they have changed any), the defaults resetToDefaults()
+   *  goes back to, and its state. */
   struct Entry {
     CommandInfo info;
     std::vector<Shortcut> shortcuts;

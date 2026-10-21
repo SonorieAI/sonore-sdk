@@ -2,15 +2,15 @@
 sdk/build/
 node_modules/
 
-# Industry validators — fetched binaries, never committed.
+# Industry validators: fetched binaries, never committed.
 # clap-validator from free-audio/clap-validator releases,
 # pluginval from Tracktion/pluginval releases. verify:sdk skips
 # LOUDLY when they are absent, so a fresh clone still runs green.
 sdk/tools/
 
-# Steinberg's ASIO SDK is NOT redistributable. sonore_enable_asio()
-# skips loudly and names where to get it; the headers must never be
-# committed here.
+# Steinberg's ASIO SDK is NOT redistributable, and the SDK does not need it
+# (sonore/audio_asio.h declares the driver interface itself). Kept ignored so
+# a copy somebody drops in by habit is never committed.
 sdk/third_party/asio/
 
 # Editor and OS noise
@@ -23,3 +23,8 @@ sdk/third_party/asio/
 sonore-stream*
 sonore-streamer-test.wav
 sdk/build-clangcl/
+sdk/build-clangcheck/
+sdk/build-wsl/
+
+# A coding assistant's local state (worktrees, settings, memory): never part of the repository.
+.claude/

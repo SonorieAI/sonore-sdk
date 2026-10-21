@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="70" viewBox="0 0 220 70">
+  <text x="4" y="24" font-family="NoSuchFont, 'Sonore Text', serif" font-size="18">First found</text>
+  <text x="4" y="46" font-family="serif" font-size="18">Generic serif</text>
+  <text x="4" y="66" font-size="18">No family</text>
+</svg>

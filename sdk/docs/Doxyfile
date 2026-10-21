@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# The API reference: Doxygen over the public headers, with the guides beside it.
+#
+#   npm run docs            (scripts/docs.mjs -- use that, not doxygen directly)
+#
+# Only what differs from Doxygen's defaults is set here. Three environment
+# variables come from scripts/docs.mjs: SONORE_SDK_DIR (the sdk/ folder),
+# SONORE_SDK_VERSION (from version.h) and SONORE_DOCS_AREAS (a generated file,
+# below).
+#
+# ── Why every path is absolute ──────────────────────────────────────────────
+#
+# Doxygen resolves a Markdown link such as [README](../../README.md) against
+# its WORKING DIRECTORY first and against the page's own folder only when that
+# finds nothing. Run from sdk/docs, a guide's ../../README.md found the
+# repository root's README instead of the SDK's, and the link went nowhere.
+# So the paths here are absolute and docs.mjs runs doxygen from an empty
+# folder of its own, where no relative link can land on the wrong file.
+#
+# ── What it reads ───────────────────────────────────────────────────────────
+#
+# The public API is sdk/include/sonore (README, "Versions and compatibility"):
+# namespace sonore and its named sub-namespaces, outside any detail namespace.
+# The headers carry their documentation as /** ... */ prose, written to be
+# read in the header; nothing here asks them to change shape for Doxygen.
+# Every class is extracted, commented or not, because a class a plugin uses is
+# part of the API whether or not it has a comment yet -- docs.mjs counts the
+# uncommented ones instead of hiding them. The SDK's README is a page of its
+# own, for the guides to link to; the CHANGELOG is not (it is written for
+# GitHub, and its SVG element names read as HTML here).
+#
+# The areas (DSP, formats, hosting, ...) are not written in the headers.
+# docs.mjs generates them as one @file block per header, filed under its
+# area, with the header's own top comment as the file's description.
+#
+# ── The preprocessor ────────────────────────────────────────────────────────
+#
+# The headers branch per platform (_WIN32, __APPLE__, else Linux). Doxygen
+# runs the preprocessor and documents the branch the macros below select,
+# which is the Windows one: the public classes are the same on every
+# platform, and a single branch keeps Doxygen from seeing a class defined
+# three times. Headers that exist for one platform only (webview_cocoa.h,
+# audio_alsa.h, ...) are listed by file all the same. __has_include answers
+# yes, so what a header compiles in when an optional SDK is present (VST3 and
+# LV2 hosting) is documented.
+
+PROJECT_NAME           = "Sonore SDK"
+PROJECT_NUMBER         = $(SONORE_SDK_VERSION)
+PROJECT_BRIEF          = "Header-only C++17 audio plugins: CLAP, VST3, AU, LV2 and a standalone from one source"
+OUTPUT_DIRECTORY       = $(SONORE_SDK_DIR)/build/docs
+WARN_LOGFILE           = $(SONORE_SDK_DIR)/build/docs/warnings.log
+
+INPUT                  = $(SONORE_SDK_DIR)/docs/index.md \
+                         $(SONORE_SDK_DIR)/README.md \
+                         $(SONORE_SDK_DIR)/docs/guides \
+                         $(SONORE_SDK_DIR)/include/sonore \
+                         $(SONORE_DOCS_AREAS)
+FILE_PATTERNS          = *.h *.md *.dox
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */third_party/*
+EXCLUDE_SYMBOLS        = detail \
+                         *detail \
+                         *::detail::*
+USE_MDFILE_AS_MAINPAGE = $(SONORE_SDK_DIR)/docs/index.md
+
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = $(SONORE_SDK_DIR)/include \
+                         $(SONORE_SDK_DIR)
+STRIP_FROM_INC_PATH    = $(SONORE_SDK_DIR)/include
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+TOC_INCLUDE_HEADINGS   = 3
+BUILTIN_STL_SUPPORT    = YES
+DISTRIBUTE_GROUP_DOC   = YES
+NUM_PROC_THREADS       = 0
+LOOKUP_CACHE_SIZE      = 3
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_ANON_NSPACES   = NO
+SORT_MEMBER_DOCS       = NO
+SHOW_USED_FILES        = YES
+VERBATIM_HEADERS       = YES
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+SEARCH_INCLUDES        = NO
+PREDEFINED             = _WIN32=1 \
+                         "__has_include(x)=1" \
+                         "SONORE_DEPRECATED(message)=" \
+                         SONORE_JS_NOINLINE= \
+                         "SONORE_VST3_EXPORT=extern \"C\""
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_COLORSTYLE        = AUTO_LIGHT
+GENERATE_TREEVIEW      = YES
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+XML_PROGRAMLISTING     = NO
+HAVE_DOT               = NO

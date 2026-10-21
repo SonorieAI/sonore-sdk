@@ -19,12 +19,12 @@ namespace sonore {
 /** One factory preset. `values` must have exactly the plugin's parameter count,
  *  in index order; a mismatch is refused at load rather than partially applied. */
 struct Preset {
-  const char* name = "";
-  const float* values = nullptr;
-  int numValues = 0;
+  const char* name = "";         ///< the name hosts and the editor list it under
+  const float* values = nullptr; ///< plain values, one per parameter; clamped into range when applied
+  int numValues = 0;             ///< entries in `values`; must equal the descriptor's numParams
 };
 
-/** Apply a preset to a parameter array. Returns false, changing nothing, when
+/** Apply a preset to a parameter array. Returns false (changing nothing) when
  *  the preset does not match the current contract, which is what stops a stale
  *  preset from writing garbage into half the controls. */
 inline bool applyPreset(const Preset& preset, const ParamInfo* params, int numParams,

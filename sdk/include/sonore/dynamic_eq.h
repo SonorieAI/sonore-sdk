@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Sonore SDK: the dynamic equaliser: a band that compresses itself.
+// Sonore SDK. The dynamic equaliser: a band that compresses itself.
 //
 // The modern mixing tool this library kept ALMOST having: eq.h knows how to
 // make a matched bell, compressors.h knows how a gain computer behaves, and
 // a dynamic EQ is exactly their composition. Per band, a detector listens
 // to the band's own slice of the spectrum (of the input, or of a sidechain
 // key), and the measured level drives the band's gain through the standard
-// compressor law: Giannoulis, Massberg & Reiss, "Digital Dynamic Range
+// compressor law, Giannoulis, Massberg & Reiss, "Digital Dynamic Range
 // Compressor Design: A Tutorial and Analysis" (JAES 2012): rectified
 // envelope, soft knee in the log domain, dB-domain attack/release smoothing
 // of the control signal. The band itself is eq.h's Vicanek matched biquad,
@@ -30,29 +30,53 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "dynamic_eq.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
 namespace sonore {
 
+/**
+ * An equaliser of up to `Bands` bands, each of which can compress or expand
+ * its own slice of the spectrum (see the file comment for the design).
+ *
+ * One channel, per sample; for linked stereo give both instances the same
+ * key through process(x, key). Call setSampleRate() in prepare(), then set
+ * the bands with setBand(): a band does nothing until its Band says
+ * `enabled`. The setters and process() run on the audio thread. The dynamic
+ * gain is worked out every 16 samples and a band's filter redesigned only
+ * when that gain moved by more than 0.05 dB; setBand() itself redesigns at
+ * once. gainDb() reads back each band's dynamic gain, for a meter.
+ */
 template<int Bands = 4>
 class DynamicEq {
 public:
+  /** One band's settings. Frequency in Hz; static gain, threshold, knee and
+   *  range in dB; attack and release in ms. The ratio applies to the Bell,
+   *  LowShelf and HighShelf shapes only, and at 1 (the default) the band is
+   *  a static EQ band at staticGainDb. A downward band cuts when its slice
+   *  is louder than the threshold, an upward one lifts when it is quieter,
+   *  and either way the movement stops at rangeDb. */
   struct Band {
-    eqdetail::Shape shape = eqdetail::Shape::Bell;
-    float hz = 1000.0f;
-    float q = 1.0f;
-    float staticGainDb = 0.0f;
-    float thresholdDb = -24.0f;
-    float ratio = 1.0f;          // 1 = a static band
-    float kneeDb = 6.0f;
-    float attackMs = 5.0f;
-    float releaseMs = 80.0f;
-    float rangeDb = 12.0f;       // the dynamic movement never exceeds this
-    bool upward = false;         // lift when quiet instead of cut when loud
-    bool enabled = false;
+    eqdetail::Shape shape = eqdetail::Shape::Bell; ///< eq.h's shapes; only Bell and the shelves move
+    float hz = 1000.0f;          ///< centre or corner in Hz, held to 10 Hz .. 0.45 x the rate
+    float q = 1.0f;              ///< the band's Q, at least 0.05; the bell's detector uses it too
+    float staticGainDb = 0.0f;   ///< the gain at rest, in dB; the dynamic gain adds to it
+    float thresholdDb = -24.0f;  ///< dBFS of the band's slice, as its peak detector reads it
+    float ratio = 1.0f;          ///< 1 = a static band; above 1 (a 1.001 margin) the band moves
+    float kneeDb = 6.0f;         ///< soft-knee width in dB around the threshold; 0 is a hard knee
+    float attackMs = 5.0f;       ///< ms to 63% of a move toward more gain change, at least 0.05
+    float releaseMs = 80.0f;     ///< ms to 63% of the way back, at least 1
+    float rangeDb = 12.0f;       ///< the dynamic movement never exceeds this; keep it 0 or more
+    bool upward = false;         ///< lift when quiet instead of cut when loud
+    bool enabled = false;        ///< false: the band is skipped entirely, its filter not run
   };
 
+  /** The rate in Hz; one of 1 or less, or NaN, is taken as 48000. Every
+   *  band's filter, detector and ballistics are designed again for it; the
+   *  filters' state and the dynamic gains are kept (reset() clears them). */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     for (int i = 0; i < Bands; ++i) {
@@ -62,11 +86,16 @@ public:
     }
     counter_ = 0;
   }
+  /** Band `i`, 0-based; an index outside 0..Bands-1 is ignored. The filter,
+   *  detector and ballistics are redesigned at once, and the band's current
+   *  envelope and dynamic gain carry on from where they were. Allocation-free. */
   void setBand(int i, const Band& b) {
     if (i < 0 || i >= Bands) return;
     band_[i] = b;
     configure(i);
   }
+  /** Silence: filter and detector state, envelopes and dynamic gains to
+   *  zero, each band back at its static gain. The bands' settings stay. */
   void reset() {
     for (int i = 0; i < Bands; ++i) {
       filter_[i].reset();
@@ -81,6 +110,8 @@ public:
   /** The band's current dynamic gain in dB (negative = cutting). */
   float gainDb(int i) const { return i >= 0 && i < Bands ? dynDb_[i] : 0.0f; }
 
+  /** [audio-thread] One sample, equalised, with the input as its own key.
+   *  Allocation-free. */
   inline float process(float x) { return process(x, x); }
   /** `key` feeds the detectors (sidechain); `x` is what gets equalised. */
   inline float process(float x, float key) {
@@ -113,13 +144,17 @@ private:
 
   void configure(int i) {
     const Band& b = band_[i];
-    // Detector: the band's own slice of the spectrum.
+    // Detector: the band's own slice of the spectrum, designed and run in
+    // double like the band itself. In a float biquad a low band's detector
+    // read the level wrong as the rate rose -- a 40 Hz low shelf's lowpass
+    // was -0.6 dB in its passband at 192 kHz and +2.3 dB at 384 kHz, so the
+    // band's threshold sat that far from the number on it.
     if (b.shape == eqdetail::Shape::LowShelf)
-      det_[i].lowpass(b.hz, 0.7071f);
+      det_[i].lowpass((double) b.hz, 0.70710678);
     else if (b.shape == eqdetail::Shape::HighShelf)
-      det_[i].highpass(b.hz, 0.7071f);
+      det_[i].highpass((double) b.hz, 0.70710678);
     else
-      det_[i].bandpass(b.hz, b.q); // RBJ 0 dB-peak variant: |H(f0)| = 1
+      bandpass(det_[i], (double) b.hz, (double) b.q); // RBJ 0 dB-peak variant: |H(f0)| = 1
     // Envelope release: at least three cycles of the band, or a low band's
     // own ripple reads as gain modulation.
     const float envMs = 3000.0f / (b.hz > 20.0f ? b.hz : 20.0f);
@@ -147,7 +182,7 @@ private:
         if (gr > b.rangeDb) gr = b.rangeDb;
         want = -gr;
       } else {
-        // Upward: the mirrored law: lift grows as the band falls below
+        // Upward: the mirrored law; lift grows as the band falls below
         // the threshold, capped where told.
         float lift = compdetail::kneeGainDb(b.thresholdDb - levelDb, 1.0f - 1.0f / b.ratio,
                                             b.kneeDb);
@@ -161,19 +196,30 @@ private:
     }
   }
 
+  /** The cookbook's constant-0 dB-peak bandpass, which IirSection does not
+   *  name, with Biquad's limits: 10 Hz .. 0.49 fs (a NaN to the bottom, as
+   *  clampf sends it) and Q at least 0.05. */
+  void bandpass(IirSection& s, double hz, double q) const {
+    const double fs = (double) sr_;
+    const double f = hz >= 10.0 ? (hz > 0.49 * fs ? 0.49 * fs : hz) : 10.0;
+    const double w0 = 2.0 * 3.14159265358979323846 * f / fs;
+    const double alpha = std::sin(w0) / (2.0 * (q >= 0.05 ? q : 0.05));
+    const double a0 = 1.0 + alpha;
+    s.setCoefficients(alpha / a0, 0.0, -alpha / a0, -2.0 * std::cos(w0) / a0, (1.0 - alpha) / a0);
+  }
+
   void design(int i) {
     const Band& b = band_[i];
     const float gain = b.staticGainDb + (dynamic(i) ? dynDb_[i] : 0.0f);
     designedDb_[i] = dynDb_[i];
-    float b0, b1, b2, a1, a2;
-    if (eqdetail::matched(b.shape, b.hz, b.q, gain, sr_, &b0, &b1, &b2, &a1, &a2))
-      filter_[i].setCoefficients(b0, b1, b2, a1, a2);
-    else
-      filter_[i].setCoefficients(1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    // The SAME design ParametricEq uses, cookbook fallback and clamps
+    // included -- see eqdetail::designBand for what a private copy got wrong.
+    eqdetail::designBand(filter_[i], b.shape, b.hz, b.q, gain, sr_);
   }
 
   Band band_[Bands];
-  Biquad filter_[Bands], det_[Bands];
+  IirSection filter_[Bands]; // double: a low band at a high rate needs it (see eq.h)
+  IirSection det_[Bands];    // ...and so does its detector
   float env_[Bands]{}, envRelease_[Bands]{}, att_[Bands]{}, rel_[Bands]{};
   float dynDb_[Bands]{}, designedDb_[Bands]{};
   float sr_ = 48000.0f;

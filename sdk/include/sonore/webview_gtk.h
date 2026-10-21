@@ -86,6 +86,10 @@ struct Api {
   GObjectPtr (*webkit_web_view_get_settings)(GtkWidgetPtr) = nullptr;
   void (*webkit_settings_set_enable_developer_extras)(GObjectPtr, int) = nullptr;
   void (*webkit_settings_set_enable_write_console_messages_to_stdout)(GObjectPtr, int) = nullptr;
+  GObjectPtr (*webkit_navigation_policy_decision_get_navigation_action)(GObjectPtr) = nullptr;
+  GObjectPtr (*webkit_navigation_action_get_request)(GObjectPtr) = nullptr;
+  const char* (*webkit_uri_request_get_uri)(GObjectPtr) = nullptr;
+  void (*webkit_policy_decision_ignore)(GObjectPtr) = nullptr;
 
   bool ok = false;
   std::string error;
@@ -168,6 +172,12 @@ inline Api& api() {
     bind(wk, "webkit_web_view_get_settings", &api.webkit_web_view_get_settings, &api);
     bind(wk, "webkit_settings_set_enable_developer_extras",
          &api.webkit_settings_set_enable_developer_extras, &api);
+    bind(wk, "webkit_navigation_policy_decision_get_navigation_action",
+         &api.webkit_navigation_policy_decision_get_navigation_action, &api);
+    bind(wk, "webkit_navigation_action_get_request", &api.webkit_navigation_action_get_request,
+         &api);
+    bind(wk, "webkit_uri_request_get_uri", &api.webkit_uri_request_get_uri, &api);
+    bind(wk, "webkit_policy_decision_ignore", &api.webkit_policy_decision_ignore, &api);
 
     api.ok = api.error.empty();
     return api;
@@ -178,7 +188,12 @@ inline Api& api() {
 /** Injection time for a user script: at document START, so the bridge exists
  *  before any page script runs (mirrors AddScriptToExecuteOnDocumentCreated). */
 constexpr int kInjectAtDocumentStart = 0;
-constexpr int kInjectInAllFrames = 0;
+/** WEBKIT_USER_CONTENT_INJECT_TOP_FRAME: the page's own document, not every
+ *  frame in it (0 is ALL_FRAMES). */
+constexpr int kInjectTopFrameOnly = 1;
+/** WebKitPolicyDecisionType. */
+constexpr int kPolicyNavigationAction = 0;
+constexpr int kPolicyNewWindowAction = 1;
 
 /**
  * A webview inside a GtkPlug, embedded in the host's X11 window.
@@ -279,13 +294,18 @@ private:
     // The bridge, injected before page script, plus the message channel the
     // bridge posts to (window.webkit.messageHandlers.sonore).
     if (GObjectPtr manager = a.webkit_web_view_get_user_content_manager(webview_)) {
-      if (GObjectPtr script = a.webkit_user_script_new(bridge.c_str(), kInjectInAllFrames,
+      if (GObjectPtr script = a.webkit_user_script_new(bridge.c_str(), kInjectTopFrameOnly,
                                                        kInjectAtDocumentStart, nullptr, nullptr))
         a.webkit_user_content_manager_add_script(manager, script);
       a.webkit_user_content_manager_register_script_message_handler(manager, "sonore");
       a.g_signal_connect_data(manager, "script-message-received::sonore",
                               (void (*)()) &WebViewHost::onScriptMessage, this, nullptr, 0);
     }
+
+    // The page stays the page (webviewMayNavigate): asked before every
+    // navigation, in the page and in its frames, and before every new window.
+    a.g_signal_connect_data(webview_, "decide-policy", (void (*)()) &WebViewHost::onDecidePolicy,
+                            nullptr, nullptr, 0);
 
     a.gtk_widget_set_size_request(webview_, (int) width_, (int) height_);
     a.gtk_container_add(plug_, webview_);
@@ -306,7 +326,7 @@ public:
     }
     if (plug_ && a.gtk_widget_destroy) {
       // Destroying the plug destroys the webview it contains. A borrowed
-      // container (the standalone's own window) is not ours to destroy:
+      // container (the standalone's own window) is not ours to destroy;
       // only the webview inside it is.
       if (ownsPlug_) a.gtk_widget_destroy(plug_);
       else if (webview_) a.gtk_widget_destroy(webview_);
@@ -314,6 +334,7 @@ public:
       webview_ = nullptr;
     }
     ready_ = false;
+    captureKeys = false; // the page that asked is gone (see webview_win32.h)
   }
 
   bool ready() const { return ready_; }
@@ -342,7 +363,7 @@ public:
 
   void eval(const std::string& js) {
     Api& a = api();
-    if (!ready_ || !webview_ || !a.webkit_web_view_run_javascript) return;
+    if (js.empty() || !ready_ || !webview_ || !a.webkit_web_view_run_javascript) return;
     a.webkit_web_view_run_javascript(webview_, js.c_str(), nullptr, nullptr, nullptr);
   }
 
@@ -351,6 +372,23 @@ private:
     auto* host = static_cast<WebViewHost*>(self);
     if (host->onTick) host->onTick();
     return 1; // G_SOURCE_CONTINUE
+  }
+
+  /** "decide-policy". TRUE says the decision is made here; FALSE leaves it to
+   *  WebKit, whose default for a navigation is to go ahead -- which is what an
+   *  allowed one wants, and what a response (type 2) should always get. A new
+   *  window is refused whatever its address. */
+  static int onDecidePolicy(GtkWidgetPtr /*view*/, GObjectPtr decision, int type, void*) {
+    if (type != kPolicyNavigationAction && type != kPolicyNewWindowAction) return 0;
+    Api& a = api();
+    if (type == kPolicyNavigationAction) {
+      GObjectPtr action = a.webkit_navigation_policy_decision_get_navigation_action(decision);
+      GObjectPtr request = action ? a.webkit_navigation_action_get_request(action) : nullptr;
+      const char* uri = request ? a.webkit_uri_request_get_uri(request) : nullptr;
+      if (uri && webviewMayNavigate(uri)) return 0;
+    }
+    a.webkit_policy_decision_ignore(decision);
+    return 1;
   }
 
   static void onScriptMessage(GObjectPtr /*manager*/, void* result, void* self) {

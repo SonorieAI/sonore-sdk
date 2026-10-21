@@ -144,15 +144,18 @@ private:
  * shadow on a large editor costs a small bitmap.
  */
 struct DropShadow {
-  Colour colour{0, 0, 0, 140};
-  int radius = 6;
-  Point offset{0.0f, 3.0f};
+  Colour colour{0, 0, 0, 140};  ///< the shadow's colour; black at 55 % by default
+  int radius = 6;  ///< the blur's radius, in the path's units; under 1 draws nothing
+  Point offset{0.0f, 3.0f};  ///< how far the shadow sits from the shape, in the path's units
 
+  /** A soft black shadow 3 units below the shape, blurred by 6. */
   DropShadow() = default;
+  /** A shadow of colour `c`, blur radius `r`, moved by `o`. */
   DropShadow(Colour c, int r, Point o) : colour(c), radius(r), offset(o) {}
 
   /** Draw the shadow of `path` -- the shape itself is NOT drawn, so a caller
-   *  fills it afterwards in whatever colour it likes. */
+   *  fills it afterwards in whatever colour it likes. A shadow wider or
+   *  taller than 4096 units is not drawn at all. */
   void drawForPath(Graphics& g, const Path& path) const {
     if (radius < 1 || colour.a == 0) return;
 
@@ -223,10 +226,10 @@ struct RectanglePlacement {
     None,
   };
 
-  Fit fit = Fit::Contain;
+  Fit fit = Fit::Contain;  ///< how the size is chosen
   /** -1 left/top, 0 centre, 1 right/bottom. */
   float alignX = 0.0f;
-  float alignY = 0.0f;
+  float alignY = 0.0f;  ///< the same, vertically
 
   /** Where `source` (a size) ends up inside `destination`. */
   Rect apply(const Rect& source, const Rect& destination) const {
@@ -235,13 +238,13 @@ struct RectanglePlacement {
     float w = source.w, h = source.h;
     switch (fit) {
       case Fit::Contain: {
-        const float scale = std::min(destination.w / source.w, destination.h / source.h);
+        const float scale = (std::min)(destination.w / source.w, destination.h / source.h);
         w = source.w * scale;
         h = source.h * scale;
         break;
       }
       case Fit::Cover: {
-        const float scale = std::max(destination.w / source.w, destination.h / source.h);
+        const float scale = (std::max)(destination.w / source.w, destination.h / source.h);
         w = source.w * scale;
         h = source.h * scale;
         break;
@@ -263,9 +266,8 @@ struct RectanglePlacement {
 /**
  * The named colours.
  *
- * The set an icon or a stylesheet actually uses, not the 148 CSS names. Thirteen
- * of them were hand-rolled inside the SVG parser; this is the same table, in
- * one place, with a few more that people write.
+ * All 148 CSS names, and transparent. Thirteen were once hand-rolled inside the
+ * SVG parser; this is the one table, and the parser asks it.
  */
 namespace colours {
 
@@ -277,19 +279,65 @@ inline bool byName(const std::string& name, Colour* out) {
     uint32_t rgb;
     uint8_t alpha;
   };
+  // A hand-written SVG says "steelblue" as readily as "#4682b4", and with
+  // twenty-four names here every other one was drawn black.
   static const Named kTable[] = {
-      {"transparent", 0x000000, 0},   {"black", 0x000000, 255},
-      {"white", 0xffffff, 255},       {"red", 0xff0000, 255},
-      {"green", 0x008000, 255},       {"lime", 0x00ff00, 255},
-      {"blue", 0x0000ff, 255},        {"yellow", 0xffff00, 255},
-      {"cyan", 0x00ffff, 255},        {"aqua", 0x00ffff, 255},
-      {"magenta", 0xff00ff, 255},     {"fuchsia", 0xff00ff, 255},
-      {"grey", 0x808080, 255},        {"gray", 0x808080, 255},
-      {"silver", 0xc0c0c0, 255},      {"orange", 0xffa500, 255},
-      {"purple", 0x800080, 255},      {"navy", 0x000080, 255},
-      {"teal", 0x008080, 255},        {"olive", 0x808000, 255},
-      {"maroon", 0x800000, 255},      {"pink", 0xffc0cb, 255},
-      {"brown", 0xa52a2a, 255},       {"gold", 0xffd700, 255},
+      {"transparent", 0x000000, 0}, {"aliceblue", 0xf0f8ff, 255}, {"antiquewhite", 0xfaebd7, 255},
+      {"aqua", 0x00ffff, 255}, {"aquamarine", 0x7fffd4, 255}, {"azure", 0xf0ffff, 255},
+      {"beige", 0xf5f5dc, 255}, {"bisque", 0xffe4c4, 255}, {"black", 0x000000, 255},
+      {"blanchedalmond", 0xffebcd, 255}, {"blue", 0x0000ff, 255}, {"blueviolet", 0x8a2be2, 255},
+      {"brown", 0xa52a2a, 255}, {"burlywood", 0xdeb887, 255}, {"cadetblue", 0x5f9ea0, 255},
+      {"chartreuse", 0x7fff00, 255}, {"chocolate", 0xd2691e, 255}, {"coral", 0xff7f50, 255},
+      {"cornflowerblue", 0x6495ed, 255}, {"cornsilk", 0xfff8dc, 255}, {"crimson", 0xdc143c, 255},
+      {"cyan", 0x00ffff, 255}, {"darkblue", 0x00008b, 255}, {"darkcyan", 0x008b8b, 255},
+      {"darkgoldenrod", 0xb8860b, 255}, {"darkgray", 0xa9a9a9, 255}, {"darkgreen", 0x006400, 255},
+      {"darkgrey", 0xa9a9a9, 255}, {"darkkhaki", 0xbdb76b, 255}, {"darkmagenta", 0x8b008b, 255},
+      {"darkolivegreen", 0x556b2f, 255}, {"darkorange", 0xff8c00, 255},
+      {"darkorchid", 0x9932cc, 255}, {"darkred", 0x8b0000, 255}, {"darksalmon", 0xe9967a, 255},
+      {"darkseagreen", 0x8fbc8f, 255}, {"darkslateblue", 0x483d8b, 255},
+      {"darkslategray", 0x2f4f4f, 255}, {"darkslategrey", 0x2f4f4f, 255},
+      {"darkturquoise", 0x00ced1, 255}, {"darkviolet", 0x9400d3, 255},
+      {"deeppink", 0xff1493, 255}, {"deepskyblue", 0x00bfff, 255}, {"dimgray", 0x696969, 255},
+      {"dimgrey", 0x696969, 255}, {"dodgerblue", 0x1e90ff, 255}, {"firebrick", 0xb22222, 255},
+      {"floralwhite", 0xfffaf0, 255}, {"forestgreen", 0x228b22, 255}, {"fuchsia", 0xff00ff, 255},
+      {"gainsboro", 0xdcdcdc, 255}, {"ghostwhite", 0xf8f8ff, 255}, {"gold", 0xffd700, 255},
+      {"goldenrod", 0xdaa520, 255}, {"gray", 0x808080, 255}, {"grey", 0x808080, 255},
+      {"green", 0x008000, 255}, {"greenyellow", 0xadff2f, 255}, {"honeydew", 0xf0fff0, 255},
+      {"hotpink", 0xff69b4, 255}, {"indianred", 0xcd5c5c, 255}, {"indigo", 0x4b0082, 255},
+      {"ivory", 0xfffff0, 255}, {"khaki", 0xf0e68c, 255}, {"lavender", 0xe6e6fa, 255},
+      {"lavenderblush", 0xfff0f5, 255}, {"lawngreen", 0x7cfc00, 255},
+      {"lemonchiffon", 0xfffacd, 255}, {"lightblue", 0xadd8e6, 255},
+      {"lightcoral", 0xf08080, 255}, {"lightcyan", 0xe0ffff, 255},
+      {"lightgoldenrodyellow", 0xfafad2, 255}, {"lightgray", 0xd3d3d3, 255},
+      {"lightgreen", 0x90ee90, 255}, {"lightgrey", 0xd3d3d3, 255}, {"lightpink", 0xffb6c1, 255},
+      {"lightsalmon", 0xffa07a, 255}, {"lightseagreen", 0x20b2aa, 255},
+      {"lightskyblue", 0x87cefa, 255}, {"lightslategray", 0x778899, 255},
+      {"lightslategrey", 0x778899, 255}, {"lightsteelblue", 0xb0c4de, 255},
+      {"lightyellow", 0xffffe0, 255}, {"lime", 0x00ff00, 255}, {"limegreen", 0x32cd32, 255},
+      {"linen", 0xfaf0e6, 255}, {"magenta", 0xff00ff, 255}, {"maroon", 0x800000, 255},
+      {"mediumaquamarine", 0x66cdaa, 255}, {"mediumblue", 0x0000cd, 255},
+      {"mediumorchid", 0xba55d3, 255}, {"mediumpurple", 0x9370db, 255},
+      {"mediumseagreen", 0x3cb371, 255}, {"mediumslateblue", 0x7b68ee, 255},
+      {"mediumspringgreen", 0x00fa9a, 255}, {"mediumturquoise", 0x48d1cc, 255},
+      {"mediumvioletred", 0xc71585, 255}, {"midnightblue", 0x191970, 255},
+      {"mintcream", 0xf5fffa, 255}, {"mistyrose", 0xffe4e1, 255}, {"moccasin", 0xffe4b5, 255},
+      {"navajowhite", 0xffdead, 255}, {"navy", 0x000080, 255}, {"oldlace", 0xfdf5e6, 255},
+      {"olive", 0x808000, 255}, {"olivedrab", 0x6b8e23, 255}, {"orange", 0xffa500, 255},
+      {"orangered", 0xff4500, 255}, {"orchid", 0xda70d6, 255}, {"palegoldenrod", 0xeee8aa, 255},
+      {"palegreen", 0x98fb98, 255}, {"paleturquoise", 0xafeeee, 255},
+      {"palevioletred", 0xdb7093, 255}, {"papayawhip", 0xffefd5, 255},
+      {"peachpuff", 0xffdab9, 255}, {"peru", 0xcd853f, 255}, {"pink", 0xffc0cb, 255},
+      {"plum", 0xdda0dd, 255}, {"powderblue", 0xb0e0e6, 255}, {"purple", 0x800080, 255},
+      {"rebeccapurple", 0x663399, 255}, {"red", 0xff0000, 255}, {"rosybrown", 0xbc8f8f, 255},
+      {"royalblue", 0x4169e1, 255}, {"saddlebrown", 0x8b4513, 255}, {"salmon", 0xfa8072, 255},
+      {"sandybrown", 0xf4a460, 255}, {"seagreen", 0x2e8b57, 255}, {"seashell", 0xfff5ee, 255},
+      {"sienna", 0xa0522d, 255}, {"silver", 0xc0c0c0, 255}, {"skyblue", 0x87ceeb, 255},
+      {"slateblue", 0x6a5acd, 255}, {"slategray", 0x708090, 255}, {"slategrey", 0x708090, 255},
+      {"snow", 0xfffafa, 255}, {"springgreen", 0x00ff7f, 255}, {"steelblue", 0x4682b4, 255},
+      {"tan", 0xd2b48c, 255}, {"teal", 0x008080, 255}, {"thistle", 0xd8bfd8, 255},
+      {"tomato", 0xff6347, 255}, {"turquoise", 0x40e0d0, 255}, {"violet", 0xee82ee, 255},
+      {"wheat", 0xf5deb3, 255}, {"white", 0xffffff, 255}, {"whitesmoke", 0xf5f5f5, 255},
+      {"yellow", 0xffff00, 255}, {"yellowgreen", 0x9acd32, 255},
   };
   for (const Named& named : kTable)
     if (name == named.name) {

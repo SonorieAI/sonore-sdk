@@ -25,8 +25,11 @@ struct SonoreDsp {
     const size_t n = io.getNumSamples();
     const size_t nch = io.getNumChannels();
     const Sample phase = p[1] >= 0.5f ? (Sample) -1 : (Sample) 1;
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float gainTarget = sonore::dbToGain(p[0]);
     for (size_t i = 0; i < n; ++i) {
-      const Sample g = (Sample) (gainSm.next(sonore::dbToGain(p[0]))) * phase;
+      const Sample g = (Sample) (gainSm.next(gainTarget)) * phase;
       for (size_t c = 0; c < nch; ++c) io.getChannelPointer(c)[i] *= g;
     }
   }
@@ -58,21 +61,4 @@ static const sonore::PluginDescriptor kDesc = {
     8,         // maxChannels: up to 7.1
 };
 
-#include <sonore/clap_wrapper.h>
-
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

@@ -749,6 +749,46 @@ int main() {
     }
   }
 
+  // ── The clipboard, across a tooltip and a second editor ──────────────────
+  //
+  // A popup installed itself as the clipboard's window like any other, and its
+  // close() uninstalled the clipboard outright: after the first tooltip, copy
+  // and paste in the editor beneath it reached nothing outside the process.
+  // And closing one of two editors left the other with no clipboard either,
+  // the text just copied from the closed one gone with its window.
+  std::printf("\n-- clipboard ownership --\n");
+  {
+    Component pageA, pageB, tip;
+    pageA.setBounds({0.0f, 0.0f, 120.0f, 60.0f});
+    pageB.setBounds({0.0f, 0.0f, 120.0f, 60.0f});
+    tip.setBounds({0.0f, 0.0f, 80.0f, 20.0f});
+    const Atom clipboardAtom = XInternAtom(poster, "CLIPBOARD", False);
+
+    NativeWindowX11 editorA, editorB, tooltip;
+    check(editorA.open(nullptr, pageA, 120, 60), "an editor window opens");
+    check(tooltip.openPopup(tip, 300, 300, 80, 20, false), "and a tooltip over it");
+    tooltip.close();
+    check(*Clipboard::setter() != nullptr && *Clipboard::getter() != nullptr,
+          "closing the tooltip leaves the editor serving the clipboard");
+    Clipboard::setText("from A");
+    check(XGetSelectionOwner(poster, clipboardAtom) == (Window) (uintptr_t) editorA.handle(),
+          "and a copy in the editor still takes the X selection");
+
+    check(editorB.open(nullptr, pageB, 120, 60), "a second editor opens");
+    Clipboard::setText("from B");
+    check(XGetSelectionOwner(poster, clipboardAtom) == (Window) (uintptr_t) editorB.handle(),
+          "a copy there takes the selection for that window");
+    editorB.close();
+    check(XGetSelectionOwner(poster, clipboardAtom) == (Window) (uintptr_t) editorA.handle(),
+          "closing it hands the selection to the editor still open");
+    std::string pasted;
+    check(Clipboard::getText(&pasted) && pasted == "from B",
+          "with the text that was copied, still there to paste");
+    editorA.close();
+    check(*Clipboard::setter() == nullptr && *Clipboard::getter() == nullptr,
+          "and with no editor open, nothing claims to serve");
+  }
+
   XCloseDisplay(poster);
   std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
   if (g_failures == 0) std::printf("SONORE X11 WINDOW TEST PASSED\n");

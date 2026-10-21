@@ -58,11 +58,16 @@ struct Display {
    * In a PLUGIN this is usually not what decides the editor's scale: the host
    * owns the window and tells us through clap.gui set_scale,
    * IPlugViewContentScaleSupport or ui:scaleFactor, and its answer wins because
-   * it may be compositing the view somewhere we cannot see. This is what the
-   * STANDALONE uses, and what a plugin falls back to when the host says
-   * nothing.
+   * it may be compositing the view somewhere we cannot see. This is the
+   * answer for a STANDALONE, and for a plugin whose host says nothing; the
+   * SDK's own windows read their window's DPI rather than this list.
+   *
+   * Win32 reads each monitor's DPI (in the opening thread's DPI awareness,
+   * like the rectangles), Cocoa each screen's backing scale; X has one scale
+   * for the whole desktop, which every screen gets.
    */
   float scale = 1.0f;
+  /** The primary screen, the one Displays::main() answers with. */
   bool isMain = false;
 };
 
@@ -84,11 +89,16 @@ public:
     return displays;
   }
 
+  /** Replace the list, as a peer does. An empty list puts back the
+   *  single-screen default: 1920 by 1080 at the origin, scale 1, main. */
   static void set(std::vector<Display> displays) {
     if (displays.empty()) displays.push_back(defaultDisplay());
     all() = std::move(displays);
   }
 
+  /** The display marked isMain, or the first one when none is. The list is
+   *  never empty, so there is always one; the reference stays valid until
+   *  the next set(). */
   static const Display& main() {
     const std::vector<Display>& list = all();
     for (const Display& d : list)
@@ -128,6 +138,7 @@ public:
     return out;
   }
 
+  /** How many screens the list has: at least 1. */
   static int count() { return (int) all().size(); }
 
 

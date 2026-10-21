@@ -87,8 +87,25 @@ inline float formatScale(long type) {
   }
 }
 
+namespace detail {
+/** What a float goes through before any format sees it: clamped to [-1, 1],
+ *  and a NaN made silence. A NaN passes both comparisons of the clamp
+ *  untouched, and an integer format then casts it to the most negative code
+ *  -- a full-scale click into the speakers from one bad sample -- so it is
+ *  caught after them. That order also lets the clamp compile to a max and a
+ *  min, where testing for NaN first left it as branches; what comes out is
+ *  the same for every input, -0.0 included. */
+inline float deviceSample(float v) {
+  v = v < -1.0f ? -1.0f : v;
+  v = v > 1.0f ? 1.0f : v;
+  return v == v ? v : 0.0f;
+}
+} // namespace detail
+
 /**
- * One float sample into a driver buffer, at frame `i`.
+ * A run of float samples into a driver buffer: `frames` of them, read
+ * `stride` floats apart from `source` (2 for one side of interleaved stereo),
+ * written to frames 0..frames-1 of `destination` in the driver's format.
  *
  * Clamped before conversion, not after. A sample above full scale wraps to
  * the opposite sign when it is truncated into an integer, and a wrap is a
@@ -98,63 +115,183 @@ inline float formatScale(long type) {
  * the largest representable positive rather than one past it. The asymmetry
  * is real and is in every fixed-point audio format: there is one more
  * negative code than positive.
+ *
+ * A RUN, because that is what the buffer switch converts: two channels each
+ * way, a block each. It went through writeSample one sample at a time, which
+ * picked the format again for every sample and kept nothing in a register
+ * from one to the next: 1.6 to 1.9 ns a sample, seven times what the
+ * standalone spends on a whole 256-frame block around a DSP that does
+ * nothing. Here the format is picked once and each loop is that format's
+ * arithmetic alone. writeSample is a run of one, so this is still the only
+ * copy of each conversion.
  */
-inline void writeSample(void* destination, size_t i, long type, float v) {
-  v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+inline void writeSamples(void* destination, long type, const float* source, size_t stride,
+                         size_t frames) {
   switch (type) {
-    case kAsioFloat32Lsb:
-      ((float*) destination)[i] = v;
-      return;
-    case kAsioInt16Lsb:
-      ((int16_t*) destination)[i] = (int16_t) (v * 32767.0f);
-      return;
-    case kAsioInt24Lsb: {
-      const int32_t s = (int32_t) (v * 8388607.0f);
-      uint8_t* p = (uint8_t*) destination + i * 3;
-      p[0] = (uint8_t) (s & 0xff);
-      p[1] = (uint8_t) ((s >> 8) & 0xff);
-      p[2] = (uint8_t) ((s >> 16) & 0xff);
+    case kAsioFloat32Lsb: {
+      float* out = static_cast<float*>(destination);
+      for (size_t i = 0; i < frames; ++i) out[i] = detail::deviceSample(source[i * stride]);
       return;
     }
-    case kAsioInt32Lsb:
-      ((int32_t*) destination)[i] = (int32_t) ((double) v * 2147483647.0);
+    case kAsioInt16Lsb: {
+      int16_t* out = static_cast<int16_t*>(destination);
+      for (size_t i = 0; i < frames; ++i)
+        out[i] = (int16_t) (detail::deviceSample(source[i * stride]) * 32767.0f);
       return;
+    }
+    case kAsioInt24Lsb: {
+      uint8_t* p = static_cast<uint8_t*>(destination);
+      for (size_t i = 0; i < frames; ++i, p += 3) {
+        const int32_t s = (int32_t) (detail::deviceSample(source[i * stride]) * 8388607.0f);
+        p[0] = (uint8_t) (s & 0xff);
+        p[1] = (uint8_t) ((s >> 8) & 0xff);
+        p[2] = (uint8_t) ((s >> 16) & 0xff);
+      }
+      return;
+    }
+    case kAsioInt32Lsb: {
+      int32_t* out = static_cast<int32_t*>(destination);
+      for (size_t i = 0; i < frames; ++i)
+        out[i] = (int32_t) ((double) detail::deviceSample(source[i * stride]) * 2147483647.0);
+      return;
+    }
     case kAsioInt32Lsb16:
     case kAsioInt32Lsb18:
     case kAsioInt32Lsb20:
-    case kAsioInt32Lsb24:
-      ((int32_t*) destination)[i] = (int32_t) (v * (formatScale(type) - 1.0f));
+    case kAsioInt32Lsb24: {
+      const float top = formatScale(type) - 1.0f;
+      int32_t* out = static_cast<int32_t*>(destination);
+      for (size_t i = 0; i < frames; ++i)
+        out[i] = (int32_t) (detail::deviceSample(source[i * stride]) * top);
       return;
+    }
     default:
       return;
   }
 }
 
-/** The exact inverse: one sample of a driver buffer back out as a float. */
-inline float readSample(const void* source, size_t i, long type) {
+/** The exact inverse, a run at a time: frames 0..frames-1 of a driver buffer
+ *  out as floats, written `stride` apart into `destination`. A format this
+ *  build does not convert reads as silence, not garbage. */
+inline void readSamples(const void* source, long type, float* destination, size_t stride,
+                        size_t frames) {
   switch (type) {
-    case kAsioFloat32Lsb:
-      return ((const float*) source)[i];
-    case kAsioInt16Lsb:
-      return (float) ((const int16_t*) source)[i] / 32768.0f;
-    case kAsioInt24Lsb: {
-      const uint8_t* p = (const uint8_t*) source + i * 3;
-      int32_t s = (int32_t) ((uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16));
-      // Sign-extend from 24 bits. Without this every negative sample reads as
-      // a large positive one, which is not quiet distortion -- it is a
-      // full-scale buzz on half the waveform.
-      if (s & 0x800000) s |= (int32_t) 0xFF000000;
-      return (float) s / 8388608.0f;
+    case kAsioFloat32Lsb: {
+      const float* in = static_cast<const float*>(source);
+      for (size_t i = 0; i < frames; ++i) destination[i * stride] = in[i];
+      return;
     }
-    case kAsioInt32Lsb:
-      return (float) ((const int32_t*) source)[i] / 2147483648.0f;
+    case kAsioInt16Lsb: {
+      const int16_t* in = static_cast<const int16_t*>(source);
+      for (size_t i = 0; i < frames; ++i) destination[i * stride] = (float) in[i] / 32768.0f;
+      return;
+    }
+    case kAsioInt24Lsb: {
+      const uint8_t* p = static_cast<const uint8_t*>(source);
+      for (size_t i = 0; i < frames; ++i, p += 3) {
+        int32_t s =
+            (int32_t) ((uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16));
+        // Sign-extend from 24 bits. Without this every negative sample reads
+        // as a large positive one, which is not quiet distortion -- it is a
+        // full-scale buzz on half the waveform.
+        if (s & 0x800000) s |= (int32_t) 0xFF000000;
+        destination[i * stride] = (float) s / 8388608.0f;
+      }
+      return;
+    }
+    case kAsioInt32Lsb: {
+      const int32_t* in = static_cast<const int32_t*>(source);
+      for (size_t i = 0; i < frames; ++i) destination[i * stride] = (float) in[i] / 2147483648.0f;
+      return;
+    }
     case kAsioInt32Lsb16:
     case kAsioInt32Lsb18:
     case kAsioInt32Lsb20:
-    case kAsioInt32Lsb24:
-      return (float) ((const int32_t*) source)[i] / formatScale(type);
+    case kAsioInt32Lsb24: {
+      const float scale = formatScale(type);
+      const int32_t* in = static_cast<const int32_t*>(source);
+      for (size_t i = 0; i < frames; ++i) destination[i * stride] = (float) in[i] / scale;
+      return;
+    }
     default:
-      return 0.0f;
+      for (size_t i = 0; i < frames; ++i) destination[i * stride] = 0.0f;
+      return;
+  }
+}
+
+/** One float sample into a driver buffer, at frame `i`: a run of one (see
+ *  writeSamples, for the clamp and the scale). */
+inline void writeSample(void* destination, size_t i, long type, float v) {
+  writeSamples(static_cast<uint8_t*>(destination) + i * formatBytes(type), type, &v, 1, 1);
+}
+
+/** The exact inverse: one sample of a driver buffer back out as a float. */
+inline float readSample(const void* source, size_t i, long type) {
+  float v = 0.0f;
+  readSamples(static_cast<const uint8_t*>(source) + i * formatBytes(type), type, &v, 1, 1);
+  return v;
+}
+
+// ── The host's half of asioMessage ───────────────────────────────────────────
+//
+// Here rather than in audio_asio.h for the reason the conversions are: the
+// answers are a table, the table is what was wrong, and outside the Windows
+// guard it can be asserted on every leg of the gate.
+//
+// The selector numbers are the published interface's, in its order. The first
+// version of this answered by a private numbering -- 4 labelled "engine
+// version", which is the BUFFER-SIZE-CHANGE selector -- and replied "yes" to
+// kAsioSelectorSupported whatever selector it was asked about. So it claimed
+// to handle resets it ignored, and "accepted" buffer-size changes it never
+// applied: the driver shrinks its buffers and we go on filling the old size.
+enum : long {
+  kAsioSelectorSupported = 1,
+  kAsioEngineVersion = 2,
+  kAsioResetRequest = 3,
+  kAsioBufferSizeChange = 4,
+  kAsioResyncRequest = 5,
+  kAsioLatenciesChanged = 6,
+  kAsioSupportsTimeInfo = 7,
+  kAsioSupportsTimeCode = 8,
+};
+
+/**
+ * What a host answers to the driver's asioMessage(selector, value).
+ *
+ * `wantsReset` is set when the driver asked for the stream to be rebuilt --
+ * the caller tears down and reopens on its own thread, never inside this
+ * callback, which may arrive on the driver's.
+ *
+ *   - ResetRequest: supported. The driver will not apply its change until we
+ *     reopen it, so saying yes and doing nothing is what hangs a control panel.
+ *   - BufferSizeChange: NOT supported, on purpose. Answering 0 is what the
+ *     interface specifies for a host that cannot resize live, and a driver
+ *     that gets it falls back to ResetRequest -- the path we do support.
+ *   - ResyncRequest: acknowledged. It invalidates the driver's timestamps,
+ *     and nothing here reads them.
+ *   - LatenciesChanged: acknowledged; latencies are asked for when needed,
+ *     never cached.
+ *   - SupportsTimeInfo / TimeCode: no. We register bufferSwitch, not
+ *     bufferSwitchTimeInfo, and saying yes would make the driver call the null
+ *     one.
+ */
+inline long hostMessageReply(long selector, long value, bool* wantsReset) {
+  switch (selector) {
+    case kAsioSelectorSupported:
+      return (value == kAsioEngineVersion || value == kAsioResetRequest ||
+              value == kAsioResyncRequest || value == kAsioLatenciesChanged)
+                 ? 1
+                 : 0;
+    case kAsioEngineVersion:
+      return 2;
+    case kAsioResetRequest:
+      if (wantsReset) *wantsReset = true;
+      return 1;
+    case kAsioResyncRequest:
+    case kAsioLatenciesChanged:
+      return 1;
+    default:
+      return 0;
   }
 }
 

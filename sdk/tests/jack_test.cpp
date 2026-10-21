@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // The JACK backend, against a real server.
 //
-// jackd can be unpacked and started without root, in dummy mode, which gives a
-// real server with a real real-time thread calling a real client. The only thing missing is actual
+// The map used to say this was "written, never run against a live JACK server
+// -- there is not one in this loop". There is now: jackd can be unpacked and
+// started without root, in dummy mode, which gives a real server with a real
+// real-time thread calling a real client. The only thing missing is actual
 // hardware, and this backend never touches hardware -- JACK does.
 //
 // What that buys is the property no amount of reading gets you: that the

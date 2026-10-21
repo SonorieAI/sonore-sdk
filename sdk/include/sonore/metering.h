@@ -13,10 +13,14 @@
 // standard's own 48 kHz table, rather than that table being pasted in and
 // wrong at every other rate.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "metering.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include "audio.h"
+#include "simd.h"
 
 namespace sonore {
 
@@ -46,13 +50,19 @@ namespace sonore {
  */
 class KWeighting {
 public:
+  /** Designs both filters for `sr` Hz (1 or less is taken as 48000) and
+   *  clears their state. No allocation, but it calls tan and pow: once per
+   *  rate change, not per block. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     design();
     reset();
   }
+  /** Clears both filters' state; the design is kept. */
   void reset() { shelf_.reset(); highpass_.reset(); }
 
+  /** [audio thread] One sample through the shelf and then the high-pass:
+   *  the K-weighted signal, whose mean square BS.1770 turns into loudness. */
   inline float process(float x) { return highpass_.process(shelf_.process(x)); }
 
 private:
@@ -70,11 +80,9 @@ private:
       const double Vh = std::pow(10.0, G / 20.0);
       const double Vb = std::pow(Vh, 0.4996667741545416);
       const double a0 = 1.0 + K / Q + K * K;
-      shelf_.setCoefficients((float) ((Vh + Vb * K / Q + K * K) / a0),
-                             (float) (2.0 * (K * K - Vh) / a0),
-                             (float) ((Vh - Vb * K / Q + K * K) / a0),
-                             (float) (2.0 * (K * K - 1.0) / a0),
-                             (float) ((1.0 - K / Q + K * K) / a0));
+      shelf_.setCoefficients((Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0,
+                             (Vh - Vb * K / Q + K * K) / a0, 2.0 * (K * K - 1.0) / a0,
+                             (1.0 - K / Q + K * K) / a0);
     }
     // RLB high-pass. The numerator is the standard's literal 1, -2, 1 --
     // NOT normalised by a0, which is how the published table has it; the
@@ -83,13 +91,13 @@ private:
       const double f0 = 38.13547087602444, Q = 0.5003270373238773;
       const double K = std::tan((double) kPi * f0 / fs);
       const double a0 = 1.0 + K / Q + K * K;
-      highpass_.setCoefficients(1.0f, -2.0f, 1.0f,
-                                (float) (2.0 * (K * K - 1.0) / a0),
-                                (float) ((1.0 - K / Q + K * K) / a0));
+      highpass_.setCoefficients(1.0, -2.0, 1.0, 2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0);
     }
   }
 
-  Biquad shelf_, highpass_;
+  // Double, coefficients and state: the 38 Hz high-pass at 384 kHz in a float
+  // biquad read 20 Hz 0.3 dB off what it reads at 192 (see IirSection).
+  IirSection shelf_, highpass_;
   float sr_ = 48000.0f;
 };
 
@@ -131,6 +139,11 @@ public:
    *  hands the faceplate -inf has to be special-cased by whoever draws it. */
   static constexpr float kSilence = -100.0f;
 
+  /** Sets the rate and channel count and starts again from silence, as
+   *  reset() does. The count is clamped to 1..MaxChannels; the standard's
+   *  channel weights for that layout are applied, except to channels
+   *  setChannelWeight() overrode. Allocates nothing: every buffer is a
+   *  fixed-size member. */
   void prepare(const ProcessSpec& spec) {
     sr_ = (float) spec.sampleRate;
     channels_ = (int) spec.numChannels;
@@ -145,6 +158,10 @@ public:
     reset();
   }
 
+  /** Forgets everything measured: filters, the 3 s window and both
+   *  histograms, so momentary(), shortTerm() and integrated() read kSilence
+   *  and range() reads 0 until enough is measured again. Channel weights are
+   *  kept. */
   void reset() {
     for (int c = 0; c < MaxChannels; ++c) filter_[c].reset();
     for (int i = 0; i < kMomentaryBlocks; ++i) momentaryRing_[i] = 0.0;
@@ -157,8 +174,20 @@ public:
     momentary_ = shortTerm_ = kSilence;
   }
 
+  /** Override one channel's weight. It KEEPS across prepare(): the defaults
+   *  were rewritten there, so a 7.1 LFE set to 0 went back to 1.0 the first
+   *  time a host changed the rate, and the reading rose with nothing said. */
   void setChannelWeight(int channel, float weight) {
-    if (channel >= 0 && channel < MaxChannels) weight_[channel] = weight;
+    if (channel >= 0 && channel < MaxChannels) {
+      weight_[channel] = weight;
+      overridden_[channel] = true;
+    }
+  }
+
+  /** Back to the standard's weights for the current layout. */
+  void resetChannelWeights() {
+    for (bool& o : overridden_) o = false;
+    defaultWeights();
   }
 
   /** One frame. `frame` holds one sample per channel. [audio thread] */
@@ -166,7 +195,14 @@ public:
     double z = 0.0;
     for (int c = 0; c < channels_; ++c) {
       const float w = filter_[c].process(frame[c]);
-      z += (double) weight_[c] * (double) w * (double) w;
+      // A sample that is not finite carries no loudness. Its power went into
+      // the 100 ms block whole: momentary read +inf LUFS for 400 ms and
+      // short-term for 3 s, and binOf() booked those blocks through (int) of
+      // infinity -- undefined; bin 0 on x64, the top bin on ARM64, where four
+      // blocks at +9.95 LUFS gate a -23 programme out of its own integrated
+      // reading. (The filter has already dropped it from its state.)
+      const double power = (double) weight_[c] * (double) w * (double) w;
+      if (std::isfinite(power)) z += power;
     }
     acc_ += z;
     if (++inSub_ >= subBlock_) {
@@ -198,13 +234,26 @@ public:
     }
   }
 
-  /** Stereo convenience: one frame from two samples. */
+  /** Stereo convenience: one frame from two samples. A meter prepared for
+   *  more channels reads the rest of the frame as silence; one prepared for
+   *  mono reads the left.
+   *
+   *  The frame is as wide as the meter. It was two floats, and process()
+   *  reads as many as prepare() was given: a 5.1 meter fed this way read
+   *  four samples past the array (ASan: stack-buffer-overflow), and a
+   *  -23 LUFS stereo tone measured +9.95 on whatever lay beside it. */
   inline void process(float left, float right) {
-    float f[2] = {left, right};
+    float f[MaxChannels] = {};
+    f[0] = left;
+    if constexpr (MaxChannels > 1) f[1] = right;
     process(f);
   }
 
+  /** Loudness of the last 400 ms in LUFS, updated every 100 ms. kSilence
+   *  until 400 ms have been measured since reset(), and for silence. */
   float momentary() const { return momentary_; }
+  /** Loudness of the last 3 s in LUFS, updated every 100 ms. kSilence until
+   *  3 s have been measured since reset(), and for silence. */
   float shortTerm() const { return shortTerm_; }
 
   /** Integrated loudness over everything since reset(), gated as BS.1770
@@ -281,21 +330,25 @@ private:
   }
 
   void defaultWeights() {
-    for (int c = 0; c < MaxChannels; ++c) weight_[c] = 1.0f;
+    float standard[MaxChannels];
+    for (int c = 0; c < MaxChannels; ++c) standard[c] = 1.0f;
     // `if constexpr` so a meter sized for stereo never even compiles the
     // 5.1 branch -- gcc's -Warray-bounds correctly points out that
-    // weight_[5] does not exist in a LoudnessMeter<2>.
+    // standard[5] does not exist in a LoudnessMeter<2>.
     if constexpr (MaxChannels >= 6) {
       if (channels_ == 6) {
-        weight_[3] = 0.0f;  // LFE
-        weight_[4] = 1.41f; // Ls
-        weight_[5] = 1.41f; // Rs
+        standard[3] = 0.0f;  // LFE
+        standard[4] = 1.41f; // Ls
+        standard[5] = 1.41f; // Rs
       }
     }
+    for (int c = 0; c < MaxChannels; ++c)
+      if (!overridden_[c]) weight_[c] = standard[c];
   }
 
   KWeighting filter_[MaxChannels];
   float weight_[MaxChannels]{};
+  bool overridden_[MaxChannels]{};
   double momentaryRing_[kMomentaryBlocks]{};
   double shortRing_[kShortTermBlocks]{};
   uint32_t integratedHist_[kBins]{};
@@ -326,16 +379,21 @@ private:
  */
 class TruePeakMeter {
 public:
+  /** Computes the interpolation taps and starts from silence. The filter
+   *  does not depend on the sample rate, so there is no prepare(). */
   TruePeakMeter() { buildTaps(); reset(); }
 
+  /** Clears the history and the held maximum: peakLinear() reads 0 and
+   *  peakDb() -180 until the next sample. */
   void reset() {
     for (int i = 0; i < 2 * kTaps; ++i) history_[i] = 0.0f;
     write_ = 0;
     held_ = 0.0f;
   }
 
-  /** Feed one sample; returns the true-peak ABSOLUTE level around it (linear),
-   *  and holds the maximum until reset(). [audio thread] */
+  /** Feed one sample; returns the true-peak ABSOLUTE level (linear) of the
+   *  stretch kHalf - 1 samples behind it -- where the interpolator's points
+   *  are -- and holds the maximum until reset(). [audio thread] */
   inline float process(float x) {
     // Written twice, a ring's length apart, so the last kTaps samples are
     // always CONTIGUOUS starting at write_+1 -- no modulo in the inner loop,
@@ -345,19 +403,31 @@ public:
     history_[write_ + kTaps] = x;
     const float* window = history_ + write_ + 1; // oldest first, newest last
     write_ = (write_ + 1) % kTaps;
-    float peak = std::fabs(x);
+    // The interpolated points fall between window[kHalf - 1] and
+    // window[kHalf], so the sample they are compared with is window[kHalf]:
+    // the same instant. Comparing them with x, the newest, put a click's
+    // level out seven samples before its waveform, and the true-peak limiter
+    // detecting on this saw every transient that early.
+    float peak = std::fabs(window[kHalf]);
     for (int ph = 0; ph < kPhases - 1; ++ph) {
-      float v = 0.0f;
-      for (int k = 0; k < kTaps; ++k) v += window[k] * taps_[ph][k];
+      // A contiguous window against contiguous taps: simd::dot's whole job,
+      // four lanes at a time, in the lane order every backend shares.
+      const float v = simd::dot(window, taps_[ph], (size_t) kTaps);
       const float a = std::fabs(v);
       if (a > peak) peak = a;
     }
+    // The held maximum takes the newest sample as well, so it never reads
+    // under the sample peak, even of the last few samples before a reset.
+    const float ax = std::fabs(x);
     if (peak > held_) held_ = peak;
+    if (ax > held_) held_ = ax;
     return peak;
   }
 
   /** The highest true peak since reset(), in dBTP. */
   float peakDb() const { return held_ > 1e-9f ? 20.0f * std::log10(held_) : -180.0f; }
+  /** The highest true peak since reset(), as a linear absolute level (1.0 is
+   *  0 dBTP). Never below the highest sample fed since then. */
   float peakLinear() const { return held_; }
 
 private:
@@ -411,14 +481,18 @@ private:
  */
 class CorrelationMeter {
 public:
+  /** The rate in Hz (1 or less is taken as 48000); recomputes the averaging
+   *  coefficient for the current setTime(). Keeps the averages. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; setTime(windowMs_); }
   /** Averaging time. 300 ms is what hardware meters use. */
   void setTime(float ms) {
     windowMs_ = ms > 1.0f ? ms : 1.0f;
     a_ = std::exp(-1.0f / (0.001f * windowMs_ * sr_));
   }
+  /** Clears the three averages, so value() reads 0 until signal arrives. */
   void reset() { lr_ = ll_ = rr_ = 0.0f; }
 
+  /** One stereo sample pair into the averages. No allocation. [audio thread] */
   inline void process(float left, float right) {
     const float b = 1.0f - a_;
     lr_ = flushDenormal(a_ * lr_ + b * left * right);

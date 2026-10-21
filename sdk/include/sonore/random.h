@@ -27,6 +27,14 @@
 namespace sonore {
 
 /**
+ * The fixed default seed, in one place instead of five copies of the literal.
+ *
+ * Every generator below takes a seed and defaults to THIS one, and each default
+ * ctor is deliberately NOT `explicit` while the seeded ctor is -- see Random.
+ */
+inline constexpr uint64_t kDefaultSeed = 0x2545F4914F6CDD1Dull;
+
+/**
  * xoshiro128+, seeded by splitmix64.
  *
  * Deterministic from its seed, which matters more than it sounds: a plugin
@@ -38,10 +46,37 @@ public:
   /** The default seed is fixed, not the clock. A plugin that seeded from time
    *  would produce a different render every time it was bounced, and "bounce
    *  twice, compare" is how people check a DAW did what they asked. A caller
-   *  that genuinely wants unpredictability passes its own seed. */
-  explicit Random(uint64_t seed = 0x2545F4914F6CDD1Dull) { setSeed(seed); }
+   *  that genuinely wants unpredictability passes its own seed.
+   *
+   *  The constructor is SPLIT IN TWO ON PURPOSE, and it is not style.
+   *
+   *  This was one `explicit Random(uint64_t seed = kDefaultSeed)`: an explicit
+   *  constructor that is also the DEFAULT constructor. A DSP holding one as a
+   *  member is then an aggregate whose member cannot be copy-initialised from
+   *  `{}`, so `SonoreDsp dsp{}` -- which is exactly what clap_wrapper.h writes
+   *  -- is ill-formed. GCC accepts it, clang does not, so a plugin using noise
+   *  or dither BUILT ON LINUX AND FAILED ON MACOS with
+   *  "chosen constructor is explicit in copy-initialization", pointing at the
+   *  SDK header rather than at the member responsible. One did: it shipped to
+   *  the marketplace Linux-only before anyone noticed.
+   *
+   *  A non-explicit default ctor fixes that. `explicit` stays on the SEEDED one,
+   *  which is where it was ever earning anything -- it stops a bare integer
+   *  silently becoming a Random. */
+  Random() { setSeed(kDefaultSeed); }
+  /** The sequence `seed` gives: the same numbers on every platform and every
+   *  run. Any value works, 0 included. */
+  explicit Random(uint64_t seed) { setSeed(seed); }
 
+  /** Back to the start of the sequence the last seed gave: what a reset()
+   *  holding one of these means. Without it a reset drew on from wherever
+   *  the noise had got to, and two renders of the same audio did not null. */
+  void restart() { setSeed(seed_); }
+
+  /** Start the sequence `seed` gives, the same as a fresh Random(seed), and
+   *  make it the one restart() returns to. Any value works, 0 included. */
   void setSeed(uint64_t seed) {
+    seed_ = seed;
     // splitmix64, whose whole job is turning a poor seed into good state. Seeded
     // directly with a small number, xoshiro's first dozen outputs are visibly
     // correlated -- and a plugin seeded with 1 is exactly what happens.
@@ -88,6 +123,7 @@ public:
     return (int) (((uint64_t) nextUint32() * (uint64_t) limit) >> 32);
   }
 
+  /** [audio thread] True or false with even odds, from the strongest (top) bit. */
   bool nextBool() { return (nextUint32() >> 31) != 0; }
 
   /**
@@ -107,6 +143,7 @@ public:
 
 private:
   uint32_t state_[4] = {0, 0, 0, 0};
+  uint64_t seed_ = kDefaultSeed; // what restart() goes back to
 };
 
 /**
@@ -118,9 +155,16 @@ private:
  */
 class WhiteNoise {
 public:
-  explicit WhiteNoise(uint64_t seed = 0x2545F4914F6CDD1Dull) : random_(seed) {}
+  /** Default ctor non-explicit so this type can be a DSP member -- see Random. */
+  WhiteNoise() : random_(kDefaultSeed) {}
+  /** Noise from `seed`; give each voice its own so voices do not cancel. */
+  explicit WhiteNoise(uint64_t seed) : random_(seed) {}
 
+  /** Start the noise `seed` gives, the same as a fresh WhiteNoise(seed);
+   *  reset() returns to it. */
   void setSeed(uint64_t seed) { random_.setSeed(seed); }
+  /** The noise from the start of its seed again. */
+  void reset() { random_.restart(); }
 
   /** [audio thread] */
   float next() { return random_.nextBipolar(); }
@@ -133,24 +177,43 @@ private:
  * Pink noise: equal energy per OCTAVE, which is what people mean when they say
  * noise sounds natural, and what every acoustic measurement is done with.
  *
- * Voss-McCartney with seven octaves, which is the standard approximation and is
- * flat to about a tenth of a decibel across the audible range. A true -3 dB per
- * octave filter is an infinite-order problem; this is seven adds.
+ * Voss-McCartney with sixteen rows: every octave from 20 Hz to 20 kHz within
+ * 0.6 dB of the others at 48 kHz (measured; the test allows 1 dB), and pink
+ * down to fs/2^17 -- 1.5 Hz even at 192 kHz -- so the level in a low band does
+ * not depend on the session's rate. Seven rows, which is what this had, are
+ * pink only above fs/128: at 48 kHz everything under 375 Hz was white, the
+ * 20-40 Hz octave 8 dB down. A true -3 dB per octave filter is an
+ * infinite-order problem; this is still one new random value per sample.
+ *
+ * Bounded to +-1 (seventeen sources, each +-1, over seventeen); about 0.14
+ * RMS, -17 dBFS.
  */
 class PinkNoise {
 public:
-  explicit PinkNoise(uint64_t seed = 0x2545F4914F6CDD1Dull) : random_(seed) {
+  /** Default ctor non-explicit so this type can be a DSP member -- see Random.
+   *  Delegating rather than duplicating the row priming below. */
+  PinkNoise() : PinkNoise(kDefaultSeed) {}
+  /** Noise from `seed`, every row already drawn, so it is at its full level
+   *  and colour from the first sample. */
+  explicit PinkNoise(uint64_t seed) { setSeed(seed); }
+
+  /** Start again from `seed`: the SAME sequence a fresh PinkNoise(seed) gives.
+   *  It reseeded only the generator and kept the rows, their running sum and
+   *  the counter, so a used noise source reseeded to 42 differed from a new
+   *  one in every sample -- and "bounce twice and compare" (tape.h's hiss
+   *  among others) compared two different noises. */
+  void setSeed(uint64_t seed) {
+    random_.setSeed(seed);
+    counter_ = 0;
     for (int i = 0; i < kOctaves; ++i) rows_[i] = random_.nextBipolar();
     running_ = 0.0f;
     for (int i = 0; i < kOctaves; ++i) running_ += rows_[i];
   }
 
-  void setSeed(uint64_t seed) { random_.setSeed(seed); }
-
   /**
    * [audio thread] Allocates nothing and takes at most one new random value per
-   * sample regardless of how many octaves there are -- which is the whole point
-   * of Voss-McCartney over summing seven independent generators.
+   * sample regardless of how many rows there are -- which is the whole point
+   * of Voss-McCartney over summing sixteen independent generators.
    */
   float next() {
     ++counter_;
@@ -168,13 +231,13 @@ public:
       running_ += replacement - rows_[row];
       rows_[row] = replacement;
     }
-    // The white component on top, and the scale that brings the sum of eight
-    // sources back to roughly +-1.
+    // The white component on top, and the scale that brings the sum of
+    // seventeen sources back within +-1.
     return (running_ + random_.nextBipolar()) * (1.0f / (float) (kOctaves + 1));
   }
 
 private:
-  static constexpr int kOctaves = 7;
+  static constexpr int kOctaves = 16;
   Random random_;
   float rows_[kOctaves] = {0};
   float running_ = 0.0f;
@@ -192,8 +255,13 @@ private:
  */
 class Dither {
 public:
-  explicit Dither(uint64_t seed = 0x2545F4914F6CDD1Dull) : random_(seed) {}
+  /** Default ctor non-explicit so this type can be a DSP member -- see Random. */
+  Dither() : random_(kDefaultSeed) {}
+  /** Dither from `seed`; give each channel its own so the channels' dither is
+   *  uncorrelated. */
+  explicit Dither(uint64_t seed) : random_(seed) {}
 
+  /** Start the dither `seed` gives, the same as a fresh Dither(seed). */
   void setSeed(uint64_t seed) { random_.setSeed(seed); }
 
   /** [audio thread] Triangular noise 2 LSB peak-to-peak, for a target of
@@ -228,18 +296,38 @@ private:
  */
 class VelvetNoise {
 public:
-  explicit VelvetNoise(uint64_t seed = 0x2545F4914F6CDD1Dull) : random_(seed) {}
+  /** Default ctor non-explicit so this type can be a DSP member -- see Random. */
+  VelvetNoise() : random_(kDefaultSeed) {}
+  /** Pulses placed and signed from `seed`; 2000 per second at 48 kHz until
+   *  setSampleRate() and setDensity() say otherwise. */
+  explicit VelvetNoise(uint64_t seed) : random_(seed) {}
 
+  /** Reseed the generator, which reset() then returns to. Only the generator:
+   *  the cell in progress carries on, so call reset() too for the pattern a
+   *  fresh VelvetNoise(seed) with the same settings gives. */
   void setSeed(uint64_t seed) { random_.setSeed(seed); }
+  /** The rate in Hz (1 or less is taken as 48000). A new rate works the grid
+   *  out again for the current density and starts a new cell. */
   void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; setDensity(density_); }
   /** Pulses per second. 1000-4000 is the reverb range. */
   void setDensity(float pulsesPerSecond) {
-    density_ = pulsesPerSecond > 1.0f ? pulsesPerSecond : 1.0f;
+    const float density = pulsesPerSecond > 1.0f ? pulsesPerSecond : 1.0f;
+    // The same density again is no change. It restarted the cell, so set
+    // every block the pulse pattern depended on the block size.
+    if (density == density_ && sr_ == gridSr_) return;
+    density_ = density;
+    gridSr_ = sr_;
     grid_ = sr_ / density_;
     cellInc_ = 1.0f / grid_;
     cell_ = 1.0f; // start a cell on the first sample
   }
-  void reset() { cell_ = 1.0f; countdown_ = -1; }
+  /** Back to the start of the seed's pattern: a new cell on the next sample,
+   *  the same pulses as before. Rate and density are kept. */
+  void reset() {
+    cell_ = 1.0f;
+    countdown_ = -1;
+    random_.restart();
+  }
 
   /** [audio thread] Exactly one non-zero sample per grid cell. */
   float next() {
@@ -258,6 +346,7 @@ public:
 private:
   Random random_;
   float sr_ = 48000.0f, density_ = 2000.0f, grid_ = 24.0f, cellInc_ = 1.0f / 24.0f;
+  float gridSr_ = 48000.0f; // the rate grid_ was worked out at
   float cell_ = 1.0f, sign_ = 1.0f;
   int countdown_ = -1;
 };

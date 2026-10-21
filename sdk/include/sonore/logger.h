@@ -38,6 +38,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -47,9 +48,23 @@
 #include "files.h"
 #include "time.h"
 #include "user_settings.h"
+#include "path_io.h"
 
 namespace sonore {
 
+/**
+ * The process's log: a capped file a user can send, the last few hundred
+ * lines in memory for a "copy diagnostics" button, and a lock-free way in
+ * from the audio thread. One instance, from get(); it covers what the
+ * reference's Logger and FileLogger do between them. See the file comment
+ * for the two doors.
+ *
+ * write() from any thread but the audio one; writeFromAudioThread() from
+ * audio threads only, several at once included. An audio-thread line reaches
+ * the file and recent() only when drain() runs, and nothing calls drain() by
+ * itself: its owner calls it from a UI-thread timer. setMaxBytes() and file()
+ * take no lock, so they belong to setup, before other threads log.
+ */
 class Logger {
 public:
   /** The longest one message from the audio thread may be. Fixed, because the
@@ -84,6 +99,8 @@ public:
     if (!parent.empty() && !isDirectory(parent)) ensureDirectory(parent);
   }
 
+  /** The path setFile() was given; empty when not writing a file. Not
+   *  locked: read it on the thread that calls setFile(). */
   const std::string& file() const { return path_; }
 
   /** Past this many bytes the file is started again. A log that grows without
@@ -119,52 +136,86 @@ public:
    *
    * Returns false when the ring is full, so a caller that cares can count its
    * own losses -- and the drop is counted here regardless.
+   *
+   * Safe from several audio threads at once, which is the normal case rather
+   * than an edge one: the logger is one per process, and a host runs the
+   * instances of a plugin on parallel threads. The first version was a
+   * single-producer ring -- two threads could claim the same slot, and one
+   * preempted between reading the head and storing it put the head back BELOW
+   * the tail, after which drain() looped for 2^64 lines with the lock held.
+   * Now a slot is claimed with a compare-exchange and published by its own
+   * sequence number: still no lock, and a loser retries on the next slot
+   * rather than waiting for anybody.
    */
   bool writeFromAudioThread(const char* message) {
     if (!message) return false;
-    const size_t head = ringHead_.load(std::memory_order_relaxed);
-    const size_t tail = ringTail_.load(std::memory_order_acquire);
-    if (head - tail >= kRingLines) {
-      dropped_.fetch_add(1, std::memory_order_relaxed);
-      return false;
+    size_t pos = ringHead_.load(std::memory_order_relaxed);
+    Slot* slot = nullptr;
+    for (;;) {
+      slot = &slots_[pos % kRingLines];
+      const size_t seq = slot->seq.load(std::memory_order_acquire);
+      const std::ptrdiff_t lag = (std::ptrdiff_t) (seq - pos);
+      if (lag == 0) {
+        // Free and this producer's turn: claim it, or learn the new head.
+        if (ringHead_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) break;
+      } else if (lag < 0) {
+        // Still holding the line from one lap ago: the ring is full.
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      } else {
+        // Another producer claimed it first.
+        pos = ringHead_.load(std::memory_order_relaxed);
+      }
     }
-    char* slot = &ring_[(head % kRingLines) * kMaxLine];
     size_t i = 0;
-    for (; i + 1 < kMaxLine && message[i] != '\0'; ++i) slot[i] = message[i];
-    slot[i] = '\0';
-    // RELEASE, so the bytes above are visible before the slot is claimed. The
-    // reader acquires the same variable, and without the pair a drainer can
-    // legitimately see the new index and the old characters.
-    ringHead_.store(head + 1, std::memory_order_release);
+    for (; i + 1 < kMaxLine && message[i] != '\0'; ++i) slot->text[i] = message[i];
+    slot->text[i] = '\0';
+    // RELEASE, so the bytes above are visible before the slot reads as full.
+    // drain() acquires the same variable, and without the pair it can
+    // legitimately see the new number and the old characters.
+    slot->seq.store(pos + 1, std::memory_order_release);
     return true;
   }
 
   /**
    * Move whatever the audio thread queued into the file.
    *
-   * Called from the editor's 33 ms clock, alongside everything else that
-   * crosses that boundary. Returns how many lines it moved.
+   * The owner calls this off the audio thread, from an editor's editorTick(),
+   * a NativeWindow's onTick or a timer of its own. Nothing in the SDK calls it
+   * by itself, and lines wait in the ring, up to its size, until something
+   * does. Returns how many lines it moved.
    */
   int drain() {
     std::lock_guard<std::mutex> lock(mutex_);
     int moved = 0;
-    for (;;) {
-      const size_t tail = ringTail_.load(std::memory_order_relaxed);
-      const size_t head = ringHead_.load(std::memory_order_acquire);
-      if (tail == head) break;
-      const char* slot = &ring_[(tail % kRingLines) * kMaxLine];
-      appendLocked(stamp() + prefix_ + "[audio] " + std::string(slot));
-      ringTail_.store(tail + 1, std::memory_order_release);
+    // Gathered, then written in ONE trip to the file. Appending each line
+    // opened and closed the file once per line, with this lock held, on the
+    // editor's clock: a full ring was 256 filesystem round trips -- 50 ms and
+    // more with a virus scanner looking -- on the thread that draws the UI.
+    std::vector<std::string> lines;
+    // One lap at most: the audio threads keep writing while this runs, and a
+    // drain that chased them would hold the lock for as long as they kept up.
+    for (size_t n = 0; n < kRingLines; ++n) {
+      Slot& slot = slots_[ringTail_ % kRingLines];
+      // Not yet written -- empty, or claimed by a producer still copying its
+      // bytes in. Either way it is the next line, so the drain stops here and
+      // the next one picks it up; nothing behind it is skipped.
+      if (slot.seq.load(std::memory_order_acquire) != ringTail_ + 1) break;
+      lines.push_back(stamp() + prefix_ + "[audio] " + std::string(slot.text));
+      // Free for the producer one lap from now.
+      slot.seq.store(ringTail_ + kRingLines, std::memory_order_release);
+      ++ringTail_;
       ++moved;
     }
     const long lost = dropped_.exchange(0, std::memory_order_relaxed);
     if (lost > 0) {
       // Counted and SAID. A drop with a number attached is a fact; a silent
       // one is a lie about a log that is missing something.
-      appendLocked(stamp() + prefix_ + "[audio] " + std::to_string(lost) +
-                   " message(s) dropped -- the ring filled faster than it drained");
+      lines.push_back(stamp() + prefix_ + "[audio] " + std::to_string(lost) +
+                      " message(s) dropped -- the ring filled faster than it drained");
       ++moved;
     }
+    if (!lines.empty()) appendLocked(lines.data(), lines.size());
     return moved;
   }
 
@@ -191,15 +242,20 @@ public:
     return out;
   }
 
+  /** Empties the in-memory buffer recent() reads. The file is untouched. */
   void clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     recent_.clear();
   }
 
+  /** The most lines recent() can return: older ones leave memory, though
+   *  the file keeps them. */
   static constexpr size_t kRecentLines = 500;
 
 private:
-  Logger() : ring_(kRingLines * kMaxLine, '\0') {}
+  Logger() {
+    for (size_t i = 0; i < kRingLines; ++i) slots_[i].seq.store(i, std::memory_order_relaxed);
+  }
 
   /** UTC and ISO, so lines from two machines in two time zones sort into the
    *  order they happened. A local timestamp in a log that will be emailed is a
@@ -209,20 +265,24 @@ private:
     return formatDateTime(now, /*withSeconds=*/true) + "Z ";
   }
 
-  void appendLocked(const std::string& line) {
-    recent_.push_back(line);
+  void appendLocked(const std::string& line) { appendLocked(&line, 1); }
+
+  void appendLocked(const std::string* lines, size_t count) {
+    for (size_t i = 0; i < count; ++i) recent_.push_back(lines[i]);
     if (recent_.size() > kRecentLines)
       recent_.erase(recent_.begin(), recent_.begin() + (recent_.size() - kRecentLines));
     if (path_.empty()) return;
 
-    // Opened and closed per write, deliberately. A plugin can be unloaded at
+    // Opened and closed per call, deliberately. A plugin can be unloaded at
     // any moment by a host that does not tell it, and a file handle held open
     // across that is a handle nothing closes -- on Windows that also stops the
     // user deleting the log they were told to send.
-    std::FILE* f = std::fopen(path_.c_str(), "ab");
+    std::FILE* f = ::sonore::pathio::open(path_.c_str(), "ab");
     if (!f) return;
-    std::fwrite(line.data(), 1, line.size(), f);
-    std::fputc('\n', f);
+    for (size_t i = 0; i < count; ++i) {
+      std::fwrite(lines[i].data(), 1, lines[i].size(), f);
+      std::fputc('\n', f);
+    }
     const long size = std::ftell(f);
     std::fclose(f);
 
@@ -254,7 +314,7 @@ private:
       --from;
     }
 
-    std::FILE* f = std::fopen(path_.c_str(), "wb");
+    std::FILE* f = ::sonore::pathio::open(path_.c_str(), "wb");
     if (!f) return;
     const std::string header =
         stamp() + "-- log restarted, " + std::to_string(from) + " older line(s) discarded --\n";
@@ -272,11 +332,24 @@ private:
   size_t maxBytes_ = 4u * 1024u * 1024u;
   std::vector<std::string> recent_;
 
-  /** The audio thread's ring. A flat char buffer rather than strings, because
-   *  a std::string in here would allocate on the one thread that must not. */
-  std::vector<char> ring_;
+  /** One line of the audio threads' ring. Fixed characters rather than a
+   *  string, because a std::string in here would allocate on the one thread
+   *  that must not.
+   *
+   *  seq says whose turn the slot is: equal to a producer's position when free
+   *  for it, one past when its line is written and waiting for drain(), and a
+   *  lap further on once drained. */
+  struct Slot {
+    std::atomic<size_t> seq{0}; ///< whose turn the slot is, as above
+    char text[kMaxLine] = {};   ///< the line, NUL-terminated and cut to fit
+  };
+  /** A member array rather than a heap one: the logger only ever exists as the
+   *  function-local static in get(), so this is static storage either way. */
+  Slot slots_[kRingLines];
+  /** The next position a producer claims. */
   std::atomic<size_t> ringHead_{0};
-  std::atomic<size_t> ringTail_{0};
+  /** The next position drain() reads. Only drain() touches it, under mutex_. */
+  size_t ringTail_ = 0;
   std::atomic<long> dropped_{0};
 };
 

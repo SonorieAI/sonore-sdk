@@ -25,7 +25,9 @@
 // the host handles before the plugin sees anything.
 //
 // Not here: Flex Data (score metadata), UMP Stream (endpoint discovery), and
-// SysEx8. Named in the feature map rather than half-written.
+// SysEx8 with the Mixed Data Set. Those are the 128-bit packets, and they
+// live in ump128.h -- a plugin that is an endpoint in its own right needs
+// them; one fed by a host that flattens MIDI 2.0 never sees them.
 //
 // ── On losing precision, and saying so ──────────────────────────────────────
 //
@@ -47,25 +49,27 @@ namespace ump {
 
 /** The message type, from the top nibble of the first word. */
 enum : uint8_t {
-  kMtUtility = 0x0,
-  kMtSystem = 0x1,
-  kMtMidi1ChannelVoice = 0x2,
-  kMtSysex7 = 0x3,
-  kMtMidi2ChannelVoice = 0x4,
-  kMtData128 = 0x5,
-  kMtFlexData = 0xD,
-  kMtStream = 0xF,
+  kMtUtility = 0x0,           ///< Utility: NOOP, jitter-reduction timestamps. One word.
+  kMtSystem = 0x1,            ///< System real-time and common messages. One word.
+  kMtMidi1ChannelVoice = 0x2, ///< MIDI 1.0 channel voice messages. One word.
+  kMtSysex7 = 0x3,            ///< SysEx in seven-bit bytes, six per packet. Two words.
+  kMtMidi2ChannelVoice = 0x4, ///< MIDI 2.0 channel voice messages. Two words.
+  kMtData128 = 0x5,           ///< SysEx8 and Mixed Data Set (ump128.h). Four words.
+  kMtFlexData = 0xD,          ///< Flex Data: tempo, signatures, text (ump128.h). Four words.
+  kMtStream = 0xF,            ///< UMP Stream: endpoint discovery and names (ump128.h). Four words.
 };
 
 /** SysEx7 status, in the second nibble of the first word. */
 enum : uint8_t {
-  kSysexComplete = 0x0,
-  kSysexStart = 0x1,
-  kSysexContinue = 0x2,
-  kSysexEnd = 0x3,
+  kSysexComplete = 0x0, ///< The whole message, in this one packet.
+  kSysexStart = 0x1,    ///< The first packet of several.
+  kSysexContinue = 0x2, ///< A packet from the middle.
+  kSysexEnd = 0x3,      ///< The last packet.
 };
 
+/** A packet's message type, a kMt value, from its first word. */
 inline uint8_t messageType(uint32_t word0) { return (uint8_t) ((word0 >> 28) & 0xF); }
+/** A packet's group, 0..15, from its first word. */
 inline uint8_t group(uint32_t word0) { return (uint8_t) ((word0 >> 24) & 0xF); }
 
 /**
@@ -93,8 +97,22 @@ inline int packetWords(uint32_t word0) {
 // The bridge every host uses today: a DAW that speaks UMP internally still
 // hands a MIDI 1.0 plugin its notes as message type 2.
 
-/** One MidiMessage as a MIDI 1.0 channel voice packet. */
+/** A system message -- clock, start, stop -- as message type 1. */
+inline uint32_t fromSystem(int status, int d1 = 0, int d2 = 0, uint8_t groupIndex = 0) {
+  return ((uint32_t) kMtSystem << 28) | ((uint32_t) (groupIndex & 0xF) << 24) |
+         ((uint32_t) (status & 0xFF) << 16) | ((uint32_t) (d1 & 0x7F) << 8) |
+         (uint32_t) (d2 & 0x7F);
+}
+
+/**
+ * One MidiMessage as a MIDI 1.0 channel voice packet -- or, for a system
+ * message (clock, start, song position...), as the system packet UMP carries
+ * it in. Type 2 is for channel statuses only: a clock written there, as it
+ * was, is a malformed channel message to a receiver, never a clock.
+ */
 inline uint32_t fromMidi1(const MidiMessage& m, uint8_t groupIndex = 0) {
+  if (m.getRawStatus() >= 0xF0)
+    return fromSystem(m.getRawStatus(), m.getRawData1(), m.getRawData2(), groupIndex);
   const uint32_t status = (uint32_t) (m.getRawStatus() & 0xF0);
   const uint32_t channel = (uint32_t) (m.getRawStatus() & 0x0F);
   return ((uint32_t) kMtMidi1ChannelVoice << 28) | ((uint32_t) (groupIndex & 0xF) << 24) |
@@ -121,24 +139,26 @@ inline uint32_t fromMidi1(const MidiMessage& m, uint8_t groupIndex = 0) {
  */
 inline bool toMidi1(uint32_t word0, MidiMessage* out, uint8_t* groupOut = nullptr) {
   if (!out || messageType(word0) != kMtMidi1ChannelVoice) return false;
-  if (groupOut) *groupOut = group(word0);
   const int status = (int) ((word0 >> 16) & 0xFF);
+  // The type alone is not enough: a type-2 packet whose status is not 0x80..
+  // 0xEF is malformed, and was read as whatever that byte is -- 0xF8 as a
+  // clock, 0x00 as a "message" whose status is a data byte.
+  if (!isChannelMessage(status)) return false;
+  if (groupOut) *groupOut = group(word0);
   *out = MidiMessage(status, (int) ((word0 >> 8) & 0x7F), (int) (word0 & 0x7F));
   return true;
 }
 
-/** A system message -- clock, start, stop -- as message type 1. */
-inline uint32_t fromSystem(int status, int d1 = 0, int d2 = 0, uint8_t groupIndex = 0) {
-  return ((uint32_t) kMtSystem << 28) | ((uint32_t) (groupIndex & 0xF) << 24) |
-         ((uint32_t) (status & 0xFF) << 16) | ((uint32_t) (d1 & 0x7F) << 8) |
-         (uint32_t) (d2 & 0x7F);
-}
-
+/** And a system packet back: false for one that is not a system common or
+ *  realtime message. A type-1 packet carrying 0x93 came back as a note-on. */
 inline bool toSystem(uint32_t word0, MidiMessage* out, uint8_t* groupOut = nullptr) {
   if (!out || messageType(word0) != kMtSystem) return false;
+  const int status = (int) ((word0 >> 16) & 0xFF);
+  // A system status with a length: not SysEx's F0 or F7, which UMP carries
+  // as SysEx7, nor the undefined F4 and F5 -- the rule deliverableToDsp uses.
+  if (status < 0xF0 || shortMessageLength(status) == 0) return false;
   if (groupOut) *groupOut = group(word0);
-  *out = MidiMessage((int) ((word0 >> 16) & 0xFF), (int) ((word0 >> 8) & 0x7F),
-                     (int) (word0 & 0x7F));
+  *out = MidiMessage(status, (int) ((word0 >> 8) & 0x7F), (int) (word0 & 0x7F));
   return true;
 }
 
@@ -171,10 +191,23 @@ inline bool toMidi1Narrowing(const uint32_t* words, size_t count, MidiMessage* o
   switch (status) {
     case 0x90: // note on
     case 0x80: { // note off
-      const int velocity = (int) ((value >> 25) & 0x7F); // top 7 of the 16-bit field
+      int velocity = (int) ((value >> 25) & 0x7F); // top 7 of the 16-bit field
+      // A MIDI 2.0 note-on is a note-on at ANY velocity, the softest included.
+      // Below 512 of 65535 the shift gives 0, and a MIDI 1.0 note-on at 0 is a
+      // note-off: the note never sounded and could release another. The
+      // protocol's translation rule is to clamp it to 1.
+      if (status == 0x90 && velocity == 0) velocity = 1;
       *out = MidiMessage(status | channel, index, velocity);
       return true;
     }
+    case 0xA0: // poly pressure: the note, and 32 bits of pressure down to 7
+      *out = MidiMessage(status | channel, index, (int) (value >> 25));
+      return true;
+    case 0xC0: // program change: the program is the top byte of the data word.
+      // The optional bank rides in the same packet; MIDI 1.0 needs two more
+      // messages for it, which one MidiMessage cannot be, so it stays behind.
+      *out = MidiMessage(status | channel, (int) ((value >> 24) & 0x7F), 0);
+      return true;
     case 0xB0: // control change: a 32-bit value down to 7 bits
       *out = MidiMessage(status | channel, index, (int) (value >> 25));
       return true;
@@ -209,53 +242,98 @@ inline bool toMidi1Narrowing(const uint32_t* words, size_t count, MidiMessage* o
  * The bytes carried are the PAYLOAD: the 0xF0 and 0xF7 that delimit a MIDI 1.0
  * SysEx are not transmitted. They are added back here, because every consumer
  * in this SDK -- midi_ci.h included -- expects a complete MIDI 1.0 message.
+ *
+ * One message in progress PER GROUP. UMP lets SysEx7 streams on different
+ * groups interleave packet by packet -- they are sixteen separate cables --
+ * and a single buffer stitched two 13-byte messages on groups 0 and 1 into
+ * one 21-byte message made of parts of both.
+ *
+ * A packet with a reserved status is ignored. One whose byte count is over
+ * six abandons the message open on its group, counted in dropped(): that
+ * message is missing the bytes the packet could not carry.
  */
 class Sysex7Assembler {
 public:
-  static constexpr int kCapacity = MidiBuffer::kSysexCapacity;
+  static constexpr int kCapacity = MidiBuffer::kSysexCapacity; ///< The longest message, F0 and F7 included; longer is dropped.
+  static constexpr int kGroups = 16;                           ///< One message in progress for each.
 
+  /** Abandon every open message and forget the last one. dropped() keeps
+   *  counting. */
   void reset() {
-    length_ = 0;
-    inMessage_ = false;
-    overflowed_ = false;
+    for (Group& g : groups_) {
+      g.length = 0;
+      g.inMessage = false;
+      g.overflowed = false;
+    }
+    last_ = 0;
   }
 
-  bool inProgress() const { return inMessage_; }
+  /** Whether any group has a message open. */
+  bool inProgress() const {
+    for (const Group& g : groups_)
+      if (g.inMessage) return true;
+    return false;
+  }
+  /** Messages lost: too long, interrupted by a new start, or cut by a
+   *  packet that could not be read. */
   uint32_t dropped() const { return dropped_; }
-  const uint8_t* data() const { return buffer_; }
-  size_t size() const { return (size_t) length_; }
+  /** The message the last push() completed, F0 to F7, and the group it came
+   *  on. Valid until that group's next start. */
+  const uint8_t* data() const { return groups_[last_].buffer; }
+  size_t size() const { return (size_t) groups_[last_].length; } ///< Its length in bytes, F0 and F7 included.
+  int group() const { return last_; }                           ///< Its group, 0..15.
 
   /** One packet. True when it completed a message. */
   bool push(const uint32_t* words, size_t count) {
     if (!words || count < 2 || messageType(words[0]) != kMtSysex7) return false;
+    const int groupIndex = (int) ((words[0] >> 24) & 0xF);
+    Group& g = groups_[groupIndex];
     const uint8_t status = (uint8_t) ((words[0] >> 20) & 0xF);
     const uint8_t numBytes = (uint8_t) ((words[0] >> 16) & 0xF);
-    if (numBytes > 6) return false; // six is the maximum a packet can hold
+    // Statuses 4 to F are reserved: such a packet belongs to no message here,
+    // and is ignored, as Sysex8Assembler ignores its own. It fell through to
+    // the append below, so its bytes became part of whatever message was open
+    // on the group -- bytes no sender put in that message.
+    if (status > kSysexEnd) return false;
+    if (numBytes > 6) {
+      // Six is the most a packet holds, so this one's bytes cannot be read.
+      // The message open on the group is then missing them, and is abandoned
+      // and counted. Skipped instead, the packet left a hole that the end
+      // closed over, and the message was handed on looking whole.
+      if (g.inMessage) {
+        g.inMessage = false;
+        g.overflowed = false;
+        g.length = 0;
+        ++dropped_;
+      }
+      return false;
+    }
 
     if (status == kSysexComplete || status == kSysexStart) {
-      if (inMessage_ && length_ > 1) ++dropped_; // a start inside a message
-      length_ = 0;
-      overflowed_ = false;
-      inMessage_ = true;
-      append(0xF0);
-    } else if (!inMessage_) {
+      if (g.inMessage && g.length > 1) ++dropped_; // a start inside a message
+      g.length = 0;
+      g.overflowed = false;
+      g.inMessage = true;
+      append(g, 0xF0);
+    } else if (!g.inMessage) {
       // A continue or an end with no start in front of it. The message began
       // before this stream was joined, and half of one is not a message.
       return false;
     }
 
-    for (uint8_t i = 0; i < numBytes; ++i) append(byteAt(words, i));
+    for (uint8_t i = 0; i < numBytes; ++i) append(g, byteAt(words, i));
 
     if (status == kSysexComplete || status == kSysexEnd) {
-      append(0xF7);
-      inMessage_ = false;
-      if (overflowed_) {
+      append(g, 0xF7);
+      g.inMessage = false;
+      if (g.overflowed) {
         ++dropped_;
-        length_ = 0;
-        overflowed_ = false;
+        g.length = 0;
+        g.overflowed = false;
         return false;
       }
-      return length_ >= 2;
+      last_ = groupIndex;
+      return g.length >= 2;
     }
     return false;
   }
@@ -268,17 +346,27 @@ private:
     return (uint8_t) ((words[1] >> (8 * (3 - (i - 2)))) & 0x7F);
   }
 
-  void append(uint8_t byte) {
-    if (length_ >= kCapacity) {
-      overflowed_ = true;
+  /** One group's message in progress: the bytes so far, F0 included,
+   *  whether a start has been seen, and whether it outgrew kCapacity -- an
+   *  overflowed message is dropped and counted when its end arrives. A
+   *  completed one stays here, as data(), until that group's next start. */
+  struct Group {
+    uint8_t buffer[kCapacity]{}; ///< The bytes so far, F0 first.
+    int length = 0;              ///< How many.
+    bool inMessage = false,      ///< A start has been seen and its end has not.
+        overflowed = false;      ///< It outgrew kCapacity.
+  };
+
+  static void append(Group& g, uint8_t byte) {
+    if (g.length >= kCapacity) {
+      g.overflowed = true;
       return;
     }
-    buffer_[length_++] = byte;
+    g.buffer[g.length++] = byte;
   }
 
-  uint8_t buffer_[kCapacity]{};
-  int length_ = 0;
-  bool inMessage_ = false, overflowed_ = false;
+  Group groups_[kGroups];
+  int last_ = 0;
   uint32_t dropped_ = 0;
 };
 

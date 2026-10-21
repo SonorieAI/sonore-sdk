@@ -17,7 +17,8 @@
 //
 // ── When there is no window backend ─────────────────────────────────────────
 //
-// Win32 and X11 have one; macOS does not yet. isAvailable() says so and
+// Win32, X11 and Cocoa each have one. Where none can run -- no display on
+// Linux, an unsupported platform -- isAvailable() says so and
 // unavailableReason() says why, so a wrapper can fall back to the webview and
 // the fallback names its reason instead of the editor silently being a blank
 // rectangle.
@@ -36,6 +37,7 @@
 #include "../commands.h"
 #include "plugin_editor.h"
 #include "popup.h"
+#include "preset_bar.h"
 #include "tooltip.h"
 #include "resizer.h"
 #include "viewport.h"
@@ -65,6 +67,9 @@ namespace gfx {
 // two peers deliberately expose the same surface; a difference between them
 // has to be written on purpose rather than arrived at.
 #if defined(_WIN32)
+/** This platform's window peer: NativeWindow on Windows, NativeWindowCocoa on
+ *  macOS, NativeWindowX11 on Linux with the X11 headers. Not declared where
+ *  there is no backend. */
 using PlatformWindow = NativeWindow;
 #elif defined(__APPLE__)
 using PlatformWindow = NativeWindowCocoa;
@@ -86,11 +91,16 @@ using PlatformWindow = NativeWindowX11;
  */
 class PopupWindow {
 public:
+  /** Nothing showing until show(). */
   PopupWindow() = default;
+  /** Not copyable: the window and the menu's callbacks point at this object. */
   PopupWindow(const PopupWindow&) = delete;
   PopupWindow& operator=(const PopupWindow&) = delete;
+  /** Closes the menu if it is up, without calling onChosen. */
   ~PopupWindow() { close(); }
 
+  /** Whether this build has a window backend at all. show() can still fail at
+   *  run time. */
   static bool isAvailable() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     return true;
@@ -108,7 +118,8 @@ public:
    * item's id or 0 for dismissed.
    */
   bool show(PopupMenu menu, Font font, float anchorX, float anchorY, float anchorHeight,
-            float screenW, float screenH, std::function<void(int)> onChosen) {
+            float screenW, float screenH, std::function<void(int)> onChosen,
+            float scale = 1.0f) {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     close();
     if (menu.isEmpty()) return false;
@@ -117,19 +128,30 @@ public:
     onChosen_ = std::move(onChosen);
     const float w = menu_.preferredWidth(font);
     const float h = menu_.preferredHeight();
+    // The anchor is in device pixels; so must the size be that it is fitted
+    // against the screen with. The window is then opened at the editor's own
+    // scale (Windows, X11), so the menu is the size of the control that
+    // opened it.
+    const float s = scale > 0.0f ? scale : 1.0f;
     // The screen the ANCHOR is on, not the main one. A menu opened near the
     // bottom of a second monitor used to be checked against the first
     // monitor's height, decide it fitted, and be drawn off the bottom of the
     // screen it was actually on.
     (void) screenW;
     (void) screenH;
-    const Point at = PopupMenu::placeOnScreen(anchorX, anchorY, anchorHeight, w, h);
+    const Point at = PopupMenu::placeOnScreen(anchorX, anchorY, anchorHeight, w * s, h * s);
 
     content_ = std::unique_ptr<PopupContent>(new PopupContent(menu_, font));
     content_->onDismiss = [this](int id) { finish(id); };
     window_.onDismissedOutside = [this]() { finish(0); };
 
-    if (!window_.openPopup(*content_, (int) at.x, (int) at.y, (int) w, (int) h)) {
+#if !defined(__APPLE__)
+    const bool opened = window_.openPopup(*content_, (int) at.x, (int) at.y, (int) w, (int) h,
+                                          /*grabMouse=*/true, s);
+#else
+    const bool opened = window_.openPopup(*content_, (int) at.x, (int) at.y, (int) w, (int) h);
+#endif
+    if (!opened) {
       content_.reset();
       onChosen_ = nullptr;
       return false;
@@ -138,11 +160,13 @@ public:
     return true;
 #else
     (void) menu; (void) font; (void) anchorX; (void) anchorY; (void) anchorHeight;
-    (void) screenW; (void) screenH; (void) onChosen;
+    (void) screenW; (void) screenH; (void) onChosen; (void) scale;
     return false;
 #endif
   }
 
+  /** From a show() that succeeded until close() -- which, after a choice, the
+   *  next tick() does. */
   bool isOpen() const { return open_; }
 
   /** Drain input, and tear the window down once something has been chosen.
@@ -158,6 +182,9 @@ public:
 #endif
   }
 
+  /** Take the window down now and drop onChosen without calling it. Safe when
+   *  nothing is open. Not for use inside onChosen, which runs inside the
+   *  window's own event handling: tick() closes after a choice. */
   void close() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     window_.close();
@@ -170,6 +197,8 @@ public:
 #endif
   }
 
+  /** The menu window's platform handle (an HWND, an NSView, an X Window), or
+   *  null when none is open. */
   void* handle() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     return window_.handle();
@@ -178,6 +207,7 @@ public:
 #endif
   }
 
+  /** The component drawing the menu while it is open, else null. Owned here. */
   PopupContent* content() { return content_.get(); }
 
 private:
@@ -224,22 +254,40 @@ public:
   TooltipWindow() = default;
   TooltipWindow(const TooltipWindow&) = delete;
   TooltipWindow& operator=(const TooltipWindow&) = delete;
+  /** Closes the window if it is showing. */
   ~TooltipWindow() { close(); }
 
-  bool show(Component& content, int screenX, int screenY, int width, int height) {
+  /**
+   * Show `content` in a frameless window at (screenX, screenY) on the desktop,
+   * `width` by `height` logical units at `scale`, that takes no mouse and no
+   * keyboard. Replaces any tooltip showing. `content` is not owned and must
+   * outlive the window or its close().
+   *
+   * False when a size is 0 or less, the window could not open, or there is no
+   * backend.
+   */
+  bool show(Component& content, int screenX, int screenY, int width, int height,
+            float scale = 1.0f) {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     close();
     if (width <= 0 || height <= 0) return false;
+#if !defined(__APPLE__)
+    if (!window_.openPopup(content, screenX, screenY, width, height, /*grabMouse=*/false, scale))
+      return false;
+#else
+    (void) scale;
     if (!window_.openPopup(content, screenX, screenY, width, height, /*grabMouse=*/false))
       return false;
+#endif
     open_ = true;
     return true;
 #else
-    (void) content; (void) screenX; (void) screenY; (void) width; (void) height;
+    (void) content; (void) screenX; (void) screenY; (void) width; (void) height; (void) scale;
     return false;
 #endif
   }
 
+  /** Take the window down; safe when none is showing. */
   void close() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     window_.close();
@@ -247,8 +295,10 @@ public:
 #endif
   }
 
+  /** Whether a show() succeeded and no close() came after. */
   bool isOpen() const { return open_; }
 
+  /** The window's platform handle, or null when none is showing. */
   void* handle() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     return window_.handle();
@@ -272,9 +322,11 @@ private:
  */
 class NativeEditor {
 public:
+  /** Closed: open() builds the editor and its window. */
   NativeEditor() = default;
   NativeEditor(const NativeEditor&) = delete;
   NativeEditor& operator=(const NativeEditor&) = delete;
+  /** Closes everything open() built. */
   ~NativeEditor() { close(); }
 
   /**
@@ -333,17 +385,43 @@ public:
     Font font = face ? Font(face, 13.0f) : Font();
     hasFont_ = face != nullptr;
 
-    editor_ = std::unique_ptr<GenericEditor>(new GenericEditor(params, numParams, host, font));
+    // ── The plugin's own face, when its DSP makes one ─────────────────────
+    //
+    // It fills the window and lays itself out to whatever size the host
+    // gives -- no viewport, because a designed editor is designed for its
+    // box, and a scroll bar appearing over it would be a layout bug made to
+    // look intentional. Everything else below is shared with the generic
+    // editor: the clock, the tooltips, the resize border, the menus.
+    if (contentFactory_) custom_ = contentFactory_(host);
+    if (custom_) {
+      if (!custom_->font().isValid()) custom_->setFont(font);
+      custom_->setBounds({0.0f, 0.0f, (float) width, (float) height});
+      custom_->onOpenComboMenu = [this](ComboBox& box) { openMenuFor(box); };
+    } else {
+      editor_ = std::unique_ptr<GenericEditor>(new GenericEditor(params, numParams, host, font));
 
-    // A plugin with forty parameters makes an editor taller than a screen, and
-    // a host given that size clips it or refuses it -- either way the last
-    // parameters cannot be reached. The viewport is always there and shows a
-    // bar only when there is something to scroll, so a four-knob plugin looks
-    // exactly as it did.
-    viewport_ = std::unique_ptr<Viewport>(new Viewport());
-    viewport_->setBounds({0.0f, 0.0f, (float) width, (float) height});
-    editor_->setSize((float) width - ScrollBar::kThickness, editor_->preferredHeight());
-    viewport_->setViewedComponent(editor_.get());
+      // The preset bar along the top, when the wrapper has presets to offer:
+      // which preset is playing, previous and next, and the menu that saves,
+      // renames, deletes, imports and exports (preset_bar.h). The generic
+      // editor is what a plugin with no face of its own gets, and a user of
+      // one still has sounds to keep.
+      const float top = host.presets ? PresetBar::kHeight : 0.0f;
+      if (host.presets) {
+        presetBar_ = std::unique_ptr<PresetBar>(new PresetBar(host.presets));
+        presetBar_->setFont(font);
+        presetBar_->setBounds({0.0f, 0.0f, (float) width, top});
+      }
+
+      // A plugin with forty parameters makes an editor taller than a screen,
+      // and a host given that size clips it or refuses it -- either way the
+      // last parameters cannot be reached. The viewport is always there and
+      // shows a bar only when there is something to scroll, so a four-knob
+      // plugin looks exactly as it did.
+      viewport_ = std::unique_ptr<Viewport>(new Viewport());
+      viewport_->setBounds({0.0f, top, (float) width, (float) height - top});
+      editor_->setSize((float) width - ScrollBar::kThickness, editor_->preferredHeight());
+      viewport_->setViewedComponent(editor_.get());
+    }
 
     // ── The root, which used to be the viewport itself ─────────────────────
     //
@@ -357,10 +435,14 @@ public:
     root_ = std::unique_ptr<Component>(new Component());
     root_->setBounds({0.0f, 0.0f, (float) width, (float) height});
     root_->setAccessibilityIgnored(true);
-    root_->addChild(viewport_.get());
+    if (custom_) root_->addChild(custom_.get());
+    else root_->addChild(viewport_.get());
+    if (presetBar_) root_->addChild(presetBar_.get());
 
     border_ = std::unique_ptr<ResizableBorder>(new ResizableBorder());
-    border_->constrainer = constrainerFor(limits_);
+    naturalWidth_ = (float) width;
+    naturalHeight_ = (float) height;
+    border_->constrainer = constrainerFor(limits_, naturalWidth_, naturalHeight_);
     // Left and top off: a plugin editor cannot move its own frame, so those
     // two edges could only grow the window the wrong way. See resizer.h.
     border_->setDraggableEdges(false, false, true, true);
@@ -401,6 +483,7 @@ public:
       // a second answer to "what time is it" drifting against the first.
       const double now = (double) (++tickCount_) * kTickSeconds;
 
+      if (custom_) custom_->editorTick(now);
       if (editor_) {
         editor_->sync();
         // Sections opening and closing. Re-ask the height only when something
@@ -411,6 +494,7 @@ public:
           viewport_->setViewedComponent(editor_.get());
         }
       }
+      if (presetBar_) presetBar_->tick();
       updateTooltip(now);
       // The menu rides the editor's clock rather than one of its own. It is a
       // separate window with separate input, and something has to pump it or a
@@ -421,17 +505,19 @@ public:
     // A stepped parameter drops down a real menu, ticked at the current
     // choice. GenericEditor cannot do this itself: a popup is a top-level
     // window and it is a Component.
-    editor_->onOpenComboMenu = [this](ComboBox& box) { openMenuFor(box); };
+    if (editor_) editor_->onOpenComboMenu = [this](ComboBox& box) { openMenuFor(box); };
 
     // Commands see a key only after the tree has declined it. See the comment
     // on MouseRouter::onUnhandledKey for why that order is the whole point.
     commandsRouterHook_ = [this](const KeyPress& key) { return commands_.keyPressed(key); };
 
     if (!window_.open(parent, *root_, width, height)) {
+      presetBar_.reset();
       root_.reset();
       border_.reset();
       viewport_.reset();
       editor_.reset();
+      custom_.reset();
       return false;
     }
     if (MouseRouter* router = window_.router()) router->onUnhandledKey = commandsRouterHook_;
@@ -449,8 +535,12 @@ public:
    * A key reaches these only when nothing in the component tree took it.
    */
   CommandManager& commands() { return commands_; }
+  /** The same, read-only. */
   const CommandManager& commands() const { return commands_; }
 
+  /** [main-thread] Take the editor down: the menu and the tooltip, then the
+   *  window, then the components outside in. Safe when nothing is open, and
+   *  open() may be called again after. */
   void close() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     // The menu first of all: it is a separate top-level window holding a
@@ -466,17 +556,21 @@ public:
     // Outside in, because each of these holds a pointer to the next. The root
     // holds the viewport and the border; the viewport holds the editor. Freeing
     // any of them before the thing that points at it is the same bug the
-    // window_.close() above avoids, one level down.
+    // window_.close() above avoids, one level down. The preset bar first of
+    // those: its questions may be up in the root.
+    presetBar_.reset();
     root_.reset();
     border_.reset();
     viewport_.reset();
     editor_.reset();
+    custom_.reset();
 #endif
   }
 
+  /** Whether open() succeeded and close() has not run since. */
   bool isOpen() const {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
-    return editor_ != nullptr && viewport_ != nullptr && window_.isOpen();
+    return ((editor_ != nullptr && viewport_ != nullptr) || custom_ != nullptr) && window_.isOpen();
 #else
     return false;
 #endif
@@ -487,6 +581,8 @@ public:
    *  leaving a user to wonder. */
   bool hasText() const { return hasFont_; }
 
+  /** The editor's window as the platform knows it -- an HWND, an NSView, an X
+   *  Window -- or null when it is not open. */
   void* handle() const {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     return window_.handle();
@@ -495,6 +591,8 @@ public:
 #endif
   }
 
+  /** Show or hide the window without closing it, as a host's show and hide ask.
+   *  Ignored when not open. */
   void setVisible(bool shouldBeVisible) {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     if (isOpen()) window_.setVisible(shouldBeVisible);
@@ -548,11 +646,40 @@ public:
 #endif
   }
 
+  /** Device pixels per logical unit: the host's, from setScale, else what the
+   *  peer read from the screen. 1 without a backend. */
   float scale() const {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     return window_.scale();
 #else
     return 1.0f;
+#endif
+  }
+
+  /** The rows are laid out to the WIDTH, so a host making the editor wider has
+   *  to reach the content and not only the viewport around it. The height is the
+   *  content's own -- that is the whole point of scrolling. */
+  void layOutContent() {
+#if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
+    if (!custom_ && (!editor_ || !viewport_)) return;
+    const float w = window_.logicalWidth(), h = window_.logicalHeight();
+    if (root_) root_->setBounds({0.0f, 0.0f, w, h});
+    if (border_) {
+      border_->setBounds({0.0f, 0.0f, w, h});
+      // Told the size the window ACTUALLY became, not the size that was asked
+      // for. A host may give less than was requested, and a border still
+      // measuring from the request would make the next drag jump.
+      border_->setCurrentSize(w, h);
+    }
+    if (custom_) {
+      custom_->setBounds({0.0f, 0.0f, w, h});
+      return;
+    }
+    const float top = presetBar_ ? PresetBar::kHeight : 0.0f;
+    if (presetBar_) presetBar_->setBounds({0.0f, 0.0f, w, top});
+    viewport_->setBounds({0.0f, top, w, h - top});
+    editor_->setSize(w - ScrollBar::kThickness, editor_->preferredHeight());
+    viewport_->contentResized();
 #endif
   }
 
@@ -563,31 +690,11 @@ public:
    * Sync first. Repainting before syncing draws the frame BEFORE the
    * automation that arrived, which is a whole frame of lag for free.
    */
-  /** The rows are laid out to the WIDTH, so a host making the editor wider has
-   *  to reach the content and not only the viewport around it. The height is the
-   *  content's own -- that is the whole point of scrolling. */
-  void layOutContent() {
-#if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
-    if (!editor_ || !viewport_) return;
-    const float w = window_.logicalWidth(), h = window_.logicalHeight();
-    if (root_) root_->setBounds({0.0f, 0.0f, w, h});
-    viewport_->setBounds({0.0f, 0.0f, w, h});
-    if (border_) {
-      border_->setBounds({0.0f, 0.0f, w, h});
-      // Told the size the window ACTUALLY became, not the size that was asked
-      // for. A host may give less than was requested, and a border still
-      // measuring from the request would make the next drag jump.
-      border_->setCurrentSize(w, h);
-    }
-    editor_->setSize(w - ScrollBar::kThickness, editor_->preferredHeight());
-    viewport_->contentResized();
-#endif
-  }
-
   void tick() {
 #if defined(SONORE_HAS_NATIVE_WINDOW_BACKEND)
     if (!isOpen()) return;
-    editor_->sync();
+    if (custom_) custom_->editorTick((double) tickCount_ * kTickSeconds);
+    else editor_->sync();
     window_.renderIfDirty();
 #endif
   }
@@ -641,7 +748,7 @@ public:
    */
   void setResizeLimits(const EditorConstraints& limits) {
     limits_ = limits;
-    if (border_) border_->constrainer = constrainerFor(limits);
+    if (border_) border_->constrainer = constrainerFor(limits, naturalWidth_, naturalHeight_);
   }
 
   /**
@@ -654,8 +761,27 @@ public:
    */
   std::function<void(int width, int height)> onRequestResize;
 
-  /** For tests and for the standalone, which drive components without a host. */
+  /** For tests and for the standalone, which drive components without a host.
+   *  Null while a plugin's own editor is showing -- see customContent(). */
   GenericEditor* content() { return editor_.get(); }
+
+  /**
+   * Where the plugin's own editor comes from, when it has one: called by
+   * open() with the host it will talk to, and a null result means "the
+   * generic editor after all". Set before open(), by the wrapper, from the
+   * DSP's createEditor() (see AudioProcessorEditor in plugin_editor.h).
+   */
+  using ContentFactory = std::function<std::unique_ptr<AudioProcessorEditor>(const EditorHost&)>;
+  /** Install the factory open() asks for the plugin's own editor; an empty one,
+   *  the default, means the generic editor. Read at each open(). */
+  void setContentFactory(ContentFactory factory) { contentFactory_ = std::move(factory); }
+
+  /** The plugin's own editor while it is open, else null. */
+  AudioProcessorEditor* customContent() { return custom_.get(); }
+
+  /** The generic editor's preset bar, or null: no presets offered, or the
+   *  plugin's own editor showing (which puts a PresetBar where it likes). */
+  PresetBar* presetBar() { return presetBar_.get(); }
 
   /** The border, for the tests that drive a drag without a mouse. */
   ResizableBorder* resizeBorder() { return border_.get(); }
@@ -705,7 +831,7 @@ private:
     tooltipWindow_.close();
     if (!tooltips_.isVisible()) return;
 
-    const Font font = editor_ ? editor_->font() : Font();
+    const Font font = contentFont();
     const Rect box = tooltips_.boundsFor(font);
     tooltipLabel_ = std::unique_ptr<Label>(new Label(tooltips_.text(), Justify::Centred));
     tooltipLabel_->setFont(font);
@@ -713,16 +839,41 @@ private:
 
     int originX = 0, originY = 0;
     desktopOriginOfWindow(&originX, &originY);
+    // The pointer and the box are logical; the origin and the screen are
+    // device pixels (Windows). Added unconverted, a tooltip at 200% landed at
+    // half the pointer's distance from the editor's corner.
+    const float s = editorScale();
     // BELOW and to the right of the pointer, which is where every desktop puts
     // one: above would put it under the cursor's own hotspot and the pointer
     // would cover the first word.
     // Below and right of the pointer, then nudged back onto whichever screen
     // the pointer is on -- a tooltip near the right edge would otherwise hang
     // off it, and near the edge of a SECOND monitor would hang off that.
-    const Point where = PopupMenu::placeOnScreen((float) originX + mouse.x + 12.0f,
-                                                 (float) originY + mouse.y + 8.0f, 12.0f, box.w,
-                                                 box.h);
-    tooltipWindow_.show(*tooltipLabel_, (int) where.x, (int) where.y, (int) box.w, (int) box.h);
+    const Point where = PopupMenu::placeOnScreen((float) originX + (mouse.x + 12.0f) * s,
+                                                 (float) originY + (mouse.y + 8.0f) * s,
+                                                 12.0f * s, box.w * s, box.h * s);
+    tooltipWindow_.show(*tooltipLabel_, (int) where.x, (int) where.y, (int) box.w, (int) box.h,
+                        s);
+  }
+
+  /** The face menus and tooltips are drawn in: whichever editor is showing. */
+  Font contentFont() const {
+    if (custom_) return custom_->font();
+    return editor_ ? editor_->font() : Font();
+  }
+
+  /** Device pixels per logical one, where the platform's desktop is in device
+   *  pixels: Windows, and X11, whose server knows nothing else -- at 200% a
+   *  tooltip there landed at half the pointer's distance from the editor's
+   *  corner, and a menu dropped half-way down the control that opened it.
+   *  The macOS desktop is in points, logical already. */
+  float editorScale() {
+#if !defined(__APPLE__)
+    const float s = window_.scale();
+    return s > 0.0f ? s : 1.0f;
+#else
+    return 1.0f;
+#endif
   }
 
   void desktopOriginOfWindow(int* x, int* y) {
@@ -759,10 +910,17 @@ private:
     desktopPositionOf(box, &screenX, &screenY, &screenW, &screenH);
 
     ComboBox* target = &box;
-    popup_.show(std::move(menu), editor_ ? editor_->font() : Font(), screenX, screenY,
-                box.bounds().h, screenW, screenH, [target](int id) {
-                  if (id > 0) target->setSelectedIndex(id - 1);
-                });
+    // Watched, not trusted. The menu is a window of its own and stays up
+    // across the editor's ticks, and a plugin's editor that rebuilds a page
+    // when automation moves the parameter it is laid out by destroys the box
+    // the menu was opened from; the choice was then written into it, freed.
+    // The watch goes with the callback, when the menu closes.
+    std::shared_ptr<detail::DeletionWatch> alive(new detail::DeletionWatch(target));
+    const float s = editorScale();
+    popup_.show(std::move(menu), contentFont(), screenX, screenY,
+                box.bounds().h * s, screenW, screenH, [target, alive](int id) {
+                  if (id > 0 && !alive->deleted) target->setSelectedIndex(id - 1);
+                }, s);
   }
 
   /** Where a component sits on the desktop, and how big the desktop is. */
@@ -780,7 +938,11 @@ private:
       localY += p->bounds().y;
     }
 #if defined(_WIN32)
-    POINT origin{(LONG) localX, (LONG) localY};
+    // The client area is in DEVICE pixels and the layout is logical: at 200%
+    // the unconverted offset dropped a menu at half the control's distance
+    // from the editor's corner.
+    const float s = editorScale();
+    POINT origin{(LONG) (localX * s + 0.5f), (LONG) (localY * s + 0.5f)};
     ClientToScreen((HWND) window_.handle(), &origin);
     *x = (float) origin.x;
     *y = (float) origin.y;
@@ -792,8 +954,10 @@ private:
     int wx = 0, wy = 0, sw = 0, sh = 0;
     window_.desktopOrigin(&wx, &wy);
     window_.screenSize(&sw, &sh);
-    *x = (float) wx + localX;
-    *y = (float) wy + localY;
+    // Device pixels on X11 as on Windows; the layout is logical.
+    const float s = editorScale();
+    *x = (float) wx + localX * s;
+    *y = (float) wy + localY * s;
     *screenW = (float) sw;
     *screenH = (float) sh;
 #endif
@@ -806,9 +970,15 @@ private:
 #endif
 
   std::unique_ptr<GenericEditor> editor_;
+  /** The plugin's own editor, instead of editor_ and the viewport. */
+  std::unique_ptr<AudioProcessorEditor> custom_;
+  ContentFactory contentFactory_;
   std::unique_ptr<Component> root_;
+  std::unique_ptr<PresetBar> presetBar_;
   std::unique_ptr<ResizableBorder> border_;
   EditorConstraints limits_;
+  /** The size the editor opened at: where a fixed axis is pinned. */
+  float naturalWidth_ = 0.0f, naturalHeight_ = 0.0f;
   std::unique_ptr<Viewport> viewport_;
   PopupWindow popup_;
   TooltipManager tooltips_;

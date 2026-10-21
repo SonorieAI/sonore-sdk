@@ -15,7 +15,7 @@
 //
 // It is not needed. IASIO is a COM vtable, and an interface declared in order
 // to INTEROPERATE is not the other party's source. This file declares that
-// vtable itself: the same thing it already does for LV2's UI descriptor and
+// vtable itself, the same thing it already does for LV2's UI descriptor and
 // LV2's worker interface, neither of which is vendored either. No Steinberg
 // code is compiled, linked, or shipped.
 //
@@ -36,6 +36,7 @@
 #pragma once
 
 #include "asio_format.h"
+#include "path_io.h"
 
 #if defined(_WIN32)
 
@@ -48,6 +49,7 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <cstring>
@@ -61,11 +63,23 @@ using AsioBool = long;
 using AsioError = long;
 using AsioSampleRate = double;
 
+/** The two results a driver means as success. */
 enum : AsioError {
-  kAsioOk = 0,
-  kAsioSuccess = 0x3f4847a0, // ASE_SUCCESS, which future() returns instead of 0
+  kAsioOk = 0,               ///< ASE_OK, what every call but future() returns on success.
+  kAsioSuccess = 0x3f4847a0, ///< ASE_SUCCESS, which future() returns instead of 0.
 };
 
+// The structs below are the ASIO SDK's C structures, transcribed field for
+// field, because a driver reads and writes them through a pointer with its
+// own compiled-in idea of their layout. Their field order, their types (a
+// `long` is 32 bits on Windows, which is what every driver was built with),
+// the 32-byte name arrays and the absence of anything else are the ABI:
+// a member added, reordered or widened is a driver writing into the wrong
+// field, or past the end of the struct.
+
+/** One clock a driver can sync to, as getClockSources fills it in. The ASIO
+ *  SDK's clock-source structure, layout unchanged (see above); nothing in
+ *  this SDK selects a clock -- that is the driver's own control panel's job. */
 struct AsioClockSource {
   long index;
   long associatedChannel;
@@ -74,6 +88,11 @@ struct AsioClockSource {
   char name[32];
 };
 
+/** What a driver says about one channel: the caller sets `channel` and
+ *  `isInput`, getChannelInfo fills in the rest. `type` is the sample format,
+ *  one of the kAsio codes in asio_format.h, and is asked for separately for
+ *  input and output because the two need not agree. The ASIO SDK's
+ *  channel-info structure, layout unchanged (see above). */
 struct AsioChannelInfo {
   long channel;
   AsioBool isInput;
@@ -83,21 +102,43 @@ struct AsioChannelInfo {
   char name[32];
 };
 
+/** One channel handed to createBuffers: the caller sets `isInput` and
+ *  `channelNum`, and the driver writes the two halves of its double buffer
+ *  into `buffers`, which the buffer-switch callback then indexes by the half
+ *  it is on. The array of these must stay alive until disposeBuffers. The
+ *  ASIO SDK's buffer-info structure, layout unchanged (see above). */
 struct AsioBufferInfo {
   AsioBool isInput;
   long channelNum;
   void* buffers[2];
 };
 
+/** A 64-bit system time in nanoseconds, split into two 32-bit halves the way
+ *  the ASIO SDK's time-stamp structure is (layout unchanged, see above). */
 struct AsioTimeStamp {
   long hi;
   unsigned long lo;
 };
+/** A 64-bit sample position, split into two 32-bit halves the way the ASIO
+ *  SDK's samples structure is (layout unchanged, see above). */
 struct AsioSamples {
   long hi;
   unsigned long lo;
 };
 
+/**
+ * The four functions a driver calls back, in the ASIO SDK's order (layout
+ * unchanged, see above).
+ *
+ * The driver KEEPS the pointer createBuffers is given rather than copying the
+ * table, so the table must outlive the buffers: AsioOutput holds it as a
+ * member for exactly that reason. There is no user-data field, which is why
+ * only one driver can be open at a time. `bufferSwitch` runs on the driver's
+ * thread -- the audio thread. AsioOutput leaves `bufferSwitchTimeInfo` null
+ * and its `asioMessage` answers no when a driver asks whether time info is
+ * supported (hostMessageReply in asio_format.h), so drivers call
+ * `bufferSwitch`.
+ */
 struct AsioCallbacks {
   void (*bufferSwitch)(long doubleBufferIndex, AsioBool directProcess);
   void (*sampleRateDidChange)(AsioSampleRate sRate);
@@ -143,8 +184,8 @@ public:
 
 /** One installed driver, as the registry describes it. */
 struct DriverInfo {
-  std::string name;
-  std::string clsid;
+  std::string name;  ///< The name every host shows, and what AsioOutput::open() takes.
+  std::string clsid; ///< The COM class id, as the registry spells it.
 };
 
 /**
@@ -162,19 +203,23 @@ inline std::vector<DriverInfo> listDrivers() {
   HKEY root = nullptr;
   // KEY_WOW64_64KEY: a 64-bit host must read the 64-bit view, and without it
   // a 32-bit build would silently enumerate a different set of drivers.
-  if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO", 0, KEY_READ | KEY_WOW64_64KEY,
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0, KEY_READ | KEY_WOW64_64KEY,
                     &root) != ERROR_SUCCESS)
     return drivers;
 
   for (DWORD index = 0;; ++index) {
-    char name[256];
-    DWORD nameLength = (DWORD) sizeof(name);
-    if (RegEnumKeyExA(root, index, name, &nameLength, nullptr, nullptr, nullptr, nullptr) !=
+    // The wide calls, and the name in UTF-8 like every other in the SDK: the
+    // A ones answer in the ANSI code page, so a driver with an accented name
+    // was listed in bytes no UTF-8 reader takes, and the UTF-8 name a user
+    // passed to --asio never matched it.
+    wchar_t name[256];
+    DWORD nameLength = (DWORD) (sizeof(name) / sizeof(name[0]));
+    if (RegEnumKeyExW(root, index, name, &nameLength, nullptr, nullptr, nullptr, nullptr) !=
         ERROR_SUCCESS)
       break;
 
     HKEY entry = nullptr;
-    if (RegOpenKeyExA(root, name, 0, KEY_READ | KEY_WOW64_64KEY, &entry) != ERROR_SUCCESS)
+    if (RegOpenKeyExW(root, name, 0, KEY_READ | KEY_WOW64_64KEY, &entry) != ERROR_SUCCESS)
       continue;
     char clsid[64] = {0};
     DWORD size = (DWORD) sizeof(clsid), type = 0;
@@ -185,7 +230,7 @@ inline std::vector<DriverInfo> listDrivers() {
     // the installer called it. They usually agree; when they do not, the key
     // name is the one every other host shows.
     RegCloseKey(entry);
-    if (haveClsid) drivers.push_back({name, clsid});
+    if (haveClsid) drivers.push_back({::sonore::pathio::narrow(name), clsid});
   }
   RegCloseKey(root);
   return drivers;
@@ -198,7 +243,8 @@ inline std::vector<DriverInfo> listDrivers() {
  * callbacks are bare C function pointers with no user-data cookie, so a host
  * has nowhere to put a `this`. Every ASIO host on Windows keeps a single
  * static instance for exactly this reason, and a second driver opened while
- * the first is running fails at the hardware anyway.
+ * the first is running fails at the hardware anyway. So open() refuses while
+ * another AsioOutput has a driver open: stop that one first.
  */
 class AsioOutput {
 public:
@@ -216,10 +262,16 @@ public:
   using RenderFn = std::function<void(const float* in, float* out, uint32_t frames,
                                       uint32_t channels)>;
 
+  /** stop(). */
   ~AsioOutput() { stop(); }
 
+  /** The rate the driver runs at, in Hz, as open() read it back; 48000
+   *  before open(). */
   double sampleRate() const { return sampleRate_; }
+  /** Always 2: the driver's first two outputs (and inputs, when asked for). */
   uint32_t channels() const { return 2; }
+  /** Frames per callback: the driver's preferred buffer size; 0 before
+   *  open(). */
   uint32_t bufferFrames() const { return (uint32_t) bufferFrames_; }
 
   /** The sample format the driver hands output back in, as an ASIO type code. */
@@ -228,20 +280,26 @@ public:
   /** The sample format the driver takes input in. Not promised to be the one
    *  it hands output back in. */
   long inputFormat() const { return inputFormat_; }
+  /** Why the last open() or start() failed; empty after one that worked. */
   const std::string& error() const { return error_; }
+  /** The driver open() was given, by name. */
   const std::string& driverName() const { return driverName_; }
 
+  /** True once per request: the driver asked for its stream to be rebuilt
+   *  (a reset, or a rate changed in its own control panel). The owner polls
+   *  this on its UI thread and reopens; nothing is torn down inside the
+   *  driver's callback, which is where the request arrives. */
+  bool takeResetRequest() { return resetRequested_.exchange(false, std::memory_order_acq_rel); }
+
   /**
-   * Open one driver by name and start it.
+   * Open one driver by name: everything up to and including createBuffers --
+   * which is where the rate and the block size are settled -- and NOT a
+   * single callback yet. run() starts it; start() does both.
    *
    * By NAME rather than by index, because the registry order is not stable --
    * an installer can add a driver and renumber everything after it, and an
    * index remembered in a settings file would then point at somebody else's
    * hardware.
-   */
-  /**
-   * Everything up to and including createBuffers -- which is where the rate
-   * and the block size are settled -- and NOT a single callback yet.
    *
    * Split from run() for the same reason WasapiOutput is: a caller has to
    * prepare its DSP at the rate the device chose, and it cannot do that until
@@ -256,6 +314,17 @@ public:
   bool open(const std::string& wanted, RenderFn render, bool withInput = false) {
     stop();
     error_.clear();
+    // The callbacks reach exactly one object, and while another has a driver
+    // open it is that one's. Opening this one as well would take them from
+    // it: its driver would go on calling into this object, whose render
+    // fills this object's buffers, while its own looped their last contents
+    // for as long as it ran.
+    if (instance_ && instance_ != this) {
+      error_ = "another AsioOutput has a driver open; ASIO calls back into one object at a "
+               "time, so stop that one first";
+      return false;
+    }
+    resetRequested_.store(false, std::memory_order_relaxed);
     render_ = std::move(render);
     wantInput_ = withInput;
 
@@ -268,8 +337,11 @@ public:
       return false;
     }
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    comInitialised_ = true;
+    // Balanced only when it succeeded. A thread already in the other
+    // apartment model answers RPC_E_CHANGED_MODE, and uninitialising after
+    // that took away an initialisation that belonged to whoever made the
+    // thread -- the host's, or the webview's.
+    comInitialised_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
     CLSID clsid{};
     wchar_t wide[64] = {};
@@ -463,6 +535,9 @@ public:
     return driver_->controlPanel() == kAsioOk;
   }
 
+  /** [main-thread] Stop the callbacks, give the buffers back and release the
+   *  driver, so another AsioOutput may open one. Harmless when nothing is
+   *  open; the destructor calls it. */
   void stop() {
     if (driver_) {
       if (running_) driver_->stop();
@@ -472,7 +547,13 @@ public:
     }
     running_ = false;
     buffersMade_ = false;
-    instance_ = nullptr;
+    // Only this object's own claim. Clearing it whoever held it meant any
+    // other AsioOutput that stopped -- one being opened, since open() stops
+    // first, or one merely destroyed -- cut the playing one off: its
+    // callback found no instance and returned without writing, and the
+    // driver went on playing whatever its two buffer halves last held, a
+    // loop of the last two blocks, until that one was stopped too.
+    if (instance_ == this) instance_ = nullptr;
     if (comInitialised_) {
       CoUninitialize();
       comInitialised_ = false;
@@ -480,6 +561,8 @@ public:
   }
 
 private:
+  friend struct AsioOutputTest; // sdk_tests drives the callbacks with a fake driver
+
   bool fail() {
     if (driver_) {
       driver_->Release();
@@ -519,8 +602,8 @@ private:
    */
   void writeChannel(void* destination, int channel, uint32_t frames) {
     if (!destination) return;
-    for (uint32_t i = 0; i < frames; ++i)
-      writeSample(destination, i, format_, scratch_[(size_t) i * 2 + (size_t) channel]);
+    // A run, not a sample at a time: see writeSamples.
+    writeSamples(destination, format_, scratch_.data() + channel, 2, frames);
   }
 
   /** One channel of the driver's own format into our interleaved float. The
@@ -529,24 +612,26 @@ private:
    *  together. */
   void readChannel(const void* source, int channel, uint32_t frames) {
     if (!source) return;
-    for (uint32_t i = 0; i < frames; ++i)
-      inputScratch_[(size_t) i * 2 + (size_t) channel] = readSample(source, i, inputFormat_);
+    readSamples(source, inputFormat_, inputScratch_.data() + channel, 2, frames);
   }
 
+  /** The rate moved under us -- someone changed it in the driver's own panel.
+   *  The DSP was prepared at the old one, so this is a reset like any other:
+   *  recording the number alone left every filter in the wrong place. */
   static void onSampleRateChanged(AsioSampleRate rate) {
-    if (instance_ && rate > 0.0) instance_->sampleRate_ = rate;
+    if (!instance_ || !(rate > 0.0)) return;
+    instance_->sampleRate_ = rate;
+    instance_->resetRequested_.store(true, std::memory_order_release);
   }
 
   /** The driver asking what we support. Answering honestly matters: a driver
-   *  told we handle a reset we do not would hand us one and wait. */
-  static long onMessage(long selector, long, void*, double*) {
-    switch (selector) {
-      case 1: // kAsioSelectorSupported
-      case 4: // kAsioEngineVersion
-        return 2;
-      default:
-        return 0;
-    }
+   *  told we handle a reset we do not would hand us one and wait. The table
+   *  is hostMessageReply in asio_format.h, where the tests can reach it. */
+  static long onMessage(long selector, long value, void*, double*) {
+    bool wantsReset = false;
+    const long reply = hostMessageReply(selector, value, &wantsReset);
+    if (wantsReset && instance_) instance_->resetRequested_.store(true, std::memory_order_release);
+    return reply;
   }
 
   IAsio* driver_ = nullptr;
@@ -557,6 +642,7 @@ private:
   std::vector<float> scratch_, inputScratch_;
   RenderFn render_;
   std::string error_, driverName_;
+  std::atomic<bool> resetRequested_{false};
   double sampleRate_ = 48000.0;
   long bufferFrames_ = 0;
   long format_ = kAsioInt32Lsb, inputFormat_ = kAsioInt32Lsb;

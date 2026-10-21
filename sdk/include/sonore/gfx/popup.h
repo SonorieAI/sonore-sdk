@@ -47,16 +47,25 @@ namespace gfx {
  */
 class PopupMenu {
 public:
+  /** A choice row's height, logical pixels. */
   static constexpr float kItemHeight = 24.0f;
+  /** A separator row's height. */
   static constexpr float kSeparatorHeight = 9.0f;
+  /** A section header's height. */
   static constexpr float kHeaderHeight = 22.0f;
   /** The same numbers the LookAndFeel draws to. Two copies of a layout
    *  constant is a menu whose text does not line up with its ticks. */
   static constexpr float kPaddingX = LookAndFeel::kPopupPadX;
+  /** Space above the first row and below the last. */
   static constexpr float kPaddingY = 5.0f;
+  /** The column kept for a tick, before the text. */
   static constexpr float kTickWidth = LookAndFeel::kPopupTickWidth;
+  /** The narrowest a menu is drawn, however short its labels. */
   static constexpr float kMinWidth = 90.0f;
 
+  /** A choice: `id` is what the menu reports when it is picked, so use 1 or
+   *  more -- 0 means dismissed. A disabled item is drawn dimmed and cannot be
+   *  picked; a ticked one shows a check. */
   void addItem(int id, std::string text, bool enabled = true, bool ticked = false) {
     PopupItem item;
     item.id = id;
@@ -77,6 +86,7 @@ public:
     items_.push_back(item);
   }
 
+  /** A heading row in the dim colour, which cannot be picked. */
   void addSectionHeader(std::string text) {
     PopupItem item;
     item.isHeader = true;
@@ -85,16 +95,22 @@ public:
     items_.push_back(std::move(item));
   }
 
+  /** Remove every row. */
   void clear() { items_.clear(); }
+  /** Rows of every kind: choices, separators and headers. */
   int numItems() const { return (int) items_.size(); }
+  /** Row `i`, which must be in range: it is not checked. */
   const PopupItem& itemAt(int i) const { return items_[(size_t) i]; }
+  /** Whether there are no rows; an empty menu is not shown. */
   bool isEmpty() const { return items_.empty(); }
 
+  /** Row `index`'s height, by its kind; `index` must be in range. */
   float heightOf(int index) const {
     const PopupItem& item = items_[(size_t) index];
     return item.isSeparator ? kSeparatorHeight : (item.isHeader ? kHeaderHeight : kItemHeight);
   }
 
+  /** Every row's height and the padding: the window's height, logical pixels. */
   float preferredHeight() const {
     float h = kPaddingY * 2.0f;
     for (int i = 0; i < numItems(); ++i) h += heightOf(i);
@@ -131,6 +147,7 @@ public:
     return -1;
   }
 
+  /** Where row `index` starts, in the menu's coordinates. */
   float topOf(int index) const {
     float y = kPaddingY;
     for (int i = 0; i < index; ++i) y += heightOf(i);
@@ -187,6 +204,7 @@ private:
  */
 class PopupContent : public Widget {
 public:
+  /** Draw `menu`, which is not copied and must outlive this, in `font`. */
   PopupContent(const PopupMenu& menu, Font font) : menu_(menu) { setFont(font); }
 
   /** The chosen id, or 0 for dismissed -- called exactly once, whichever
@@ -194,6 +212,7 @@ public:
    *  the menu to decide. */
   std::function<void(int)> onDismiss;
 
+  /** The row under the pointer, or -1. */
   int highlighted() const { return highlighted_; }
 
   void paint(Graphics& g) override {
@@ -245,6 +264,7 @@ public:
     if (onDismiss) onDismiss(id);
   }
 
+  /** Whether onDismiss has been called -- a press, or dismissWith. */
   bool isDismissed() const { return dismissed_; }
 
 private:

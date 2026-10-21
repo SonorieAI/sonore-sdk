@@ -50,6 +50,7 @@ public:
    *  larger buffer here would only produce messages that are then dropped. */
   static constexpr int kCapacity = MidiBuffer::kSysexCapacity;
 
+  /** Abandon a message part way through, and the last one completed. */
   void reset() {
     length_ = 0;
     inMessage_ = false;
@@ -135,7 +136,10 @@ public:
     return found;
   }
 
+  /** The message the last push() completed, F0 to F7; valid until the next
+   *  push(), as push() says. */
   const uint8_t* data() const { return buffer_; }
+  /** Its length in bytes, F0 and F7 included. */
   size_t size() const { return (size_t) length_; }
 
 private:

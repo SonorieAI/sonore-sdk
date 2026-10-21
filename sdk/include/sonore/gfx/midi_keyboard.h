@@ -31,6 +31,18 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * A piano keyboard drawn on screen: played with the mouse, and lit by the
+ * notes the DSP is sounding. See the file comment for why an instrument wants
+ * one and why the black keys sit where they do.
+ *
+ * Two inputs, kept apart. A click or drag fires onNoteOn / onNoteOff with
+ * MIDI note numbers 0..127 and a 0..1 velocity, for the owner to turn into
+ * MIDI; setNoteHeld lights a key and fires nothing. Both on the message
+ * thread: notes reaching the DSP on the audio thread are handed over by the
+ * owner (through a queue or an atomic), never by calling setNoteHeld from
+ * there. Shows C3 to C6 until setRange says otherwise.
+ */
 class MidiKeyboard : public Widget {
 public:
   /** One element, not 128. A reader enumerating every key would take a minute
@@ -43,11 +55,13 @@ public:
     return info;
   }
 
-  MidiKeyboard() { setRange(48, 84); } // C3 to C6, three octaves
+  MidiKeyboard() { setRange(48, 84); } ///< C3 to C6, three octaves
 
   /** Fired when a key is pressed or released with the mouse. Velocity is 0..1;
    *  the wrapper turns it into 1..127. */
   std::function<void(int note, float velocity)> onNoteOn;
+  /** The key the mouse was playing was let go: the button came up, or the
+   *  pointer slid to another key or off the keyboard. */
   std::function<void(int note)> onNoteOff;
 
   /**
@@ -66,7 +80,9 @@ public:
     repaint();
   }
 
+  /** The lowest key shown, as a MIDI note number; always a white key. */
   int lowestNote() const { return lowest_; }
+  /** The highest key shown, as a MIDI note number; always a white key. */
   int highestNote() const { return highest_; }
 
   /**
@@ -83,18 +99,31 @@ public:
     repaint();
   }
 
+  /** Lit by the host, or pressed with the mouse. Two sources, kept apart:
+   *  one flag for both had a mouse release put out a note the host was
+   *  still holding. */
   bool isNoteHeld(int note) const {
-    return note >= 0 && note <= 127 && held_[(size_t) note];
+    return note >= 0 && note <= 127 && (held_[(size_t) note] || note == mouseNote_);
   }
 
+  /** The key under the pointer, or -1. */
+  int hoveredNote() const { return hoverNote_; }
+
+  /** Unlight every key, the one under the mouse included. The host's lights
+   *  go out silently; a note the MOUSE is holding is ended with onNoteOff,
+   *  because the owner sent its note-on and is waiting for the off. */
   void allNotesOff() {
     bool any = false;
     for (size_t i = 0; i < held_.size(); ++i) {
       if (held_[i]) any = true;
       held_[i] = false;
     }
-    mouseNote_ = -1;
     if (any) repaint();
+    // The mouse's note was dropped here without its note-off, and the release
+    // that followed found nothing to release -- so the owner's synth held the
+    // note for good. Last, because onNoteOff is the owner's code and may
+    // delete this keyboard.
+    releaseMouseNote();
   }
 
   /** How wide one white key is. Everything else follows from it. */
@@ -103,6 +132,7 @@ public:
     return whites > 0 ? localBounds().w / (float) whites : 0.0f;
   }
 
+  /** How many white keys the range shows. */
   int numWhiteKeys() const {
     int n = 0;
     for (int note = lowest_; note <= highest_; ++note)
@@ -157,6 +187,7 @@ public:
     return kMinVelocity + clamped * (1.0f - kMinVelocity);
   }
 
+  /** Whether MIDI note `note` is a black key (C#, D#, F#, G#, A#), any octave. */
   static bool isBlack(int note) {
     switch (((note % 12) + 12) % 12) {
       case 1:
@@ -191,8 +222,16 @@ public:
   void mouseUp(const MouseEvent&) override { releaseMouseNote(); }
 
   /** The pointer leaving with the button down ends the note. A keyboard that
-   *  kept it sounding would leave a stuck note the user has no way to stop. */
-  void mouseExit(const MouseEvent&) override { releaseMouseNote(); }
+   *  kept it sounding would leave a stuck note the user has no way to stop.
+   *  And it takes the hover highlight with it, which stayed on the last key
+   *  crossed on the way out. */
+  void mouseExit(const MouseEvent&) override {
+    releaseMouseNote();
+    if (hoverNote_ >= 0) {
+      hoverNote_ = -1;
+      repaint();
+    }
+  }
 
   void paint(Graphics& g) override {
     LookAndFeel& lf = lookAndFeel();
@@ -218,8 +257,10 @@ public:
     repaint();
   }
 
-  static constexpr float kBlackWidth = 0.62f;  // of a white key
-  static constexpr float kBlackHeight = 0.62f; // of the full height
+  static constexpr float kBlackWidth = 0.62f;  ///< of a white key
+  static constexpr float kBlackHeight = 0.62f; ///< of the full height
+  /** The velocity of a press at the very top of a key; one at the bottom
+   *  gives 1. */
   static constexpr float kMinVelocity = 0.25f;
 
 private:
@@ -241,8 +282,8 @@ private:
   }
 
   void startNote(int note, float velocity) {
-    mouseNote_ = note;
-    setNoteHeld(note, true);
+    mouseNote_ = note; // lit through isNoteHeld, not the host's flags
+    repaint();
     if (onNoteOn) onNoteOn(note, velocity);
   }
 
@@ -251,9 +292,9 @@ private:
     const int note = mouseNote_;
     mouseNote_ = -1;
     // The HOST may also be holding this note -- somebody playing along on a
-    // controller. Only the mouse's own light is taken away here; a note the
-    // DSP is still sounding stays lit because setNoteHeld owns that.
-    setNoteHeld(note, false);
+    // controller. Only the mouse's own light goes out here; the host's flag
+    // is setNoteHeld's alone, so a note the DSP is still sounding stays lit.
+    repaint();
     if (onNoteOff) onNoteOff(note);
   }
 

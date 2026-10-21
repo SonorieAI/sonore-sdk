@@ -1,7 +1,8 @@
 # Third-party notices
 
-The Sonore SDK is Apache-2.0 (see `LICENSE`). Its own code, everything under
-`sdk/include/sonore`, `sdk/examples` and `sdk/tests`, is original work.
+The Sonore SDK is Apache-2.0 (see `LICENSE`). Its own code (everything under
+`sdk/include/sonore`, `sdk/examples` and `sdk/tests`) is original work, but
+for the text shaping below that follows HarfBuzz.
 
 This file lists everything that is **not** ours: code vendored into the tree,
 code fetched at build time, and the format obligations that no software
@@ -20,8 +21,39 @@ Each retains its own licence, which travels with any copy you distribute.
 | minimp3 | `sdk/third_party/minimp3.h` | CC0 (public domain dedication) | lieff |
 | stb_vorbis (v1.22) | `sdk/third_party/stb_vorbis.c` | MIT **or** public domain (Unlicense), at your option | Sean Barrett |
 
+Unicode Character Database data, © 1991–2022 Unicode, Inc., under the
+[Unicode License v3](https://www.unicode.org/license.txt): the tables generated
+into `sdk/include/sonore/gfx/bidi.h`, `gfx/text_shaper.h` and
+`gfx/line_break.h` (bidi classes, paired brackets, mirroring, Arabic joining
+types, scripts, combining classes, canonical decompositions and compositions,
+line breaking classes -- see `scripts/unicode/`), and
+`sdk/tests/data/bidi/BidiCharacterTest-15.0.0-sample.txt` and
+`sdk/tests/data/linebreak/LineBreakTest-15.0.0-sample.txt`, samples of
+Unicode's bidi and line breaking conformance files. The licence asks that its notice travel with copies of
+the data, which this paragraph and the files' own headers do.
+
+HarfBuzz, © 2010–2023 Google, Inc., Behdad Esfahbod, Red Hat, Inc. and the
+others its `COPYING` names, under the "Old MIT" licence: the shapers in
+`sdk/include/sonore/gfx/text_shaper.h` for Thai and Lao, Hangul, the Indic
+scripts, Khmer, Myanmar and the Universal Shaping Engine follow HarfBuzz's
+closely, and the syllable grammars and the Indic and Universal categories
+`scripts/unicode/gen_syllables.py`, `gen_indic.py` and `gen_use.py`
+regenerate are HarfBuzz's. The licence asks that its copyright
+notice and two paragraphs appear in all copies; they are at the head of
+`text_shaper.h`, which carries them wherever the header goes.
+
+Microsoft's `IndicShapingInvalidCluster.txt`,
+`IndicSyllabicCategory-Additional.txt` and
+`IndicPositionalCategory-Additional.txt`, © Microsoft Corporation, under the
+MIT licence (`scripts/unicode/ms-use/COPYING`): the sequences of a vowel
+letter and a sign that look like another letter, and the Universal Shaping
+Engine's corrections to the UCD's categories, generated into
+`text_shaper.h` as `kInvalidClusters` and `kUseRanges`.
+
 Full licence texts live beside the code: `clap/LICENSE`, `lv2/COPYING`,
 `vst3/LICENSE.txt`, and inline at the foot of `minimp3.h` / `stb_vorbis.c`.
+An installed SDK (`cmake --install`) carries `minimp3.h` and `stb_vorbis.c`
+in `include/sonore/third_party/`, licences inline as above.
 
 The vendored `stb_vorbis.c` carries TWO local changes, each marked `SONORE
 LOCAL FIX` in the source, both in the error path a corrupt header takes:
@@ -32,9 +64,13 @@ freeing the uninitialised entries after it). Everything else is upstream
 v1.22 byte for byte. Both were found by `tests/fuzz_parsers.cpp`.
 
 `minimp3` and `stb_vorbis` are compiled inside an **anonymous namespace**, so
-each translation unit gets an internal-linkage copy. A header-only SDK that
+each translation unit gets an internal-linkage copy: a header-only SDK that
 emitted external symbols from vendored C would collide the moment a plugin was
-built from two files.
+built from two files. For that, both files carry one more local change, marked
+`SONORE LOCAL CHANGE`: their `extern "C"` blocks are skipped when
+`SONORE_CODEC_CPP_LINKAGE` is defined, which `audiofile_codecs.h` does, because
+C language linkage made MSVC give the functions external linkage even inside
+the anonymous namespace.
 
 ## Fetched at build time, never vendored
 
@@ -89,6 +125,6 @@ are trademarks of Apple Inc. All other trademarks are the property of their
 respective owners, and are used here only to identify the formats this SDK
 can build.
 
-Licensing or naming questions, including whether a particular use of the name
-is fine, go to **legal@sonorie.com**. Bugs and features belong in the issue
+Licensing or naming questions (including whether a particular use of the name
+is fine) go to **legal@sonorie.com**. Bugs and features belong in the issue
 tracker, and vulnerabilities in `SECURITY.md`.

@@ -14,6 +14,7 @@
 // The bag the host reads back, which is how a test sees what the plugin was
 // told about its surroundings.
 #include <sonore/state_bag.h>
+#include <cstdlib>
 
 struct SonoreDsp {
   sonore::Smooth gain;
@@ -27,15 +28,24 @@ struct SonoreDsp {
    *
    *  That is the harder half of the feature. A DSP taking a ProcessContext can
    *  read ctx.offline every block; one taking process(block, params) has no
-   *  context at all, and only learns the render mode because the wrapper
-   *  re-runs prepare() when it changes. Reading it HERE, in prepare, is what
-   *  makes the test prove that re-prepare actually happens. */
+   *  context at all, and only learns the render mode from the prepare() that
+   *  follows the change -- the next activation in CLAP and VST3, never one
+   *  forced mid-render. Reading it HERE, in prepare, is what makes the test
+   *  prove that prepare actually carries it. */
   bool offline = false;
+  /** And what the LAST prepare() said, for the same reason: a wrapper that
+   *  re-prepares (on a render-mode change, LV2's freewheel) must hand over the
+   *  session's rate and block, not defaults it never overwrote. Reported
+   *  through the state bag; kept as numbers here so prepare allocates nothing. */
+  double preparedRate = 0.0;
+  uint32_t preparedBlock = 0;
 
   void prepare(const sonore::ProcessSpec& spec) {
     gain.setup((float) spec.sampleRate, 5.0f);
     gain.snap(1.0f);
     offline = spec.offline;
+    preparedRate = spec.sampleRate;
+    preparedBlock = spec.maximumBlockSize;
   }
 
   /** Optional hook: the wrapper calls this before every block when present. */
@@ -81,11 +91,29 @@ struct SonoreDsp {
     bag.setString("track", track.hasName ? track.name : std::string());
     bag.setString("trackColour", track.colourHex());
     bag.setString("file", lastFilePath);
+    bag.setString("prepared", "prepared " + std::to_string((long long) preparedRate) + " Hz, " +
+                                  std::to_string(preparedBlock) + " frames");
+    // Where the host said the last block began, in beats -- the musical clock
+    // a tempo-synced LFO or an arpeggiator runs on.
+    char beats[48];
+    sonore::numtext::format(beats, sizeof(beats), transport.hasBeats ? transport.positionBeats : -1.0,
+                            "%.3f");
+    bag.setString("transport", std::string("beat ") + beats);
+    // Only for the test that asks. A count of loads is the one thing here a
+    // save/load/save round trip cannot reproduce, and clap-validator's
+    // state-reproducibility-binary checks exactly that: with the count always
+    // saved, the probe failed it ("loads 0" saved, "loads 1" after).
+    if (std::getenv("SONORE_PROBE_COUNT_LOADS"))
+      bag.setString("loads", "loads " + std::to_string(loads));
   }
-  void loadState(const sonore::StateBag&) {}
+  /** How many times the wrapper restored state into this DSP. A host's one
+   *  restore is one load, however many interfaces it delivers the bytes to.
+   *  Saved only under SONORE_PROBE_COUNT_LOADS, which vst3_host_test sets. */
+  int loads = 0;
+  void loadState(const sonore::StateBag&) { ++loads; }
 
-  /** The fixture's third job. A DSP that delays its signal: a look-ahead
-   *  limiter, a convolver: must report it or every parallel mix it sits in is
+  /** The fixture's third job. A DSP that delays its signal (a look-ahead
+   *  limiter, a convolver) must report it or every parallel mix it sits in is
    *  silently smeared. Declaring it here proves the wrapper asks. */
   int latencySamples() const { return extraLatency > 0.5f ? 512 : 64; }
 
@@ -95,8 +123,8 @@ struct SonoreDsp {
    * A fixture that declares a latency it does not have is a fixture nobody
    * can check latency compensation against. The LV2 host test measures the
    * delay through the plugin and compares it to the published number; this
-   * probe published 64 and delayed by 0, which is the mismatch that test
-   * exists to catch.
+   * probe published 64 and delayed by 0, and the only reason that never
+   * failed is that the two had never been run against each other.
    *
    * So the audio is really late now, and this is the one plugin in the suite
    * where a host's delay compensation can be verified rather than assumed.
@@ -286,44 +314,41 @@ window.addEventListener('sonore:ready', function () {
   // the host's name into its bag, so seeing it HERE proves the whole channel:
   // DSP bag -> wrapper -> editor tick -> page.
   //
-  // Reported on a SEPARATE parameter rather than by gating the one above,
-  // because not every format can do this. An LV2 UI is a different module
-  // from the plugin and talks to it only through ports -- it never sees the
-  // bag, by design. Gating 0.777 on the state made the LV2 bridge test fail
-  // for a reason that was not a bug, which is how this ended up written down.
+  // Reported on a SEPARATE parameter rather than by gating the one above.
+  // An LV2 interface is a module of its own, and the state reaches it only as
+  // atoms through the host -- and LV2 gives a plugin no host name, so its
+  // state says host "". That still proves the state crossed, which LV2's page
+  // never did until it spoke in the atoms hosts carry: Gain goes to 0.75 for
+  // a state with no host name, 1.25 for one with a name.
+  // A host change made while the editor was HIDDEN must reach the page when
+  // it is shown again. The host test moves Gain to 0.4321 behind a hidden
+  // editor; seeing it arrive, the page answers on the probe parameter.
+  sonore.on(function (values, index, value) {
+    if (index === 0 && Math.abs(value - 0.4321) < 1e-4) sonore.set('probe', 0.5);
+  });
   sonore.onState(function (state) {
-    if (!state || typeof state.host !== 'string' || state.host.length === 0) {
+    if (!state || typeof state.host !== 'string') {
       document.getElementById('log').textContent = 'bridge BROKEN - no state';
       return;
     }
     sonore.begin(0);
-    sonore.set(0, 1.25);
+    sonore.set(0, state.host.length > 0 ? 1.25 : 0.75);
     sonore.end(0);
   });
   // A right-click on parameter 2, at a position the host can recognise. The
   // host's own menu is what carries MIDI learn and "remove automation", so a
   // page that handles the click itself takes those away from the user.
   sonore.contextMenu(2, 12, 34);
+  // The spacebar, pressed while the editor has focus. The page does nothing
+  // with it, so it must reach the HOST, where it is transport.
+  document.body.dispatchEvent(new KeyboardEvent('keydown', {key: ' ', code: 'Space', bubbles: true}));
+  document.body.dispatchEvent(new KeyboardEvent('keyup', {key: ' ', code: 'Space', bubbles: true}));
+  // Then a text field takes the keyboard and still has it when the editor
+  // goes: the user was typing a name when they closed the window. That is
+  // this page's business, not the next one's -- the CLAP host test presses
+  // the space again on the page rebuilt after a park, and it must arrive.
+  sonore.captureKeys(true);
 });
 </script></body></html>)HTML"
 
-#include <sonore/clap_wrapper.h>
-
-// The same source builds a VST3 as well: the CLAP wrapper owns the shared
-// machinery and the VST3 one adapts it, so the two formats cannot drift.
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-// …and an Audio Unit on macOS, from the same sources again.
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-// …and an LV2, which is the format the probe was missing. It is here for the
-// same reason the probe exists at all: it REPORTS what the host told it, and
-// lv2:freeWheeling cannot be shown to reach a DSP by any other means.
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

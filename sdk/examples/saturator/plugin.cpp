@@ -30,13 +30,14 @@ struct SonoreDsp {
     dcL.setSampleRate(sr); dcR.setSampleRate(sr);
     dcL.reset(); dcR.reset();
     osL.reset(); osR.reset();
+    mixer.setSampleRate(sr);
     mixer.setWetLatency(sonore::Oversampler2x::latencySamples());
     lastTone = -1.0f;
   }
 
   /** The oversampler delays the signal, so the plugin says so. Without this
    *  the host cannot time-align it and every parallel mix it sits in is
-   *  smeared: silently, which is the worst kind. (A saturator that would
+   *  smeared, silently, which is the worst kind. (A saturator that would
    *  rather have none can use sonore::OversamplerIir instead: minimum phase,
    *  no latency to report, and a quarter of the multiplies.) */
   int latencySamples() const { return sonore::Oversampler2x::latencySamples(); }
@@ -63,12 +64,15 @@ struct SonoreDsp {
     }
     mixer.setMix(p[2] * 0.01f); // the control is a percentage
 
+    // Once per block: the control is constant across it, and the smoother
+    // does the ramp, so the dB-to-gain power need not run per sample.
+    const float outTarget = sonore::dbToGain(p[3]);
     for (size_t i = 0; i < n; ++i) {
       const float drive = driveSm.next(p[0]);
-      const float outGain = outSm.next(sonore::dbToGain(p[3]));
+      const float outGain = outSm.next(outTarget);
       const float dryL = L[i], dryR = R[i];
 
-      // The nonlinearity runs oversampled, that is what keeps the aliasing
+      // The nonlinearity runs oversampled: that is what keeps the aliasing
       // probe clean at high drive.
       float wetL = osL.process(dryL, [drive](float x) { return std::tanh(x * drive); });
       float wetR = osR.process(dryR, [drive](float x) { return std::tanh(x * drive); });
@@ -91,7 +95,7 @@ static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     {"output", "Output", "dB", -24.0f, 12.0f, 0.0f, 0},
 };
 
-// Factory presets: drive, tone, mix, output: in the contract's index order.
+// Factory presets: drive, tone, mix, output, in the contract's index order.
 // Compiled in, so they can never go missing or drift from the parameter set
 // that shipped with them.
 #include <sonore/presets.h>
@@ -200,7 +204,10 @@ static const sonore::PluginDescriptor kDesc = {
       dial.addEventListener('pointercancel', release);
       dial.addEventListener('dblclick', function () { sonore.set(i, p.default); show(p.default); });
 
-      sonore.on(function (j, v) { if (j === i) show(v); });
+      // (values, index, value), as the bridge calls it. Read as (index,
+      // value), j was the values object and never i: no knob here moved when
+      // the host automated, loaded a preset or restored a session.
+      sonore.on(function (values, j, v) { if (j === i) show(v); });
     });
 
     var lvl = document.getElementById('lvl');
@@ -208,27 +215,4 @@ static const sonore::PluginDescriptor kDesc = {
   });
   </script></body></html>)HTML"
 
-#include <sonore/clap_wrapper.h>
-
-// The same source builds a VST3 as well: the CLAP wrapper owns the shared
-// machinery and the VST3 one adapts it, so the two formats cannot drift.
-#if defined(SONORE_BUILD_VST3)
-#include <sonore/vst3_wrapper.h>
-#endif
-
-// …and an Audio Unit on macOS, from the same sources again.
-#if defined(SONORE_BUILD_AU)
-#include <sonore/au_wrapper.h>
-#include <sonore/au_view.h>
-#endif
-
-// …and an LV2 bundle for the Linux-native hosts (the same file also builds
-// the TTL generator under SONORE_LV2_TTLGEN).
-#if defined(SONORE_BUILD_LV2)
-#include <sonore/lv2_wrapper.h>
-#endif
-
-// …and a runnable application, no DAW required. standalone.h defines main().
-#if defined(SONORE_BUILD_STANDALONE)
-#include <sonore/standalone.h>
-#endif
+#include <sonore/formats.h> // CLAP, and every format this target is built as

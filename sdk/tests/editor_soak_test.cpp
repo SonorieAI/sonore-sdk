@@ -114,6 +114,14 @@ int main(int argc, char** argv) {
   const int warm = cycles / 4 > 3 ? cycles / 4 : 3;
   DWORD handlesAtWarm = 0;
   size_t bytesAtWarm = 0;
+  // The end is the LOWEST of the last three cycles, not the last reading. On
+  // a machine busy compiling, the OS keeps extra worker threads and their
+  // events in the process for a moment, and one reading taken then failed
+  // the check with the count flat at 218 in every run alone. A real leak
+  // grows every cycle, so it still shows in the lowest of three.
+  const int tail = 3;
+  DWORD handlesEnd = 0;
+  size_t bytesEnd = 0;
   int opened = 0, created = 0;
   for (int c = 0; c < cycles; ++c) {
     plugin->setParameterValue(1, 0.0);
@@ -121,7 +129,10 @@ int main(int argc, char** argv) {
     const bool ok = plugin->openEditor(parent);
     if (ok) ++opened;
     bool up = false;
-    const ULONGLONG deadline = GetTickCount64() + 6000;
+    // Twenty seconds: this measures leaks, not start-up time, and a WebView2
+    // cold start on a machine busy compiling took longer than the six this
+    // had. A page that never comes up still fails, only later.
+    const ULONGLONG deadline = GetTickCount64() + 20000;
     while (GetTickCount64() < deadline) {
       pump(20);
       processOne(); // the page's edit crosses on the audio thread
@@ -142,10 +153,13 @@ int main(int argc, char** argv) {
       handlesAtWarm = h;
       bytesAtWarm = b;
     }
+    if (c >= cycles - tail) {
+      handlesEnd = (c == cycles - tail || h < handlesEnd) ? h : handlesEnd;
+      bytesEnd = (c == cycles - tail || b < bytesEnd) ? b : bytesEnd;
+    }
   }
-  const DWORD handlesEnd = handles();
-  const size_t bytesEnd = privateBytes();
-  const int measured = cycles - warm;
+  // The lowest may come from the first of the last three cycles.
+  const int measured = cycles - warm - (tail - 1) > 1 ? cycles - warm - (tail - 1) : 1;
   const double handlesPerCycle = ((double) handlesEnd - (double) handlesAtWarm) / measured;
   const double bytesPerCycle = ((double) bytesEnd - (double) bytesAtWarm) / measured;
   std::printf("  ---- after warm-up: %+.2f handles and %+.1f KB per open/close cycle over %d "

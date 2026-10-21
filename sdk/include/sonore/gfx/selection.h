@@ -44,12 +44,17 @@ namespace gfx {
 template <typename ItemType>
 class SelectedItemSet {
 public:
+  /** The selected items, in the order they were selected. */
   using Items = std::vector<ItemType>;
 
+  /** What is selected, in selection order. */
   const Items& items() const { return items_; }
+  /** How many items are selected. */
   int size() const { return (int) items_.size(); }
+  /** Whether nothing is selected. */
   bool isEmpty() const { return items_.empty(); }
 
+  /** Whether `item` is selected, compared with ==. */
   bool isSelected(const ItemType& item) const {
     return std::find(items_.begin(), items_.end(), item) != items_.end();
   }
@@ -58,6 +63,7 @@ public:
    *  selecting forty things repaints once. */
   std::function<void()> onChange;
 
+  /** Make `item` the whole selection. onChange fires unless it already was. */
   void selectOnly(const ItemType& item) {
     if (items_.size() == 1 && items_[0] == item) return;
     items_.clear();
@@ -65,12 +71,14 @@ public:
     changed();
   }
 
+  /** Add `item` at the end; nothing happens if it is already selected. */
   void addToSelection(const ItemType& item) {
     if (isSelected(item)) return;
     items_.push_back(item);
     changed();
   }
 
+  /** Remove `item`; nothing happens if it is not selected. */
   void deselect(const ItemType& item) {
     const auto at = std::find(items_.begin(), items_.end(), item);
     if (at == items_.end()) return;
@@ -78,11 +86,13 @@ public:
     changed();
   }
 
+  /** Remove `item` if it is selected, add it if not. */
   void toggleSelection(const ItemType& item) {
     if (isSelected(item)) deselect(item);
     else addToSelection(item);
   }
 
+  /** Empty the selection; onChange fires only if it was not already empty. */
   void deselectAll() {
     if (items_.empty()) return;
     items_.clear();
@@ -142,6 +152,7 @@ private:
  */
 class LassoComponent : public Widget {
 public:
+  /** Hidden until beginLasso; never takes the mouse, never announced. */
   LassoComponent() {
     // It is drawn over everything and must not take clicks: the press that
     // started it went to whatever is underneath, and the release has to reach
@@ -154,8 +165,12 @@ public:
   /** Called on every drag with the current rectangle, in the LASSO's own
    *  coordinates -- which is its parent's, since it covers it. */
   std::function<void(const Rect& area, bool addToExisting)> onLassoChanged;
+  /** After endLasso, once the band has gone. */
   std::function<void()> onLassoEnded;
 
+  /** Start a band at `start`, in the parent's coordinates: covers the parent
+   *  and shows. `addToExisting` is passed through to onLassoChanged, for a
+   *  modifier that adds to the selection rather than replacing it. */
   void beginLasso(Point start, bool addToExisting) {
     if (Component* p = parent()) setBounds({0.0f, 0.0f, p->bounds().w, p->bounds().h});
     start_ = start;
@@ -166,6 +181,8 @@ public:
     repaint();
   }
 
+  /** Move the band's free corner to `to`, in the parent's coordinates, and call
+   *  onLassoChanged. Ignored unless a lasso is active. */
   void dragLasso(Point to) {
     if (!active_) return;
     current_ = to;
@@ -173,6 +190,7 @@ public:
     if (onLassoChanged) onLassoChanged(area(), addToExisting_);
   }
 
+  /** Hide the band and call onLassoEnded. Ignored unless a lasso is active. */
   void endLasso() {
     if (!active_) return;
     active_ = false;
@@ -181,6 +199,7 @@ public:
     if (onLassoEnded) onLassoEnded();
   }
 
+  /** Between beginLasso and endLasso. */
   bool isActive() const { return active_; }
 
   /** Normalised, so dragging up-and-left gives the same rectangle as
@@ -225,6 +244,8 @@ private:
  */
 class ComponentDragger {
 public:
+  /** Begin moving `component` from its current bounds; called from its
+   *  mouseDown with the event. Null is ignored. */
   void startDraggingComponent(Component* component, const MouseEvent& e) {
     if (!component) return;
     startBounds_ = component->bounds();
@@ -257,7 +278,9 @@ public:
     component->setBounds({x, y, startBounds_.w, startBounds_.h});
   }
 
+  /** The drag is over; dragComponent does nothing until the next start. */
   void endDrag() { dragging_ = false; }
+  /** Between startDraggingComponent and endDrag. */
   bool isDragging() const { return dragging_; }
 
   /** How far the pointer has travelled since the press. What a caller uses to

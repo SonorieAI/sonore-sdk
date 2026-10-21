@@ -63,6 +63,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "tube.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -81,18 +84,33 @@ namespace sonore {
  */
 class TubeStage {
 public:
+  /** The tube's model, 12AX7 (ECC83) by default: Koren's plate-current
+   *  constants and Dempwolf and Zölzer's grid-current ones. Another triode
+   *  is another set of these, given to setTriode(), which rebuilds the plate
+   *  curve (about 3.7 ms) only when a value actually changed. */
   struct Triode {
-    // Koren's plate-current parameters, 12AX7.
+    ///@{
+    /** Koren's plate-current parameters, 12AX7: Ip = 2 E1^ex / kg1 with
+     *  E1 = (Vpk / kp) ln(1 + e^(kp (1/mu + Vgk / sqrt(kvb + Vpk^2)))), in
+     *  amps for voltages in volts. */
     float mu = 100.0f, ex = 1.4f, kg1 = 1060.0f, kp = 600.0f, kvb = 300.0f;
-    // Dempwolf & Zölzer's grid-current parameters, ECC83: Ig = Gg (ln(1 + e^(Cg Vgk)) / Cg)^xi.
+    ///@}
+    ///@{
+    /** Dempwolf and Zölzer's grid-current parameters, ECC83:
+     *  Ig = Gg (ln(1 + e^(Cg Vgk)) / Cg)^xi, in amps for Vgk in volts. */
     float gg = 6.177e-4f, cg = 9.901f, xi = 1.314f;
+    ///@}
   };
 
+  /** Prepare for a sample rate in Hz (1 or less means 48000): the output DC
+   *  blocker and the capacitors' steps, and on the first call the plate
+   *  curve (about 3.7 ms; that first build also reset()s). Call it before
+   *  the first process() and again on a rate change; a later call keeps the
+   *  capacitors' charge. No allocation. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     blocker_.setSampleRate(sr_);
-    dtOverCin_ = 1.0f / (sr_ * cin_);
-    dtOverCk_ = ck_ > 0.0f ? 1.0f / (sr_ * ck_) : 0.0f;
+    updateSteps();
     if (!built_) build();
   }
   /** Volume before the grid, linear. */
@@ -100,17 +118,37 @@ public:
   /** A plain multiplier on the unity-normalised output. Negative keeps the
    *  stage's own inversion. */
   void setOutputGain(float g) { outputGain_ = g; }
+  /** Both rebuild the plate curve, 2048 solves, about 3.7 ms -- so the same
+   *  values again are no work at all. A plugin applies its parameters every
+   *  block, and every call rebuilt and RESET the stage: a third of a 512-sample
+   *  block's time gone, and a click (spurs from -88 to -29 dBc) each time. */
   void setTriode(const Triode& t) {
+    if (built_ && t.mu == triode_.mu && t.ex == triode_.ex && t.kg1 == triode_.kg1 &&
+        t.kp == triode_.kp && t.kvb == triode_.kvb && t.gg == triode_.gg && t.cg == triode_.cg &&
+        t.xi == triode_.xi)
+      return;
     triode_ = t;
     build();
   }
+  /** The circuit around the tube: supply (B+) in volts, plate load and
+   *  cathode resistor in kΩ, the cathode floored at 0.01 kΩ. Like
+   *  setTriode(), rebuilds the plate curve and the operating point only when
+   *  a value changed. After the first build a change is not a reset: the
+   *  capacitors keep their charge and the stage moves to the new operating
+   *  point through them. No allocation. */
   void setCircuit(float supplyVolts, float plateKohm, float cathodeKohm) {
-    supply_ = supplyVolts;
     // Koren's current comes out in AMPS with these constants, so the
     // resistors are held in ohms. The first build had them in kΩ and got a
     // stage gain of -0.4: a 0.2 V plate swing instead of 200.
-    rp_ = plateKohm * 1000.0f;
-    rk_ = cathodeKohm * 1000.0f;
+    const float rp = plateKohm * 1000.0f;
+    // Floored: a cathode resistor of 0 divided the bias current by zero and
+    // the stage's output went NaN, then the plate lookup read out of bounds.
+    const float rk = (cathodeKohm > 0.01f ? cathodeKohm : 0.01f) * 1000.0f;
+    if (built_ && supplyVolts == supply_ && rp == rp_ && rk == rk_) return;
+    supply_ = supplyVolts;
+    rp_ = rp;
+    rk_ = rk;
+    updateSteps();
     build();
   }
   /** The input network: coupling capacitor (nF), grid leak (MΩ) and the
@@ -120,15 +158,22 @@ public:
     cin_ = clampf(couplingNf, 0.1f, 10000.0f) * 1e-9f;
     rg_ = clampf(gridLeakMohm, 0.01f, 100.0f) * 1e6f;
     rs_ = clampf(sourceKohm, 5.0f, 10000.0f) * 1e3f;
-    dtOverCin_ = 1.0f / (sr_ * cin_);
-    build();
+    updateSteps();
+    // The input network shapes the gain, not the plate curve: no rebuild of
+    // the table, and no reset -- this is a control a user can automate.
+    updateGain();
   }
   /** Cathode bypass capacitor in µF; 0 = unbypassed, the degenerated stage. */
   void setCathodeBypass(float microfarads) {
     ck_ = microfarads > 0.0f ? microfarads * 1e-6f : 0.0f;
-    dtOverCk_ = ck_ > 0.0f ? 1.0f / (sr_ * ck_) : 0.0f;
-    build();
+    updateSteps();
+    // Likewise: the operating point is the grid at 0 V either way, so only
+    // the gain moves.
+    updateGain();
   }
+  /** Empty the capacitors: no charge on the coupling capacitor, the cathode
+   *  at its idle bias, the output DC blocker cleared. The plate curve is
+   *  kept. No allocation. */
   void reset() {
     blocker_.reset();
     vc_ = 0.0f;
@@ -136,6 +181,12 @@ public:
     vg_ = 0.0f;
   }
 
+  /** One sample. `x` times the input gain is the source voltage in volts;
+   *  the result is the plate swing about idle, normalised to unity
+   *  small-signal gain the right way up, times the output gain, through a
+   *  10 Hz DC blocker. No allocation: a few Newton steps for the grid while
+   *  it nears conduction, and a 22-step bisection for an unbypassed
+   *  cathode. A NaN or infinite input does not stick: the stage recovers. */
   inline float process(float x) {
     const float vs = x * inputGain_;
     // The grid node, with the coupling capacitor's charge subtracted from
@@ -152,7 +203,7 @@ public:
     const float ip = (supply_ - vp) / rp_;
     if (ck_ > 0.0f) {
       // Bypassed: the cathode voltage follows the mean current through R_k C_k.
-      vk_ += ((ip + ig) - vk_ / rk_) * dtOverCk_;
+      vk_ = flushDenormal(vk_ + ((ip + ig) - vk_ / rk_) * dtOverCk_);
     } else {
       // Unbypassed: the cathode sits at I_k R_k this instant, solved.
       vk_ = solveCathode(vg);
@@ -163,14 +214,20 @@ public:
   /** The stage's small-signal voltage gain from the source, negative (it
    *  inverts), for the current bypass setting. */
   float smallSignalGain() const { return gain_; }
-  /** Idle plate voltage and cathode bias. */
+  /** Idle plate voltage in volts, with the grid at 0 V. */
   float idlePlateVolts() const { return vp0_; }
+  /** Idle cathode voltage in volts above ground, with the grid at 0 V: the
+   *  stage's bias (about 1 to 1.5 V for the default 12AX7 and 1.5 kΩ). */
   float cathodeBiasVolts() const { return vk0_; }
-  /** The live states: the cathode voltage now (the bias shift), the charge on
-   *  the coupling capacitor now (the blocking), the grid current at the last
-   *  sample in mA. */
+  /** The cathode voltage now, in volts: cathodeBiasVolts() at rest, moving
+   *  away from it under a loud passage (the bias shift). */
   float cathodeVolts() const { return vk_; }
+  /** The voltage on the input coupling capacitor now, source side minus
+   *  grid side: it charges while the grid conducts, and the grid sees the
+   *  source minus this (the blocking). */
   float couplingVolts() const { return vc_; }
+  /** The grid current in mA for the last sample's grid voltage against the
+   *  cathode now: near zero until the grid comes close to the cathode. */
   float gridCurrentMilliamps() const { return 1000.0f * gridCurrent(vg_ - vk_); }
   /** The DC transfer at a grid-cathode voltage: plate swing in volts about
    *  the idle point, for checking the curve against the tube's data. */
@@ -226,7 +283,10 @@ private:
   /** Plate voltage for a grid-cathode voltage, from the table. */
   inline float plateVolts(float vgk) const {
     const float t = (vgk - kVgkMin) * tableScale_;
-    if (t <= 0.0f) return table_[0];
+    // Written so NaN takes the first branch: `t <= 0` and `t >= top` are both
+    // false for it, and (int) NaN indexed the table at INT_MIN -- one bad
+    // input sample crashed the host.
+    if (!(t > 0.0f)) return table_[0];
     if (t >= (float) (kPoints - 1)) return table_[kPoints - 1];
     const int i = (int) t;
     const float frac = t - (float) i;
@@ -252,7 +312,13 @@ private:
     for (int i = 0; i < 22; ++i) {
       const float mid = 0.5f * (lo + hi);
       const float vgk = vg - mid;
-      const float ik = (supply_ - plateVolts(vgk)) / rp_ + gridCurrent(vgk);
+      // The grid term only where the grid can conduct. More than a volt
+      // below the cathode Dempwolf's current is a millionth of its 1 V value
+      // -- solveGrid() stops at the same line -- and most of the bracket is
+      // down there: evaluated anyway, its log1p, exp and pow were nearly all
+      // of the unbypassed stage's cost, 22 times a sample.
+      const float ig = vgk < -1.0f ? 0.0f : gridCurrent(vgk);
+      const float ik = (supply_ - plateVolts(vgk)) / rp_ + ig;
       if (ik * rk_ - mid > 0.0f) lo = mid; else hi = mid;
     }
     return 0.5f * (lo + hi);
@@ -270,14 +336,42 @@ private:
     // finds it for any cathode resistor.
     vk0_ = solveCathode(0.0f);
     vp0_ = plateVolts(-vk0_);
-    // Small-signal gain from the source, numerically, through the whole
-    // static path -- the input divider, the grid, the cathode as configured.
+    updateGain();
+    // Reset on the FIRST build only. A circuit changed while it plays keeps
+    // its capacitors' charge and moves to the new operating point through
+    // them, as the real one does, instead of being emptied mid-note.
+    const bool first = !built_;
+    built_ = true;
+    if (first) reset();
+  }
+  /** The two capacitors' per-sample steps, held where the explicit update
+   *  stays stable. vc += i dt / C and vk += i dt / C are forward Euler, which
+   *  rings and then diverges once dt exceeds about twice the network's time
+   *  constant: a 0.5 nF coupling cap with a 10 kOhm leak blew up at 48 kHz
+   *  (and was fine at 96), and a 0.01 uF bypass rang at Nyquist. The step is
+   *  capped at one time constant -- the same value a user would hear, short
+   *  of settings no real stage uses. The cathode's conductance includes the
+   *  tube's own transconductance, bounded generously at 5 mA/V. */
+  void updateSteps() {
+    const float dt = 1.0f / sr_;
+    const float inTau = (rs_ + rg_) * cin_;
+    dtOverCin_ = (dt < inTau ? dt : inTau) / cin_;
+    if (ck_ > 0.0f) {
+      const float kTau = ck_ / (1.0f / rk_ + 5e-3f);
+      dtOverCk_ = (dt < kTau ? dt : kTau) / ck_;
+    } else {
+      dtOverCk_ = 0.0f;
+    }
+  }
+
+  /** Small-signal gain from the source, numerically, through the whole
+   *  static path -- the input divider, the grid, the cathode as configured.
+   *  A handful of plate solves: cheap enough for a setter to call. */
+  void updateGain() {
     const float dv = 0.01f;
     const float up = staticPlate(dv), down = staticPlate(-dv);
     gain_ = (up - down) / (2.0f * dv);
     norm_ = std::fabs(gain_) > 1e-3f ? 1.0f / gain_ : 1.0f;
-    built_ = true;
-    reset();
   }
   /** The plate voltage for a source voltage with every capacitor at rest. */
   float staticPlate(float vs) const {
@@ -314,39 +408,69 @@ public:
    *  same topology with different parts. Resistances in ohms, capacitances
    *  in farads. */
   struct Components {
+    ///@{
+    /** The capacitors, farads: 250 pF on the treble pot, 20 nF on the bass
+     *  and on the mid. */
     float c1 = 250e-12f, c2 = 20e-9f, c3 = 20e-9f;
+    ///@}
+    ///@{
+    /** The resistors, ohms: r1 the 250 kΩ treble pot, r2 the 1 MΩ bass pot,
+     *  r3 the 25 kΩ mid pot, r4 the fixed 56 kΩ. */
     float r1 = 250e3f, r2 = 1e6f, r3 = 25e3f, r4 = 56e3f;
+    ///@}
   };
 
+  /** The sample rate in Hz (1 or less means 48000); recomputes the filter
+   *  and keeps its state. Until this or another setter has run, the stack
+   *  passes the signal unchanged. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     update();
   }
+  /** New component values; recomputes the filter (a few hundred
+   *  multiplies, no allocation) and keeps its state. */
   void setComponents(const Components& c) {
     parts_ = c;
     update();
   }
+  /** The bass pot, 0..1 and clamped. Recomputes the filter at once, with
+   *  no smoothing, and keeps its state. */
   void setBass(float v) {
     l_ = clampf(v, 0.0f, 1.0f);
     update();
   }
+  /** The mid pot, 0..1 and clamped; as setBass(). */
   void setMid(float v) {
     m_ = clampf(v, 0.0f, 1.0f);
     update();
   }
+  /** The treble pot, 0..1 and clamped; as setBass(). */
   void setTreble(float v) {
     t_ = clampf(v, 0.0f, 1.0f);
     update();
   }
+  /** Clear the filter state. */
   void reset() { z1_ = z2_ = z3_ = 0.0; }
 
+  /** One sample through the third-order filter, computed in double. A
+   *  result that is not finite clears the state and returns 0. No
+   *  allocation. */
   inline float process(float x) {
     // Transposed direct form II, third order, in double (see the header).
     const double in = x;
     const double y = b0_ * in + z1_;
-    z1_ = b1_ * in - a1_ * y + z2_;
-    z2_ = b2_ * in - a2_ * y + z3_;
-    z3_ = b3_ * in - a3_ * y;
+    // One NaN or Inf in, and the double state held it for good: the stack was
+    // silent -- or infinite -- until reset(). Dropped here instead.
+    if (!std::isfinite(y)) {
+      z1_ = z2_ = z3_ = 0.0;
+      return 0.0f;
+    }
+    // And tiny state to zero: a decaying tail went on into the float range's
+    // subnormals, about 9,500 of them after every stop, which slowed
+    // whatever processed this output next.
+    z1_ = tiny(b1_ * in - a1_ * y + z2_);
+    z2_ = tiny(b2_ * in - a2_ * y + z3_);
+    z3_ = tiny(b3_ * in - a3_ * y);
     return (float) y;
   }
 
@@ -370,6 +494,7 @@ public:
   }
 
 private:
+  static double tiny(double z) { return std::fabs(z) >= 1e-30 ? z : 0.0; }
   void update() {
     const double C1 = parts_.c1, C2 = parts_.c2, C3 = parts_.c3;
     const double R1 = parts_.r1, R2 = parts_.r2, R3 = parts_.r3, R4 = parts_.r4;

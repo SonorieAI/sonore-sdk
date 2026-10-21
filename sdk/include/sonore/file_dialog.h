@@ -17,9 +17,11 @@
 // a timer that the host is also waiting on.
 //
 // WHAT IS VERIFIED: the Windows path is exercised on this machine. The Cocoa
-// and GTK paths are written against their documented APIs. The parts that
-// decide anything (filters, extensions, defaults) are shared across all three
-// and are tested.
+// and GTK paths are written against their documented APIs and have never been
+// run, for the same reason the AU wrapper has not: there is no macOS or
+// Linux desktop in this loop. The parts that decide anything (filters,
+// extensions, defaults) are shared across all three and are tested; what is
+// unverified is the platform call at the end of each.
 #pragma once
 
 #include <string>
@@ -58,8 +60,10 @@
 #elif defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <sys/stat.h>
 #elif defined(__linux__)
 #include <dlfcn.h>
+#include <sys/stat.h>
 #endif
 
 namespace sonore {
@@ -141,6 +145,62 @@ inline std::string ensureExtension(const std::string& path,
   return path + "." + extensions.front();
 }
 
+namespace detail {
+
+/** A pattern list as the Windows and GTK dialogs take it: one pattern per
+ *  entry, split at ';' or ',', and an entry with no wildcard read as the
+ *  extension filterExtensions reads it ("wav" and ".wav" become "*.wav").
+ *  Both dialogs match each pattern literally and know only ';' (Windows) or
+ *  one pattern per call (GTK), so "*.wav,*.aif" -- the reference's own
+ *  spelling -- and "wav;aif", which Cocoa and filterExtensions accept,
+ *  showed no files at all there. */
+inline std::vector<std::string> filterPatterns(const std::string& patterns) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= patterns.size()) {
+    size_t end = patterns.find_first_of(";,", start);
+    if (end == std::string::npos) end = patterns.size();
+    size_t a = start, b = end;
+    while (a < b && (patterns[a] == ' ' || patterns[a] == '\t')) ++a;
+    while (b > a && (patterns[b - 1] == ' ' || patterns[b - 1] == '\t')) --b;
+    std::string p = patterns.substr(a, b - a);
+    if (!p.empty() && p.find_first_of("*?") == std::string::npos) {
+      const size_t dot = p.find_first_not_of('.');
+      p = dot == std::string::npos ? std::string() : "*." + p.substr(dot);
+    }
+    if (!p.empty()) out.push_back(p);
+    start = end + 1;
+  }
+  return out;
+}
+
+/** saveFile's answer, apart from the platform: ask(name, folder) runs the
+ *  dialog, exists(path) looks at the disk.
+ *
+ *  An extension added HERE is added after the dialog's own overwrite check:
+ *  the check was about "kit", the plugin then wrote "kit.wav", and an
+ *  existing kit.wav was replaced without a word. So when the full name
+ *  exists, the user is asked again, by that name, and the dialog's check
+ *  runs on what will actually be written. Windows and macOS add the
+ *  extension inside the dialog and never come back; GTK has no such option.
+ *  Bounded, and a give-up is a cancel, never a write. */
+template <typename Ask, typename Exists>
+std::string saveWithExtension(Ask ask, Exists exists, const std::vector<std::string>& extensions,
+                              std::string name, std::string folder) {
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    const std::string path = ask(name, folder);
+    if (path.empty() || extensions.empty()) return path;
+    const std::string full = ensureExtension(path, extensions);
+    if (full == path || !exists(full)) return full;
+    const size_t slash = full.find_last_of("/\\");
+    name = slash == std::string::npos ? full : full.substr(slash + 1);
+    folder = slash == std::string::npos ? std::string() : full.substr(0, slash);
+  }
+  return std::string();
+}
+
+} // namespace detail
+
 #if defined(_WIN32)
 namespace detail {
 
@@ -200,6 +260,9 @@ inline std::string runDialog(Mode mode, const std::string& title,
   if (mode == Mode::Folder) options |= FOS_PICKFOLDER;
   if (mode == Mode::Open) options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
   if (mode == Mode::Save) options |= FOS_OVERWRITEPROMPT;
+  // And the dialog adds the extension itself, so that prompt is about the
+  // file that will be written. Added afterwards, "kit" was checked and
+  // "kit.wav" was returned -- and replaced, unasked, when it existed.
   dialog->SetOptions(options);
 
   if (!title.empty()) dialog->SetTitle(widen(title).c_str());
@@ -212,12 +275,20 @@ inline std::string runDialog(Mode mode, const std::string& title,
     storage.reserve(filters.size() * 2);
     for (const FileFilter& f : filters) {
       storage.push_back(widen(f.label));
-      storage.push_back(widen(f.patterns.empty() ? std::string("*.*") : f.patterns));
+      std::string spec;
+      for (const std::string& p : filterPatterns(f.patterns)) spec += (spec.empty() ? "" : ";") + p;
+      storage.push_back(widen(spec.empty() ? std::string("*.*") : spec));
     }
     for (size_t i = 0; i < filters.size(); ++i)
       specs.push_back({storage[i * 2].c_str(), storage[i * 2 + 1].c_str()});
     dialog->SetFileTypes((UINT) specs.size(), specs.data());
     dialog->SetFileTypeIndex(1); // one-based, and zero is an error rather than a default
+    // Any default turns the appending on; the dialog then follows whichever
+    // type the user picks.
+    if (mode == Mode::Save) {
+      const std::vector<std::string> exts = filterExtensions(filters.front().patterns);
+      if (!exts.empty()) dialog->SetDefaultExtension(widen(exts.front()).c_str());
+    }
   }
 
   if (!suggestedName.empty()) dialog->SetFileName(widen(suggestedName).c_str());
@@ -287,6 +358,7 @@ inline std::string runDialog(Mode mode, const std::string& title,
   using PendingFn = int (*)();
   using IterateFn = void (*)(int);
   using FreeFn = void (*)(void*);
+  using SetBoolFn = void (*)(void*, int);
 
   auto dialogNew = (NewFn) sym("gtk_file_chooser_dialog_new");
   auto run = (RunFn) sym("gtk_dialog_run");
@@ -313,21 +385,21 @@ inline std::string runDialog(Mode mode, const std::string& title,
   if (!startingPath.empty() && setFolder) setFolder(dialog, startingPath.c_str());
   if (!suggestedName.empty() && setName && mode == Mode::Save)
     setName(dialog, suggestedName.c_str());
+  // GTK asks before replacing a file only when told to. It was not: a save
+  // dialog here overwrote whatever the user clicked on.
+  if (mode == Mode::Save)
+    if (auto confirm = (SetBoolFn) sym("gtk_file_chooser_set_do_overwrite_confirmation"))
+      confirm(dialog, 1);
   if (mode != Mode::Folder && filterNew && filterName && filterPattern && addFilter) {
     for (const FileFilter& f : filters) {
       void* filter = filterNew();
       if (!filter) continue;
       filterName(filter, f.label.c_str());
-      std::string one;
-      for (size_t i = 0; i <= f.patterns.size(); ++i) {
-        const bool end = i == f.patterns.size();
-        if (!end && f.patterns[i] != ';' && f.patterns[i] != ',') {
-          if (f.patterns[i] != ' ') one.push_back(f.patterns[i]);
-          continue;
-        }
-        if (!one.empty()) filterPattern(filter, one.c_str());
-        one.clear();
-      }
+      // A filter with no pattern matches nothing in GTK; empty means every
+      // file, as it does on Windows.
+      const std::vector<std::string> patterns = filterPatterns(f.patterns);
+      for (const std::string& p : patterns) filterPattern(filter, p.c_str());
+      if (patterns.empty()) filterPattern(filter, "*");
       addFilter(dialog, filter);
     }
   }
@@ -458,15 +530,39 @@ inline std::string runDialog(Mode mode, const std::string& title,
 } // namespace detail
 #endif
 
+namespace detail {
+inline bool pathExists(const std::string& path) {
+#if defined(_WIN32)
+  return GetFileAttributesW(widen(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+#elif defined(__linux__) || defined(__APPLE__)
+  struct stat st;
+  return ::stat(path.c_str(), &st) == 0;
+#else
+  (void) path;
+  return false;
+#endif
+}
+} // namespace detail
+
 /**
- * Ask the user for a file.
+ * Ask the user for a file: one to open, where to save, or a folder. The
+ * reference's file chooser, as three static calls.
  *
- * Returns the chosen path, or an empty string if they cancelled or there is
- * no way to ask. Those two are deliberately the same answer: a plugin has to
- * handle "no file" either way, and a caller that treated "cannot ask" as an
- * error would show an error box on a machine that simply has no GTK.
+ * Each returns the chosen path, or an empty string if they cancelled or
+ * there is no way to ask. Those two are deliberately the same answer: a
+ * plugin has to handle "no file" either way, and a caller that treated
+ * "cannot ask" as an error would show an error box on a machine that simply
+ * has no GTK.
+ *
+ * MAIN THREAD and MODAL (see the file comment). `parentWindow` is the native
+ * window to sit over -- an HWND on Windows -- and may be null; the GTK and
+ * macOS paths ignore it.
  */
 struct FileDialog {
+  /** Ask for an existing file to open, by UTF-8 path. `filters` are the
+   *  file types offered, the first one selected; none shows every file.
+   *  `startingPath` is the FOLDER to open in; empty leaves it to the
+   *  system. */
   static std::string openFile(const std::string& title,
                               const std::vector<FileFilter>& filters = {},
                               const std::string& startingPath = std::string(),
@@ -484,6 +580,8 @@ struct FileDialog {
    * Ask where to save. The extension is added if the user did not type one --
    * "my kit" means "my kit.wav", and writing the extensionless file gives
    * them something their file manager cannot open and they cannot find again.
+   * A file that already exists under the full name is never replaced without
+   * the dialog asking (see detail::saveWithExtension).
    */
   static std::string saveFile(const std::string& title,
                               const std::vector<FileFilter>& filters = {},
@@ -491,10 +589,14 @@ struct FileDialog {
                               const std::string& startingPath = std::string(),
                               void* parentWindow = nullptr) {
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
-    std::string path = detail::runDialog(detail::Mode::Save, title, filters, startingPath,
-                                         suggestedName, parentWindow);
-    if (path.empty() || filters.empty()) return path;
-    return ensureExtension(path, filterExtensions(filters.front().patterns));
+    const std::vector<std::string> extensions =
+        filters.empty() ? std::vector<std::string>() : filterExtensions(filters.front().patterns);
+    return detail::saveWithExtension(
+        [&](const std::string& name, const std::string& folder) {
+          return detail::runDialog(detail::Mode::Save, title, filters, folder, name, parentWindow);
+        },
+        [](const std::string& path) { return detail::pathExists(path); }, extensions,
+        suggestedName, startingPath);
 #else
     (void) title; (void) filters; (void) suggestedName; (void) startingPath;
     (void) parentWindow;
@@ -502,6 +604,8 @@ struct FileDialog {
 #endif
   }
 
+  /** Ask for a folder, by UTF-8 path, opening in the folder `startingPath`
+   *  when it is not empty. */
   static std::string chooseFolder(const std::string& title,
                                   const std::string& startingPath = std::string(),
                                   void* parentWindow = nullptr) {

@@ -17,12 +17,10 @@
 #include <string>
 #include <cstring>
 #include "audio.h"
+#include "number_text.h"
 
 namespace sonore {
 
-/** One automatable control. Ranges are plain values (not normalised): the host
- *  sees the same numbers the user sees, which is what CLAP wants and what makes
- *  automation survive a range change. */
 /**
  * Which kind of editor a plugin opens.
  *
@@ -41,12 +39,25 @@ namespace sonore {
  * instances, or a plugin with no HTML that still wants a webview because it is
  * about to load some.
  */
-enum class EditorKind { Auto, Native, Web };
+enum class EditorKind {
+  Auto,   ///< the web editor when the plugin supplies `uihtml`, the native one otherwise
+  Native, ///< the SDK's native editor, even when a page is supplied
+  Web     ///< a webview: the supplied page, or one generated from the parameter table
+};
 
 /** What a plugin ACTUALLY opened, which is not always what it asked for. */
-enum class EditorBackend { Native, Web, None };
+enum class EditorBackend {
+  Native, ///< the SDK's native editor
+  Web,    ///< an OS webview showing the plugin's page
+  None    ///< no editor: this build has neither backend
+};
 
+/** chooseEditorBackend's answer: the editor that will open, None when neither
+ *  is in this build, and the reason whenever that is not what was asked for.
+ *  `reason` points at a string literal or at the caller's own reason string,
+ *  so it lives as long as that does; nothing here owns memory. */
 struct EditorChoice {
+  /** The editor that will open; None when the build has neither backend. */
   EditorBackend backend = EditorBackend::None;
   /** Empty when the plugin got what it asked for. Otherwise why not -- and
    *  never a generic "unavailable", because a user reporting "my plugin has
@@ -103,13 +114,16 @@ inline EditorChoice chooseEditorBackend(EditorKind wanted, bool hasWebPage, bool
   return out;
 }
 
+/** One automatable control. Ranges are plain values (not normalised): the host
+ *  sees the same numbers the user sees, which is what CLAP wants and what makes
+ *  automation survive a range change. */
 struct ParamInfo {
-  const char* id = "";        // stable machine id, never shown
-  const char* label = "";     // display name, e.g. "Drive"
-  const char* unit = "";      // e.g. "dB", "Hz", "%": may be empty
-  float minValue = 0.0f;
-  float maxValue = 1.0f;
-  float defaultValue = 0.0f;
+  const char* id = "";        ///< stable machine id, never shown; unique in the table and never empty
+  const char* label = "";     ///< display name, e.g. "Drive"; never empty
+  const char* unit = "";      ///< e.g. "dB", "Hz", "%" -- may be empty; "Hz" prints as kHz from 1000 up
+  float minValue = 0.0f;      ///< lowest plain value, finite and below maxValue
+  float maxValue = 1.0f;      ///< highest plain value, finite
+  float defaultValue = 0.0f;  ///< plain value at load and reset, inside the range and on a step if stepped
   /** >0 marks a stepped/enum control with this many discrete positions
    *  (a 4-way ratio switch is stepCount 4); 0 = continuous. */
   int stepCount = 0;
@@ -139,6 +153,8 @@ struct ParamInfo {
    * somebody will make, and did, in the first version of this.
    */
   const char* const* valueNames = nullptr;
+  /** How many entries `valueNames` holds. With a table it must equal
+   *  stepCount (descriptorProblem() reports any other count); 0 without. */
   int numValueNames = 0;
 
   /**
@@ -235,7 +251,10 @@ inline double toNormalisedValue(const ParamInfo& p, double plain) {
   double n = (plain - (double) p.minValue) / span;
   if (n < 0.0) n = 0.0;
   if (n > 1.0) n = 1.0;
-  if (p.skew == 1.0f || !(p.skew > 0.0f)) return n;
+  // A stepped control is stepped EVENLY: a host offers its positions at
+  // k / (positions - 1), and a curve applied before the snap bunched them
+  // until one could not be reached at all.
+  if (p.stepCount > 0 || p.skew == 1.0f || !(p.skew > 0.0f)) return n;
   return std::pow(n, (double) p.skew);
 }
 
@@ -247,7 +266,7 @@ inline double toPlainValue(const ParamInfo& p, double normalised) {
   // and a VST3 host handing one over would reach the DSP with it.
   if (!(normalised == normalised)) return (double) p.defaultValue;
   double n = normalised < 0.0 ? 0.0 : (normalised > 1.0 ? 1.0 : normalised);
-  if (p.skew != 1.0f && p.skew > 0.0f) n = std::pow(n, 1.0 / (double) p.skew);
+  if (p.stepCount <= 0 && p.skew != 1.0f && p.skew > 0.0f) n = std::pow(n, 1.0 / (double) p.skew);
   return (double) p.minValue + n * ((double) p.maxValue - (double) p.minValue);
 }
 
@@ -336,10 +355,16 @@ inline bool stepsAreConsecutiveIntegers(const ParamInfo& p) {
  *  the same way. Index 0 is reserved for "no group" in the formats that need
  *  a root, so a group's id is its index here PLUS ONE. */
 struct GroupTable {
+  /** Groups past this many are not collected: their parameters show at the
+   *  top level, as if they declared no group. */
   static constexpr int kMaxGroups = 32;
+  /** The first `count` entries are the group names, pointing into the
+   *  parameter table's own strings (nothing is copied). */
   const char* names[kMaxGroups] = {};
-  int count = 0;
+  int count = 0; ///< how many of `names` are in use, 0..kMaxGroups
 
+  /** The 0-based index of `name` (compared exactly, case and all), or -1 for
+   *  a null or empty name or one not in the table. */
   int indexOf(const char* name) const {
     if (!name || !name[0]) return -1;
     for (int i = 0; i < count; ++i)
@@ -397,9 +422,9 @@ struct EditorConstraints {
   /** Inclusive, in LOGICAL pixels -- the size before any HiDPI scale, which is
    *  what a layout is written in and what every format's size call means. */
   uint32_t minWidth = 320;
-  uint32_t minHeight = 200;
-  uint32_t maxWidth = 8192;
-  uint32_t maxHeight = 8192;
+  uint32_t minHeight = 200;  ///< inclusive, logical pixels; raised to kEditorSizeFloor if below it
+  uint32_t maxWidth = 8192;  ///< inclusive, logical pixels; lowered to kEditorSizeCeiling if above it
+  uint32_t maxHeight = 8192; ///< inclusive, logical pixels; lowered to kEditorSizeCeiling if above it
 
   /**
    * A fixed interface says false, and says it per axis.
@@ -411,7 +436,7 @@ struct EditorConstraints {
    * is the behaviour nobody wants.
    */
   bool resizableHorizontally = true;
-  bool resizableVertically = true;
+  bool resizableVertically = true; ///< as above, for the height
 
   /**
    * width / height the editor keeps, or 0 for free.
@@ -427,7 +452,7 @@ struct EditorConstraints {
  *  this is a typo or a mistake, and a window of a few pixels is one nobody can
  *  find the edge of to fix. */
 constexpr uint32_t kEditorSizeFloor = 64;
-constexpr uint32_t kEditorSizeCeiling = 8192;
+constexpr uint32_t kEditorSizeCeiling = 8192; ///< the largest width or height, in logical pixels
 
 /**
  * Bring a size inside what the plugin declared. The ONE place that decides.
@@ -487,43 +512,57 @@ struct Preset; // presets.h
  *  main out. Declared in the descriptor and handed to the DSP through
  *  ProcessContext::auxOut(). */
 struct AuxBusInfo {
-  const char* name = "Aux";
-  int channels = 2;
+  const char* name = "Aux"; ///< the port name a host shows; never empty
+  int channels = 2;         ///< the bus width, 1..8
 };
 
 /** Identity + capabilities. `isInstrument` flips the note input and drops the
  *  audio input bus, as a generated instrument project must. */
 struct PluginDescriptor {
-  const char* id = "com.sonorie.plugin";  // reverse-URI, unique per product
+  /** Reverse-URI, unique per product, never empty. It is CLAP's plugin id as
+   *  written, the seed VST3's class ids are derived from, the end of the LV2
+   *  URI (`urn:sonorie:` + id) and the key preset files carry, so changing it
+   *  after release orphans every saved session and preset. */
+  const char* id = "com.sonorie.plugin";
+  /** The product name hosts list; never empty. With `vendor` it also names
+   *  the preset folders. */
   const char* name = "Sonorie Plugin";
+  /** The maker's name, never empty: shown by hosts, the author of the factory
+   *  presets, and the outer preset folder. */
   const char* vendor = "Sonorie";
+  /** Dotted "major.minor.patch", never empty. Hosts are given the text as is;
+   *  LV2 gets minor and micro versions computed from the three numbers. */
   const char* version = "1.0.0";
-  const char* description = "";
+  const char* description = ""; ///< one line for CLAP's descriptor; may be empty
+  /** The product's web page, or empty. Given to CLAP and VST3, written as the
+   *  LV2 maintainer's homepage, and the LV2 licence when `license` is unset. */
   const char* url = "";
-  bool isInstrument = false;
+  bool isInstrument = false; ///< takes notes, has no audio input bus and no host bypass parameter
+  /** The parameter table, `numParams` entries; index i is p[i] in the DSP.
+   *  Not copied: it must outlive every instance, so it is a static array. */
   const ParamInfo* params = nullptr;
-  int numParams = 0;
+  int numParams = 0; ///< entries in `params`, 0..kMaxParams
   /** Optional factory presets, compiled in. See presets.h. */
   const Preset* presets = nullptr;
-  int numPresets = 0;
+  int numPresets = 0; ///< entries in `presets`; 0 for none
   /** Optional metadata, emitted only where a format has a slot for it (LV2
    *  TTL today; CLAP feature lists next). Absent fields are simply omitted --
    *  never invented. */
   const char* category = nullptr; // "distortion", "reverb", "synth", ...
-  const char* license = nullptr;  // URI of the licence terms; falls back to `url`
-  const char* email = nullptr;    // maintainer contact, bare "user@host"
+  const char* license = nullptr;  ///< URI of the licence terms; falls back to `url`
+  const char* email = nullptr;    ///< maintainer contact, a bare address (LV2 adds the `mailto:`)
   /** Main-bus width the DSP genuinely handles, inclusive. The default keeps
    *  every existing plugin exactly as it was: fixed stereo. A DSP that loops
    *  over block.getNumChannels() instead of assuming two can widen the range
    *  (1..8) and every wrapper negotiates mono/surround from it -- effects are
    *  symmetric (in width == out width), instruments are output-only. */
   int minChannels = 2;
-  int maxChannels = 2;
+  int maxChannels = 2; ///< the widest main bus, minChannels..8
   /** Extra output buses, beyond the main one. Empty by default: a plugin that
    *  declares none exposes exactly one output port, as before. A DSP with aux
    *  buses must take the ProcessContext form of process(). */
   const AuxBusInfo* auxOutputs = nullptr;
-  int numAuxOutputs = 0;
+  int numAuxOutputs = 0; ///< entries in `auxOutputs`
   /** Does this plugin EMIT MIDI? An arpeggiator, a chord generator, any note
    *  effect does. It costs an output note port / event bus in every format,
    *  so it is opt-in; a DSP that says yes writes into ctx.midiOut. */
@@ -548,8 +587,32 @@ struct PluginDescriptor {
   /** How big the editor may be, and whether it may be resized at all. The
    *  defaults are the constants every wrapper used to hardcode, so a plugin
    *  that says nothing behaves exactly as it did. */
-  EditorConstraints editorLimits;
+  EditorConstraints editorLimits{};
+  /** The output guard (output_guard.h). On, a block whose output holds a NaN
+   *  or an infinity on any port -- a filter that blew up, a division by
+   *  zero -- leaves as silence instead of reaching the host's mix bus and the
+   *  speakers, the DSP keeps its state and plays the next finite block as
+   *  normal, and the first such block is reported once: in the host's log,
+   *  or on stderr where there is none. It costs an integer test per sample
+   *  of output, vectorised: 12 ns for a stereo block of 32, 83 ns for 512 --
+   *  under 3% of the cheapest example's process() and 0.3% of a waveshaper's.
+   *  Off skips the check entirely, for a plugin that wants its NaN to reach
+   *  the host. Last in the struct, so a descriptor written positionally
+   *  before it existed still compiles and gets the guard. */
+  bool guardOutput = true;
 };
+
+/** Whether an INTERFACE may write parameter `index` or open a gesture on it:
+ *  in range, and not one the plugin reports rather than takes -- readOnly, a
+ *  meter or a gain reduction. Every editor path and every page bridge goes
+ *  through this; a host's own writes do not, and are the host's business.
+ *  None did: the native editor dragged a read-only row like any other and a
+ *  page's sonore.set reached one, and both told the host -- beginEdit and
+ *  performEdit, a CLAP gesture and value -- on a parameter it was told it
+ *  could not set. */
+inline bool uiMayWrite(const PluginDescriptor& d, int index) {
+  return index >= 0 && index < d.numParams && d.params && !d.params[index].readOnly;
+}
 
 /** Clamp a plain value into a parameter's declared range. A NaN is not a
  *  value at all, and it fails BOTH comparisons, so the first version of this
@@ -653,7 +716,15 @@ inline const char* descriptorProblem(const PluginDescriptor& d, int* badParam = 
 inline void formatParamValue(const ParamInfo& p, float value, char* out, size_t capacity) {
   if (!out || capacity == 0) return;
   // Already ON a step for a stepped control: the clamp snaps.
-  const float v = clampToRange(p, value);
+  float v = clampToRange(p, value);
+  // Within float noise of zero IS zero. A VST3 host hands the value back as
+  // a normalised position, and REAPER keeps that position in single
+  // precision: 0 dB on a -60..12 dB control comes back as 0.83333331, which
+  // is -0.0000014 dB -- and the decimals rule below, seeing a value under
+  // 0.1, printed it as "-0.000 dB" where the CLAP build of the same plugin
+  // in the same DAW said "0.0 dB". A millionth of the range is far below
+  // anything a control can mean, and far above that rounding.
+  if (std::fabs(v) <= (p.maxValue - p.minValue) * 1e-6f) v = 0.0f;
   if (p.stepCount > 0) {
     if (const char* name = paramValueName(p, stepIndexOf(p, v))) {
       std::snprintf(out, capacity, "%s", name);
@@ -668,24 +739,40 @@ inline void formatParamValue(const ParamInfo& p, float value, char* out, size_t 
       return;
     }
   }
+  // Always with '.', whatever the C locale: a host that sets a comma locale
+  // made this "-3,5 dB", which the parser below -- and any host reading our
+  // text back -- then took for -3.
+  char number[48];
   // Hz reads better as kHz past 1000: the one unit where the raw number is
   // genuinely harder to read than the scaled one.
   if (p.unit && std::strcmp(p.unit, "Hz") == 0 && v >= 1000.0f) {
-    std::snprintf(out, capacity, "%.2f kHz", v / 1000.0f);
+    numtext::format(number, sizeof(number), (double) v / 1000.0, "%.2f");
+    std::snprintf(out, capacity, "%s kHz", number);
     return;
   }
+  // As many decimals as the range calls for, and never so few that the value
+  // reads as nothing: from the range alone, an attack of 0.1 to 2000 ms showed
+  // every setting below half a millisecond as "0 ms". Two significant figures
+  // at least.
   const float span = p.maxValue - p.minValue;
-  const int decimals = span >= 100.0f ? 0 : (span >= 10.0f ? 1 : 2);
+  int decimals = span >= 100.0f ? 0 : (span >= 10.0f ? 1 : 2);
+  const float magnitude = std::fabs(v);
+  const int needed = (magnitude == 0.0f || magnitude >= 10.0f) ? 0
+                     : magnitude >= 1.0f                       ? 1
+                     : magnitude >= 0.1f                       ? 2
+                                                               : 3;
+  if (needed > decimals) decimals = needed;
+  char conversion[8];
+  std::snprintf(conversion, sizeof(conversion), "%%.%df", decimals);
+  numtext::format(number, sizeof(number), (double) v, conversion);
   if (p.unit && p.unit[0])
-    std::snprintf(out, capacity, "%.*f %s", decimals, v, p.unit);
+    std::snprintf(out, capacity, "%s %s", number, p.unit);
   else
-    std::snprintf(out, capacity, "%.*f", decimals, v);
+    std::snprintf(out, capacity, "%s", number);
 }
 
-/** Parse a host-supplied string back to a plain value. Returns false when the
- *  text isn't a number at all, so the wrapper can decline rather than guess. */
 /** ASCII case folding. Deliberately not tolower(): that one is locale-dependent
- *  and in a Turkish locale maps 'I' to a dotless \u0131, which would stop
+ *  and in a Turkish locale maps 'I' to a dotless `\u0131`, which would stop
  *  "Highpass" matching itself on a machine whose owner did nothing wrong. */
 inline char asciiLower(char c) { return (c >= 'A' && c <= 'Z') ? (char) (c - 'A' + 'a') : c; }
 
@@ -704,6 +791,37 @@ inline bool looseEquals(const char* a, const char* b) {
   return true;
 }
 
+/** A choice rather than a count: whole-number steps, every one of them
+ *  named. What a host can offer as a menu -- CLAP's IS_ENUM, AU's Indexed
+ *  unit with its value strings. */
+inline bool isNamedChoice(const ParamInfo& p) {
+  return stepsAreConsecutiveIntegers(p) && p.valueNames && p.numValueNames >= p.stepCount;
+}
+
+/** A switch typed as text -- the host's bypass, which prints "On" and "Off".
+ *  On, off, 1, 0, true, false, yes, no, in any case, spaces around allowed.
+ *  Anything else is not a switch position and is refused: it was read as
+ *  "off", so "Onn", "bypassed" or a stray "10" turned a bypass off and said
+ *  the text had been understood. */
+inline bool parseSwitchText(const char* text, bool* on) {
+  if (!text || !on) return false;
+  static const char* const kOn[] = {"on", "1", "true", "yes"};
+  static const char* const kOff[] = {"off", "0", "false", "no"};
+  for (const char* word : kOn)
+    if (looseEquals(text, word)) {
+      *on = true;
+      return true;
+    }
+  for (const char* word : kOff)
+    if (looseEquals(text, word)) {
+      *on = false;
+      return true;
+    }
+  return false;
+}
+
+/** Parse a host-supplied string back to a plain value. Returns false when the
+ *  text isn't a number at all, so the wrapper can decline rather than guess. */
 inline bool parseParamValue(const ParamInfo& p, const char* text, float* out) {
   if (!text || !out) return false;
   // A named step is matched by NAME first. A host that reads a value back out
@@ -723,20 +841,41 @@ inline bool parseParamValue(const ParamInfo& p, const char* text, float* out) {
       }
     }
   }
-  char* end = nullptr;
-  const double parsed = std::strtod(text, &end);
-  if (end == text) return false;
-  // strtod happily reads "nan" and "inf". Neither is a value a person meant
-  // to set, so they are refused like any other text that is not a number --
-  // silently landing on the default (which is what the clamp does with a
-  // NaN) would leave someone staring at a knob that ignored what they typed.
+  // The number, read the same whatever the process's C locale says. strtod
+  // follows it: once a host set a comma locale, "-3.5" read as -3 and "0.5"
+  // as 0. Written with '.', as this SDK prints it, or with ',', as a person
+  // in a comma locale types it.
+  const char* s = text;
+  while (*s == ' ' || *s == '	') ++s;
+  char number[64];
+  size_t n = 0;
+  while (n + 1 < sizeof(number) && s[n] &&
+         ((s[n] >= '0' && s[n] <= '9') || s[n] == '.' || s[n] == ',' || s[n] == '-' ||
+          s[n] == '+' || s[n] == 'e' || s[n] == 'E')) {
+    number[n] = s[n] == ',' ? '.' : s[n];
+    ++n;
+  }
+  double parsed = 0.0;
+  const size_t used = numtext::parse(number, n, &parsed);
+  if (used == 0) return false;
+  // "nan" and "inf" never get this far -- they are not digits -- and a
+  // finite-looking string that overflows is refused like them: silently
+  // landing on the default would leave someone staring at a knob that
+  // ignored what they typed.
   if (!std::isfinite(parsed)) return false;
   float v = (float) parsed;
+  const char* rest = s + used;
+  while (*rest == ' ' || *rest == '	') ++rest;
   // Accept what we print: "2.3 kHz" must come back as 2300.
-  if (p.unit && std::strcmp(p.unit, "Hz") == 0) {
-    while (*end == ' ') ++end;
-    if (*end == 'k' || *end == 'K') v *= 1000.0f;
+  const bool hz = p.unit && std::strcmp(p.unit, "Hz") == 0;
+  if (hz && (*rest == 'k' || *rest == 'K')) {
+    v *= 1000.0f;
+    ++rest;
   }
+  // After the number, nothing but the unit. Whatever else followed was
+  // ignored, so "12abc" set 12 and "5 s" on a millisecond control set 5 ms:
+  // text that is not a value of this control is refused, not guessed at.
+  if (*rest && !(p.unit && p.unit[0] && looseEquals(rest, p.unit))) return false;
   *out = clampToRange(p, v);
   return true;
 }

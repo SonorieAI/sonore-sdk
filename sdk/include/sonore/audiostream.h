@@ -26,7 +26,12 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sys/types.h> // off_t, for fseeko / ftello
+#endif
+
 #include "wav.h"
+#include "path_io.h"
 
 namespace sonore {
 
@@ -44,19 +49,29 @@ namespace sonore {
  */
 class AudioFileReader {
 public:
+  /** Closes the file. */
   ~AudioFileReader() { close(); }
 
+  /** Not open: every read returns 0. */
   AudioFileReader() = default;
-  AudioFileReader(const AudioFileReader&) = delete;
-  AudioFileReader& operator=(const AudioFileReader&) = delete;
+  AudioFileReader(const AudioFileReader&) = delete;            ///< Not copyable: one file, one position.
+  AudioFileReader& operator=(const AudioFileReader&) = delete; ///< Not copyable: one file, one position.
 
+  /** Open the file at `path`, UTF-8, closing any file open before, and read
+   *  its header: a PCM or float WAV, or an AIFF or uncompressed AIFF-C. The
+   *  samples stay on the disk. False, with error() saying why and the reader
+   *  closed, for a file that cannot be opened, is compressed or is
+   *  malformed. Not for the audio thread: it opens a file. */
   bool open(const char* path) {
     close();
+    // error() is about the latest open(): one that worked went on reporting
+    // the failure before it, "could not open" a file it was reading.
+    error_.clear();
     if (!path) {
       error_ = "no path";
       return false;
     }
-    file_ = std::fopen(path, "rb");
+    file_ = ::sonore::pathio::open(path, "rb");
     if (!file_) {
       error_ = std::string("could not open ") + path;
       return false;
@@ -68,7 +83,7 @@ public:
       close();
       return false;
     }
-    std::fseek(file_, 0, SEEK_SET);
+    seekTo(0);
 
     bool ok = false;
     if (std::memcmp(magic, "RIFF", 4) == 0) {
@@ -89,6 +104,8 @@ public:
     return ok;
   }
 
+  /** Close the file; harmless when none is open. sampleRate(), numChannels()
+   *  and numFrames() answer 0 afterwards. */
   void close() {
     if (file_) std::fclose(file_);
     file_ = nullptr;
@@ -97,13 +114,18 @@ public:
     sampleRate_ = 0;
   }
 
+  /** True after a successful open(), until close(). */
   bool isOpen() const { return file_ != nullptr; }
+  /** The file's rate in Hz; 0 when not open. */
   uint32_t sampleRate() const { return sampleRate_; }
+  /** Channels per frame, interleaved in what read() writes; 0 when not open. */
   uint16_t numChannels() const { return channels_; }
+  /** The file's length in frames (one sample per channel); 0 when not open. */
   uint64_t numFrames() const { return frames_; }
   /** Bits per sample as stored, which a caller may want to report and must
    *  not need in order to read: everything comes back as float either way. */
   uint16_t bitsPerSample() const { return bits_; }
+  /** Why the latest open() failed; empty after one that succeeded. */
   const std::string& error() const { return error_; }
 
   /**
@@ -121,8 +143,7 @@ public:
     if ((uint64_t) frames > available) frames = (size_t) available;
 
     const size_t bytesPerFrame = (size_t) channels_ * (size_t) (bits_ / 8);
-    const long offset = (long) (dataOffset_ + startFrame * bytesPerFrame);
-    if (std::fseek(file_, offset, SEEK_SET) != 0) return 0;
+    if (!seekTo((int64_t) (dataOffset_ + startFrame * bytesPerFrame))) return 0;
 
     scratch_.resize(frames * bytesPerFrame);
     const size_t got = std::fread(scratch_.data(), 1, scratch_.size(), file_);
@@ -132,10 +153,17 @@ public:
   }
 
 private:
-  enum class Sample { Pcm16, Pcm24, Float32 };
+  enum class Sample { PcmU8, Pcm16, Pcm24, Pcm32, Float32 };
 
   void convert(const uint8_t* in, float* out, size_t count) const {
     switch (kind_) {
+      case Sample::PcmU8: // WAV's 8-bit is unsigned, centred on 128
+        for (size_t i = 0; i < count; ++i) out[i] = ((float) in[i] - 128.0f) / 128.0f;
+        break;
+      case Sample::Pcm32: // little-endian: only WAV reaches here
+        for (size_t i = 0; i < count; ++i)
+          out[i] = (float) ((double) (int32_t) wavdetail::readU32(in + i * 4) / 2147483648.0);
+        break;
       case Sample::Pcm16:
         for (size_t i = 0; i < count; ++i) {
           const uint16_t raw = bigEndian_ ? (uint16_t) ((in[i * 2] << 8) | in[i * 2 + 1])
@@ -163,16 +191,37 @@ private:
     }
   }
 
+  /** Every offset is 64 bits. fseek and ftell take a `long`, which is 32
+   *  bits on Windows: a file of 2 GiB or more did not open ("too short", from
+   *  ftell's -1), and nothing past 2 GiB could be read -- in the reader whose
+   *  whole purpose is files too big to load. */
+  bool seekTo(int64_t offset) {
+    if (offset < 0) return false;
+#if defined(_WIN32)
+    return _fseeki64(file_, offset, SEEK_SET) == 0;
+#else
+    return fseeko(file_, (off_t) offset, SEEK_SET) == 0;
+#endif
+  }
+  int64_t fileSize() {
+#if defined(_WIN32)
+    if (_fseeki64(file_, 0, SEEK_END) != 0) return -1;
+    return _ftelli64(file_);
+#else
+    if (fseeko(file_, 0, SEEK_END) != 0) return -1;
+    return (int64_t) ftello(file_);
+#endif
+  }
+
   /** Read a chunk header and body without loading the file: headers are tiny
    *  and scattered, so this seeks to each one rather than mapping the lot. */
-  bool readAt(long offset, void* into, size_t bytes) {
-    if (std::fseek(file_, offset, SEEK_SET) != 0) return false;
+  bool readAt(int64_t offset, void* into, size_t bytes) {
+    if (!seekTo(offset)) return false;
     return std::fread(into, 1, bytes, file_) == bytes;
   }
 
   bool parseWav() {
-    std::fseek(file_, 0, SEEK_END);
-    const long size = std::ftell(file_);
+    const int64_t size = fileSize();
     if (size < 12) {
       error_ = "the RIFF file is too short";
       return false;
@@ -184,14 +233,14 @@ private:
     }
 
     uint16_t format = 0;
-    long pos = 12;
+    int64_t pos = 12;
     uint32_t dataSize = 0;
     bool haveFmt = false, haveData = false;
     while (pos + 8 <= size) {
       uint8_t chunk[8];
       if (!readAt(pos, chunk, 8)) break;
       const uint32_t chunkSize = wavdetail::readU32(chunk + 4);
-      const long body = pos + 8;
+      const int64_t body = pos + 8;
       if (std::memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16) {
         uint8_t fmt[40] = {0};
         const size_t want = chunkSize < sizeof(fmt) ? chunkSize : sizeof(fmt);
@@ -217,20 +266,37 @@ private:
       error_ = "the WAVE file has no fmt or data chunk";
       return false;
     }
+    if (!channelsPlausible()) return false;
+    // A rate of zero is no rate: every position and length a caller works
+    // out from it divides by it. The AIFF path refused one; this did not.
+    if (sampleRate_ == 0) {
+      error_ = "the WAVE sample rate is zero";
+      return false;
+    }
     // A data chunk that claims more than the file holds is truncated to what
     // is there: refusing outright would reject every file a recorder was
     // still writing when it lost power, and those are worth recovering.
     const uint64_t onDisk = (uint64_t) size - dataOffset_;
     if ((uint64_t) dataSize > onDisk) dataSize = (uint32_t) onDisk;
+    // PCM (1) or IEEE float (3), and nothing else. A compressed tag -- WMA
+    // (0x0161), AC-3 (0x0092), ADPCM -- was read as PCM of whatever depth
+    // its header gave, and played as full-scale noise. The whole-file reader
+    // has always refused them.
+    if (format != 1 && format != 3) {
+      char buffer[96];
+      std::snprintf(buffer, sizeof(buffer), "WAVE format 0x%04X is compressed, not PCM or float",
+                    (unsigned) format);
+      error_ = buffer;
+      return false;
+    }
     bigEndian_ = false;
-    if (!classify(format == 3)) return false;
+    if (!classify(format == 3, true)) return false;
     frames_ = (uint64_t) dataSize / ((uint64_t) channels_ * (bits_ / 8));
     return true;
   }
 
   bool parseAiff() {
-    std::fseek(file_, 0, SEEK_END);
-    const long size = std::ftell(file_);
+    const int64_t size = fileSize();
     if (size < 12) {
       error_ = "the FORM file is too short";
       return false;
@@ -243,16 +309,17 @@ private:
       return false;
     }
 
-    long pos = 12;
+    int64_t pos = 12;
     uint64_t declaredFrames = 0;
     bool haveComm = false, haveSsnd = false, littleEndian = false;
+    char compression[5] = {0};
     while (pos + 8 <= size) {
       uint8_t chunk[8];
       if (!readAt(pos, chunk, 8)) break;
       // AIFF is big-endian throughout, including its chunk sizes.
       const uint32_t chunkSize = (uint32_t) ((chunk[4] << 24) | (chunk[5] << 16) |
                                              (chunk[6] << 8) | chunk[7]);
-      const long body = pos + 8;
+      const int64_t body = pos + 8;
       if (std::memcmp(chunk, "COMM", 4) == 0 && chunkSize >= 18) {
         uint8_t comm[32] = {0};
         const size_t want = chunkSize < sizeof(comm) ? chunkSize : sizeof(comm);
@@ -264,8 +331,15 @@ private:
         sampleRate_ = (uint32_t) (extendedToDouble(comm + 8) + 0.5);
         // AIFF-C names its encoding; "sowt" is PCM with the bytes the other
         // way round, which is what Mac tools write and what a big-endian-only
-        // reader turns into noise.
-        if (aifc && chunkSize >= 22) littleEndian = std::memcmp(comm + 18, "sowt", 4) == 0;
+        // reader turns into noise. "NONE" and "twos" are PCM as plain AIFF
+        // has it. Anything else -- u-law, IMA ADPCM, float -- was read as PCM
+        // and played as noise too; it is refused below.
+        if (aifc && chunkSize >= 22) {
+          littleEndian = std::memcmp(comm + 18, "sowt", 4) == 0;
+          const bool pcm = littleEndian || std::memcmp(comm + 18, "NONE", 4) == 0 ||
+                           std::memcmp(comm + 18, "twos", 4) == 0;
+          if (!pcm) std::memcpy(compression, comm + 18, 4);
+        }
         haveComm = true;
       } else if (std::memcmp(chunk, "SSND", 4) == 0 && chunkSize >= 8) {
         uint8_t ssnd[8];
@@ -282,8 +356,26 @@ private:
       error_ = "the AIFF file has no COMM or SSND chunk";
       return false;
     }
+    if (compression[0]) {
+      for (char& c : compression)
+        if (c && (c < 0x20 || c > 0x7e)) c = '?';
+      error_ = std::string("AIFF-C compression '") + compression + "' is not PCM";
+      return false;
+    }
+    if (!channelsPlausible()) return false;
+    // SSND's own offset field is added to its start, and nothing stopped it
+    // pointing past the end of the file: `size - dataOffset_` then wrapped
+    // to a number of frames in the billions, with no audio behind any of them.
+    if (dataOffset_ > (uint64_t) size) {
+      error_ = "the AIFF sound data starts past the end of the file";
+      return false;
+    }
+    if (sampleRate_ == 0) {
+      error_ = "the AIFF sample rate is not a usable number";
+      return false;
+    }
     bigEndian_ = !littleEndian;
-    if (!classify(false)) return false;
+    if (!classify(false, false)) return false;
     const uint64_t onDisk = (uint64_t) size - dataOffset_;
     const uint64_t fits = onDisk / ((uint64_t) channels_ * (bits_ / 8));
     frames_ = declaredFrames < fits ? declaredFrames : fits;
@@ -300,23 +392,56 @@ private:
    * negative number and the walk went BACKWARDS through the file, reading
    * chunk headers out of the middle of the audio.
    *
-   * Never forwards by nothing and never past the end, both of which are
-   * termination conditions rather than errors: a file can be truncated
-   * because a recorder lost power, and the chunks that ARE there are still
-   * worth reading.
+   * Never past the end, which is a termination condition rather than an
+   * error: a file can be truncated because a recorder lost power, and the
+   * chunks that ARE there are still worth reading.
+   *
+   * A chunk of size zero is NOT one. It is legal RIFF and ordinary AIFF -- an
+   * empty NAME or ANNO, a JUNK with nothing in it -- and its eight-byte
+   * header alone moves the walk on, so the walk always progresses. It was
+   * taken for "no progress" and ended the walk: every chunk after it went
+   * unread, the data or SSND chunk among them, and a file the whole-file
+   * readers play was refused here as having no audio.
    */
-  static long nextChunk(long body, uint32_t chunkSize, long size) {
+  static int64_t nextChunk(int64_t body, uint32_t chunkSize, int64_t size) {
     // 64-bit throughout: this is the sum that used to overflow.
     const uint64_t padded = (uint64_t) chunkSize + (uint64_t) (chunkSize & 1u);
     const uint64_t next = (uint64_t) body + padded;
-    if (next <= (uint64_t) body) return -1; // a zero-size chunk, and no progress
-    if (next > (uint64_t) size) return -1;  // claims more than the file holds
-    return (long) next;
+    if (next > (uint64_t) size) return -1; // claims more than the file holds
+    return (int64_t) next;
   }
 
-  bool classify(bool isFloat) {
+  /** The whole-file readers stop at 32 channels and so does this one now.
+   *  The field is sixteen bits, and every buffer sized from it -- a sample
+   *  stream's 64K-frame window, a waveform cache, this reader's own scratch --
+   *  multiplies by it: a 60-byte header claiming 65535 channels asked for
+   *  17 GB, and the bad_alloc took the host down with it. */
+  static constexpr uint16_t kMaxChannels = 32;
+  bool channelsPlausible() {
+    if (channels_ <= kMaxChannels) return true;
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer), "%u channels is more than this reader opens (%u)",
+                  (unsigned) channels_, (unsigned) kMaxChannels);
+    error_ = buffer;
+    return false;
+  }
+
+  /** `wav` admits the two depths readWav reads and readAiff does not:
+   *  unsigned 8-bit and 32-bit integer PCM, which turn up in sample libraries
+   *  from old drum machines and Pro Tools bounces. This reader refused them,
+   *  so a WAV that readAudioFile plays would not stream, play through
+   *  AudioFormatReaderSource or draw from its file. */
+  bool classify(bool isFloat, bool wav) {
     if (isFloat && bits_ == 32) {
       kind_ = Sample::Float32;
+      return true;
+    }
+    if (!isFloat && wav && bits_ == 8) {
+      kind_ = Sample::PcmU8;
+      return true;
+    }
+    if (!isFloat && wav && bits_ == 32) {
+      kind_ = Sample::Pcm32;
       return true;
     }
     if (!isFloat && bits_ == 16) {
@@ -341,6 +466,11 @@ private:
     uint64_t mantissa = 0;
     for (int i = 0; i < 8; ++i) mantissa = (mantissa << 8) | p[2 + i];
     if (mantissa == 0) return 0.0;
+    // A rate is a small positive number, and the exponent field can say
+    // 2^16384: the result was +inf, cast straight to uint32_t by the caller,
+    // which is undefined behaviour on a corrupt COMM chunk. audiofile.h's
+    // copy of this conversion learned that long ago; this one had not.
+    if ((p[0] & 0x80) || exponent > 30 || exponent < -30) return 0.0;
     return std::ldexp((double) mantissa, exponent - 63);
   }
 

@@ -35,6 +35,9 @@
 #include "widgets.h"
 
 namespace sonore {
+
+class PresetManager; // user_presets.h
+
 namespace gfx {
 
 /**
@@ -47,9 +50,12 @@ namespace gfx {
 struct EditorHost {
   /** The parameter's PLAIN value, in its own units. */
   std::function<float(int index)> getParameter;
+  /** [main-thread] Set parameter `index` to `plain`, in its own units: an edit.
+   *  The attachments bracket every call with beginGesture and endGesture. */
   std::function<void(int index, float plain)> setParameter;
   /** A drag is one automation edit and one undo step. */
   std::function<void(int index)> beginGesture;
+  /** Closes the gesture beginGesture opened on `index`. */
   std::function<void(int index)> endGesture;
 
   /**
@@ -61,6 +67,7 @@ struct EditorHost {
    * same answer the descriptor already had.
    */
   std::function<void(int note, float velocity)> noteOn;
+  /** The on-screen key for `note`, a MIDI note number, was let go. */
   std::function<void(int note)> noteOff;
 
   /**
@@ -80,6 +87,18 @@ struct EditorHost {
    * extensions ask for.
    */
   std::function<void(int index, int x, int y)> showContextMenu;
+
+  /**
+   * The plugin instance's presets -- factory and the user's own -- or null.
+   *
+   * A pointer to what the wrapper's instance owns, not a copy: the selection
+   * and the "modified" marker belong to the instance and outlive every
+   * editor, so closing the window and opening it again shows the same preset.
+   * Null where a format offers no preset bar (a test's four lambdas, a host
+   * that drives an editor itself), and then the bar is simply not there.
+   * See gfx/preset_bar.h.
+   */
+  PresetManager* presets = nullptr;
 };
 
 /**
@@ -92,18 +111,30 @@ struct EditorHost {
  */
 class SliderAttachment {
 public:
+  /**
+   * [main-thread] Bind `slider` to parameter `index`, described by `info`.
+   *
+   * Gives the slider the parameter's default, disables it for a read-only
+   * parameter, takes over its onDragStart, onDragEnd and onValueChange, and
+   * syncs it to the host's value. `slider` and `info` are kept by reference and
+   * must outlive this; `host` is copied.
+   */
   SliderAttachment(Slider& slider, const ParamInfo& info, int index, EditorHost host)
       : slider_(slider), info_(info), index_(index), host_(std::move(host)) {
     slider_.setDefaultValue((float) toNormalisedValue(info_, info_.defaultValue));
 
+    // A read-only parameter is SHOWN here and never set: the slider is
+    // disabled, and nothing below reaches the host for it (see uiMayWrite).
+    slider_.setEnabled(!info_.readOnly);
     slider_.onDragStart = [this]() {
-      if (host_.beginGesture) host_.beginGesture(index_);
+      if (!info_.readOnly && host_.beginGesture) host_.beginGesture(index_);
     };
     slider_.onDragEnd = [this]() {
-      if (host_.endGesture) host_.endGesture(index_);
+      if (!info_.readOnly && host_.endGesture) host_.endGesture(index_);
     };
     slider_.onValueChange = [this](float normalised) {
-      if (host_.setParameter) host_.setParameter(index_, (float) toPlainValue(info_, normalised));
+      if (!info_.readOnly && host_.setParameter)
+        host_.setParameter(index_, (float) toPlainValue(info_, normalised));
       if (onDisplayChanged) onDisplayChanged(displayText());
     };
     sync();
@@ -142,6 +173,7 @@ public:
    */
   bool setFromText(const std::string& typed) {
     float plain = 0.0f;
+    if (info_.readOnly) return false; // a reading, not a setting
     if (!parseParamValue(info_, typed.c_str(), &plain)) return false;
     if (host_.beginGesture) host_.beginGesture(index_);
     if (host_.setParameter) host_.setParameter(index_, plain);
@@ -154,6 +186,8 @@ public:
     return true;
   }
 
+  /** displayText(), each time what the slider shows changes -- an edit, a
+   *  sync, a typed value -- so a readout beside it can follow. */
   std::function<void(const std::string&)> onDisplayChanged;
 
 private:
@@ -178,11 +212,20 @@ private:
  */
 class ButtonAttachment {
 public:
+  /** [main-thread] Bind `button` to the two-position parameter `index`: it
+   *  becomes a toggle named for a reader by the parameter's label, disabled for
+   *  a read-only parameter, synced now. Each press is one complete edit to the
+   *  minimum or the maximum. `button` and `info` must outlive this. */
   ButtonAttachment(Button& button, const ParamInfo& info, int index, EditorHost host)
       : button_(button), info_(info), index_(index), host_(std::move(host)) {
     button_.setToggleable(true);
     button_.setAccessibleName(info_.label);
+    button_.setEnabled(!info_.readOnly); // shown, never set: see SliderAttachment
     button_.onToggle = [this](bool on) {
+      if (info_.readOnly) {
+        sync(); // back to what the plugin says
+        return;
+      }
       // One complete edit, opened and closed around the change -- the same
       // rule a choice follows, and for the same reason: a switch is not a drag
       // and must not leave a gesture open behind it.
@@ -194,6 +237,8 @@ public:
     sync();
   }
 
+  /** Pull the host's value -- on at or above the middle of the range -- without
+   *  calling onToggle. Called on the UI tick. */
   void sync() {
     if (!host_.getParameter) return;
     const float plain = host_.getParameter(index_);
@@ -226,6 +271,10 @@ private:
 /** The same, for a stepped parameter drawn as a list of named choices. */
 class ComboAttachment {
 public:
+  /** [main-thread] Bind `box` to the stepped parameter `index`: its items become
+   *  the value names (a step's number where a name is missing), it is disabled
+   *  for a read-only parameter and synced now. Each choice is one complete
+   *  edit. `box` and `info` must outlive this. */
   ComboAttachment(ComboBox& box, const ParamInfo& info, int index, EditorHost host)
       : box_(box), info_(info), index_(index), host_(std::move(host)) {
     std::vector<std::string> items;
@@ -237,7 +286,12 @@ public:
       else items.push_back(std::to_string(i));
     }
     box_.setItems(std::move(items));
+    box_.setEnabled(!info_.readOnly); // shown, never set: see SliderAttachment
     box_.onChange = [this](int selected) {
+      if (info_.readOnly) {
+        sync(); // back to what the plugin says
+        return;
+      }
       // A choice is a complete edit: opened and closed around one change,
       // never left open the way a drag is.
       if (host_.beginGesture) host_.beginGesture(index_);
@@ -250,6 +304,8 @@ public:
     sync();
   }
 
+  /** Select the step the host's value is on, without calling onChange. Does
+   *  nothing for a parameter with no steps. Called on the UI tick. */
   void sync() {
     if (!host_.getParameter || info_.stepCount <= 0) return;
     box_.setSelectedIndex(stepIndexOf(info_, host_.getParameter(index_)), /*notify=*/false);
@@ -298,14 +354,29 @@ private:
  */
 class GenericEditor : public Widget {
 public:
+  /** One parameter row's pitch in logical pixels; its controls are 6 shorter. */
   static constexpr float kRowHeight = 34.0f;
+  /** The margin round the rows, and the gap before a slider's readout. */
   static constexpr float kPadding = 12.0f;
+  /** The width of the parameter-name column. */
   static constexpr float kLabelWidth = 108.0f;
+  /** The width of the value box beside a slider. */
   static constexpr float kValueWidth = 84.0f;
   /** A toggle is a control to press, not a bar to fill the row with. */
   static constexpr float kSwitchWidth = 96.0f;
+  /** The height of the on-screen keyboard an instrument gets along the bottom. */
   static constexpr float kKeyboardHeight = 64.0f;
 
+  /**
+   * [main-thread] A row for each of `numParams` parameters: a switch for two
+   * steps, a combo box for named steps, otherwise a slider with a value box to
+   * type into. Grouped parameters go into open sections below the ungrouped
+   * rows, and an instrument (`host.noteOn` set) gets a keyboard. Starts 360
+   * wide and preferredHeight() tall.
+   *
+   * `params` is borrowed -- the attachments keep references into it -- and must
+   * outlive the editor; `host` is copied.
+   */
   GenericEditor(const ParamInfo* params, int numParams, EditorHost host, Font font)
       : params_(params), numParams_(numParams < 0 ? 0 : numParams), host_(std::move(host)) {
     setFont(font);
@@ -395,6 +466,7 @@ public:
         row->value->onTextEntered = [attach](const std::string& typed) {
           return attach->setFromText(typed);
         };
+        if (p.readOnly) row->value->setEnabled(false); // read, not typed into
         row->attach->sync();
       }
       // Right-click reaches the host's menu, from whichever control this row
@@ -561,6 +633,10 @@ public:
   }
 
 private:
+  /** One parameter's row, owning its controls: always the name label, then
+   *  exactly one of a switch (two steps), a combo box (named steps) or a
+   *  slider with a ValueBox -- each with the attachment that binds it to the
+   *  parameter. The pointers that are not used stay null. */
   struct Row {
     std::unique_ptr<Label> name;
     std::unique_ptr<ValueBox> value;
@@ -665,6 +741,54 @@ private:
   std::vector<std::unique_ptr<RowHolder>> bodies_;
   std::vector<Row*> ungrouped_;
   mutable std::vector<Row*> allRows_;
+};
+
+/**
+ * A plugin's OWN native editor -- the reference's AudioProcessorEditor.
+ *
+ * GenericEditor is what a plugin gets when it says nothing. A plugin that
+ * wants a face of its own derives from this, builds it from the same widgets,
+ * and hands it over from its DSP:
+ *
+ *   std::unique_ptr<gfx::AudioProcessorEditor> createEditor(const gfx::EditorHost& host);
+ *
+ * [main-thread], called each time a host opens the editor. NativeEditor puts
+ * the result in its window instead of the generic one -- with the same clock,
+ * tooltips, resize border and drop-down menus -- and destroys it when the host
+ * closes the window. The DSP outlives every editor it makes, so the editor may
+ * keep a reference to it, as the reference's editor keeps one to its
+ * processor; anything it hands the audio thread still crosses by atomics.
+ *
+ * It is a Widget and nothing more, so it renders into a Bitmap with no window
+ * at all: createEditor() with four lambdas for a host, paintTree() into a
+ * Graphics, and the pixels are there to check.
+ */
+class AudioProcessorEditor : public Widget {
+public:
+  /**
+   * [main-thread] One UI frame (33 ms), before the repaint: follow the host --
+   * automation, a preset it loaded, its undo. `now` is seconds on the window's
+   * clock, the same one the generic editor animates by.
+   */
+  virtual void editorTick(double now) { (void) now; }
+
+  /**
+   * Set by the window around the editor: drop `box`'s list down as a real menu
+   * anchored under it. Empty with no window (a test, a headless render), and
+   * openComboMenu() then steps the box to its next item, as GenericEditor does.
+   */
+  std::function<void(ComboBox&)> onOpenComboMenu;
+
+  /** What a ComboBox in this editor should do with its onOpenMenu:
+   *  box.onOpenMenu = [this](ComboBox& b) { openComboMenu(b); }. */
+  void openComboMenu(ComboBox& box) {
+    if (onOpenComboMenu) {
+      onOpenComboMenu(box);
+      return;
+    }
+    const int n = (int) box.items().size();
+    if (n > 0) box.setSelectedIndex((box.selectedIndex() + 1) % n);
+  }
 };
 
 } // namespace gfx

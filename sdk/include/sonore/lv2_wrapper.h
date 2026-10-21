@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Sonore SDK: the LV2 format wrapper.
 //
-// LV2 is the open standard (ISC-licensed headers, vendored) that Linux DAWs:
-// Ardour, Reaper on Linux, Carla, Zrythm: treat as native. The plugin is a
+// LV2 is the open standard (ISC-licensed headers, vendored) that Linux DAWs
+// (Ardour, Reaper on Linux, Carla, Zrythm) treat as native. The plugin is a
 // shared library plus a bundle of Turtle (.ttl) metadata describing every port;
 // hosts read the TTL to know the plugin's shape BEFORE loading any code.
 //
@@ -32,17 +32,24 @@
 #include <lv2/state/state.h>
 #include <lv2/urid/urid.h>
 
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
 
 #include "audio.h"
 #include "gui.h"
 #include "plugin.h"
+#include "lv2_atom.h"
+#include "number_text.h"
 #include "lv2_ui.h"
 #include "presets.h"
+#include "transport.h"
 
 #ifndef SONORE_NUM_PARAMS
 #error "Define SONORE_NUM_PARAMS (and struct SonoreDsp) before including lv2_wrapper.h"
@@ -65,17 +72,25 @@ namespace lv2 {
 // answer comes back through work_response() before the next run().
 #define SONORE_LV2_WORKER__schedule "http://lv2plug.in/ns/ext/worker#schedule"
 #define SONORE_LV2_WORKER__interface "http://lv2plug.in/ns/ext/worker#interface"
+// The time extension is URIs only -- time:Position is an atom object whose
+// properties a host fills in -- so its header is not vendored for one prefix.
+#define SONORE_LV2_TIME "http://lv2plug.in/ns/ext/time#"
 
 typedef void* Lv2WorkerRespondHandle;
 typedef void* Lv2WorkerScheduleHandle;
 enum Lv2WorkerStatus { kLv2WorkerSuccess = 0, kLv2WorkerErrUnknown = 1, kLv2WorkerErrNoSpace = 2 };
 typedef Lv2WorkerStatus (*Lv2WorkerRespondFunction)(Lv2WorkerRespondHandle, uint32_t, const void*);
 
+/** LV2_Worker_Schedule, the host's half: schedule_work() hands a job to the
+ *  worker thread. Spelled here for its layout; see above. */
 struct Lv2WorkerSchedule {
   Lv2WorkerScheduleHandle handle;
   Lv2WorkerStatus (*schedule_work)(Lv2WorkerScheduleHandle, uint32_t, const void*);
 };
 
+/** LV2_Worker_Interface, the plugin's half: work() runs on the worker thread,
+ *  work_response() back on the audio thread before the next run(), and
+ *  end_run() after each run(). */
 struct Lv2WorkerInterface {
   Lv2WorkerStatus (*work)(LV2_Handle, Lv2WorkerRespondFunction, Lv2WorkerRespondHandle, uint32_t,
                           const void*);
@@ -83,11 +98,35 @@ struct Lv2WorkerInterface {
   Lv2WorkerStatus (*end_run)(LV2_Handle);
 };
 
+// ── The log extension ────────────────────────────────────────
+//
+// Declared the same way, for one message: the output guard's report, which
+// goes to the host's log as a warning where the host offers one. The spec
+// allows its printf from any NON-realtime context, so it is called from the
+// worker or from deactivate()/cleanup(), never from run().
+#define SONORE_LV2_LOG__log "http://lv2plug.in/ns/ext/log#log"
+#define SONORE_LV2_LOG__Warning "http://lv2plug.in/ns/ext/log#Warning"
+
+/** LV2_Log_Log: the host's log, for non-realtime contexts only. */
+struct Lv2Log {
+  void* handle;
+  // printf and vprintf upstream; renamed because a C library may define
+  // printf as a macro, and only the layout is the ABI.
+  int (*print)(void* handle, LV2_URID type, const char* format, ...);
+  int (*vprint)(void* handle, LV2_URID type, const char* format, va_list args);
+};
+
+/** What run() hands the worker to have the output guard's report made: an
+ *  exact byte string, which no file-load payload can equal (a payload ends
+ *  with a path after the purpose's terminator, and this ends at its own). */
+inline const char* outputGuardWork() { return "sonore:output-guard"; }
+
 using clapwrap::Instance;
 
 // ── Port arithmetic, shared by the wrapper and the TTL generator ─────────────
 
 #include "lv2_ports.h"
+#include "path_io.h"
 
 /** The plugin URI: derived from the reverse-DNS id, which is already unique
  *  per product. LV2 identifies plugins by URI exactly as VST3 does by UID. */
@@ -97,14 +136,23 @@ inline void pluginUri(char* out, size_t capacity) {
 
 // ── The instance ─────────────────────────────────────────────────────────────
 
+/** One LV2 instance: the Instance every format wrapper shares, plus what LV2
+ *  adds -- the host's port pointers, the URIDs it mapped, the worker and the
+ *  log it offered, and the MIDI and transport of the current run(). */
 struct Plugin {
   Instance shared;
+  /** A long run()'s MIDI, held here while it is handed out slice by slice.
+   *  A member, so nothing in run() allocates for it. */
+  MidiBuffer runMidi;
   double sampleRate = 48000.0;
 
   /** Host-connected port locations. Controls may be null until connected. */
   const float* controls[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
-  const float* audioIn[2]{};
-  float* audioOut[2]{};
+  /** One per channel of the main bus, which is lv2Width() wide -- up to
+   *  kMaxAudioChannels, not two. These were two-wide, so a quad-only effect's
+   *  third and fourth channels were read through slots that did not exist. */
+  const float* audioIn[clapwrap::kMaxAudioChannels]{};
+  float* audioOut[clapwrap::kMaxAudioChannels]{};
   /** lv2:enabled port location, or null when the host never connected it
    *  (it is connectionOptional): null means enabled. */
   const float* enabled = nullptr;
@@ -118,6 +166,19 @@ struct Plugin {
   /** The interface's two atom ports. */
   const LV2_Atom_Sequence* uiControlIn = nullptr;
   LV2_Atom_Sequence* uiNotifyOut = nullptr;
+
+  /** time:Position objects from the host, when the DSP takes the transport. */
+  const LV2_Atom_Sequence* timeIn = nullptr;
+  /** Where the host's transport is, as of the start of the next run(): set
+   *  from each time:Position, carried forward by every run in between --
+   *  a host sends one only when the transport jumps. */
+  TransportInfo transport;
+  double transportSpeed = 0.0;
+  LV2_URID uridAtomObject = 0, uridAtomBlank = 0, uridAtomFloat = 0, uridAtomDouble = 0,
+           uridAtomInt = 0, uridAtomLong = 0;
+  LV2_URID uridTimePosition = 0, uridTimeBar = 0, uridTimeBarBeat = 0, uridTimeBeat = 0,
+           uridTimeBeatUnit = 0, uridTimeBeatsPerBar = 0, uridTimeBeatsPerMinute = 0,
+           uridTimeFrame = 0, uridTimeSpeed = 0;
   LV2_URID uridStateRequest = 0;
   LV2_URID uridStateJson = 0;
   LV2_URID uridLoadFile = 0;
@@ -131,11 +192,47 @@ struct Plugin {
    *  this plugin cannot be handed a file -- which is better than loading one
    *  in run() and calling it a feature. */
   const Lv2WorkerSchedule* worker = nullptr;
-  /** Built by work() on the host's thread, swapped in by work_response() on
-   *  the audio thread. A swap of two strings moves two pointers and allocates
-   *  nothing, which is what makes the handover legal where a rebuild would
-   *  not be. */
-  std::string uiStatePending;
+  /** The host's log, if it offered one, and its warning type: where the
+   *  output guard's report goes. Null means stderr. */
+  const Lv2Log* log = nullptr;
+  LV2_URID uridLogWarning = 0;
+  /** LV2 runs the DSP's [main-thread] calls -- loadFile, saveState,
+   *  loadState, prepare -- on THREE threads: the host's (activate, save,
+   *  restore), the worker's (work), and the audio thread's when a freewheel
+   *  flip re-prepares (updateFreeWheel). The DSP was promised one, as CLAP
+   *  and VST3 give it, so they take turns here. run() only ever try_locks
+   *  it, and puts the flip off to the next run when it is held. */
+  std::mutex mainThread;
+  /** An interface state the worker built, on its way to run(). work() hands
+   *  it over by pointer in its response, so each response carries its own;
+   *  one shared string, written by the next work() while the previous
+   *  response was still queued, ended on the state before both loads.
+   *  work_response() swaps the text in -- two pointers, no allocation -- and
+   *  pushes the husk onto uiRetired for the worker to free. */
+  struct UiText {
+    std::string json;
+    /** Which build of the state this is: see uiBuilt. */
+    uint32_t build = 0;
+    UiText* next = nullptr;
+    /** The next in uiTexts. */
+    UiText* older = nullptr;
+  };
+  std::atomic<UiText*> uiRetired{nullptr};
+  /** Every UiText work() has made and nothing has freed yet, delivered or
+   *  not, under mainThread. A response the host never delivers -- host.h
+   *  drops its queue with the instance on every prepare(), jalv at exit --
+   *  never reaches uiRetired, and its text was lost with the instance: two
+   *  heap blocks per dropped load. cleanup() frees what is left here. */
+  UiText* uiTexts = nullptr;
+  /** Every interface state is numbered as it is built, under mainThread --
+   *  by work(), and by activate() and restore() -- and uiShown is the number
+   *  of the one uiStateJson holds. A response is swapped in only when it is
+   *  newer: one the worker built BEFORE a restore, still queued when the
+   *  host restored between two runs, put the old file back on the interface
+   *  while the DSP held the restored one. uiShown is written by restore()
+   *  and activate(), which LV2 never runs beside work_response(). */
+  uint32_t uiBuilt = 0;
+  uint32_t uiShown = 0;
   /**
    * The bag as an object literal, built OFF the audio thread.
    *
@@ -152,6 +249,10 @@ struct Plugin {
   uint32_t uiStateSent = 0;
   /** True once a request has arrived and until it has been answered. */
   bool uiStateRequested = false;
+  /** Frames run since the state was last put on the notify port. At a second
+   *  of audio it is sent again whether or not anything asked: see
+   *  writeUiNotify. */
+  uint64_t framesSinceUiState = 0;
   /** lv2:freeWheeling input, or null when the host never connected it: null
    *  means real time, which is what a host that does not know about the port
    *  is doing. */
@@ -180,6 +281,7 @@ inline LV2_Handle instantiate(const LV2_Descriptor*, double sampleRate, const ch
   // has promised it. Verify anyway: a null map here would be a crash later.
   LV2_URID_Map* map = nullptr;
   const Lv2WorkerSchedule* worker = nullptr;
+  const Lv2Log* log = nullptr;
   for (int i = 0; features && features[i]; ++i) {
     if (std::strcmp(features[i]->URI, LV2_URID__map) == 0)
       map = (LV2_URID_Map*) features[i]->data;
@@ -188,6 +290,9 @@ inline LV2_Handle instantiate(const LV2_Descriptor*, double sampleRate, const ch
     // at all over that would be a worse trade than the missing feature.
     else if (std::strcmp(features[i]->URI, SONORE_LV2_WORKER__schedule) == 0)
       worker = (const Lv2WorkerSchedule*) features[i]->data;
+    // Optional too: without it the output guard's report goes to stderr.
+    else if (std::strcmp(features[i]->URI, SONORE_LV2_LOG__log) == 0)
+      log = (const Lv2Log*) features[i]->data;
   }
   if (!map) return nullptr;
 
@@ -195,6 +300,8 @@ inline LV2_Handle instantiate(const LV2_Descriptor*, double sampleRate, const ch
   if (!memory) return nullptr;
   Plugin* self = new (memory) Plugin();
   self->worker = worker;
+  self->log = log;
+  if (log) self->uridLogWarning = map->map(map->handle, SONORE_LV2_LOG__Warning);
   self->sampleRate = sampleRate;
   self->uridMidiEvent = map->map(map->handle, LV2_MIDI__MidiEvent);
   self->uridAtomSequence = map->map(map->handle, LV2_ATOM__Sequence);
@@ -204,6 +311,21 @@ inline LV2_Handle instantiate(const LV2_Descriptor*, double sampleRate, const ch
   self->uridStateJson = map->map(map->handle, "urn:sonorie:ui:stateJson");
   self->uridLoadFile = map->map(map->handle, "urn:sonorie:ui:loadFile");
   self->uridNotes = map->map(map->handle, "urn:sonorie:ui:notes");
+  self->uridAtomObject = map->map(map->handle, LV2_ATOM__Object);
+  self->uridAtomBlank = map->map(map->handle, LV2_ATOM__Blank);
+  self->uridAtomFloat = map->map(map->handle, LV2_ATOM__Float);
+  self->uridAtomDouble = map->map(map->handle, LV2_ATOM__Double);
+  self->uridAtomInt = map->map(map->handle, LV2_ATOM__Int);
+  self->uridAtomLong = map->map(map->handle, LV2_ATOM__Long);
+  self->uridTimePosition = map->map(map->handle, SONORE_LV2_TIME "Position");
+  self->uridTimeBar = map->map(map->handle, SONORE_LV2_TIME "bar");
+  self->uridTimeBarBeat = map->map(map->handle, SONORE_LV2_TIME "barBeat");
+  self->uridTimeBeat = map->map(map->handle, SONORE_LV2_TIME "beat");
+  self->uridTimeBeatUnit = map->map(map->handle, SONORE_LV2_TIME "beatUnit");
+  self->uridTimeBeatsPerBar = map->map(map->handle, SONORE_LV2_TIME "beatsPerBar");
+  self->uridTimeBeatsPerMinute = map->map(map->handle, SONORE_LV2_TIME "beatsPerMinute");
+  self->uridTimeFrame = map->map(map->handle, SONORE_LV2_TIME "frame");
+  self->uridTimeSpeed = map->map(map->handle, SONORE_LV2_TIME "speed");
   for (int i = 0; i < SONORE_NUM_PARAMS && i < kDesc.numParams; ++i)
     self->shared.params[i] = kDesc.params[i].defaultValue;
   return (LV2_Handle) self;
@@ -221,6 +343,14 @@ inline LV2_Handle instantiate(const LV2_Descriptor*, double sampleRate, const ch
 inline void updateFreeWheel(Plugin* self) {
   const bool offline = self->freeWheel && *self->freeWheel >= 0.5f;
   if (offline == self->shared.offline) return;
+  // prepare() is a [main-thread] call, and the worker's loadFile() and the
+  // host's save() -- which LV2 lets run beside run() -- take mainThread
+  // before they call the DSP. This did not, and a flip arriving while a file
+  // loaded ran prepare() inside loadFile(). Taken here too, but never waited
+  // for: a run that finds it held leaves the flag unmoved, and the next run
+  // makes the flip.
+  std::unique_lock<std::mutex> turn(self->mainThread, std::try_to_lock);
+  if (!turn.owns_lock()) return;
   self->shared.offline = offline;
   clapwrap::prepareDsp(&self->shared);
 }
@@ -248,6 +378,10 @@ inline void connectPort(LV2_Handle handle, uint32_t port, void* data) {
     self->uiNotifyOut = (LV2_Atom_Sequence*) data;
     return;
   }
+  if (timePorts() && port == (uint32_t) portTimeIn()) {
+    self->timeIn = (const LV2_Atom_Sequence*) data;
+    return;
+  }
   if (port == (uint32_t) portMeterPeak()) {
     self->meterPeakOut = (float*) data;
     return;
@@ -270,19 +404,27 @@ inline void connectPort(LV2_Handle handle, uint32_t port, void* data) {
     self->freeWheel = (const float*) data;
     return;
   }
-  if (isInstrument()) {
-    if (port == (uint32_t) portMidiIn()) self->midiIn = (const LV2_Atom_Sequence*) data;
-    else if (port == (uint32_t) portAudioOutL()) self->audioOut[0] = (float*) data;
-    else if (port == (uint32_t) portAudioOutL() + 1) self->audioOut[1] = (float*) data;
+  // The main bus by RANGE, lv2Width() ports each way. It was matched as
+  // "the first port" and "the one after it" whatever the width -- and at
+  // width 1 the one after the input IS the output, so the output port was
+  // taken for a right input and never connected: a mono-only effect's run()
+  // returned on its first line and the host heard its own stale buffer.
+  const uint32_t width = (uint32_t) lv2Width();
+  const uint32_t outFirst = (uint32_t) portAudioOutL();
+  if (port >= outFirst && port < outFirst + width) {
+    self->audioOut[port - outFirst] = (float*) data;
     return;
   }
+  if (midiPorts() && port == (uint32_t) portMidiIn()) {
+    self->midiIn = (const LV2_Atom_Sequence*) data;
+    return;
+  }
+  if (isInstrument()) return;
+  const uint32_t inFirst = (uint32_t) portAudioInL();
   if (port == (uint32_t) portEnabled()) self->enabled = (const float*) data;
   else if (scPorts() && port == (uint32_t) portScInL()) self->scIn[0] = (const float*) data;
   else if (scPorts() && port == (uint32_t) portScInL() + 1) self->scIn[1] = (const float*) data;
-  else if (port == (uint32_t) portAudioInL()) self->audioIn[0] = (const float*) data;
-  else if (port == (uint32_t) portAudioInL() + 1) self->audioIn[1] = (const float*) data;
-  else if (port == (uint32_t) portAudioOutL()) self->audioOut[0] = (float*) data;
-  else if (port == (uint32_t) portAudioOutL() + 1) self->audioOut[1] = (float*) data;
+  else if (port >= inFirst && port < inFirst + width) self->audioIn[port - inFirst] = (const float*) data;
 }
 
 /**
@@ -297,22 +439,66 @@ inline void refreshUiState(Plugin* self) {
   StateBag bag;
   clapwrap::saveDspState(self->shared.dsp, bag);
   self->uiStateJson = bagToJson(bag);
+  self->uiShown = ++self->uiBuilt; // newer than any response still queued
   ++self->uiStateSeq;
+}
+
+/** [worker-thread or main-thread] Free what work_response() has finished
+ *  with. Never on the audio thread, which only pushes. */
+inline void freeRetiredUiText(Plugin* self) {
+  Plugin::UiText* r = self->uiRetired.exchange(nullptr, std::memory_order_acquire);
+  while (r) {
+    Plugin::UiText* next = r->next;
+    for (Plugin::UiText** link = &self->uiTexts; *link; link = &(*link)->older)
+      if (*link == r) {
+        *link = r->older;
+        break;
+      }
+    delete r;
+    r = next;
+  }
 }
 
 inline void activate(LV2_Handle handle) {
   auto* self = (Plugin*) handle;
+  std::lock_guard<std::mutex> turn(self->mainThread);
   refreshUiState(self);
-  ProcessSpec spec;
-  spec.sampleRate = self->sampleRate;
+  // Into the SHARED instance, and prepared through prepareDsp, because that
+  // is what updateFreeWheel calls when an export starts -- and it reads these
+  // three fields. They were never written here: activate built its own spec
+  // and handed it to the DSP directly, so the shared ones kept the Instance
+  // defaults, and the first freewheel flip re-prepared every DSP at 48 kHz,
+  // 128 frames and two channels whatever the session was. A 44.1 kHz bounce
+  // came out 8.8% sharp in every filter and delay, and stayed that way after
+  // the bounce, because turning freewheel off re-prepared with the same.
+  self->shared.sampleRate = self->sampleRate;
   // LV2 gives no maximum block size up front; 8192 covers every host's real
   // behaviour, and run() slices anything larger.
-  spec.maximumBlockSize = 8192;
-  spec.numChannels = (uint32_t) lv2Width();
-  self->shared.dsp.prepare(spec);
-  self->shared.bypass.prepare(self->sampleRate, 8192, clapwrap::dspLatency(self->shared.dsp),
-                              (uint32_t) lv2Width());
+  self->shared.maxFrames = 8192;
+  self->shared.mainChannels = (uint32_t) lv2Width();
+  clapwrap::prepareDsp(&self->shared);
+  // With room for the latency to move: LV2 has no restart (see follow()).
+  const uint32_t latency = clapwrap::dspLatency(self->shared.dsp);
+  self->shared.bypass.prepare(self->sampleRate, 8192, latency, (uint32_t) lv2Width(),
+                              clapwrap::HasLatency<SonoreDsp>::value
+                                  ? clapwrap::BypassState::roomFor(latency, self->sampleRate)
+                                  : 0);
   if (scPorts()) self->shared.scSilence.assign(8192, 0.0f);
+}
+
+/** Claim the MIDI output buffer for this run(): note the host's capacity and
+ *  leave an empty sequence, whatever follows. First thing in run(), because
+ *  a host reads atom.size back as how much was written -- and a run() of
+ *  zero frames, or one that returned early, claimed it nowhere and left the
+ *  capacity there, which reads as a buffer full of events. */
+inline void claimMidiOut(Plugin* self) {
+  if (!midiOutPorts() || !self->midiOut) return;
+  LV2_Atom_Sequence* seq = self->midiOut;
+  self->midiOutCapacity = seq->atom.size;
+  seq->atom.type = self->uridAtomSequence;
+  seq->atom.size = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
+  seq->body.unit = 0;
+  seq->body.pad = 0;
 }
 
 /** Append this slice's emitted MIDI to the host's output sequence.
@@ -324,60 +510,68 @@ inline void activate(LV2_Handle handle) {
 inline void writeMidiOut(Plugin* self, uint32_t frameOffset, uint32_t frames) {
   if (!midiOutPorts() || !self->midiOut) return;
   LV2_Atom_Sequence* seq = self->midiOut;
-  if (frameOffset == 0) {
-    // First slice of this run(): claim the buffer.
-    self->midiOutCapacity = seq->atom.size;
-    seq->atom.type = self->uridAtomSequence;
-    seq->atom.size = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
-    seq->body.unit = 0;
-    seq->body.pad = 0;
-  }
   auto* base = (uint8_t*) &seq->body;
-  for (const auto& e : self->shared.midiOut) {
-    const uint32_t need = (uint32_t) (sizeof(LV2_Atom_Event) + 8u);
-    if (seq->atom.size + need > self->midiOutCapacity) break; // full: drop, never overrun
+  // One event: the body padded to eight, which is part of what the next
+  // event's offset is measured from -- wrong, it does not truncate a message,
+  // it misaligns everything after it. False when the buffer is full: drop,
+  // never overrun.
+  auto put = [&](int position, const uint8_t* data, uint32_t size) {
+    const uint32_t need = (uint32_t) sizeof(LV2_Atom_Event) + ((size + 7u) & ~7u);
+    if (seq->atom.size + need > self->midiOutCapacity) return false;
     auto* ev = (LV2_Atom_Event*) (base + seq->atom.size);
-    int64_t t = e.samplePosition < 0 ? 0 : e.samplePosition;
+    int64_t t = position < 0 ? 0 : position;
     if (t >= (int64_t) frames) t = (int64_t) frames - 1;
     ev->time.frames = (int64_t) frameOffset + t;
-    ev->body.size = 3;
+    ev->body.size = size;
     ev->body.type = self->uridMidiEvent;
-    auto* bytes = (uint8_t*) ev + sizeof(LV2_Atom_Event);
-    bytes[0] = (uint8_t) e.message.getRawStatus();
-    bytes[1] = (uint8_t) e.message.getRawData1();
-    bytes[2] = (uint8_t) e.message.getRawData2();
-    seq->atom.size += need; // events are padded to 8 bytes
-  }
-
-  // SysEx out. Same sequence, same MIDI type -- an LV2 MIDI event is simply
-  // however many bytes the atom says, so a long one needs no special type,
-  // only the right padding.
-  for (auto it = self->shared.midiOut.sysexBegin(); it != self->shared.midiOut.sysexEnd(); ++it) {
-    // Atom bodies are padded to a multiple of eight, and the pad is part of
-    // what the next event's offset is measured from. Getting this wrong does
-    // not truncate the message -- it misaligns everything after it.
-    const uint32_t body = it->length;
-    const uint32_t need = (uint32_t) sizeof(LV2_Atom_Event) + ((body + 7u) & ~7u);
-    if (seq->atom.size + need > self->midiOutCapacity) break;
-    auto* ev = (LV2_Atom_Event*) (base + seq->atom.size);
-    int64_t t = it->samplePosition < 0 ? 0 : it->samplePosition;
-    if (t >= (int64_t) frames) t = (int64_t) frames - 1;
-    ev->time.frames = (int64_t) frameOffset + t;
-    ev->body.size = body;
-    ev->body.type = self->uridMidiEvent;
-    auto* bytes = (uint8_t*) ev + sizeof(LV2_Atom_Event);
-    const uint8_t* from = self->shared.midiOut.sysexData(*it);
-    for (uint32_t i = 0; i < body; ++i) bytes[i] = from[i];
+    std::memcpy((uint8_t*) ev + sizeof(LV2_Atom_Event), data, size);
     seq->atom.size += need;
+    return true;
+  };
+
+  // Short messages and SysEx MERGED by time, as CLAP's finishProcess merges
+  // them: a sequence is read in order, and all the short ones first put a
+  // note at frame 20 ahead of SysEx at frame 0, which JACK refuses. Each
+  // short message at its real length -- a clock is one byte, a program
+  // change two -- not padded out to three, which a receiver using running
+  // status reads as extra events.
+  const MidiBuffer& out = self->shared.midiOut;
+  const auto* e = out.begin();
+  const auto* x = out.sysexBegin();
+  while (e != out.end() || x != out.sysexEnd()) {
+    const bool shortNext =
+        x == out.sysexEnd() || (e != out.end() && e->samplePosition <= x->samplePosition);
+    if (shortNext) {
+      const int status = e->message.getRawStatus();
+      const int length = shortMessageLength(status);
+      const uint8_t bytes[3] = {(uint8_t) status, (uint8_t) e->message.getRawData1(),
+                                (uint8_t) e->message.getRawData2()};
+      if (length > 0 && !put(e->samplePosition, bytes, (uint32_t) length)) break;
+      ++e;
+    } else {
+      if (!put(x->samplePosition, out.sysexData(*x), x->length)) break;
+      ++x;
+    }
   }
 }
+
+/** What the notify port asks a host for (rsz:minimumSize): room for the
+ *  state as one JSON message. */
+constexpr uint32_t kUiNotifyMinimumBytes = 65536;
 
 /**
  * [audio-thread] Put the state on the notify port, if anything is owed.
  *
- * Owed means either a UI asked, or the state moved since the last time it was
- * sent. The second is what keeps an already-open interface current; the first
- * is what lets one opened later catch up, and neither covers the other.
+ * Owed means a UI asked, or the state moved since the last time it was sent,
+ * or a second of audio has run since then. The second keeps an already-open
+ * interface current; the first lets one opened later catch up -- where the
+ * host carries its request. REAPER does not, dependably: of an interface's
+ * requests, sent at every idle, the plugin saw one per editor opened at best
+ * and in some sessions none, and that interface's page never had the state.
+ * The third is what does not depend on the host: an interface opened at any
+ * time has the state within a second of audio. It costs a copy of the JSON
+ * into the host's buffer once a second, and the interface passes on only a
+ * state that differs from the one its page has.
  */
 inline void writeUiNotify(Plugin* self) {
   LV2_Atom_Sequence* seq = self->uiNotifyOut;
@@ -416,7 +610,8 @@ inline void writeUiNotify(Plugin* self) {
     }
   }
 
-  const bool owed = self->uiStateRequested || self->uiStateSent != self->uiStateSeq;
+  const bool owed = self->uiStateRequested || self->uiStateSent != self->uiStateSeq ||
+                    self->framesSinceUiState >= (uint64_t) self->sampleRate;
   if (!owed) return;
 
   const uint32_t payload = (uint32_t) self->uiStateJson.size();
@@ -436,13 +631,138 @@ inline void writeUiNotify(Plugin* self) {
 
   self->uiStateRequested = false;
   self->uiStateSent = self->uiStateSeq;
+  self->framesSinceUiState = 0;
+}
+
+/** A number out of an atom of any of the four types a host may send one in. */
+inline bool atomNumber(const Plugin* self, const LV2_Atom* a, double* out) {
+  const void* v = a + 1;
+  if (a->type == self->uridAtomFloat && a->size >= 4) *out = (double) *(const float*) v;
+  else if (a->type == self->uridAtomDouble && a->size >= 8) *out = *(const double*) v;
+  else if (a->type == self->uridAtomInt && a->size >= 4) *out = (double) *(const int32_t*) v;
+  else if (a->type == self->uridAtomLong && a->size >= 8) *out = (double) *(const int64_t*) v;
+  else return false;
+  return std::isfinite(*out);
+}
+
+/**
+ * [audio-thread] Take a time:Position into the transport.
+ *
+ * Any property may be missing -- a host sends what changed -- so each one
+ * that is there overwrites its part and the rest stand. LV2 counts in the
+ * meter's own beat (an eighth in 6/8, at that many a minute); every other
+ * format, and TransportInfo, counts quarter notes, so beats and tempo are
+ * converted by 4 / beatUnit.
+ */
+inline bool readTimePosition(Plugin* self, const LV2_Atom* obj) {
+  if (obj->size < sizeof(LV2_Atom_Object_Body)) return false;
+  if (((const LV2_Atom_Object_Body*) (obj + 1))->otype != self->uridTimePosition) return false;
+  double bpm = -1.0, barBeat = -1.0, beat = -1.0, beatsPerBar = -1.0, beatUnit = -1.0;
+  double frame = -1.0, bar = -1.0, speed = 0.0;
+  bool haveSpeed = false;
+  forEachAtomProperty(obj, [&](const LV2_Atom_Property_Body* p) {
+    double v = 0.0;
+    if (!atomNumber(self, &p->value, &v)) return;
+    if (p->key == self->uridTimeBeatsPerMinute) bpm = v;
+    else if (p->key == self->uridTimeBarBeat) barBeat = v;
+    else if (p->key == self->uridTimeBeat) beat = v;
+    else if (p->key == self->uridTimeBeatsPerBar) beatsPerBar = v;
+    else if (p->key == self->uridTimeBeatUnit) beatUnit = v;
+    else if (p->key == self->uridTimeFrame) frame = v;
+    else if (p->key == self->uridTimeBar) bar = v;
+    else if (p->key == self->uridTimeSpeed) speed = v, haveSpeed = true;
+  });
+  TransportInfo& t = self->transport;
+  if (haveSpeed) {
+    self->transportSpeed = speed;
+    t.isPlaying = speed != 0.0;
+  }
+  if (beatsPerBar > 0.0 && beatUnit >= 1.0) {
+    t.timeSigNumerator = (int) (beatsPerBar + 0.5);
+    t.timeSigDenominator = (int) (beatUnit + 0.5);
+  }
+  const double quarter = t.timeSigDenominator > 0 ? 4.0 / (double) t.timeSigDenominator : 1.0;
+  if (bpm > 0.0) {
+    t.tempo = bpm * quarter;
+    t.hasTempo = true;
+  }
+  if (frame >= 0.0 && self->sampleRate > 0.0) {
+    t.positionSeconds = frame / self->sampleRate;
+    t.hasSeconds = true;
+  }
+  if (bar >= 0.0 && barBeat >= 0.0) {
+    const double barLength = beatsPerBar > 0.0 ? beatsPerBar : (double) t.timeSigNumerator;
+    t.barNumber = (int32_t) bar;
+    t.barStartBeats = bar * barLength * quarter;
+    t.positionBeats = t.barStartBeats + barBeat * quarter;
+    t.hasBeats = true;
+  } else if (beat >= 0.0) {
+    t.positionBeats = beat * quarter;
+    t.hasBeats = true;
+  }
+  return true;
+}
+
+/** [audio-thread] Carry the transport over `frames` at the host's speed, so
+ *  the next run() starts where this one ended. */
+inline void advanceTransport(Plugin* self, uint32_t frames) {
+  TransportInfo& t = self->transport;
+  if (!t.isPlaying || !(self->sampleRate > 0.0)) return;
+  const double seconds = (double) frames / self->sampleRate * self->transportSpeed;
+  if (t.hasSeconds) t.positionSeconds += seconds;
+  if (t.hasBeats && t.hasTempo) {
+    t.positionBeats += seconds * t.tempo / 60.0;
+    const double barLength = t.beatsPerBar();
+    if (barLength > 0.0) {
+      const double bars = std::floor((t.positionBeats - t.barStartBeats) / barLength);
+      if (bars != 0.0 && std::isfinite(bars)) {
+        t.barStartBeats += bars * barLength;
+        t.barNumber += (int32_t) bars;
+      }
+    }
+  }
+}
+
+/** A float as Turtle: the fewest significant digits that read back as the
+ *  same float, with a full stop whatever the locale. %g gave six, so a
+ *  default of 0.70710678 was published as 0.707107 -- a different float, and
+ *  a host that resets a control to its default put it somewhere the plugin
+ *  never did. Nine is always enough; 0.1 still prints as 0.1. */
+inline void ttlNumber(char* out, size_t capacity, float value) {
+  char conversion[8];
+  for (int digits = 6; digits <= 9; ++digits) {
+    std::snprintf(conversion, sizeof(conversion), "%%.%dg", digits);
+    numtext::format(out, capacity, (double) value, conversion);
+    if ((float) numtext::parseOr(out, 0.0) == value) return;
+  }
+}
+
+/** An atom event's frame, clamped into a run of `sampleCount`: at or past the
+ *  end a note-off was never reached and the note hung, and a frame past what
+ *  an int holds came out negative (see clapwrap::eventTime). */
+inline int frameInRun(int64_t frame, uint32_t sampleCount) {
+  if (sampleCount == 0 || frame < 0) return 0;
+  return frame < (int64_t) sampleCount ? (int) frame : (int) sampleCount - 1;
 }
 
 inline void run(LV2_Handle handle, uint32_t sampleCount) {
   auto* self = (Plugin*) handle;
-  if (!self->audioOut[0]) return;
-  float* outL = self->audioOut[0];
-  float* outR = lv2Width() > 1 && self->audioOut[1] ? self->audioOut[1] : self->audioOut[0];
+  claimMidiOut(self);
+  if (!self->audioOut[0]) {
+    // Nothing to render into -- but the notify port is still the host's to
+    // read back, and an unclaimed one reads as its whole capacity.
+    if (LV2_Atom_Sequence* seq = self->uiNotifyOut) {
+      seq->atom.type = self->uridAtomSequence;
+      seq->atom.size = (uint32_t) sizeof(LV2_Atom_Sequence_Body);
+    }
+    return;
+  }
+  const uint32_t width = (uint32_t) lv2Width();
+  // Every channel of the main bus, each its own port. An output a host left
+  // unconnected falls back to the first, as the right one always did.
+  float* chans[clapwrap::kMaxAudioChannels];
+  for (uint32_t c = 0; c < width; ++c)
+    chans[c] = self->audioOut[c] ? self->audioOut[c] : self->audioOut[0];
 
   // Is the host bouncing? Checked before anything else in the block, because a
   // change re-prepares the DSP and everything below should run against the
@@ -462,19 +782,20 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
   if (!isInstrument()) self->shared.bypass.engaged = self->enabled && *self->enabled <= 0.0f;
   if (self->latencyOut) *self->latencyOut = (float) clapwrap::dspLatency(self->shared.dsp);
 
-  // MIDI arrives as an atom:Sequence of events with frame timestamps. The
-  // layout is public and fixed: each event is an LV2_Atom_Event followed by
-  // its body bytes, the whole thing padded to 8-byte alignment.
-  self->shared.midi.clear();
-  if (self->midiIn && isInstrument()) {
-    const LV2_Atom_Sequence* seq = self->midiIn;
-    const auto* begin = (const uint8_t*) &seq->body + sizeof(LV2_Atom_Sequence_Body);
-    const auto* end = (const uint8_t*) &seq->body + seq->atom.size;
-    const uint8_t* p = begin;
-    while (p + sizeof(LV2_Atom_Event) <= end) {
-      const auto* event = (const LV2_Atom_Event*) p;
-      const uint8_t* body = p + sizeof(LV2_Atom_Event);
-      if (body + event->body.size > end) break;
+  // MIDI arrives as an atom:Sequence of events with frame timestamps, walked
+  // by the same bounds-checked walk as every other sequence here. This one
+  // had its own copy, whose pointer sum could wrap on a 32-bit build and
+  // whose step padded a host's size in 32 bits.
+  //
+  // ADDED to what is already waiting, not cleared first: every slice below
+  // clears what it played, so anything here is what a run of ZERO frames
+  // read and never played. It was cleared at this line, unplayed -- a
+  // note-off in such a run left its note sounding. It plays at frame 0 of
+  // this run instead, as a VST3 zero-sample call's events do.
+  if (self->midiIn && midiPorts()) {
+    forEachAtomEvent(self->midiIn, [self, sampleCount](const LV2_Atom_Event* event) {
+      const uint8_t* body = (const uint8_t*) event + sizeof(LV2_Atom_Event);
+      const int at = frameInRun(event->time.frames, sampleCount);
       if (event->body.type == self->uridMidiEvent && event->body.size >= 1) {
         const int status = body[0];
         // >= 1, not >= 3. Clock, start, stop and continue are a SINGLE byte,
@@ -483,39 +804,77 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
         if (isSysexStart(status)) {
           // One atom event carries the WHOLE message -- the atom has a size,
           // so unlike a serial stream there is nothing to reassemble.
-          self->shared.midi.addSysex(body, (size_t) event->body.size,
-                                     (int) event->time.frames);
+          self->shared.midi.addSysex(body, (size_t) event->body.size, at);
         } else if (deliverableToDsp(status)) {
           const int d1 = event->body.size >= 2 ? body[1] : 0;
           const int d2 = event->body.size >= 3 ? body[2] : 0;
-          self->shared.midi.addEvent(MidiMessage(status, d1, d2), (int) event->time.frames);
+          self->shared.midi.addEvent(MidiMessage(status, d1, d2), at);
         }
       }
-      const uint32_t advance =
-          (uint32_t) sizeof(LV2_Atom_Event) + atomPad(event->body.size);
-      p += advance;
+    });
+  }
+
+  for (uint32_t c = 0; c < width; ++c) {
+    if (c > 0 && chans[c] == chans[0]) continue; // a fallback: already written
+    if (isInstrument()) {
+      std::memset(chans[c], 0, sampleCount * sizeof(float));
+    } else {
+      const float* in = self->audioIn[c] ? self->audioIn[c] : self->audioIn[0];
+      if (in && in != chans[c]) std::memcpy(chans[c], in, sampleCount * sizeof(float));
     }
   }
 
-  if (isInstrument()) {
-    std::memset(outL, 0, sampleCount * sizeof(float));
-    if (outR != outL) std::memset(outR, 0, sampleCount * sizeof(float));
-  } else {
-    const float* inL = self->audioIn[0];
-    const float* inR = self->audioIn[1] ? self->audioIn[1] : self->audioIn[0];
-    if (inL && inL != outL) std::memcpy(outL, inL, sampleCount * sizeof(float));
-    if (inR && outR != outL && inR != outR) std::memcpy(outR, inR, sampleCount * sizeof(float));
+  // The host's timeline. A time:Position arrives when the transport jumps --
+  // start, stop, locate, a tempo change -- and between them the position is
+  // carried forward here. The DSP was handed an empty one, always: no tempo,
+  // no position, no play state, in every LV2 host.
+  //
+  // A position describes the song AT ITS FRAME. The DSP hears of it for the
+  // whole run (a transport is block-granular in every format), but it is
+  // carried forward only from where it was stamped: carried over the whole
+  // run, a locate stamped at frame 300 left the position 300 frames ahead
+  // for good.
+  if (clapwrap::WantsTransport<SonoreDsp>::value) {
+    uint32_t stampedAt = 0;
+    if (self->timeIn && self->timeIn->atom.type == self->uridAtomSequence)
+      forEachAtomEvent(self->timeIn, [self, sampleCount, &stampedAt](const LV2_Atom_Event* ev) {
+        if (ev->body.type == self->uridAtomObject || ev->body.type == self->uridAtomBlank)
+          if (readTimePosition(self, &ev->body))
+            stampedAt = (uint32_t) frameInRun(ev->time.frames, sampleCount);
+      });
+    clapwrap::sendTransport(self->shared.dsp, self->transport);
+    advanceTransport(self, sampleCount - stampedAt);
   }
-
-  float* chans[2] = {outL, outR};
-  clapwrap::sendTransport(self->shared.dsp, TransportInfo{});
   // Slice: prepare() promised the DSP at most 8192 frames per call, and LV2
   // hosts are allowed to exceed any expectation you didn't write down.
+  //
+  // The MIDI is sliced WITH the audio: each slice gets the events inside it,
+  // at times counted from its own start. All of it went to the first slice,
+  // at times counted from the start of the run -- so a note at frame 9000 of
+  // a 12000-frame run reached a DSP rendering 8192 frames and was never
+  // played, and a note-off lost that way left a note stuck.
+  const bool sliced = sampleCount > 8192;
+  if (sliced) {
+    self->runMidi.clear();
+    for (const auto& e : self->shared.midi) self->runMidi.addEvent(e.message, e.samplePosition);
+    forwardSysex(self->shared.midi, self->runMidi);
+  }
   uint32_t done = 0;
   while (done < sampleCount) {
     const uint32_t n = (sampleCount - done) > 8192 ? 8192 : (sampleCount - done);
-    float* slice[2] = {chans[0] + done, chans[1] + done};
-    const uint32_t width = (uint32_t) lv2Width();
+    if (sliced) {
+      self->shared.midi.clear();
+      const int lo = (int) done, hi = (int) (done + n);
+      for (const auto& e : self->runMidi)
+        if (e.samplePosition >= lo && e.samplePosition < hi)
+          self->shared.midi.addEvent(e.message, e.samplePosition - lo);
+      for (auto it = self->runMidi.sysexBegin(); it != self->runMidi.sysexEnd(); ++it)
+        if (it->samplePosition >= lo && it->samplePosition < hi)
+          self->shared.midi.addSysex(self->runMidi.sysexData(*it), it->length,
+                                     it->samplePosition - lo);
+    }
+    float* slice[clapwrap::kMaxAudioChannels];
+    for (uint32_t c = 0; c < width; ++c) slice[c] = chans[c] + done;
     float* zero = self->shared.scSilence.empty() ? nullptr : self->shared.scSilence.data();
     float* scSlice[2] = {zero, zero};
     if (self->scIn[0]) {
@@ -523,20 +882,24 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
       scSlice[1] = (float*) (self->scIn[1] ? self->scIn[1] : self->scIn[0]) + done;
     }
     AudioBlock<float> scBlock(scSlice, 2, scSlice[0] ? n : 0);
-    clapwrap::bypassCapture(self->shared.bypass, slice, n);
+    if (clapwrap::HasLatency<SonoreDsp>::value)
+      self->shared.bypass.follow(clapwrap::dspLatency(self->shared.dsp));
+    clapwrap::bypassCapture(self->shared.bypass, slice, width, n);
     AudioBlock<float> block(slice, width, n);
 
     // Aux buses: our flattened ports, re-grouped into blocks for the context.
-    AudioBlock<float> auxBlocks[clapwrap::kMaxAuxOutputs] = {};
-    float* auxPtrs[clapwrap::kMaxAuxOutputs][clapwrap::kMaxAudioChannels] = {};
+    // Held in the instance, not zeroed on the stack for every slice (see
+    // clapwrap::processdetail::AuxScratch).
+    AudioBlock<float>* const auxBlocks = self->shared.aux32.blocks;
     const uint32_t nAux = clapwrap::numAuxOutputs();
     uint32_t flat = 0;
     for (uint32_t b = 0; b < nAux; ++b) {
+      float** const auxRow = self->shared.aux32.row(b);
       const uint32_t want = clapwrap::auxBusChannels(b);
       uint32_t have = 0;
       for (uint32_t c = 0; c < want; ++c, ++flat)
-        if (self->auxOut[flat]) auxPtrs[b][have++] = self->auxOut[flat] + done;
-      auxBlocks[b] = AudioBlock<float>(auxPtrs[b], have, have ? n : 0);
+        if (self->auxOut[flat]) auxRow[have++] = self->auxOut[flat] + done;
+      auxBlocks[b] = AudioBlock<float>(auxRow, have, have ? n : 0);
     }
 
     self->shared.midiOut.clear();
@@ -545,6 +908,8 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
         rolesFromMask(defaultChannelMask(width), roles, clapwrap::kMaxAudioChannels);
     self->shared.expression.clear();
     if (kDesc.supportsMpe) self->shared.mpe.process(self->shared.midi, self->shared.expression);
+    // ctx.offline too: it was left false, so a DSP reading it -- as the
+    // other formats let it -- never heard that the host was freewheeling.
     ProcessContext ctx{block,
                        auxBlocks,
                        nAux,
@@ -552,13 +917,25 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
                        self->shared.midi,
                        self->shared.midiOut,
                        numRoles ? roles : nullptr,
-                       &self->shared.expression};
+                       &self->shared.expression,
+                       nullptr,
+                       true,
+                       self->shared.offline};
     trackNotes(self->shared.notes, ctx.midi);
     clapwrap::snapshotParams(&self->shared);
     clapwrap::runDspCtx(self->shared.dsp, ctx, self->shared.paramsBlock);
     writeMidiOut(self, done, n);
-    clapwrap::bypassApply(self->shared.bypass, slice, n);
-    self->shared.midi.clear(); // events belong to the first slice only
+    clapwrap::bypassApply(self->shared.bypass, slice, width, n);
+    // NaN or infinity on any output port leaves as silence (output_guard.h),
+    // each slice as the block the DSP ran. LV2 has no main thread to ask for:
+    // the first trip goes to the worker, which may write a log, and a host
+    // with no worker hears of it at deactivate().
+    if (clapwrap::guardOutputs(&self->shared, slice, width, auxBlocks, nAux, n) && self->worker &&
+        self->worker->schedule_work)
+      self->worker->schedule_work(self->worker->handle,
+                                  (uint32_t) std::strlen(outputGuardWork()) + 1,
+                                  outputGuardWork());
+    self->shared.midi.clear(); // this slice's events are spent
     done += n;
   }
 
@@ -581,6 +958,7 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
       }
     });
   }
+  self->framesSinceUiState += sampleCount;
   writeUiNotify(self);
 
   // The whole run() call, not the last slice: a host that splits a block at
@@ -594,6 +972,19 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
   }
 }
 
+/** [worker-thread or main-thread] The output guard's report, once: a warning
+ *  in the host's log where it gave one, stderr otherwise. Never run(): the
+ *  log's printf is for non-realtime contexts only. */
+inline void reportOutputGuard(Plugin* self) {
+  char message[400];
+  if (!self->shared.outputGuard.takeReport(kDesc.name, message, sizeof(message))) return;
+  if (self->log && self->log->print) {
+    self->log->print(self->log->handle, self->uridLogWarning, "%s\n", message);
+    return;
+  }
+  clapwrap::writeOutputGuardReport(message);
+}
+
 /**
  * [worker-thread] Read the file the interface picked.
  *
@@ -603,12 +994,18 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
  *
  * The payload is "purpose\0path" -- two C strings in one blob, because the
  * schedule call takes one buffer and inventing a struct for two strings would
- * mean agreeing on padding across a boundary that does not need it.
+ * mean agreeing on padding across a boundary that does not need it. The one
+ * other payload is run()'s own: the output guard has something to report.
  */
 inline Lv2WorkerStatus workerWork(LV2_Handle handle, Lv2WorkerRespondFunction respond,
                                   Lv2WorkerRespondHandle responder, uint32_t size,
                                   const void* data) {
   auto* self = (Plugin*) handle;
+  if (data && size == std::strlen(outputGuardWork()) + 1 &&
+      std::memcmp(data, outputGuardWork(), size) == 0) {
+    reportOutputGuard(self);
+    return kLv2WorkerSuccess;
+  }
   if (!data || size < 2) return kLv2WorkerErrUnknown;
   const char* purpose = (const char*) data;
   const size_t purposeLength = strnlen(purpose, size);
@@ -623,32 +1020,67 @@ inline Lv2WorkerStatus workerWork(LV2_Handle handle, Lv2WorkerRespondFunction re
                              strnlen(purpose + purposeLength + 1, remaining));
   const char* path = pathCopy.c_str();
 
+  // The host may be saving or restoring on its own thread right now, and the
+  // DSP's file and its state are one thing to it.
+  std::lock_guard<std::mutex> turn(self->mainThread);
+  freeRetiredUiText(self);
   clapwrap::sendFile(self->shared.dsp, purpose, path);
 
-  // Rebuilt HERE, where allocating is allowed, into a buffer only this thread
-  // touches. run() gets it by swapping two pointers.
+  // Rebuilt HERE, where allocating is allowed, into a buffer of its own that
+  // travels in the response. run() gets it by swapping two pointers.
   StateBag bag;
   clapwrap::saveDspState(self->shared.dsp, bag);
-  self->uiStatePending = bagToJson(bag);
-
-  const uint8_t done = 1;
-  if (respond) respond(responder, 1, &done);
+  auto* fresh = new Plugin::UiText;
+  fresh->json = bagToJson(bag);
+  fresh->build = ++self->uiBuilt;
+  // Listed before it is handed over, so a host that never delivers it
+  // leaves it to cleanup() rather than to nobody.
+  fresh->older = self->uiTexts;
+  self->uiTexts = fresh;
+  if (!respond || respond(responder, (uint32_t) sizeof(fresh), &fresh) != kLv2WorkerSuccess) {
+    self->uiTexts = fresh->older; // nothing will deliver it
+    delete fresh;
+  }
   return kLv2WorkerSuccess;
 }
 
 /** [audio-thread] The worker finished. Swapping two std::strings moves two
- *  pointers and allocates nothing, which is what makes this legal here. */
-inline Lv2WorkerStatus workerResponse(LV2_Handle handle, uint32_t, const void*) {
+ *  pointers and allocates nothing, and pushing the husk is a compare-and-swap,
+ *  which is what makes this legal here. */
+inline Lv2WorkerStatus workerResponse(LV2_Handle handle, uint32_t size, const void* data) {
   auto* self = (Plugin*) handle;
-  self->uiStateJson.swap(self->uiStatePending);
-  ++self->uiStateSeq;
+  Plugin::UiText* fresh = nullptr;
+  if (!data || size != sizeof(fresh)) return kLv2WorkerErrUnknown;
+  std::memcpy(&fresh, data, sizeof(fresh));
+  if (!fresh) return kLv2WorkerErrUnknown;
+  // Only a state newer than the one shown. Older is a load the host has
+  // since restored over: its text goes to be freed unread. Compared as a
+  // signed difference, so the numbering may wrap.
+  if ((int32_t) (fresh->build - self->uiShown) > 0) {
+    self->uiStateJson.swap(fresh->json);
+    self->uiShown = fresh->build;
+    ++self->uiStateSeq;
+  }
+  fresh->next = self->uiRetired.load(std::memory_order_relaxed);
+  while (!self->uiRetired.compare_exchange_weak(fresh->next, fresh, std::memory_order_release,
+                                                std::memory_order_relaxed)) {
+  }
   return kLv2WorkerSuccess;
 }
 
-inline void deactivate(LV2_Handle) {}
+/** Instantiation class, so not realtime: the output guard's report for a host
+ *  with no worker, or one whose worker has not got to it yet. */
+inline void deactivate(LV2_Handle handle) { reportOutputGuard((Plugin*) handle); }
 
 inline void cleanup(LV2_Handle handle) {
   auto* self = (Plugin*) handle;
+  reportOutputGuard(self); // a host that never deactivated
+  freeRetiredUiText(self);
+  // And the answers the host dropped: no work_response() comes after this.
+  while (Plugin::UiText* t = self->uiTexts) {
+    self->uiTexts = t->older;
+    delete t;
+  }
   self->~Plugin();
   std::free(self);
 }
@@ -659,6 +1091,8 @@ inline LV2_State_Status stateSave(LV2_Handle handle, LV2_State_Store_Function st
                                   LV2_State_Handle host, uint32_t,
                                   const LV2_Feature* const*) {
   auto* self = (Plugin*) handle;
+  // Not while the worker is loading a file into the DSP being saved.
+  std::lock_guard<std::mutex> turn(self->mainThread);
   // The FULL versioned SNRS blob, built by the one shared serializer in
   // clap_wrapper.h -- params, bypass, selected preset, editor size AND the
   // DSP's StateBag. This file used to write only header+params while stamping
@@ -676,14 +1110,21 @@ inline LV2_State_Status stateSave(LV2_Handle handle, LV2_State_Store_Function st
                                             return size;
                                           });
   if (!ok || blob.empty()) return LV2_STATE_ERR_UNKNOWN;
+  // POD, not PORTABLE. state.h's portable values "MUST NOT depend on ...
+  // endianness or alignment" and "MUST NOT contain filenames"; this is a
+  // native struct dump, and the DSP's bag in it may carry an absolute path
+  // (the sampler's sample). Declared portable, a host may move it between
+  // machines as if it were neither. Mapping such paths through state:mapPath
+  // needs the bag to know which entries ARE paths, which it does not yet.
   return store(host, self->uridStateBlob, blob.data(), blob.size(), self->uridAtomChunk,
-               LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE);
+               LV2_STATE_IS_POD);
 }
 
 inline LV2_State_Status stateRestore(LV2_Handle handle, LV2_State_Retrieve_Function retrieve,
                                      LV2_State_Handle host, uint32_t,
                                      const LV2_Feature* const*) {
   auto* self = (Plugin*) handle;
+  std::lock_guard<std::mutex> turn(self->mainThread);
   size_t size = 0;
   uint32_t type = 0, flags = 0;
   const auto* blob = (const uint8_t*) retrieve(host, self->uridStateBlob, &size, &type, &flags);
@@ -744,6 +1185,20 @@ inline const LV2_Descriptor* descriptor() {
 }
 
 // ── The TTL generator ────────────────────────────────────────────────────────
+/** The suffix of main-bus audio port `c`'s symbol and name. "l"/"r" for the
+ *  first two, which every existing session's port symbols already say and
+ *  which must not change; the channel's number after that. It used to be
+ *  `c ? 'r' : 'l'` for every channel, so a quad bus declared four ports and
+ *  three of them were "in_r" -- symbols LV2 requires to be unique. */
+inline const char* audioPortSymbol(int c) {
+  static const char* const kSymbols[] = {"l", "r", "3", "4", "5", "6", "7", "8"};
+  return (c >= 0 && c < 8) ? kSymbols[c] : "x";
+}
+inline const char* audioPortName(int c) {
+  static const char* const kNames[] = {"L", "R", "3", "4", "5", "6", "7", "8"};
+  return (c >= 0 && c < 8) ? kNames[c] : "X";
+}
+
 /** Escape a string for a Turtle literal.
  *
  *  A preset called `Bass "Heavy"` would otherwise close the literal early and
@@ -763,11 +1218,6 @@ inline void writeTurtleString(std::FILE* out, const char* text) {
   }
 }
 
-/** How many factory presets are genuinely usable.
- *
- *  A preset whose value count does not match the parameter contract is
- *  skipped rather than written out half-applied -- the same rule applyPreset()
- *  follows at runtime, so a host never sees a preset the plugin would refuse. */
 /** An IRI inside <...>: the characters Turtle forbids there are
  *  percent-encoded, so a URL with a space or a stray quote yields a file
  *  every host can still parse rather than one none can. */
@@ -780,6 +1230,23 @@ inline void writeTurtleIri(std::FILE* out, const char* text) {
     else
       std::fputc(*p, out);
   }
+}
+
+/** LV2's own unit for a parameter's unit string -- the units extension's
+ *  spelling of the ones the SDK uses (the AU wrapper maps the same set) -- or
+ *  null for one it has no word for, which the TTL then declares itself. */
+inline const char* lv2UnitFor(const char* unit) {
+  if (!unit || !unit[0]) return nullptr;
+  static const char* const kUnits[][2] = {
+      {"dB", "units:db"},   {"Hz", "units:hz"},     {"kHz", "units:khz"},
+      {"ms", "units:ms"},   {"s", "units:s"},       {"min", "units:min"},
+      {"%", "units:pc"},    {"ct", "units:cent"},   {"cents", "units:cent"},
+      {"st", "units:semitone12TET"},                {"semitones", "units:semitone12TET"},
+      {"bpm", "units:bpm"}, {"BPM", "units:bpm"},   {"oct", "units:oct"},
+  };
+  for (const auto& u : kUnits)
+    if (std::strcmp(unit, u[0]) == 0) return u[1];
+  return nullptr;
 }
 
 /** lv2:symbol is [_a-zA-Z][_a-zA-Z0-9]*. A parameter id outside that -- a
@@ -799,6 +1266,71 @@ inline void lv2Symbol(const char* id, char* out, size_t capacity) {
   out[n] = '\0';
 }
 
+/** Whether `symbol` is one the wrapper may give a port of its own: the
+ *  designated controls, the meters, the atom ports, and every audio port
+ *  name it can write (in_/out_ l, r, 3..8 and x, sc_l and sc_r, auxB_C). */
+inline bool lv2ReservedSymbol(const char* symbol) {
+  static const char* const kFixed[] = {"enabled", "freewheel", "latency",  "meterPeak", "meterRms",
+                                       "midi_in", "midi_out",  "time_in",  "uiControl", "uiNotify",
+                                       "sc_l",    "sc_r"};
+  for (const char* fixed : kFixed)
+    if (std::strcmp(symbol, fixed) == 0) return true;
+  static const char* const kChannels[] = {"l", "r", "3", "4", "5", "6", "7", "8", "x"};
+  for (const char* c : kChannels) {
+    char name[16];
+    std::snprintf(name, sizeof(name), "in_%s", c);
+    if (std::strcmp(symbol, name) == 0) return true;
+    std::snprintf(name, sizeof(name), "out_%s", c);
+    if (std::strcmp(symbol, name) == 0) return true;
+  }
+  // "aux", digits, "_", digits, and nothing after: an aux bus's channel.
+  // Walked by hand -- sscanf is C4996 under MSVC, an error where warnings are.
+  if (std::strncmp(symbol, "aux", 3) != 0) return false;
+  const char* p = symbol + 3;
+  const auto digits = [&p] {
+    const char* start = p;
+    while (*p >= '0' && *p <= '9') ++p;
+    return p != start;
+  };
+  if (!digits() || *p++ != '_' || !digits()) return false;
+  return *p == '\0';
+}
+
+/** Every parameter's lv2:symbol, in table order.
+ *
+ *  lv2Symbol() of the id, made unique. LV2 requires a plugin's port symbols
+ *  to be, and hosts look ports up by them -- a parameter whose id was
+ *  "enabled" or "latency" shared a symbol with the wrapper's own port of that
+ *  name, and two ids that map onto one symbol ("gain-db", "gain_db") shared
+ *  it with each other: a host saving or automating one of them by symbol got
+ *  the other. A clash now gets "_2", "_3"... until it is free. Every id that
+ *  was already unique keeps its symbol, so no existing session's or preset's
+ *  port moves. The TTL and the presets file both take their symbols from
+ *  here. Built at TTL generation, which is allowed to allocate. */
+inline std::vector<std::string> lv2ParamSymbols() {
+  std::vector<std::string> symbols;
+  symbols.reserve((size_t) (kDesc.numParams > 0 ? kDesc.numParams : 0));
+  for (int i = 0; i < kDesc.numParams; ++i) {
+    char base[96];
+    lv2Symbol(kDesc.params[i].id, base, sizeof(base));
+    std::string symbol = base;
+    auto taken = [&](const std::string& candidate) {
+      if (lv2ReservedSymbol(candidate.c_str())) return true;
+      for (const std::string& earlier : symbols)
+        if (earlier == candidate) return true;
+      return false;
+    };
+    for (int n = 2; taken(symbol); ++n) symbol = std::string(base) + "_" + std::to_string(n);
+    symbols.push_back(symbol);
+  }
+  return symbols;
+}
+
+/** How many factory presets are genuinely usable.
+ *
+ *  A preset whose value count does not match the parameter contract is
+ *  skipped rather than written out half-applied -- the same rule applyPreset()
+ *  follows at runtime, so a host never sees a preset the plugin would refuse. */
 inline int numFactoryPresets() {
   if (!kDesc.presets || kDesc.numPresets <= 0) return 0;
   return kDesc.numPresets;
@@ -816,6 +1348,7 @@ inline void writePresetsTtl(std::FILE* out, const char* uri) {
                "@prefix pset: <http://lv2plug.in/ns/ext/presets#> .\n"
                "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
 
+  const std::vector<std::string> symbols = lv2ParamSymbols();
   for (int i = 0; i < numFactoryPresets(); ++i) {
     const Preset& preset = kDesc.presets[i];
     std::fprintf(out,
@@ -838,10 +1371,10 @@ inline void writePresetsTtl(std::FILE* out, const char* uri) {
     }
     std::fprintf(out, "    lv2:port ");
     for (int v = 0; v < n; ++v) {
-      char symbol[96];
-      lv2Symbol(kDesc.params[v].id, symbol, sizeof(symbol));
-      std::fprintf(out, "%s[\n        lv2:symbol \"%s\" ;\n        pset:value %g\n    ]",
-                   v == 0 ? "" : " ,\n             ", symbol, (double) preset.values[v]);
+      char value[32];
+      ttlNumber(value, sizeof(value), preset.values[v]);
+      std::fprintf(out, "%s[\n        lv2:symbol \"%s\" ;\n        pset:value %s\n    ]",
+                   v == 0 ? "" : " ,\n             ", symbols[(size_t) v].c_str(), value);
     }
     std::fprintf(out, " .\n");
   }
@@ -855,8 +1388,16 @@ inline void writePresetsTtl(std::FILE* out, const char* uri) {
 /** Map the descriptor's plain-word category onto lv2core's plugin taxonomy.
  *  Hosts (and lv2lint) treat the bare base class as "uncategorised", so a
  *  known word buys real browser placement; an unknown one falls back rather
- *  than guessing. */
+ *  than guessing.
+ *
+ *  An INSTRUMENT is lv2:InstrumentPlugin whatever its category says. The
+ *  class is what a host files a plugin by -- REAPER lists an LV2 as "LV2i:"
+ *  only for this one -- and isInstrument is what CLAP's instrument feature
+ *  and VST3's "Instrument" subcategory are built from. The category used to
+ *  win here, so the arpeggiator (isInstrument, "utility") was an instrument
+ *  in REAPER as CLAP and VST3 and an effect as LV2. */
 inline const char* lv2ClassFor(const PluginDescriptor& d) {
+  if (d.isInstrument) return "lv2:InstrumentPlugin";
   struct Pair { const char* key; const char* cls; };
   static const Pair kMap[] = {
       {"distortion", "lv2:DistortionPlugin"}, {"saturator", "lv2:DistortionPlugin"},
@@ -878,7 +1419,7 @@ inline const char* lv2ClassFor(const PluginDescriptor& d) {
   if (d.category)
     for (const Pair& m : kMap)
       if (std::strcmp(d.category, m.key) == 0) return m.cls;
-  return d.isInstrument ? "lv2:InstrumentPlugin" : nullptr;
+  return nullptr;
 }
 
 /** LV2's version pair is its own numbering domain: even minor >= 2 announces a
@@ -888,7 +1429,16 @@ inline const char* lv2ClassFor(const PluginDescriptor& d) {
  *  doubling keeps ordering and keeps everything even. */
 inline void lv2VersionFromProduct(const char* version, int* outMinor, int* outMicro) {
   int maj = 0, min = 0, mic = 0;
-  if (version) std::sscanf(version, "%d.%d.%d", &maj, &min, &mic);
+  // Parsed by hand: sscanf is the one call in this file MSVC flags (C4996),
+  // which a project with /sdl -- Visual Studio's default -- turns into an error.
+  if (version) {
+    char* end = nullptr;
+    maj = (int) std::strtol(version, &end, 10);
+    if (end && *end == '.') {
+      min = (int) std::strtol(end + 1, &end, 10);
+      if (end && *end == '.') mic = (int) std::strtol(end + 1, &end, 10);
+    }
+  }
   *outMinor = maj * 2;
   *outMicro = (min * 100 + mic) * 2;
 }
@@ -902,19 +1452,27 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                "@prefix doap:  <http://usefulinc.com/ns/doap#> .\n"
                "@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .\n"
                "@prefix foaf:  <http://xmlns.com/foaf/0.1/> .\n"
+               "@prefix log:   <http://lv2plug.in/ns/ext/log#> .\n"
                "@prefix midi:  <http://lv2plug.in/ns/ext/midi#> .\n"
                "@prefix pg:    <http://lv2plug.in/ns/ext/port-groups#> .\n"
                // port-props, for notOnGUI. Declared here because a turtle file
                // that USES a prefix it never declared is not a turtle file --
                // lv2lint rejects the whole bundle, not just the line.
                "@prefix pprops: <http://lv2plug.in/ns/ext/port-props#> .\n"
+               // resize-port, for the notify port's rsz:minimumSize.
+               "@prefix rsz:   <http://lv2plug.in/ns/ext/resize-port#> .\n"
                "@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n"
                "@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .\n"
                "@prefix state: <http://lv2plug.in/ns/ext/state#> .\n"
+               "@prefix time:  <http://lv2plug.in/ns/ext/time#> .\n"
                "@prefix work:  <http://lv2plug.in/ns/ext/worker#> .\n"
+               "@prefix units: <http://lv2plug.in/ns/extensions/units#> .\n"
                "@prefix urid:  <http://lv2plug.in/ns/ext/urid#> .\n\n");
   const char* lv2Class = lv2ClassFor(kDesc);
-  std::fprintf(out, "<%s>\n    a lv2:Plugin%s%s ;\n    doap:name \"", uri,
+  // The plugin is a doap:Project as well -- the class doap:maintainer belongs
+  // to -- so the author below can sit on the plugin itself and strict RDF
+  // validation stays clean.
+  std::fprintf(out, "<%s>\n    a lv2:Plugin%s%s , doap:Project ;\n    doap:name \"", uri,
                lv2Class ? " , " : "", lv2Class ? lv2Class : "");
   // Through the escaper, like the preset names always were: a name with a
   // quote in it (12" Kick) is a plausible name, and unescaped it made a file
@@ -938,28 +1496,26 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
   }
   if ((kDesc.vendor && kDesc.vendor[0]) || (kDesc.url && kDesc.url[0]) ||
       (kDesc.email && kDesc.email[0])) {
-    // doap:maintainer's declared domain is doap:Project, so the author block
-    // nests under lv2:project -- lilv still finds it there (it falls back from
-    // the plugin to the project), and strict RDF validation stays clean.
-    std::fprintf(out, "    lv2:project [\n        a doap:Project ;\n        doap:name \"");
-    writeTurtleString(out, kDesc.name);
-    std::fprintf(out, "\" ;\n        doap:maintainer [\n            a foaf:Person ;\n");
+    // On the plugin, not nested under an lv2:project: lilv looks at both, but
+    // REAPER reads the vendor only from here -- with the author one level down
+    // every Sonore LV2 was listed with no vendor while its CLAP and VST3 had one.
+    std::fprintf(out, "    doap:maintainer [\n        a foaf:Person ;\n");
     if (kDesc.vendor && kDesc.vendor[0]) {
-      std::fprintf(out, "            foaf:name \"");
+      std::fprintf(out, "        foaf:name \"");
       writeTurtleString(out, kDesc.vendor);
       std::fprintf(out, "\" ;\n");
     }
     if (kDesc.url && kDesc.url[0]) {
-      std::fprintf(out, "            foaf:homepage <");
+      std::fprintf(out, "        foaf:homepage <");
       writeTurtleIri(out, kDesc.url);
       std::fprintf(out, "> ;\n");
     }
     if (kDesc.email && kDesc.email[0]) {
-      std::fprintf(out, "            foaf:mbox <mailto:");
+      std::fprintf(out, "        foaf:mbox <mailto:");
       writeTurtleIri(out, kDesc.email);
       std::fprintf(out, "> ;\n");
     }
-    std::fprintf(out, "        ] ;\n    ] ;\n");
+    std::fprintf(out, "    ] ;\n");
   }
   std::fprintf(out, "    lv2:binary <%s> ;\n", binaryName);
   std::fprintf(out, "    lv2:requiredFeature urid:map ;\n");
@@ -971,6 +1527,8 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
   // hand a plugin a sample, and refusing to load over that would be a worse
   // trade than the missing feature.
   std::fprintf(out, "    lv2:optionalFeature work:schedule ;\n");
+  // Where the output guard's one warning goes; stderr without it.
+  std::fprintf(out, "    lv2:optionalFeature log:log ;\n");
   std::fprintf(out, "    lv2:extensionData state:interface , work:interface ;\n");
 
   std::fprintf(out, "    lv2:port [\n");
@@ -980,11 +1538,11 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
     first = false;
   };
 
+  const std::vector<std::string> paramSymbols = lv2ParamSymbols();
   for (int i = 0; i < kDesc.numParams; ++i) {
     const ParamInfo& p = kDesc.params[i];
     separator();
-    char symbol[96];
-    lv2Symbol(p.id, symbol, sizeof(symbol));
+    const char* symbol = paramSymbols[(size_t) i].c_str();
     std::fprintf(out,
                  "        a lv2:InputPort , lv2:ControlPort ;\n"
                  "        lv2:index %d ;\n"
@@ -992,12 +1550,43 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                  "        lv2:name \"",
                  i, symbol);
     writeTurtleString(out, p.label);
+    char def[32], lo[32], hi[32];
+    ttlNumber(def, sizeof(def), p.defaultValue);
+    ttlNumber(lo, sizeof(lo), p.minValue);
+    ttlNumber(hi, sizeof(hi), p.maxValue);
     std::fprintf(out,
                  "\" ;\n"
-                 "        lv2:default %g ;\n"
-                 "        lv2:minimum %g ;\n"
-                 "        lv2:maximum %g ;\n",
-                 (double) p.defaultValue, (double) p.minValue, (double) p.maxValue);
+                 "        lv2:default %s ;\n"
+                 "        lv2:minimum %s ;\n"
+                 "        lv2:maximum %s ;\n",
+                 def, lo, hi);
+    // What the number is IN. LV2 has no call that turns a value into the
+    // plugin's text, so this is all a host has to say "6000 Hz" rather than
+    // "6000": the units extension's own unit where it has one, else a unit
+    // declared here with the plugin's symbol. Not on a control whose steps
+    // are named -- the names say what they are.
+    if (p.unit && p.unit[0] && !(p.stepCount > 0 && paramValueName(p, 0) != nullptr)) {
+      if (const char* known = lv2UnitFor(p.unit)) {
+        std::fprintf(out, "        units:unit %s ;\n", known);
+      } else {
+        // units:render is a printf format: a '%' in the symbol is doubled.
+        char render[128];
+        size_t n = 0;
+        for (const char* c = "%f "; *c; ++c) render[n++] = *c;
+        for (const char* c = p.unit; *c && n + 2 < sizeof(render); ++c) {
+          if (*c == '%') render[n++] = '%';
+          render[n++] = *c;
+        }
+        render[n] = '\0';
+        std::fprintf(out, "        units:unit [\n            a units:Unit ;\n            rdfs:label \"");
+        writeTurtleString(out, p.unit);
+        std::fprintf(out, "\" ;\n            units:symbol \"");
+        writeTurtleString(out, p.unit);
+        std::fprintf(out, "\" ;\n            units:render \"");
+        writeTurtleString(out, render);
+        std::fprintf(out, "\"\n        ] ;\n");
+      }
+    }
     // What the port is FOR, beyond its range.
     //
     // Only `hidden` has a standard spelling here. pprops:notOnGUI is an
@@ -1052,8 +1641,9 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
         // The step's VALUE, not its index: a control declared 2..8 in four
         // steps names 2, 4, 6 and 8, and a host that jumped to "index 2"
         // would land between two of them.
-        std::fprintf(out, "\" ;\n            rdf:value %g\n        ] ;\n",
-                     (double) stepValueOf(p, v));
+        char value[32];
+        ttlNumber(value, sizeof(value), stepValueOf(p, v));
+        std::fprintf(out, "\" ;\n            rdf:value %s\n        ] ;\n", value);
       }
     }
     // LV2 groups ports by pointing them at a pg:Group resource, declared
@@ -1125,8 +1715,27 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                  "        lv2:index %d ;\n"
                  "        lv2:symbol \"uiNotify\" ;\n"
                  "        lv2:name \"UI Notify\" ;\n"
+                 "        lv2:portProperty lv2:connectionOptional ;\n"
+                 // The state goes to the interface as one JSON message, never
+                 // in pieces: one bigger than the buffer the host gave waits,
+                 // and with no size asked for a host picks its own -- 4 KB in
+                 // jalv, 8 KB in Ardour -- and a plugin with enough
+                 // parameters never reached its own page. Hosts that know
+                 // resize-port allocate at least this much.
+                 "        rsz:minimumSize %u ;\n",
+                 portUiNotify(), (unsigned) kUiNotifyMinimumBytes);
+  }
+  if (timePorts()) {
+    separator();
+    std::fprintf(out,
+                 "        a lv2:InputPort , atom:AtomPort ;\n"
+                 "        atom:bufferType atom:Sequence ;\n"
+                 "        atom:supports time:Position ;\n"
+                 "        lv2:index %d ;\n"
+                 "        lv2:symbol \"time_in\" ;\n"
+                 "        lv2:name \"Transport\" ;\n"
                  "        lv2:portProperty lv2:connectionOptional ;\n",
-                 portUiNotify());
+                 portTimeIn());
   }
   if (latencyPorts()) {
     separator();
@@ -1144,6 +1753,9 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
   }
 
   {
+    // The host's switch, not the user's: notOnGUI and notAutomatic keep it out
+    // of a generic editor and its automation lanes, where REAPER showed it as
+    // a control anyone could move -- and automate -- mid-song.
     separator();
     std::fprintf(out,
                  "        a lv2:InputPort , lv2:ControlPort ;\n"
@@ -1153,12 +1765,13 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                  "        lv2:default 0 ;\n"
                  "        lv2:minimum 0 ;\n"
                  "        lv2:maximum 1 ;\n"
-                 "        lv2:portProperty lv2:integer , lv2:toggled , lv2:connectionOptional ;\n"
+                 "        lv2:portProperty lv2:integer , lv2:toggled , lv2:connectionOptional ,\n"
+                 "            pprops:notOnGUI , pprops:notAutomatic ;\n"
                  "        lv2:designation lv2:freeWheeling ;\n",
                  portFreeWheel());
   }
 
-  if (isInstrument()) {
+  if (midiPorts()) {
     separator();
     std::fprintf(out,
                  "        a lv2:InputPort , atom:AtomPort ;\n"
@@ -1168,15 +1781,16 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                  "        atom:bufferType atom:Sequence ;\n"
                  "        atom:supports midi:MidiEvent ;\n",
                  portMidiIn());
-  } else {
+  }
+  if (!isInstrument()) {
     for (int c = 0; c < audioInPorts(); ++c) {
       separator();
       std::fprintf(out,
                    "        a lv2:InputPort , lv2:AudioPort ;\n"
                    "        lv2:index %d ;\n"
-                   "        lv2:symbol \"in_%c\" ;\n"
-                   "        lv2:name \"In %c\" ;\n",
-                   portAudioInL() + c, c ? 'r' : 'l', c ? 'R' : 'L');
+                   "        lv2:symbol \"in_%s\" ;\n"
+                   "        lv2:name \"In %s\" ;\n",
+                   portAudioInL() + c, audioPortSymbol(c), audioPortName(c));
     }
   }
 
@@ -1197,9 +1811,9 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
     std::fprintf(out,
                  "        a lv2:OutputPort , lv2:AudioPort ;\n"
                  "        lv2:index %d ;\n"
-                 "        lv2:symbol \"out_%c\" ;\n"
-                 "        lv2:name \"Out %c\" ;\n",
-                 portAudioOutL() + c, c ? 'r' : 'l', c ? 'R' : 'L');
+                 "        lv2:symbol \"out_%s\" ;\n"
+                 "        lv2:name \"Out %s\" ;\n",
+                 portAudioOutL() + c, audioPortSymbol(c), audioPortName(c));
   }
 
   if (midiOutPorts()) {
@@ -1230,8 +1844,13 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                      "        a lv2:OutputPort , lv2:AudioPort ;\n"
                      "        lv2:index %d ;\n"
                      "        lv2:symbol \"%s\" ;\n"
-                     "        lv2:name \"%s\" ;\n",
-                     portAuxOut0() + flat, symbol, label);
+                     "        lv2:name \"",
+                     portAuxOut0() + flat, symbol);
+        // Escaped, as every other name in this file: a bus called Stem "A"
+        // closed the literal early, and a bundle with one line of broken
+        // Turtle is a bundle a host skips whole.
+        writeTurtleString(out, label);
+        std::fprintf(out, "\" ;\n");
       }
     }
   }
@@ -1271,10 +1890,14 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
       symbol[n] = 0;
       if (n == 0) std::snprintf(symbol, sizeof(symbol), "group%d", g);
 
-      std::fprintf(out,
-                   "\n<%s#group%d>\n    a pg:Group ;\n    lv2:name \"%s\" ;\n"
-                   "    lv2:symbol \"%s\" ;\n    rdfs:label \"%s\" .\n",
-                   uri, g, groups.names[g], symbol, groups.names[g]);
+      // The name through the escaper, twice: a group called Amp "Clean" or
+      // In\Out was written raw, and its quote or backslash made the whole
+      // plugin.ttl unreadable -- the plugin did not exist in LV2.
+      std::fprintf(out, "\n<%s#group%d>\n    a pg:Group ;\n    lv2:name \"", uri, g);
+      writeTurtleString(out, name);
+      std::fprintf(out, "\" ;\n    lv2:symbol \"%s\" ;\n    rdfs:label \"", symbol);
+      writeTurtleString(out, name);
+      std::fprintf(out, "\" .\n");
     }
   }
 }
@@ -1297,7 +1920,7 @@ inline int ttlGeneratorMain(int argc, char** argv) {
   pluginUri(uri, sizeof(uri));
 
   std::snprintf(path, sizeof(path), "%s/manifest.ttl", dir);
-  std::FILE* manifest = std::fopen(path, "w");
+  std::FILE* manifest = ::sonore::pathio::open(path, "w");
   if (!manifest) {
     std::fprintf(stderr, "cannot write %s\n", path);
     return 1;
@@ -1335,7 +1958,7 @@ inline int ttlGeneratorMain(int argc, char** argv) {
                  "\n<%s#ui>\n"
                  "    a %s ;\n"
                  "    ui:binary <%s> ;\n"
-                 "    lv2:extensionData ui:idleInterface ;\n"
+                 "    lv2:extensionData ui:idleInterface , ui:resize ;\n"
                  "    lv2:requiredFeature ui:idleInterface , ui:parent ;\n"
                  "    ui:portNotification [\n"
                  "        ui:plugin <%s> ;\n"
@@ -1365,7 +1988,7 @@ inline int ttlGeneratorMain(int argc, char** argv) {
 
   if (numFactoryPresets() > 0) {
     std::snprintf(path, sizeof(path), "%s/presets.ttl", dir);
-    std::FILE* presets = std::fopen(path, "w");
+    std::FILE* presets = ::sonore::pathio::open(path, "w");
     if (!presets) {
       std::fprintf(stderr, "cannot write %s\n", path);
       return 1;
@@ -1375,7 +1998,7 @@ inline int ttlGeneratorMain(int argc, char** argv) {
   }
 
   std::snprintf(path, sizeof(path), "%s/plugin.ttl", dir);
-  std::FILE* plugin = std::fopen(path, "w");
+  std::FILE* plugin = ::sonore::pathio::open(path, "w");
   if (!plugin) {
     std::fprintf(stderr, "cannot write %s\n", path);
     return 1;
@@ -1408,5 +2031,20 @@ int main(int argc, char** argv) { return sonore::lv2::ttlGeneratorMain(argc, arg
 /** The host's entry point. */
 LV2_SYMBOL_EXPORT const LV2_Descriptor* lv2_descriptor(uint32_t index) {
   return index == 0 ? sonore::lv2::descriptor() : nullptr;
+}
+
+/** The generator as a plain function, for a plugin compiled ONCE into an
+ *  object that every format links (sonore_add_plugin): the ttlgen executable
+ *  is then cmake/lv2_ttlgen_main.cpp -- a main() and nothing else -- linked
+ *  against that object, instead of a second full compile of the plugin that
+ *  existed to print two text files. Hidden, because a host must never see it
+ *  in the module; not inline, because an object nobody calls it from would
+ *  not contain it and the link would fail on the one symbol it needs. */
+#if defined(_MSC_VER)
+extern "C" int sonore_lv2_ttlgen_main(int argc, char** argv) {
+#else
+extern "C" __attribute__((visibility("hidden"))) int sonore_lv2_ttlgen_main(int argc, char** argv) {
+#endif
+  return sonore::lv2::ttlGeneratorMain(argc, argv);
 }
 #endif

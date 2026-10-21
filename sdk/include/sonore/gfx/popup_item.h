@@ -29,10 +29,18 @@ struct PopupItem {
    *  everywhere: a menu whose items start at 1 can tell nothing-chosen from the
    *  first item, and one that starts at 0 cannot. */
   int id = 0;
+  /** The row's label (UTF-8): an item's text, or a section header's. Unused
+   *  on a separator. */
   std::string text;
+  /** Can be chosen and lit. A disabled item is drawn dimmed; separators and
+   *  headers are never enabled. */
   bool enabled = true;
+  /** Drawn with a check mark in front of the text. */
   bool ticked = false;
+  /** A horizontal rule, not an item: it has no text and cannot be chosen. */
   bool isSeparator = false;
+  /** A section title drawn dimmed above the items it names: shown, never
+   *  chosen. */
   bool isHeader = false;
 };
 

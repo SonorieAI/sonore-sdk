@@ -43,29 +43,54 @@
 #include <string>
 #include <vector>
 
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
 
+#include "../simd.h" // the blit's channel swap uses SSE2 where it is there
 #include "backing.h"
 #include "component.h"
 #include "displays.h"
 #include "graphics.h"
+#include "mouse_input.h"
+#include "text_drag.h"
+#include "text_input.h"
 #include "uia_win32.h"
 
 namespace sonore {
 namespace gfx {
 
+/**
+ * The Win32 peer for a component tree: a child window inside a host's HWND
+ * (or a top-level window, or a popup), the Backing it paints into, and the
+ * translation of Windows messages into MouseRouter calls. What it does and
+ * does not do is in the file comment; NativeWindowX11 and NativeWindowCocoa
+ * are the same job on the other platforms.
+ *
+ * open() takes the content by reference and does not own it: the component
+ * must outlive the window, or close() must come first -- NativeEditor holds
+ * one of these as a member and reuses it across every open. Everything here
+ * runs on the thread that called open(), which owns the HWND and receives
+ * its messages: the message thread. The window procedure keeps a pointer to
+ * this object, and the object owns the router, the UI Automation root and
+ * the drop target by raw pointer, so a NativeWindow can be neither copied nor
+ * moved -- as NativeWindowX11 and NativeWindowCocoa cannot.
+ */
 class NativeWindow {
 public:
+  /** Closed: no HWND until open() or openPopup(). */
+  NativeWindow() = default;
+  /** Deleted, not left to the compiler: the implicit copy shared the HWND and
+   *  every raw pointer above, and the second close() released them again.
+   *  Declaring the copy also leaves no implicit move, which would do the
+   *  same. */
+  NativeWindow(const NativeWindow&) = delete;
+  /** Not assignable, for the same reason. */
+  NativeWindow& operator=(const NativeWindow&) = delete;
+  /** Closes the window if it is open, as close() does. */
   ~NativeWindow() { close(); }
 
-  /**
-   * Open inside a host's window.
-   *
-   * `parent` is the HWND a plugin format hands over. Null makes a top-level
-   * window, which is what the standalone and the tests use.
-   */
   /**
    * Open as a POPUP: a top-level window with no frame, above everything,
    * holding the mouse until it is dismissed.
@@ -81,12 +106,18 @@ public:
    * see because the click never reaches it.
    */
   bool openPopup(Component& content, int screenX, int screenY, int width, int height,
-                 bool grabMouse = true) {
+                 bool grabMouse = true, float scale = 0.0f) {
     isPopup_ = true;
     grabsMouse_ = grabMouse;
+    // The scale of the editor that opened it, when it has one. A popup has no
+    // parent to read a DPI from, and the monitor's answer is not the editor's
+    // when a host has set the editor's scale itself: a menu under a 200%
+    // editor came out at 100%, half the size of the control that opened it.
+    popupScale_ = scale;
     const bool ok = open(nullptr, content, width, height, screenX, screenY);
     if (!ok) {
       isPopup_ = false;
+      popupScale_ = 0.0f;
       return false;
     }
     // Shown WITHOUT activating: a menu that stole focus would take it from the
@@ -102,8 +133,13 @@ public:
     return true;
   }
 
+  /** A popup opened with `grabMouse` saw a left press outside its content.
+   *  The popup stays open: the owner closes it, usually from here. */
   std::function<void()> onDismissedOutside;
 
+  /** Open inside a host's window: `parent` is the HWND a plugin format
+   *  hands over, and null makes a top-level window -- which is what the
+   *  standalone and the tests use. Sizes as for the overload below. */
   bool open(void* parent, Component& content, int width, int height) {
     return open(parent, content, width, height, 0, 0);
   }
@@ -126,13 +162,15 @@ public:
    */
   bool open(void* parent, Component& content, int width, int height, int screenX, int screenY) {
     const bool popup = isPopup_;
+    const float popupScale = popupScale_;
     close();
     isPopup_ = popup; // close() resets it; this call is the one that set it
+    popupScale_ = popupScale;
     content_ = &content;
     router_ = new MouseRouter(content);
     if (!registerClass()) return false;
 
-    const float openScale = dpiScaleForWindow((HWND) parent);
+    const float openScale = popupScale_ > 0.0f ? popupScale_ : dpiScaleForWindow((HWND) parent);
     logicalWidth_ = (float) width;
     logicalHeight_ = (float) height;
     width = Backing::toDevice(logicalWidth_, openScale);
@@ -184,7 +222,7 @@ public:
     // when it is not -- a top-level window that landed on another monitor --
     // it is applied here, before anything is shown, rather than as a visible
     // jump a frame later.
-    const float realScale = dpiScaleForWindow(hwnd_);
+    const float realScale = popupScale_ > 0.0f ? popupScale_ : dpiScaleForWindow(hwnd_);
     if (realScale != openScale) {
       backing_.setScale(realScale);
       width = Backing::toDevice(logicalWidth_, realScale);
@@ -199,6 +237,10 @@ public:
     // else -- a reader already running when the editor opens asks immediately.
     uiaRoot_ = new uia::RootProvider(hwnd_, content_, accessibleWindowName_);
     uiaRoot_->setScale(backing_.scale());
+    // Taken now, on this thread: a reader's first call can arrive on one of
+    // UIA's own threads, which may not take it, before the clock's first tick
+    // -- and an empty snapshot is an editor with nothing in it.
+    uiaRoot_->refresh();
 
     // 33 ms, the same rate as the webview host. Faster is invisible on a
     // knob; slower makes automation look like it is stepping.
@@ -206,10 +248,49 @@ public:
     // Files can be dropped on us. Costs nothing when nothing accepts them: the
     // router finds no interested component and the drop is ignored.
     DragAcceptFiles(hwnd_, TRUE);
+    // And text, which only OLE carries -- see text_drag.h for why this is
+    // now worth the COM it costs, and why a host thread that refuses OLE
+    // leaves the window on WM_DROPFILES exactly as before. Not for a popup:
+    // nothing is dropped on a menu.
+    if (!isPopup_)
+      oleDrop_ = detail::registerOleDropTarget(
+          hwnd_, *router_, content,
+          [this](LONG sx, LONG sy) {
+            POINT p{sx, sy};
+            ScreenToClient(hwnd_, &p);
+            return backing_.toLogical(p.x, p.y);
+          },
+          &oleInitialised_);
+    if (oleDrop_) oleDrop_->onChanged = [this] { renderIfDirty(); };
     return true;
   }
 
+  /**
+   * Destroy the window and let go of the content: the accessibility provider
+   * detached, the drop target revoked, the router and the pixels freed. The
+   * component itself is untouched, and the object can be opened again. Does
+   * nothing more when already closed; the destructor calls it.
+   */
   void close() {
+    if (uiaRoot_) {
+      // DETACHED before released: UIA may hold references of its own and go on
+      // calling in after the window is gone, and an provider still holding the
+      // editor's component tree would walk freed memory. Detaching leaves an
+      // object that answers "empty" forever, which is the correct answer for a
+      // window that no longer exists.
+      uiaRoot_->detach();
+      // Tells UIA to drop anything it cached for this window -- while the
+      // window still EXISTS. This ran after hwnd_ had been cleared, so UIA was
+      // told about a null window and a reader went on announcing controls
+      // from an editor that had closed. Then the provider is disconnected, so
+      // UIA cannot call into it after this module unloads.
+      if (hwnd_ && UiaClientsAreListening()) UiaReturnRawElementProvider(hwnd_, 0, 0, nullptr);
+      UiaDisconnectProvider(static_cast<IRawElementProviderSimple*>(uiaRoot_));
+      uiaRoot_->Release();
+      uiaRoot_ = nullptr;
+    }
+    // Revoked while the window and the router it delivers into both exist.
+    detail::revokeOleDropTarget(hwnd_, oleDrop_, oleInitialised_);
     if (hwnd_) {
       // Cleared BEFORE DestroyWindow: destroying sends WM_DESTROY straight
       // back into the procedure, and a procedure that finds a live pointer
@@ -219,19 +300,6 @@ public:
       DestroyWindow(hwnd_);
       hwnd_ = nullptr;
     }
-    if (uiaRoot_) {
-      // DETACHED before released: UIA may hold references of its own and go on
-      // calling in after the window is gone, and an provider still holding the
-      // editor's component tree would walk freed memory. Detaching leaves an
-      // object that answers "empty" forever, which is the correct answer for a
-      // window that no longer exists.
-      uiaRoot_->detach();
-      uiaRoot_->Release();
-      uiaRoot_ = nullptr;
-      // Tells UIA to drop anything it cached for this window. Without it a
-      // reader keeps announcing controls from an editor that has closed.
-      if (UiaClientsAreListening()) UiaReturnRawElementProvider(hwnd_, 0, 0, nullptr);
-    }
     delete router_;
     router_ = nullptr;
     content_ = nullptr;
@@ -240,9 +308,16 @@ public:
     // open -- so leaving it set means the next paint reaches a component the
     // editor has already destroyed.
     backing_.setContent(nullptr);
+    // And its pixels, with the strip the blit converts through. This object
+    // outlives the window, so what it holds now it holds until the plugin is
+    // unloaded; the next open() allocates both again.
+    backing_.release();
+    std::vector<uint8_t>().swap(scratch_);
     isPopup_ = false;
+    popupScale_ = 0.0f;
   }
 
+  /** Opened by openPopup() and not closed since. */
   bool isPopup() const { return isPopup_; }
 
   /** Where the pointer last was, in this window's coordinates. Tracked because
@@ -263,8 +338,12 @@ public:
    */
   std::function<void()> onTick;
 
+  /** The HWND, or null while closed. */
   void* handle() const { return hwnd_; }
+  /** open() or openPopup() succeeded and close() has not run since. */
   bool isOpen() const { return hwnd_ != nullptr; }
+  /** The bitmap the tree is painted into, in device pixels: the client
+   *  area's size, and empty once closed. For a test reading pixels back. */
   Bitmap& bitmap() { return backing_.bitmap(); }
 
   /**
@@ -279,6 +358,8 @@ public:
     render();
   }
 
+  /** Device pixels per logical unit now: the window's DPI over 96, unless
+   *  setScale() or openPopup()'s `scale` said otherwise. */
   float scale() const { return backing_.scale(); }
 
   /** What a screen reader calls this window. Set BEFORE open(): the provider
@@ -288,7 +369,10 @@ public:
   /** The client area in LOGICAL units, which is what a caller reasoning about
    *  layout wants and what setSize below is the inverse of. */
   float logicalWidth() const { return backing_.logicalWidth(); }
+  /** The client area's height in logical units. */
   float logicalHeight() const { return backing_.logicalHeight(); }
+  /** The router the window's input goes to, owned by this object; null while
+   *  closed. */
   MouseRouter* router() { return router_; }
 
   /** SW_SHOWNA, not SW_SHOW: an editor appearing must not steal focus from
@@ -317,11 +401,9 @@ public:
   /**
    * Repaint if anything asked to be.
    *
-   * Called from a timer. The damaged rectangle is currently the whole window
-   * rather than the union the tree reports -- correct, and wasteful. Partial
-   * repaint needs the tree to paint only the components that intersect the
-   * damage, and doing that wrong shows as stale pixels nobody can reproduce.
-   * The damage IS tracked; using it is the optimisation, and it is not free.
+   * Called from a timer. Only what changed is repainted: the backing store
+   * paints the components under the damage, clipped to it, render() hands
+   * Windows those rectangles, and WM_PAINT converts and copies only them.
    */
   bool renderIfDirty() {
     if (!hwnd_ || !content_ || !content_->isDirty()) return false;
@@ -339,7 +421,8 @@ private:
    *
    * The WORK area, not the full bounds, is what a menu is placed inside --
    * otherwise a menu near the bottom of the screen goes under the taskbar,
-   * which is where the host's own transport usually is.
+   * which is where the host's own transport usually is. Each monitor's own
+   * DPI scale comes with it (dpiScaleForMonitor).
    */
   static void refreshDisplays() {
     std::vector<Display> found;
@@ -360,8 +443,31 @@ private:
                       (float) (info.rcWork.right - info.rcWork.left),
                       (float) (info.rcWork.bottom - info.rcWork.top));
     d.isMain = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    d.scale = dpiScaleForMonitor(monitor);
     ((std::vector<Display>*) userData)->push_back(d);
     return TRUE;
+  }
+
+  /**
+   * One monitor's DPI scale, for the list above: Display::scale was never
+   * set, so scaleAt() said 1 on every screen.
+   *
+   * GetDpiForMonitor is shcore's, Windows 8.1 and later, and resolved at
+   * runtime as GetDpiForWindow is. Its effective DPI answers in the calling
+   * thread's awareness, as GetMonitorInfo's rectangles do: a per-monitor
+   * aware thread gets each monitor's own, any other the system's. Before 8.1
+   * every monitor has the system's DPI, which is the fallback.
+   */
+  static float dpiScaleForMonitor(HMONITOR monitor) {
+    typedef HRESULT(WINAPI * GetDpiForMonitorFn)(HMONITOR, int, UINT*, UINT*);
+    static GetDpiForMonitorFn fn = [] {
+      HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+      return shcore ? (GetDpiForMonitorFn) GetProcAddress(shcore, "GetDpiForMonitor") : nullptr;
+    }();
+    UINT dpiX = 0, dpiY = 0;
+    if (fn && monitor && SUCCEEDED(fn(monitor, 0 /* MDT_EFFECTIVE_DPI */, &dpiX, &dpiY)) && dpiX > 0)
+      return (float) dpiX / 96.0f;
+    return dpiScaleForWindow(nullptr);
   }
 
   static HMODULE thisModule() {
@@ -417,47 +523,56 @@ private:
     render();
   }
 
-  /**
-   * Repaint, drawing only what changed.
-   *
-   * This is what the comment on renderIfDirty asked for since this file was
-   * written: "the damaged rectangle is currently the whole window rather than
-   * the union the tree reports -- correct, and wasteful. The damage IS tracked;
-   * using it is the optimisation, and it is not free."
-   *
-   * It is not free, and here is the price: the ground under the damaged area
-   * has to be cleared before the tree paints over it, or the previous frame
-   * shows through anything transparent. Clearing the WHOLE bitmap would undo
-   * the saving entirely, so it clears exactly the damaged rectangles.
-   *
-   * A full repaint is still what happens on the first frame and after a resize,
-   * because there is no previous frame to keep.
-   */
 public:
   /**
-   * Where an input method's candidate window should sit, in DEVICE pixels
-   * relative to the client area. False when nothing focused has a caret.
+   * Hand the OS keyboard focus to this window when -- and only when -- the
+   * component the user just focused is a TEXT field, and give it back to the
+   * host when it no longer is.
    *
-   * Separated from the call that uses it so it can be TESTED. Whether imm32
-   * moved a window is not observable from here; whether the arithmetic put the
-   * point beside the caret of the focused field is exactly observable, and it
-   * is the half that can be wrong.
+   * Nothing in this SDK called SetFocus. A child HWND inside a DAW does not
+   * take the keyboard just because it was clicked, so WM_KEYDOWN and WM_CHAR
+   * never arrived: typing a value, Ctrl+C and Ctrl+V were dead in every host,
+   * and the tests could not see it because they SendMessage straight to the
+   * window. Taking focus on EVERY click is the opposite failure -- knobs and
+   * buttons want keyboard focus too (for Tab), and a plugin that grabbed the
+   * keyboard whenever a knob moved would swallow the host's space bar. So the
+   * test is the caret: a component that has one is being typed into.
    */
+  void syncKeyboardFocus() {
+    if (isPopup_ || !hwnd_ || !router_) return;
+    Component* focused = router_->focused();
+    Rect caret;
+    const bool typing = focused && focused->caretBounds(&caret);
+    const HWND has = GetFocus();
+    if (typing && has != hwnd_) {
+      SetFocus(hwnd_);
+    } else if (!typing && has == hwnd_) {
+      // Back to the window we live in -- the host's. A standalone's window
+      // has no parent and simply keeps it.
+      if (HWND parent = GetParent(hwnd_)) SetFocus(parent);
+    }
+  }
+
+  /** Where an input method's candidate window should sit, in DEVICE pixels
+   *  relative to the client area; false when nothing focused has a caret.
+   *
+   *  Separated from the call that uses it so it can be TESTED. Whether
+   *  imm32 moved a window is not observable from here; whether the
+   *  arithmetic put the point beside the caret of the focused field is
+   *  exactly observable, and it is the half that can be wrong. */
   bool compositionPoint(int* x, int* y) const {
     if (!router_ || !x || !y) return false;
-    Component* focused = router_->focused();
-    if (!focused) return false;
-    Rect caret;
-    if (!focused->caretBounds(&caret)) return false;
-
     // The caret is in the FOCUSED component's coordinates and the IME wants
-    // the window's. Walking up through the parents is what converts them, and
-    // it is the step that silently produces a point in the top-left corner if
-    // it is left out -- which looks exactly like not having implemented this
-    // at all.
-    const Point origin = focused->localToRoot({caret.x, caret.y + caret.h});
-    *x = (int) (origin.x * backing_.scale() + 0.5f);
-    *y = (int) (origin.y * backing_.scale() + 0.5f);
+    // the window's. focusedCaretInRoot walks up through the parents -- the
+    // step that silently produces a point in the top-left corner if it is
+    // left out, which looks exactly like not having implemented this at all
+    // -- and is the same walk the X11 spot location and the macOS first rect
+    // take (gfx/text_input.h). The bottom-left corner: the IME hangs its list
+    // below the line.
+    Rect caret;
+    if (!focusedCaretInRoot(router_, &caret)) return false;
+    *x = (int) (caret.x * backing_.scale() + 0.5f);
+    *y = (int) ((caret.y + caret.h) * backing_.scale() + 0.5f);
     return true;
   }
 
@@ -477,7 +592,7 @@ public:
     using ImmGetContextFn = HIMC(WINAPI*)(HWND);
     using ImmSetCompositionWindowFn = BOOL(WINAPI*)(HIMC, COMPOSITIONFORM*);
     using ImmReleaseContextFn = BOOL(WINAPI*)(HWND, HIMC);
-    static HMODULE imm = LoadLibraryW(L"imm32.dll");
+    static HMODULE imm = LoadLibraryExW(L"imm32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!imm) return;
     static auto getContext = (ImmGetContextFn) (void*) GetProcAddress(imm, "ImmGetContext");
     static auto setWindow =
@@ -497,6 +612,21 @@ public:
 
 private:
 
+  /** Repaint, drawing only what changed.
+   *
+   *  This is what the comment on renderIfDirty asked for since this file
+   *  was written: "the damaged rectangle is currently the whole window
+   *  rather than the union the tree reports -- correct, and wasteful. The
+   *  damage IS tracked; using it is the optimisation, and it is not free."
+   *
+   *  It is not free, and here is the price: the ground under the damaged
+   *  area has to be cleared before the tree paints over it, or the previous
+   *  frame shows through anything transparent. Clearing the WHOLE bitmap
+   *  would undo the saving entirely, so it clears exactly the damaged
+   *  rectangles (Backing::render does both).
+   *
+   *  A full repaint is still what happens on the first frame and after a
+   *  resize, because there is no previous frame to keep. */
   void render() {
     const std::vector<PixelRect>& changed = backing_.render();
     if (!hwnd_) return;
@@ -518,37 +648,95 @@ private:
    *  in the tree has painted. */
   static Colour LookAndFeelBackground() { return palette::background(); }
 
+  /** The most the blit's strip holds: a band of the window's rows -- 42 of
+   *  them across a 1560-pixel window. See blit(). */
+  static constexpr size_t kBlitBandBytes = 256u * 1024u;
+
   /**
    * Copy the bitmap into the window.
    *
    * Windows wants BGRA and the rasteriser produces RGBA, so the channels are
    * swapped into a scratch buffer here. Storing BGRA natively would save the
    * pass and would put a platform's byte order into the rasteriser that three
-   * platforms share -- the wrong side of the boundary to leak across.
+   * platforms share -- the wrong side of the boundary to leak across. So
+   * would handing Windows the RGBA masks as BI_BITFIELDS and letting it
+   * swap: measured, its own conversion took sixteen times as long as this.
+   *
+   * A band of rows at a time, through a strip of at most kBlitBandBytes.
+   * The scratch used to be a second copy of the whole window, filled where
+   * the paint fell and handed over entire: 6 MB beside the bitmap's 6 MB for
+   * a 780x500 editor at 200%, half of everything an open editor held, there
+   * to copy a meter. Each band is a top-down DIB of its own, drawn at its
+   * place in the window -- the whole-DIB call as before, with no start-scan
+   * arithmetic, which is where SetDIBitsToDevice's rules for top-down DIBs
+   * bite. The pixels Windows is handed are the same, and a strip that stays
+   * in the cache is quicker to hand over than a window that does not: a
+   * full repaint at 1560x1000 went from 2.25 ms to 1.81 ms.
    */
-  void blit(HDC dc) {
+  void blit(HDC dc, const RECT& area) {
     const Bitmap& bm = backing_.bitmap();
     const int w = bm.width(), h = bm.height();
     if (w <= 0 || h <= 0) return;
-    scratch_.resize((size_t) w * (size_t) h * 4u);
-    const uint8_t* src = bm.data();
-    for (size_t i = 0; i < scratch_.size(); i += 4) {
-      scratch_[i + 0] = src[i + 2];
-      scratch_[i + 1] = src[i + 1];
-      scratch_[i + 2] = src[i + 0];
-      scratch_[i + 3] = src[i + 3];
-    }
+    // Only what this paint covers. BeginPaint clips drawing to the update
+    // region, whose bounding box is `area`, so a pixel outside it is never
+    // shown -- and converting the whole bitmap anyway was most of the cost of
+    // every repaint: a 20x20 meter in a 1600x1000 editor took as long as the
+    // full window.
+    const int x0 = area.left < 0 ? 0 : (int) area.left;
+    const int y0 = area.top < 0 ? 0 : (int) area.top;
+    const int x1 = area.right > w ? w : (int) area.right;
+    const int y1 = area.bottom > h ? h : (int) area.bottom;
+    if (x0 >= x1 || y0 >= y1) return;
+    const int bandWidth = x1 - x0;
+    const size_t rowBytes = (size_t) bandWidth * 4u;
+    int bandRows = (int) (kBlitBandBytes / rowBytes);
+    if (bandRows < 1) bandRows = 1;
+    if (bandRows > y1 - y0) bandRows = y1 - y0;
+    scratch_.resize(rowBytes * (size_t) bandRows);
+
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = w;
-    // NEGATIVE height: a DIB is bottom-up by default and this buffer is
-    // top-down. Positive here draws the whole interface upside down.
-    info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biWidth = bandWidth;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
-    SetDIBitsToDevice(dc, 0, 0, (DWORD) w, (DWORD) h, 0, 0, 0, (UINT) h, scratch_.data(), &info,
-                      DIB_RGB_COLORS);
+    const uint8_t* const src = bm.data();
+    for (int top = y0; top < y1; top += bandRows) {
+      const int rows = (std::min)(bandRows, y1 - top);
+      // A pixel at a time as a 32-bit word, red and blue trading places, and
+      // four at a time where SSE2 is there: byte by byte through the two
+      // vectors -- which the compiler had to assume might overlap -- this was
+      // an eighth of the message thread's busy time while a level display
+      // moved. Windows is little-endian everywhere it runs, so RGBA in memory
+      // is the word 0xAABBGGRR, and BGRA is 0xAARRGGBB.
+      for (int row = 0; row < rows; ++row) {
+        const uint8_t* from = src + bm.offsetOf(x0, top + row);
+        uint8_t* to = scratch_.data() + (size_t) row * rowBytes;
+        int n = bandWidth;
+#if defined(SONORE_SIMD_SSE)
+        const __m128i greenAlpha = _mm_set1_epi32((int) 0xFF00FF00u);
+        const __m128i low = _mm_set1_epi32(0xFF);
+        for (; n >= 4; n -= 4, from += 16, to += 16) {
+          const __m128i v = _mm_loadu_si128((const __m128i*) from);
+          const __m128i swapped =
+              _mm_or_si128(_mm_and_si128(v, greenAlpha),
+                           _mm_or_si128(_mm_and_si128(_mm_srli_epi32(v, 16), low), _mm_slli_epi32(_mm_and_si128(v, low), 16)));
+          _mm_storeu_si128((__m128i*) to, swapped);
+        }
+#endif
+        for (; n > 0; --n, from += 4, to += 4) {
+          uint32_t p;
+          std::memcpy(&p, from, 4);
+          p = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+          std::memcpy(to, &p, 4);
+        }
+      }
+      // NEGATIVE height: a DIB is bottom-up by default and this strip is
+      // top-down. Positive here draws each band upside down.
+      info.bmiHeader.biHeight = -rows;
+      SetDIBitsToDevice(dc, x0, top, (DWORD) bandWidth, (DWORD) rows, 0, 0, 0, (UINT) rows,
+                        scratch_.data(), &info, DIB_RGB_COLORS);
+    }
   }
 
   void armMouseLeave() {
@@ -561,16 +749,6 @@ private:
     trackingLeave_ = true;
   }
 
-  /**
-   * A mouse position from Windows, in the tree's own units.
-   *
-   * Windows reports DEVICE pixels, always. At 200% an unconverted position is
-   * twice the coordinate the control was drawn at, so every click lands on
-   * whatever is a screenful down and to the right -- or on nothing, which does
-   * not read as a coordinate bug. It reads as "the plugin ignores my mouse".
-   *
-   * A member rather than a static because the divisor is per-window.
-   */
   /**
    * The DPI scale of the monitor a window is on.
    *
@@ -597,6 +775,15 @@ private:
     return dpi > 0 ? (float) dpi / 96.0f : 1.0f;
   }
 
+  /** A mouse position from Windows, in the tree's own units.
+   *
+   *  Windows reports DEVICE pixels, always. At 200% an unconverted position
+   *  is twice the coordinate the control was drawn at, so every click lands
+   *  on whatever is a screenful down and to the right -- or on nothing,
+   *  which does not read as a coordinate bug. It reads as "the plugin
+   *  ignores my mouse".
+   *
+   *  A member rather than a static because the divisor is per-window. */
   Point pointOf(LPARAM lp) const {
     return backing_.toLogical((int) (short) LOWORD(lp), (int) (short) HIWORD(lp));
   }
@@ -630,6 +817,9 @@ private:
    *  through WM_CHAR with the user's layout applied, which is the only way a
    *  field can be typed into on a keyboard that is not American. */
   static int namedKey(int vk) {
+    // F10 arrives as WM_SYSKEYDOWN, which is why both messages come here: it is
+    // the key Windows itself uses to enter a menu bar.
+    if (vk >= VK_F1 && vk <= VK_F12) return KeyPress::F1 + (vk - VK_F1);
     switch (vk) {
       case VK_BACK: return KeyPress::Backspace;
       case VK_TAB: return KeyPress::Tab;
@@ -684,7 +874,7 @@ private:
       case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
-        self->blit(dc);
+        self->blit(dc, ps.rcPaint);
         EndPaint(hwnd, &ps);
         return 0;
       }
@@ -698,6 +888,19 @@ private:
           // screen -- which is worse than having no clock, because the state
           // and the pixels then disagree.
           self->renderIfDirty();
+          // The accessibility snapshot, retaken on this thread -- the only one
+          // that may walk the tree -- while a client listens: what UIA's own
+          // threads read between their visits here is at most a tick old.
+          // And what changed, told to the reader: the focus, the focused
+          // control's value. Only once a reader has asked for THIS window's
+          // provider: UiaClientsAreListening is true on nearly every machine
+          // -- an IME, the touch keyboard, any UIA client anywhere -- and
+          // every open editor walked its tree thirty times a second for
+          // nobody.
+          if (self->uiaRoot_ && self->uiaAsked_ && UiaClientsAreListening()) {
+            self->uiaRoot_->refresh();
+            self->uiaRoot_->announce(GetTickCount64());
+          }
         }
         return 0;
       // The pointer moved over this window and Windows is asking what it should
@@ -718,7 +921,9 @@ private:
       // a reader the editor's controls are the window's title bar.
       case WM_GETOBJECT:
         if (self->uiaRoot_ && (DWORD) lp == (DWORD) UiaRootObjectId) {
+          self->uiaAsked_ = true;
           self->uiaRoot_->setScale(self->backing_.scale());
+          self->uiaRoot_->refresh();
           return UiaReturnRawElementProvider(
               hwnd, wp, lp, static_cast<IRawElementProviderSimple*>(self->uiaRoot_));
         }
@@ -749,6 +954,20 @@ private:
         self->render();
         return 0;
       }
+      // The same move, as a CHILD window sees it. WM_DPICHANGED goes to
+      // top-level windows only; an editor embedded in a host's window gets
+      // this once the parent has moved to the new monitor, and ignored it
+      // kept its old scale until a host happened to call setScale -- blurred,
+      // or twice the size, on the new screen. The window's DPI is read back
+      // rather than carried: the message's own parameters are unused.
+      case 0x02E3: { // WM_DPICHANGED_AFTERPARENT
+        const float scale = dpiScaleForWindow(hwnd);
+        if (scale > 0.0f && std::fabs(scale - self->backing_.scale()) > 0.001f) {
+          self->backing_.setScale(scale);
+          self->render();
+        }
+        return 0;
+      }
       case WM_LBUTTONDOWN:
       case WM_LBUTTONDBLCLK: {
         // With capture held by a popup, a click ANYWHERE arrives here, in this
@@ -764,8 +983,12 @@ private:
           }
         }
         SetCapture(hwnd);
+        // The mouse's MouseInputSource first, so a mouseDown asking it how
+        // many clicks this is, or whether it is down, hears about this one.
+        detail::noteWin32Mouse(PointerSample::Phase::Down, self->pointOf(lp));
         self->router_->mouseDown(self->pointOf(lp), msg == WM_LBUTTONDBLCLK ? 2 : 1, shiftHeld(),
                                  ctrlHeld(), altHeld());
+        self->syncKeyboardFocus();
         self->renderIfDirty();
         return 0;
       }
@@ -793,6 +1016,7 @@ private:
         // until a WM_RBUTTONUP that a host's own menu may swallow, and a window
         // that keeps the mouse after its menu closes is a window nothing else
         // on the desktop can be clicked past.
+        detail::noteWin32Mouse(PointerSample::Phase::Down, self->pointOf(lp), /*rightButton=*/true);
         self->router_->mouseDown(self->pointOf(lp), 1, shiftHeld(), ctrlHeld(), altHeld(),
                                  /*rightButton=*/true);
         self->renderIfDirty();
@@ -801,6 +1025,7 @@ private:
       case WM_MOUSEMOVE:
         self->lastMouse_ = self->pointOf(lp);
         self->armMouseLeave();
+        detail::noteWin32Mouse(PointerSample::Phase::Move, self->pointOf(lp));
         self->router_->mouseMove(self->pointOf(lp), shiftHeld(), ctrlHeld(), altHeld());
         self->renderIfDirty();
         return 0;
@@ -813,8 +1038,13 @@ private:
         // first therefore cancelled every click before its mouse-up arrived:
         // a button pressed and released cleanly did nothing at all, and only
         // a test driving a real window with real messages could see it.
+        detail::noteWin32Mouse(PointerSample::Phase::Up, self->pointOf(lp));
         self->router_->mouseUp(self->pointOf(lp), shiftHeld(), ctrlHeld(), altHeld());
-        ReleaseCapture();
+        // Only OUR capture. ReleaseCapture releases the thread's, and a combo
+        // box opens its menu inside the mouseUp above -- the menu takes the
+        // capture to hear clicks outside it, and releasing here took it away
+        // again: the menu could then never be dismissed except by choosing.
+        if (GetCapture() == hwnd) ReleaseCapture();
         self->renderIfDirty();
         return 0;
       case WM_MOUSELEAVE:
@@ -890,6 +1120,9 @@ private:
         key.ctrlDown = ctrl;
         key.altDown = alt;
         if (self->router_->keyPressed(key)) {
+          // Return or Escape may have ended the edit, and the host wants its
+          // keyboard back the moment nobody is typing.
+          self->syncKeyboardFocus();
           self->renderIfDirty();
           return 0;
         }
@@ -914,8 +1147,14 @@ private:
         KeyPress key;
         key.character = cp;
         key.shiftDown = shiftHeld();
-        key.ctrlDown = ctrlHeld();
-        key.altDown = altHeld();
+        // AltGr is reported as Ctrl+Alt. A PRINTABLE character arriving with
+        // both is text the layout produced -- @, the euro sign, braces and the
+        // pipe on German and French keyboards -- not a shortcut, and passing
+        // the modifiers on made the text field refuse every one of them.
+        const bool ctrl = ctrlHeld(), alt = altHeld();
+        const bool altGr = ctrl && alt && cp >= 0x20;
+        key.ctrlDown = ctrl && !altGr;
+        key.altDown = alt && !altGr;
         if (self->router_->keyPressed(key)) {
           self->renderIfDirty();
           return 0;
@@ -981,6 +1220,31 @@ private:
         return 0;
       }
 
+#if defined(SONORE_HAS_WIN32_POINTER)
+      // ── Pens and fingers ────────────────────────────────────────────────
+      //
+      // Handled here, they are delivered with their pressure, tilt and
+      // finger index (mouse_input.h), and returning 0 stops Windows turning
+      // them into the WM_LBUTTONDOWN and WM_MOUSEMOVE above -- so nothing
+      // arrives twice. The mouse is not a pointer here (nobody called
+      // EnableMouseInPointer, and a plugin must not), so it keeps the legacy
+      // path; anything the handler declines goes to DefWindowProc, which
+      // makes legacy messages of it as it always did.
+      case WM_POINTERDOWN:
+      case WM_POINTERUPDATE:
+      case WM_POINTERUP:
+      case WM_POINTERLEAVE:
+      case WM_POINTERCAPTURECHANGED:
+        if (handleWin32PointerMessage(
+                *self->router_, hwnd, msg, wp,
+                [self](int x, int y) { return self->backing_.toLogical(x, y); }, shiftHeld(),
+                ctrlHeld(), altHeld())) {
+          if (msg == WM_POINTERDOWN) self->syncKeyboardFocus();
+          self->renderIfDirty();
+          return 0;
+        }
+        break;
+#endif
       case WM_CAPTURECHANGED:
         // Something took capture away -- a modal dialog, Alt-Tab. The gesture
         // is over whether the component liked it or not, and leaving the
@@ -988,6 +1252,7 @@ private:
         //
         // Harmless after a normal release, because the router has already
         // ended that gesture and has nothing captured to tell.
+        detail::noteWin32Mouse(PointerSample::Phase::Cancel, {-1.0f, -1.0f});
         self->router_->mouseUp({-1.0f, -1.0f});
         self->renderIfDirty();
         return 0;
@@ -1002,6 +1267,9 @@ private:
   MouseRouter* router_ = nullptr;
   Backing backing_;
   uia::RootProvider* uiaRoot_ = nullptr;
+  detail::OleDropTarget* oleDrop_ = nullptr;
+  bool oleInitialised_ = false;
+  bool uiaAsked_ = false; // a reader has asked for this window's provider
   /** What a reader calls this window. Set before open(); a plugin's name is
    *  the only thing distinguishing one editor from another in a host running
    *  twelve of them. */
@@ -1015,6 +1283,8 @@ private:
   bool trackingLeave_ = false;
   bool inTick_ = false;
   bool isPopup_ = false;
+  /** A popup's scale, from the editor that opened it; 0 = the monitor's. */
+  float popupScale_ = 0.0f;
   bool grabsMouse_ = true;
   wchar_t pendingHighSurrogate_ = 0;
   static constexpr UINT_PTR kTimerId = 1;

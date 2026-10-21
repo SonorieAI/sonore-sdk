@@ -7,8 +7,10 @@
   simply never seen, however correct the code inside is.
 
   `type` distinguishes an effect (aufx) from an instrument (aumu), and the host
-  files them in different menus — so it is set from the descriptor at configure
-  time rather than hardcoded.
+  files them in different menus. It comes from sonore_add_au's TYPE, aufx when
+  none is given; an instrument must pass TYPE aumu, or no player finds it.
+  (No double hyphen anywhere in this comment: XML forbids one there.)
+  The name a host lists is "<VENDOR>: <NAME>", from the same call.
 -->
 <plist version="1.0">
 <dict>
@@ -17,15 +19,15 @@
   <key>CFBundleExecutable</key>
   <string>@SONORE_AU_NAME@</string>
   <key>CFBundleIdentifier</key>
-  <string>com.sonorie.@SONORE_AU_NAME@</string>
+  <string>@SONORE_AU_BUNDLE_ID@</string>
   <key>CFBundleName</key>
   <string>@SONORE_AU_NAME@</string>
   <key>CFBundlePackageType</key>
   <string>BNDL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>@SONORE_AU_VERSION@</string>
   <key>CFBundleVersion</key>
-  <string>1.0.0</string>
+  <string>@SONORE_AU_VERSION@</string>
   <key>CFBundleSignature</key>
   <string>????</string>
   <key>NSHighResolutionCapable</key>
@@ -34,9 +36,9 @@
   <array>
     <dict>
       <key>name</key>
-      <string>Sonorie: @SONORE_AU_NAME@</string>
+      <string>@SONORE_AU_VENDOR@: @SONORE_AU_DISPLAY_NAME@</string>
       <key>description</key>
-      <string>@SONORE_AU_NAME@</string>
+      <string>@SONORE_AU_DISPLAY_NAME@</string>
       <key>factoryFunction</key>
       <string>SonoreAUFactory</string>
       <key>type</key>
@@ -46,7 +48,7 @@
       <key>manufacturer</key>
       <string>@SONORE_AU_MANUFACTURER@</string>
       <key>version</key>
-      <integer>65536</integer>
+      <integer>@SONORE_AU_VERSION_INT@</integer>
       <key>sandboxSafe</key>
       <true/>
     </dict>

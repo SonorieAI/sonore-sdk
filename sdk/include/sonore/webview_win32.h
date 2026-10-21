@@ -14,15 +14,24 @@
 //    Edge initialises, so "not ready yet" is the normal case, not an edge one.
 //
 //  - The runtime may be ABSENT (older Windows without the Edge WebView2
-//    Runtime). That degrades to a plain message in the child window: never a
+//    Runtime). That degrades to a plain message in the child window, never a
 //    failed plugin load, and never a silent black rectangle.
 //
 //  - The webview is created with a per-plugin user-data folder under %LOCALAPPDATA%.
 //    Without an explicit folder WebView2 tries to write beside the host EXE,
 //    which fails in Program Files and takes the whole editor down with it.
 //
-//  - The page is served with NavigateToString, so a generated UI is entirely
-//    self-contained. There is no network access and no local file exposure.
+//  - The page is served from memory, as the answer to a request for an
+//    address of the plugin's own that never leaves the process
+//    (https://<plugin>.sonore.invalid/editor.html, loadPage), so a generated
+//    UI is entirely self-contained, reloads like any page, and has an origin
+//    of its own: localStorage works and is kept per plugin. And it STAYS the
+//    page: every navigation away from it is
+//    cancelled (webviewMayNavigate in gui.h), in the page and in its frames,
+//    and window.open opens nothing. Before, a link or a script could take the
+//    view to a remote site, which then held window.sonore and set parameters;
+//    and a window.open popup was a top-level Edge window that outlived the
+//    editor.
 #pragma once
 
 #if defined(_WIN32)
@@ -42,6 +51,7 @@
 #include <shlwapi.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <cwchar>
 #include <memory>
@@ -161,7 +171,7 @@ inline ATOM registerWindowClass() {
 /** One-method COM callback, refcounted. WebView2's creation API hands results
  *  back through these; a template keeps the three we need to one implementation. */
 template <typename Interface, typename Arg1, typename Arg2>
-class ComCallback : public Interface {
+class ComCallback final : public Interface { // final: Release() deletes it as itself
 public:
   using Fn = std::function<HRESULT(Arg1, Arg2)>;
   explicit ComCallback(Fn fn) : fn_(std::move(fn)) {}
@@ -199,6 +209,168 @@ using MessageHandler = ComCallback<ICoreWebView2WebMessageReceivedEventHandler,
 using KeyHandler = ComCallback<ICoreWebView2AcceleratorKeyPressedEventHandler,
                                ICoreWebView2Controller*,
                                ICoreWebView2AcceleratorKeyPressedEventArgs*>;
+using NavigationHandler = ComCallback<ICoreWebView2NavigationStartingEventHandler,
+                                      ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs*>;
+using NewWindowHandler = ComCallback<ICoreWebView2NewWindowRequestedEventHandler,
+                                     ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs*>;
+using ResourceHandler = ComCallback<ICoreWebView2WebResourceRequestedEventHandler, ICoreWebView2*,
+                                    ICoreWebView2WebResourceRequestedEventArgs*>;
+
+/**
+ * Keeps WebView2's processes running between one editor closing and the
+ * next one opening.
+ *
+ * WebView2 shuts its whole process tree down -- browser, GPU, utility --
+ * within a quarter of a second of the last webview closing, whatever still
+ * holds the environment. So the shared environment above saved nothing on a
+ * REOPEN: closing an editor and opening it again a few seconds later, which
+ * is how anybody works with a plugin, started Edge from nothing every time.
+ * Measured with the saturator's page, reopened three seconds after it
+ * closed: the controller arrived in ~290 ms instead of ~40, and the page
+ * showed its values ~410 ms after the host's open instead of ~120.
+ *
+ * What keeps the tree alive is a webview, so this is one: a controller
+ * that never navigates, invisible, in a hidden window of its own. It is
+ * asked for alongside an editor's -- after it, so the editor is first in
+ * line -- and lives while any editor is open and for graceMs() after the
+ * last one closes. That is a trade, and it is stated: the tree costs about
+ * 130-170 MB of private memory while no editor is open, for that long (the
+ * keep-alive itself adds one small renderer, ~3 MB, while editors are
+ * open). The grace is the same half minute a hidden editor keeps its
+ * renderer (webviewParkAfterMs in clap_wrapper.h); SONORE_WEBVIEW_KEEP_MS
+ * sets it, and 0 turns this off and leaves WebView2 to itself.
+ *
+ * Released no later than the last WebViewHost is destroyed -- one lives in
+ * every plugin instance, so that is before the module can be unloaded --
+ * because the hidden window runs this module's window procedure, and a
+ * window outliving its code crashes at the next message. Everything here
+ * happens on the main thread, as everything else in this file does.
+ */
+namespace detail {
+class BrowserKeepAlive {
+public:
+  static constexpr UINT_PTR kTimerId = 2;
+
+  /** The grace after the last editor closes, in ms; 0 or less is off. */
+  static int graceMs() {
+    static const int value = [] {
+      char text[32]{};
+      const DWORD n = GetEnvironmentVariableA("SONORE_WEBVIEW_KEEP_MS", text, sizeof(text));
+      if (n == 0 || n >= sizeof(text)) return 30000;
+      return std::atoi(text);
+    }();
+    return value;
+  }
+
+  /** An editor has the environment and is about to ask for its controller. */
+  static void editorOpened(ICoreWebView2Environment* env) {
+    State& s = state();
+    ++s.openEditors;
+    if (s.window && s.timing) {
+      KillTimer(s.window, kTimerId);
+      s.timing = false;
+    }
+    if (graceMs() <= 0 || s.controller || s.pending || !env) return;
+    if (!s.window)
+      s.window = CreateWindowExW(0, windowClassName(), L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+                                 thisModule(), nullptr);
+    if (!s.window) return;
+    s.pending = true;
+    const unsigned generation = s.generation;
+    auto* handler = new ControllerHandler([generation](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
+      State& st = state();
+      // Released while it was being made: close what arrived, and leave the
+      // flags alone -- they may already describe a newer request.
+      if (generation != st.generation) {
+        if (c) c->Close();
+        return S_OK;
+      }
+      st.pending = false;
+      if (FAILED(hr) || !c) return S_OK;
+      c->put_IsVisible(FALSE);
+      st.controller = c;
+      st.controller->AddRef();
+      return S_OK;
+    });
+    if (FAILED(env->CreateCoreWebView2Controller(s.window, handler))) s.pending = false;
+    handler->Release();
+  }
+
+  /** An editor that editorOpened counted has gone: its webview is closed. */
+  static void editorClosed() {
+    State& s = state();
+    if (s.openEditors > 0) --s.openEditors;
+    if (s.openEditors > 0 || !s.window) return;
+    s.timing = SetTimer(s.window, kTimerId, (UINT) graceMs(), nullptr) != 0;
+    if (!s.timing) release();
+  }
+
+  static void hostCreated() { ++state().liveHosts; }
+
+  /** The last WebViewHost going means the module may be unloaded next. */
+  static void hostDestroyed() {
+    State& s = state();
+    if (s.liveHosts > 0) --s.liveHosts;
+    if (s.liveHosts == 0) release();
+  }
+
+  /** The grace ran out, on the hidden window's timer. */
+  static void expired(HWND window) {
+    KillTimer(window, kTimerId);
+    State& s = state();
+    s.timing = false;
+    if (s.openEditors == 0) release();
+  }
+
+  static bool isKeepAliveWindow(HWND window) { return window && window == state().window; }
+
+  /** The browser process the keep-alive holds, 0 while it holds none. Not
+   *  necessarily a child of this process: every Sonore editor on the machine
+   *  shares one user-data folder, so a browser another process started (a
+   *  DAW, a test run just before) is the one this one joins. */
+  static DWORD browserProcessId() {
+    State& s = state();
+    if (!s.controller) return 0;
+    ICoreWebView2* webview = nullptr;
+    UINT32 pid = 0;
+    if (SUCCEEDED(s.controller->get_CoreWebView2(&webview)) && webview) {
+      webview->get_BrowserProcessId(&pid);
+      webview->Release();
+    }
+    return (DWORD) pid;
+  }
+
+private:
+  struct State {
+    HWND window = nullptr;
+    ICoreWebView2Controller* controller = nullptr;
+    bool pending = false, timing = false;
+    unsigned generation = 0;
+    int openEditors = 0, liveHosts = 0;
+  };
+  static State& state() {
+    static State s;
+    return s;
+  }
+
+  static void release() {
+    State& s = state();
+    ++s.generation; // a controller still being made is closed when it lands
+    s.pending = false;
+    if (s.controller) {
+      s.controller->Close();
+      s.controller->Release();
+      s.controller = nullptr;
+    }
+    if (s.window) {
+      if (s.timing) KillTimer(s.window, kTimerId);
+      DestroyWindow(s.window);
+      s.window = nullptr;
+    }
+    s.timing = false;
+  }
+};
+} // namespace detail
 
 #endif // SONORE_HAS_WEBVIEW2
 
@@ -229,7 +401,25 @@ public:
    */
   bool captureKeys = false;
 
+#if defined(SONORE_HAS_WEBVIEW2)
+  WebViewHost() { detail::BrowserKeepAlive::hostCreated(); }
+  ~WebViewHost() {
+    destroy();
+    detail::BrowserKeepAlive::hostDestroyed();
+  }
+#else
+  WebViewHost() = default;
   ~WebViewHost() { destroy(); }
+#endif
+  // Counted, so never copied: the window procedure holds `this` as well.
+  WebViewHost(const WebViewHost&) = delete;
+  WebViewHost& operator=(const WebViewHost&) = delete;
+
+private:
+  /** Set when the shared environment could not be had; read by create(). */
+  [[maybe_unused]] bool runtimeMissing_ = false; // unread when built without WebView2
+
+public:
 
   bool create(HWND parent, uint32_t width, uint32_t height, std::string html,
               std::string bridge, std::string userDataName) {
@@ -239,6 +429,9 @@ public:
     html_ = std::move(html);
     bridge_ = std::move(bridge);
     userDataName_ = std::move(userDataName);
+#if defined(SONORE_HAS_WEBVIEW2)
+    servedPage_ = servedPageFor(userDataName_);
+#endif
 
     // WebView2 is COM, and COM needs this thread to be in a single-threaded
     // apartment. A DAW's main thread already is, in which case this returns
@@ -255,14 +448,30 @@ public:
     SetWindowLongPtrW(hwnd_, GWLP_USERDATA, (LONG_PTR) this);
 
 #if defined(SONORE_HAS_WEBVIEW2)
+    runtimeMissing_ = false;
     startWebView();
-#else
-    setStatusText("This build has no webview backend.");
-#endif
+    if (runtimeMissing_) {
+      // Known NOW, not later: CreateCoreWebView2EnvironmentWithOptions
+      // refuses synchronously when there is no runtime, and the refusal has
+      // already run. Said here, every wrapper opens its native editor in
+      // place of this one -- the plugin loses its designed face and keeps its
+      // controls. Returning true left the user a window that said the
+      // runtime was not installed, and nothing to turn.
+      destroy();
+      return false;
+    }
     // The UI clock: parameter echoes and meters, ~30 Hz. Cheap, and it stops
     // the moment the editor closes.
     SetTimer(hwnd_, kTimerId, 33, nullptr);
     return true;
+#else
+    // No backend at all: the same answer, for the same fallback. The clock
+    // and the `return true` stay in the branch above: after this return
+    // they were unreachable, and /W4 says so (C4702) in every build without
+    // the WebView2 SDK -- a generated project's, for one.
+    destroy();
+    return false;
+#endif
   }
 
   void destroy() {
@@ -281,12 +490,31 @@ public:
       webview_->Release();
       webview_ = nullptr;
     }
+    // After the close, so the browser this editor used is still held while
+    // it lets go: the last editor out starts the keep-alive's grace.
+    if (keepAliveCounted_) {
+      keepAliveCounted_ = false;
+      detail::BrowserKeepAlive::editorClosed();
+    }
 #endif
     if (hwnd_) {
       DestroyWindow(hwnd_);
       hwnd_ = nullptr;
     }
     ready_ = false;
+    // The keyboard was the PAGE's to ask for, and the page is gone. Kept, a
+    // page closed or parked with a text field focused handed its claim to
+    // the next one, which never asked: every key stayed in the editor, the
+    // spacebar never reached the host, and nothing on the page said why.
+    captureKeys = false;
+    // And this editor's copy of the page and its bridge, which create() took
+    // by value. This object is a member of the plugin instance and outlives
+    // every editor it shows, so what it kept here stayed until the plugin
+    // was removed: a generated page with an inlined filmstrip is 1.4 MB, in
+    // each instance whose editor had ever been opened. The next create()
+    // is handed both again.
+    std::string().swap(html_);
+    std::string().swap(bridge_);
     if (comInitialised_) {
       CoUninitialize();
       comInitialised_ = false;
@@ -426,7 +654,9 @@ public:
    *  Edge starts is correct behaviour, not an error to report. */
   void eval(const std::string& js) {
 #if defined(SONORE_HAS_WEBVIEW2)
-    if (!ready_ || !webview_) return;
+    // Nothing to say is nothing to send: an empty ExecuteScript is still a
+    // round trip that wakes the renderer, and a tick with no change is empty.
+    if (js.empty() || !ready_ || !webview_) return;
     // Silent while hidden, and not merely as an optimisation: ExecuteScript
     // on a suspended renderer WAKES it, so the wrapper's 33 ms meter tick
     // would resurrect every hidden editor within one frame of it suspending.
@@ -467,17 +697,6 @@ private:
   }
 
 #if defined(SONORE_HAS_WEBVIEW2)
-  /** Is the object these callbacks were made for still there?
-   *
-   *  WebView2 starts asynchronously and takes a few hundred milliseconds. A
-   *  user who opens an editor and closes it inside that window -- clicking
-   *  the wrong plugin, or a host that probes an editor to measure it -- had
-   *  the completion handler fire into freed memory, because the handlers held
-   *  a bare `this`. It is a crash you cannot reproduce by hand reliably and
-   *  which lands on whoever happens to close a window quickly.
-   *
-   *  A token both sides share settles it: destroy() marks this generation
-   *  dead and starts a new one, so a late handler can tell it is late. */
   /**
    * One WebView2 environment for the whole binary, and one user-data folder
    * for ALL Sonore plugins.
@@ -551,16 +770,33 @@ private:
     }
   }
 
+  /** Create this editor's webview once the shared environment is ready --
+   *  if the object these callbacks were made for is still there.
+   *
+   *  WebView2 starts asynchronously and takes a few hundred milliseconds. A
+   *  user who opens an editor and closes it inside that window -- clicking
+   *  the wrong plugin, or a host that probes an editor to measure it -- had
+   *  the completion handler fire into freed memory, because the handlers held
+   *  a bare `this`. It is a crash you cannot reproduce by hand reliably and
+   *  which lands on whoever happens to close a window quickly.
+   *
+   *  A token both sides share settles it: destroy() marks this generation
+   *  dead and starts a new one, so a late handler can tell it is late. */
   void startWebView() {
     auto alive = alive_;
     sharedEnvironment([this, alive](ICoreWebView2Environment* env) {
       if (!alive->load()) return; // the editor closed while Edge was starting
       if (!env) {
+        // Synchronously, from inside create(), when the runtime is absent:
+        // create() sees this and reports failure. Asynchronously -- an
+        // environment that failed to start after all -- the window is
+        // already the host's, and the message is what is left to show.
+        runtimeMissing_ = true;
         setStatusText("Microsoft Edge WebView2 Runtime is not installed.");
         return;
       }
       auto* controllerHandler =
-          new ControllerHandler([this, alive](HRESULT hr2, ICoreWebView2Controller* c) -> HRESULT {
+          new ControllerHandler([this, alive, env](HRESULT hr2, ICoreWebView2Controller* c) -> HRESULT {
             if (!alive->load()) {
               // Closed while the controller was being built. It arrived after
               // its window did not: close it, or a live controller sits
@@ -584,14 +820,20 @@ private:
             ready_ = true;
             layout();
             // Inject the bridge so it exists before ANY page script, then load.
+            // WebView2 keeps its own copy and runs it on every document from
+            // here on, so ours has done its job.
             webview_->AddScriptToExecuteOnDocumentCreated(widen(bridge_).c_str(), nullptr);
-            webview_->NavigateToString(widen(html_).c_str());
+            std::string().swap(bridge_);
+            loadPage(env);
             return S_OK;
           });
       env->CreateCoreWebView2Controller(hwnd_, controllerHandler);
       // The API holds its own reference now; keeping ours would leak the
       // handler once per editor open.
       controllerHandler->Release();
+      // Second in line, behind this editor's own controller.
+      detail::BrowserKeepAlive::editorOpened(env);
+      keepAliveCounted_ = true;
     });
   }
 
@@ -618,7 +860,16 @@ private:
           LPWSTR raw = nullptr;
           if (SUCCEEDED(args->TryGetWebMessageAsString(&raw)) && raw) {
             const BridgeMessage msg = parseBridgeMessage(narrow(raw));
-            if (msg.kind != BridgeMessage::Kind::None) onMessage(msg);
+            if (msg.kind == BridgeMessage::Kind::Key) {
+              // A key the page passed on: to the host, the way the
+              // accelerator handler sends the rest.
+              if (!captureKeys && msg.index > 0 && msg.index < 256)
+                if (HWND parent = GetParent(hwnd_))
+                  PostMessageW(parent, msg.value >= 0.5 ? WM_KEYDOWN : WM_KEYUP,
+                               (WPARAM) msg.index, 0);
+            } else if (msg.kind != BridgeMessage::Kind::None) {
+              onMessage(msg);
+            }
             CoTaskMemFree(raw);
           }
           return S_OK;
@@ -626,6 +877,107 @@ private:
     webview_->add_WebMessageReceived(messageHandler, &token);
     // The webview holds the subscription's reference for its own lifetime.
     messageHandler->Release();
+
+    // The page stays the page: see webviewMayNavigate. One handler for the
+    // top document and for frames -- FrameNavigationStarting is the frames'.
+    auto* navigationHandler =
+        new NavigationHandler([this](ICoreWebView2*,
+                                     ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+          if (!args) return S_OK;
+          LPWSTR uri = nullptr;
+          const bool allowed = SUCCEEDED(args->get_Uri(&uri)) && uri &&
+                               (webviewMayNavigate(narrow(uri)) || servedPage_ == uri);
+          if (uri) CoTaskMemFree(uri);
+          if (!allowed) args->put_Cancel(TRUE);
+          return S_OK;
+        });
+    webview_->add_NavigationStarting(navigationHandler, &token);
+    webview_->add_FrameNavigationStarting(navigationHandler, &token);
+    navigationHandler->Release();
+
+    // Handled, with no new window given: window.open returns null. Unhandled,
+    // WebView2 opened a top-level browser window that outlived the editor.
+    auto* newWindowHandler =
+        new NewWindowHandler([](ICoreWebView2*,
+                                ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+          if (args) args->put_Handled(TRUE);
+          return S_OK;
+        });
+    webview_->add_NewWindowRequested(newWindowHandler, &token);
+    newWindowHandler->Release();
+  }
+
+  /** The address the page is served at: https://<label>.sonore.invalid/
+   *  editor.html, the label made from the plugin's id. .invalid is reserved
+   *  and never resolves, so the request cannot leave the process even if the
+   *  handler were missing. One per plugin because the address is the page's
+   *  origin, and an origin is what localStorage and IndexedDB are kept by:
+   *  every Sonore editor shares one user-data folder, so a shared address
+   *  would have handed one vendor's plugin another's stored settings. The
+   *  label is the id's letters and digits, lowered, the rest made hyphens,
+   *  and a hash of the whole id, so two ids that read alike stay apart. */
+  static std::wstring servedPageFor(const std::string& id) {
+    std::wstring label;
+    for (unsigned char c : id) {
+      if (label.size() >= 40) break;
+      if (c >= 'A' && c <= 'Z') c = (unsigned char) (c - 'A' + 'a');
+      const bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+      if (keep) label += (wchar_t) c;
+      else if (!label.empty() && label.back() != L'-') label += L'-';
+    }
+    if (label.empty()) label = L"plugin"; // a label may not start with a hyphen
+    if (label.back() != L'-') label += L'-';
+    uint32_t hash = 2166136261u; // FNV-1a: stable across builds and runs
+    for (unsigned char c : id) hash = (hash ^ c) * 16777619u;
+    wchar_t hex[9];
+    std::swprintf(hex, 9, L"%08x", (unsigned) hash);
+    return L"https://" + label + hex + L".sonore.invalid/editor.html";
+  }
+
+  /** The page, as the answer to a request for servedPage_, from memory.
+   *
+   *  It went by NavigateToString up to 1 MiB, and only past that by this
+   *  road, since NavigateToString refuses more than 2 MB of data: URL (the
+   *  page base64-encoded, about 1.5 MB of HTML) without a word: measured, a
+   *  1.9 MB page left the editor blank. But a page NavigateToString gave has
+   *  nothing to reload from: one that called location.reload() came back
+   *  blank. And it had no origin of its own -- localStorage threw. Served,
+   *  every page reloads, and stores what it stores under its plugin's
+   *  address. The copy is kept while the editor is open, as the answer to
+   *  every request, and let go in destroy(). Only with no environment to
+   *  make a response in does the page go by NavigateToString. */
+  void loadPage(ICoreWebView2Environment* env) {
+    if (!env) {
+      webview_->NavigateToString(widen(html_).c_str());
+      std::string().swap(html_);
+      return;
+    }
+    webview_->AddWebResourceRequestedFilter(servedPage_.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    EventRegistrationToken token{};
+    auto* handler = new ResourceHandler(
+        [this, env](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+          ICoreWebView2WebResourceRequest* request = nullptr;
+          if (!args || FAILED(args->get_Request(&request)) || !request) return S_OK;
+          LPWSTR uri = nullptr;
+          const bool ours =
+              SUCCEEDED(request->get_Uri(&uri)) && uri && servedPage_ == uri;
+          if (uri) CoTaskMemFree(uri);
+          request->Release();
+          if (!ours) return S_OK;
+          IStream* body = SHCreateMemStream((const BYTE*) html_.data(), (UINT) html_.size());
+          ICoreWebView2WebResourceResponse* response = nullptr;
+          if (body && SUCCEEDED(env->CreateWebResourceResponse(
+                          body, 200, L"OK", L"Content-Type: text/html; charset=utf-8", &response)) &&
+              response) {
+            args->put_Response(response);
+            response->Release();
+          }
+          if (body) body->Release();
+          return S_OK;
+        });
+    webview_->add_WebResourceRequested(handler, &token);
+    handler->Release();
+    webview_->Navigate(servedPage_.c_str());
   }
 
   static void createFolders(const std::wstring& path) {
@@ -640,6 +992,8 @@ private:
 
   ICoreWebView2Controller* controller_ = nullptr;
   ICoreWebView2* webview_ = nullptr;
+  /** Whether BrowserKeepAlive counts this editor as open. */
+  bool keepAliveCounted_ = false;
 #endif // SONORE_HAS_WEBVIEW2
 
   HWND hwnd_ = nullptr;
@@ -651,6 +1005,8 @@ private:
   /** Shared with every pending async handler; see startWebView. */
   std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
   std::string html_, bridge_, userDataName_, status_;
+  /** Where this editor's page is served (servedPageFor), set by create(). */
+  std::wstring servedPage_;
 
   friend LRESULT CALLBACK hostWndProc(HWND, UINT, WPARAM, LPARAM);
 };
@@ -659,9 +1015,25 @@ inline LRESULT CALLBACK hostWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   auto* host = (WebViewHost*) GetWindowLongPtrW(hwnd, GWLP_USERDATA);
   switch (msg) {
     case WM_SIZE:
-      if (host) host->layout();
+      // The size the window HAS, not the size it was last told: an LV2 host
+      // has no call to resize a ui:WindowsUI and moves the widget's window
+      // itself, and the webview stayed at the old size inside it. setSize()
+      // arrives here too, with the same numbers.
+      if (host && wp != SIZE_MINIMIZED) {
+        host->width_ = LOWORD(lp);
+        host->height_ = HIWORD(lp);
+        host->layout();
+      }
       return 0;
     case WM_TIMER:
+#if defined(SONORE_HAS_WEBVIEW2)
+      // The keep-alive's hidden window has no host; its one timer is the grace.
+      if (!host && wp == detail::BrowserKeepAlive::kTimerId &&
+          detail::BrowserKeepAlive::isKeepAliveWindow(hwnd)) {
+        detail::BrowserKeepAlive::expired(hwnd);
+        return 0;
+      }
+#endif
       if (host && host->onTick) host->onTick();
       return 0;
     case WM_PAINT: {

@@ -26,19 +26,23 @@
   "type": "module",
   "scripts": {
     "verify": "node scripts/sdk-verify.mjs",
-    "llms": "node scripts/llms-txt.mjs",
-    "verify:llms": "node scripts/llms-txt.mjs --check",
-    "mcp": "node scripts/mcp-server.mjs",
     "verify:sdk": "node scripts/sdk-verify.mjs",
     "verify:sanitize": "node scripts/sdk-sanitize.mjs",
     "verify:features": "node scripts/feature-map.mjs",
     "verify:parity": "node scripts/reference-parity.mjs",
     "verify:unclaimed": "node scripts/unclaimed.mjs",
     "verify:headers": "node scripts/header-rules.mjs",
+    "verify:bridge": "node scripts/bridge-keys.mjs",
+    "verify:bridge-types": "node scripts/bridge-types.mjs",
     "verify:namespaces": "node scripts/namespace-rules.mjs",
     "verify:backends": "node scripts/backend-surface.mjs",
     "verify:rt": "node scripts/audio-thread-rules.mjs",
-    "verify:daw": "node scripts/daw-probe.mjs",
-    "verify:daw-render": "node scripts/daw-render.mjs"
+    "verify:reaper": "node scripts/reaper-host-test.mjs",
+    "verify:clang": "node scripts/clang-check.mjs",
+    "docs": "node scripts/docs.mjs",
+    "docs:fetch": "node scripts/fetch-doxygen.mjs",
+    "llms": "node scripts/llms-txt.mjs",
+    "verify:llms": "node scripts/llms-txt.mjs --check",
+    "mcp": "node scripts/mcp-server.mjs"
   }
 }

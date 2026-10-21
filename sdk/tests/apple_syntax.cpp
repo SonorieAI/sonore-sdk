@@ -16,9 +16,13 @@
 #include <sonore/audio_coreaudio.h>
 #include <sonore/audio_coreaudio_input.h>
 #include <sonore/midi_input.h>
+// And the CoreMIDI output, whose platform selection now yields to the check
+// the same way midi_input.h's does.
+#include <sonore/midi_output.h>
 
 int main() {
   auto outs = sonore::standalone::CoreAudioOutput::listDevices();
   auto ins = sonore::midiin::Device::listDevices();
-  return (int) (outs.size() + ins.size());
+  auto midiOuts = sonore::midiout::Device::enumerate();
+  return (int) (outs.size() + ins.size() + midiOuts.size());
 }

@@ -71,7 +71,10 @@ inline double butterworthQ(int order, int section) {
  * plausible and has the wrong corner.
  */
 struct ChebyshevSection {
+  /** The section's Q, from where its pole pair sits on the ellipse. */
   double q = 0.70710678;
+  /** The pair's distance from the origin, as a multiple of the passband
+   *  edge: the section's natural frequency is the edge times this. */
   double frequencyScale = 1.0;
 };
 
@@ -81,6 +84,11 @@ inline double chebyshevEpsilon(double rippleDb) {
   return std::sqrt(std::pow(10.0, rippleDb / 10.0) - 1.0);
 }
 
+/** Where pole pair `section` (0-based, 0 .. order / 2 - 1) of an
+ *  order-`order` Type I design with `rippleDb` of passband ripple sits. An
+ *  order below 2 gives the defaults (Q 0.7071, scale 1), and a ripple of 0
+ *  or less is taken as 0.01 dB. An odd order's real pole is not a pair and
+ *  is not returned here: CascadedIir builds it apart. */
 inline ChebyshevSection chebyshevSectionFor(int order, int section, double rippleDb) {
   ChebyshevSection out;
   if (order < 2) return out;
@@ -91,11 +99,17 @@ inline ChebyshevSection chebyshevSectionFor(int order, int section, double rippl
   const double v0 = std::log(1.0 / eps + std::sqrt(1.0 / (eps * eps) + 1.0)) / (double) order;
   const double sinhV = std::sinh(v0), coshV = std::cosh(v0);
 
-  // Same angles as Butterworth for even orders, and the odd case again needs
-  // its own spacing because one pole is real.
-  const double theta = (order % 2 == 0)
-                           ? pi * (double) (2 * section + 1) / (double) (2 * order)
-                           : pi * (double) (section + 1) / (double) order;
+  // ONE spacing for every order, (2k+1) pi / 2N, because theta here is
+  // measured from the IMAGINARY axis (it is the sine that makes the real part).
+  // An odd order's real pole is simply the k with theta = pi/2, which is not a
+  // pair and is built separately -- the pairs below it keep the same spacing.
+  //
+  // This once borrowed butterworthQ's odd-order rule, pi (k+1) / N. That rule
+  // is right THERE because it measures from the real axis, into Q = 1/(2 cos);
+  // put into the sine and cosine below it is a different pole altogether.
+  // Order 3 at 1 dB ripple was 13.2 dB down at its passband edge instead of
+  // 1 dB; order 5, 21.3. The tests only ever designed orders 4 and 6.
+  const double theta = pi * (double) (2 * section + 1) / (double) (2 * order);
   const double re = -sinhV * std::sin(theta);
   const double im = coshV * std::cos(theta);
   const double magnitude = std::sqrt(re * re + im * im);
@@ -103,6 +117,25 @@ inline ChebyshevSection chebyshevSectionFor(int order, int section, double rippl
   out.q = magnitude / (2.0 * std::fabs(re));
   return out;
 }
+
+// IirSection, the double-precision section, lives in dsp.h beside Biquad:
+// the equalisers need it too, and they do not include this file.
+
+/** The bilinear substitution's normalised coefficients, shared by both kinds
+ *  of section below. `ok` is false for a degenerate denominator. */
+struct BilinearCoefficients {
+  ///@{
+  /** The digital section with a0 normalised to 1: numerator b0 + b1 z^-1 +
+   *  b2 z^-2, denominator 1 + a1 z^-1 + a2 z^-2, in the order
+   *  setCoefficients() takes them. The defaults pass the input through. */
+  double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+  ///@}
+  /** False when the denominator came out degenerate (the digital a0, before
+   *  normalising, near zero); the coefficients are then the pass-through
+   *  defaults, and
+   *  bilinearSection() leaves its section alone. */
+  bool ok = false;
+};
 
 /**
  * One second-order analog section, turned into a digital biquad.
@@ -119,9 +152,15 @@ inline ChebyshevSection chebyshevSectionFor(int order, int section, double rippl
  * and S = c(1 - z^-1)/(1 + z^-1) where c = 1/tan(pi f0 / fs). That tan is the
  * prewarping: without it the corner lands somewhere near where it was asked
  * for and drifts further out the closer it gets to Nyquist.
+ *
+ * The analog coefficients come highest power first, for a corner of
+ * `cutoffHz` at `sampleRate`, both in Hz; the corner must lie between 0 and
+ * Nyquist for the tangent to mean anything. A design-time call: a tangent
+ * and a few divisions, in double.
  */
-inline void bilinearSection(double b2, double b1, double b0, double a2, double a1, double a0,
-                            double cutoffHz, double sampleRate, Biquad& out) {
+inline BilinearCoefficients bilinearCoefficients(double b2, double b1, double b0, double a2,
+                                                 double a1, double a0, double cutoffHz,
+                                                 double sampleRate) {
   const double pi = 3.14159265358979323846;
   const double c = 1.0 / std::tan(pi * cutoffHz / sampleRate);
   const double cc = c * c;
@@ -133,9 +172,65 @@ inline void bilinearSection(double b2, double b1, double b0, double a2, double a
   const double na1 = 2.0 * (a0 - a2 * cc);
   const double na2 = a2 * cc - a1 * c + a0;
 
+  BilinearCoefficients out;
+  if (std::fabs(na0) < 1e-30) return out;
+  out.b0 = nb0 / na0;
+  out.b1 = nb1 / na0;
+  out.b2 = nb2 / na0;
+  out.a1 = na1 / na0;
+  out.a2 = na2 / na0;
+  out.ok = true;
+  return out;
+}
+
+/** bilinearCoefficients() written into a float Biquad. A degenerate result
+ *  leaves `out` as it was. Its state is not cleared. */
+inline void bilinearSection(double b2, double b1, double b0, double a2, double a1, double a0,
+                            double cutoffHz, double sampleRate, Biquad& out) {
+  const BilinearCoefficients k = bilinearCoefficients(b2, b1, b0, a2, a1, a0, cutoffHz, sampleRate);
+  if (!k.ok) return;
+  out.setCoefficients((float) k.b0, (float) k.b1, (float) k.b2, (float) k.a1, (float) k.a2);
+}
+
+/** As above, into a double-precision IirSection: the form to use for a
+ *  corner far below the sample rate, where float coefficients lose it. */
+inline void bilinearSection(double b2, double b1, double b0, double a2, double a1, double a0,
+                            double cutoffHz, double sampleRate, IirSection& out) {
+  const BilinearCoefficients k = bilinearCoefficients(b2, b1, b0, a2, a1, a0, cutoffHz, sampleRate);
+  if (!k.ok) return;
+  out.setCoefficients(k.b0, k.b1, k.b2, k.a1, k.a2);
+}
+
+/**
+ * The same substitution for a FIRST-order section, H(S) = (b1 S + b0)/(a1 S + a0).
+ *
+ * Not bilinearSection with the squared terms zeroed. That works on paper and
+ * not in a float: a first-order section pushed through the second-order
+ * formula comes out with a POLE ON z = -1 (or +1 for a highpass) that is
+ * meant to cancel a zero at the same place. In exact arithmetic it does; in
+ * float coefficients the two land a rounding apart, and the leftover pole sits
+ * on the unit circle -- an order-3 Type II highpass at 2 kHz built that way
+ * integrated its noise to 125 times its input level.
+ */
+inline void bilinearFirstOrder(double b1, double b0, double a1, double a0, double cutoffHz,
+                               double sampleRate, Biquad& out) {
+  const double pi = 3.14159265358979323846;
+  const double c = 1.0 / std::tan(pi * cutoffHz / sampleRate);
+  const double na0 = a1 * c + a0;
   if (std::fabs(na0) < 1e-30) return;
-  out.setCoefficients((float) (nb0 / na0), (float) (nb1 / na0), (float) (nb2 / na0),
-                      (float) (na1 / na0), (float) (na2 / na0));
+  out.setCoefficients((float) ((b1 * c + b0) / na0), (float) ((b0 - b1 * c) / na0), 0.0f,
+                      (float) ((a0 - a1 * c) / na0), 0.0f);
+}
+
+/** As above, into a double-precision IirSection. A degenerate denominator
+ *  leaves `out` as it was. */
+inline void bilinearFirstOrder(double b1, double b0, double a1, double a0, double cutoffHz,
+                               double sampleRate, IirSection& out) {
+  const double pi = 3.14159265358979323846;
+  const double c = 1.0 / std::tan(pi * cutoffHz / sampleRate);
+  const double na0 = a1 * c + a0;
+  if (std::fabs(na0) < 1e-30) return;
+  out.setCoefficients((b1 * c + b0) / na0, (b0 - b1 * c) / na0, 0.0, (a0 - a1 * c) / na0, 0.0);
 }
 
 /**
@@ -158,11 +253,16 @@ inline void bilinearSection(double b2, double b1, double b0, double a2, double a
 struct Chebyshev2Section {
   /** Pole, as its real part and its distance from the origin. */
   double poleReal = -0.70710678;
+  /** The pole's distance from the origin, to go with poleReal. */
   double poleMagnitude = 1.0;
   /** Zero, on the imaginary axis, at this distance from the origin. */
   double zero = 0.0;
 };
 
+/** Where pole pair `section` (0-based, 0 .. order / 2 - 1) of an
+ *  order-`order` Type II design with `stopbandDb` of rejection sits, on the
+ *  prototype normalised to the stopband edge. An order below 2 gives the
+ *  defaults; a rejection under 1 dB is taken as 1. */
 inline Chebyshev2Section chebyshev2SectionFor(int order, int section, double stopbandDb) {
   Chebyshev2Section out;
   if (order < 2) return out;
@@ -175,9 +275,8 @@ inline Chebyshev2Section chebyshev2SectionFor(int order, int section, double sto
   const double v0 = std::log(1.0 / eps + std::sqrt(1.0 / (eps * eps) + 1.0)) / (double) order;
   const double sinhV = std::sinh(v0), coshV = std::cosh(v0);
 
-  const double theta = (order % 2 == 0)
-                           ? pi * (double) (2 * section + 1) / (double) (2 * order)
-                           : pi * (double) (section + 1) / (double) order;
+  // The same spacing as chebyshevSectionFor, for the same reason: see there.
+  const double theta = pi * (double) (2 * section + 1) / (double) (2 * order);
 
   // Type I's pole, then inverted. 1/(x+iy) = (x-iy)/(x^2+y^2).
   const double re = -sinhV * std::sin(theta);
@@ -204,24 +303,36 @@ inline Chebyshev2Section chebyshev2SectionFor(int order, int section, double sto
 template <int MaxOrder = 8>
 class CascadedIir {
 public:
+  /** Biquad storage: (MaxOrder + 1) / 2 sections, enough for every pole
+   *  pair of the highest order. An odd order's real pole has its own. */
   static constexpr int kMaxSections = (MaxOrder + 1) / 2;
 
+  /** The rate in Hz; 0 or less means 48 kHz. Set it before designing: a
+   *  design is made for the rate set at the time, and a later change does
+   *  not redesign, so design again after it. */
   void setSampleRate(float sr) {
     sr_ = sr > 0.0f ? sr : 48000.0f;
     for (int i = 0; i < kMaxSections; ++i) sections_[i].setSampleRate(sr_);
     onePole_.setSampleRate(sr_);
   }
 
+  /** Clear every section's state; the design is kept. No allocation. */
   void reset() {
     for (int i = 0; i < kMaxSections; ++i) sections_[i].reset();
     onePole_.reset();
   }
 
+  /** The order of the last successful design; 0 before one. */
   int order() const { return order_; }
 
   /** Maximally flat lowpass. Returns false, and leaves the filter as it was,
    *  if the order does not fit or is not a positive number. */
   bool designButterworthLowpass(float freq, int order) { return design(freq, order, false); }
+  /** Maximally flat highpass, `freq` its -3 dB point in Hz. Refused, with
+   *  false and the filter left as it was, for an order outside 1 ..
+   *  MaxOrder or a frequency not between 0 and Nyquist. Like every design
+   *  here it keeps the filter's state when the order and kind stay the
+   *  same, so it may be called every block with a moving cutoff. */
   bool designButterworthHighpass(float freq, int order) { return design(freq, order, true); }
 
   /**
@@ -237,6 +348,9 @@ public:
   bool designChebyshevLowpass(float freq, int order, float rippleDb) {
     return designChebyshev(freq, order, rippleDb, false);
   }
+  /** Type I highpass: `freq` is the passband edge, where the response is
+   *  -rippleDb, and the ripple must be above 0 dB. Refused as the lowpass
+   *  is. */
   bool designChebyshevHighpass(float freq, int order, float rippleDb) {
     return designChebyshev(freq, order, rippleDb, true);
   }
@@ -257,10 +371,16 @@ public:
   bool designChebyshev2Lowpass(float freq, int order, float stopbandDb) {
     return designChebyshev2(freq, order, stopbandDb, false);
   }
+  /** Type II highpass: `freq` is the stopband edge, below which the
+   *  rejection is at least `stopbandDb` (above 0). Refused, with false and
+   *  the filter unchanged, for an order outside 1 .. MaxOrder or a
+   *  frequency not between 0 and Nyquist. */
   bool designChebyshev2Highpass(float freq, int order, float stopbandDb) {
     return designChebyshev2(freq, order, stopbandDb, true);
   }
 
+  /** [audio-thread] One sample through the cascade. Before the first
+   *  design it passes the input through. No allocation. */
   inline float process(float x) {
     if (hasOnePole_) x = onePole_.process(x);
     for (int i = 0; i < biquads_; ++i) x = sections_[i].process(x);
@@ -282,9 +402,7 @@ private:
     const float nyquist = sr_ * 0.5f;
     if (!(freq > 0.0f) || freq >= nyquist) return false;
 
-    order_ = order;
-    biquads_ = butterworthBiquads(order);
-    hasOnePole_ = (order & 1) != 0;
+    shape(order, highpass ? 5 : 4);
     gain_ = 1.0f;
 
     for (int i = 0; i < biquads_; ++i) {
@@ -332,13 +450,15 @@ private:
           1.0 / std::sqrt(std::pow(10.0, (double) stopbandDb / 10.0) - 1.0);
       const double v0 =
           std::log(1.0 / eps + std::sqrt(1.0 / (eps * eps) + 1.0)) / (double) order;
+      // LOWPASS pr / (S + pr); HIGHPASS, by S -> 1/S, S / (S + 1/pr). The
+      // highpass used to put its pole at pr rather than 1/pr, and went through
+      // the second-order substitution besides -- see bilinearFirstOrder.
       const double pr = 1.0 / std::sinh(v0);
       if (highpass)
-        bilinearSection(1.0, 0.0, 0.0, 1.0, pr, 0.0, (double) freq, (double) sr_, onePole_);
+        bilinearFirstOrder(1.0, 0.0, 1.0, 1.0 / pr, (double) freq, (double) sr_, onePole_);
       else
-        bilinearSection(0.0, 0.0, pr, 0.0, 1.0, pr, (double) freq, (double) sr_, onePole_);
+        bilinearFirstOrder(0.0, pr, 1.0, pr, (double) freq, (double) sr_, onePole_);
     }
-    reset();
     return true;
   }
 
@@ -351,44 +471,38 @@ private:
     const double v0 =
         std::log(1.0 / eps + std::sqrt(1.0 / (eps * eps) + 1.0)) / (double) order;
 
-    // Every section has to fit under Nyquist BEFORE anything is changed, or a
-    // refusal leaves the filter half rebuilt. The outermost pole pair sits
-    // furthest from the cutoff and is the one that fails first.
-    const int biquads = butterworthBiquads(order);
-    for (int i = 0; i < biquads; ++i) {
-      const ChebyshevSection section = chebyshevSectionFor(order, i, (double) rippleDb);
-      const double sectionFreq = highpass ? (double) freq / section.frequencyScale
-                                          : (double) freq * section.frequencyScale;
-      if (!(sectionFreq > 0.0) || sectionFreq >= (double) nyquist) return false;
-    }
+    shape(order, highpass ? 3 : 2);
 
-    order_ = order;
-    biquads_ = biquads;
-    hasOnePole_ = (order & 1) != 0;
-
+    // The analog prototype, normalised so the passband edge is at 1, and ONE
+    // bilinear transform prewarped at that edge -- so the edge lands exactly on
+    // `freq` and every pole of a stable prototype lands inside the unit circle,
+    // whatever the cutoff.
+    //
+    // It was built from cookbook biquads at freq * frequencyScale instead, each
+    // prewarped at its OWN frequency. That is not the transform of this
+    // prototype, it drifts from it towards Nyquist, and a highpass divides by
+    // the scale: its sections and its real pole landed past Nyquist, where the
+    // tangent turns negative. A pre-check refused the pairs but not the real
+    // pole, so an order-3 highpass at 12 kHz designed "fine" and rang to
+    // infinity. With one prewarp there is nothing left to refuse.
     for (int i = 0; i < biquads_; ++i) {
       const ChebyshevSection section = chebyshevSectionFor(order, i, (double) rippleDb);
-      const float sectionFreq = (float) (highpass ? (double) freq / section.frequencyScale
-                                                  : (double) freq * section.frequencyScale);
+      const double m = section.frequencyScale, m2 = m * m, damping = m / section.q;
+      // Lowpass m^2 / (S^2 + (m/q) S + m^2); the highpass is S -> 1/S.
       if (highpass)
-        sections_[i].highpass(sectionFreq, (float) section.q);
+        bilinearSection(m2, 0.0, 0.0, m2, damping, 1.0, (double) freq, (double) sr_, sections_[i]);
       else
-        sections_[i].lowpass(sectionFreq, (float) section.q);
+        bilinearSection(0.0, 0.0, m2, 1.0, damping, m2, (double) freq, (double) sr_, sections_[i]);
     }
 
     if (hasOnePole_) {
-      // The real pole, at sinh(v0) times the cutoff.
-      const double pi = 3.14159265358979323846;
-      const double scale = std::sinh(v0);
-      const double poleFreq = highpass ? (double) freq / scale : (double) freq * scale;
-      const double k = std::tan(pi * poleFreq / (double) sr_);
-      const double norm = 1.0 / (k + 1.0);
+      // The real pole, at sinh(v0) on the prototype: sinh(v0) / (S + sinh(v0)),
+      // and S / (S + 1/sinh(v0)) for the highpass.
+      const double sigma = std::sinh(v0);
       if (highpass)
-        onePole_.setCoefficients((float) norm, (float) -norm, 0.0f, (float) ((k - 1.0) * norm),
-                                 0.0f);
+        bilinearFirstOrder(1.0, 0.0, 1.0, 1.0 / sigma, (double) freq, (double) sr_, onePole_);
       else
-        onePole_.setCoefficients((float) (k * norm), (float) (k * norm), 0.0f,
-                                 (float) ((k - 1.0) * norm), 0.0f);
+        bilinearFirstOrder(0.0, sigma, 1.0, sigma, (double) freq, (double) sr_, onePole_);
     }
 
     // EVEN orders need a gain trim and odd orders do not, which is the part
@@ -398,7 +512,6 @@ private:
     // this the whole passband sits `rippleDb` too high and the filter is
     // quietly louder than it was asked to be.
     gain_ = (order % 2 == 0) ? (float) (1.0 / std::sqrt(1.0 + eps * eps)) : 1.0f;
-    reset();
     return true;
   }
 
@@ -407,16 +520,19 @@ private:
     const float nyquist = sr_ * 0.5f;
     if (!(freq > 0.0f) || freq >= nyquist) return false;
 
-    order_ = order;
-    biquads_ = butterworthBiquads(order);
-    hasOnePole_ = (order & 1) != 0;
+    shape(order, highpass ? 1 : 0);
 
+    // By the bilinear transform directly, as the Chebyshev designs are, and
+    // NOT through Biquad::lowpass/highpass: those clamp the corner to 10 Hz,
+    // so a 5 Hz order-4 highpass -- a DC blocker, a rumble filter -- read
+    // -23.6 dB at its own corner instead of -3, and an odd order mixed a 5 Hz
+    // real pole (unclamped) with 10 Hz pairs into no Butterworth at all.
     for (int i = 0; i < biquads_; ++i) {
-      const float q = (float) butterworthQ(order, i);
+      const double damping = 1.0 / butterworthQ(order, i);
       if (highpass)
-        sections_[i].highpass(freq, q);
+        bilinearSection(1.0, 0.0, 0.0, 1.0, damping, 1.0, (double) freq, (double) sr_, sections_[i]);
       else
-        sections_[i].lowpass(freq, q);
+        bilinearSection(0.0, 0.0, 1.0, 1.0, damping, 1.0, (double) freq, (double) sr_, sections_[i]);
     }
 
     gain_ = 1.0f;
@@ -428,23 +544,37 @@ private:
       const double k = std::tan(pi * (double) freq / (double) sr_);
       const double norm = 1.0 / (k + 1.0);
       if (highpass)
-        onePole_.setCoefficients((float) norm, (float) -norm, 0.0f, (float) ((k - 1.0) * norm),
-                                 0.0f);
+        onePole_.setCoefficients(norm, -norm, 0.0, (k - 1.0) * norm, 0.0);
       else
-        onePole_.setCoefficients((float) (k * norm), (float) (k * norm), 0.0f,
-                                 (float) ((k - 1.0) * norm), 0.0f);
+        onePole_.setCoefficients(k * norm, k * norm, 0.0, (k - 1.0) * norm, 0.0);
     }
-    reset();
     return true;
   }
 
-  Biquad sections_[kMaxSections];
-  Biquad onePole_;
+  /** The cascade's shape, for a design about to be written. Its state is
+   *  KEPT when the shape is the one it already had -- a cutoff re-designed
+   *  every block, as a plugin applies its parameters, at the same value or a
+   *  moving one -- and cleared only when the sections themselves change.
+   *  Every design cleared it: a filter whose cutoff was applied per block
+   *  crackled (THD+N -4 dBc at 64-sample blocks, 48 kHz) and lost 3 dB of
+   *  the fundamental it was passing. */
+  void shape(int order, int kind) {
+    const bool same = order == order_ && kind == kind_;
+    order_ = order;
+    kind_ = kind;
+    biquads_ = butterworthBiquads(order);
+    hasOnePole_ = (order & 1) != 0;
+    if (!same) reset();
+  }
+
+  IirSection sections_[kMaxSections];
+  IirSection onePole_;
   float sr_ = 48000.0f;
   /** An overall trim, needed only by even-order Chebyshev. One for everything
    *  else, which costs a multiply nobody will measure. */
   float gain_ = 1.0f;
   int order_ = 0, biquads_ = 0;
+  int kind_ = -1; // Butterworth / Chebyshev I / II, low or high: see shape()
   bool hasOnePole_ = false;
 };
 
@@ -469,8 +599,12 @@ private:
 template <int MaxOrder = 8>
 class LinkwitzRileyN {
 public:
+  /** The highest order of each Butterworth half: MaxOrder / 2. */
   static constexpr int kHalfMax = MaxOrder / 2;
 
+  /** The rate in Hz for all four cascades (0 or less means 48 kHz). Set it
+   *  before setCrossover(), which designs for the rate set at the time; a
+   *  later rate change needs setCrossover() again. */
   void setSampleRate(float sr) {
     lowA_.setSampleRate(sr);
     lowB_.setSampleRate(sr);
@@ -497,11 +631,15 @@ public:
     // With an ODD half the two bands come out in antiphase and the sum nulls
     // instead of adding. LR2 and LR6 need the flip; LR4 and LR8 do not.
     invertHigh_ = (half & 1) != 0;
+    // No reset: each cascade keeps its state while its shape stays the same
+    // and clears it when the order changes (see CascadedIir::shape). Applied
+    // per block, the reset here cost the band sum 31 dB of its fundamental
+    // at 192 kHz.
     order_ = order;
-    reset();
     return true;
   }
 
+  /** Clear all four cascades' state; the crossover is kept. */
   void reset() {
     lowA_.reset();
     lowB_.reset();
@@ -509,8 +647,13 @@ public:
     highB_.reset();
   }
 
+  /** The Linkwitz-Riley order of the last accepted setCrossover(); 0 before
+   *  one. */
   int order() const { return order_; }
 
+  /** [audio-thread] One sample into the low and the high band, whose sum is
+   *  flat in level at every frequency. Before a setCrossover() both are the
+   *  input unchanged. No allocation. */
   void process(float x, float& lowOut, float& highOut) {
     lowOut = lowB_.process(lowA_.process(x));
     highOut = highB_.process(highA_.process(x));

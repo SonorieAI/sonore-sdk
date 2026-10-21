@@ -2,7 +2,7 @@
 // The SDK under the sanitizers: every example built as .clap, .vst3 and .lv2
 // with AddressSanitizer + UndefinedBehaviorSanitizer and driven by the same
 // host tests verify:sdk runs; the DSP unit suite the same way; the parser
-// fuzzer at depth; and the sampler's sample handover under ASan and then
+// and plugin-state fuzzers at depth; and the sampler's sample handover under ASan and then
 // ThreadSanitizer.
 //
 //   npm run verify:sanitize
@@ -59,6 +59,10 @@ fail() { failed="$failed\\n  $1"; }
 
 build() { # out src extra...
   local out=$1 src=$2; shift 2
+  # Removed FIRST. $O persists between runs, so a compile that failed used to
+  # leave the PREVIOUS run's binary in place, the existence check below
+  # passed, and the old code was what got sanitized and reported clean.
+  rm -f $out
   g++ $SAN "$@" -o $out $src 2>&1 | grep -E "error" | head -8
   [ -f $out ] || fail "build: $out"
 }
@@ -94,10 +98,24 @@ build $O/vst3_host_test $S/tests/vst3_host_test.cpp $INC $VINC -ldl
 build $O/lv2_host_test $S/tests/lv2_host_test.cpp $INC $LINC -ldl
 build $O/sdk_tests $S/tests/sdk_tests.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" $INC $VINC
 build $O/fuzz_parsers $S/tests/fuzz_parsers.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" $INC $VINC $LINC -ldl
+build $O/fuzz_state $S/tests/fuzz_state.cpp -pthread $INC -ldl
+for fx in synth ducker splitter; do
+  build $O/fuzz_calls_$fx $S/tests/fuzz_calls.cpp -pthread -DSONORE_FUZZ_PLUGIN="\\"$S/examples/$fx/plugin.cpp\\"" $INC -ldl
+done
+# float-cast-overflow is not part of -fsanitize=undefined in GCC, and a NaN
+# or a 1e30 converted to int is exactly what this one hunts for.
+build $O/fuzz_graphics $S/tests/fuzz_graphics.cpp -pthread -fsanitize=float-cast-overflow $INC
 build $O/sampler_stress $S/tests/sampler_stress_test.cpp -pthread $INC -ldl
+build $O/reverb_stress $S/tests/reverb_stress_test.cpp -pthread $INC -ldl
 build $O/SaturatorApp $S/examples/saturator/plugin.cpp -DSONORE_BUILD_STANDALONE $INC -ldl -lpthread
 build $O/SynthApp $S/examples/synth/plugin.cpp -DSONORE_BUILD_STANDALONE $INC -ldl -lpthread
 build $O/ArpApp $S/examples/arp/plugin.cpp -DSONORE_BUILD_STANDALONE $INC -ldl -lpthread
+# The area fuzzers: every parser, widget and protocol written since the
+# fuzzers above, under the same ASan+UBSan.
+for fz in fuzz_core_data fuzz_javascript fuzz_core_crypto fuzz_midi_osc fuzz_system fuzz_code_editor fuzz_gui_widgets fuzz_gui_infra fuzz_app_infra fuzz_modules fuzz_audio_io fuzz_plugin_state fuzz_user_presets; do
+  build $O/$fz $S/tests/$fz.cpp -pthread $INC -ldl
+done
+build $O/fuzz_images $S/tests/fuzz_images.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" $INC
 
 echo "== the DSP unit suite"
 run sdk_tests $O/sdk_tests
@@ -133,30 +151,54 @@ run app_synth $O/SynthApp --verify
 run app_arp $O/ArpApp --verify
 
 echo "== the parsers, at depth"
-# A corrupt Ogg header asks stb_vorbis for an absurd allocation; that is
-# upstream's and not memory-unsafe, and ASan's default is to abort the whole
-# process on it. Returning null instead is what production malloc does.
-ASAN_OPTIONS=detect_leaks=0:halt_on_error=0:allocator_may_return_null=1 \\
+# ASan's default allocator policy, on purpose. A corrupt Ogg header used to
+# ask stb_vorbis for an absurd allocation and this ran with
+# allocator_may_return_null=1 to let it through; stb_vorbis now refuses such a
+# size itself (SONORE LOCAL FIX, third), and the same header hid a real heap
+# overrun -- so an absurd request from any parser is a finding again.
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=0 \\
   run fuzz_parsers $O/fuzz_parsers --iterations 3000
+# The state loader every format shares, fed damaged sessions with the ducker
+# compiled in: refused blobs must leave the plugin untouched, loaded ones must
+# play finite audio and survive their own round trip.
+run fuzz_state $O/fuzz_state --iterations 50000
+# Every order of calls CLAP allows, at random, with notes, a sidechain and
+# aux outputs between the three plugins.
+for fx in synth ducker splitter; do
+  run fuzz_calls_$fx $O/fuzz_calls_$fx --steps 100000
+done
+# The drawing API under the numbers broken paint code computes.
+run fuzz_graphics $O/fuzz_graphics --steps 5000
+echo "== the area fuzzers"
+for fz in fuzz_core_data fuzz_javascript fuzz_core_crypto fuzz_midi_osc fuzz_system fuzz_code_editor fuzz_gui_widgets fuzz_gui_infra fuzz_app_infra fuzz_modules fuzz_audio_io fuzz_plugin_state fuzz_user_presets; do
+  run $fz $O/$fz
+done
+run fuzz_images $O/fuzz_images --iterations 100
 
-echo "== the sampler handover and the two-thread plugin probe: ASan, then ThreadSanitizer"
+echo "== the sampler and reverb handovers and the two-thread plugin probe: ASan, then ThreadSanitizer"
 run sampler_asan $O/sampler_stress 5
+run reverb_asan $O/reverb_stress 3
 build $O/concurrency_asan $S/tests/concurrency_test.cpp -pthread $INC -ldl
 run concurrency_asan $O/concurrency_asan 4
+rm -f $O/concurrency_tsan $O/sampler_stress_tsan $O/reverb_stress_tsan
 g++ -std=c++17 -O1 -g -fsanitize=thread -pthread $INC -o $O/concurrency_tsan $S/tests/concurrency_test.cpp -ldl 2>&1 | grep -E "error" | head -5
 g++ -std=c++17 -O1 -g -fsanitize=thread -pthread $INC -o $O/sampler_stress_tsan $S/tests/sampler_stress_test.cpp -ldl 2>&1 | grep -E "error" | head -5
+g++ -std=c++17 -O1 -g -fsanitize=thread -pthread $INC -o $O/reverb_stress_tsan $S/tests/reverb_stress_test.cpp -ldl 2>&1 | grep -E "error" | head -5
 if [ -f $O/sampler_stress_tsan ]; then
   # ThreadSanitizer refuses to start under the address-space randomisation
   # of a recent kernel ("unexpected memory mapping"); setarch -R turns it off
   # for this one process where the tool exists.
   if command -v setarch > /dev/null; then
     TSAN_OPTIONS=halt_on_error=0 run sampler_tsan setarch $(uname -m) -R $O/sampler_stress_tsan 5
+    [ -f $O/reverb_stress_tsan ] && TSAN_OPTIONS=halt_on_error=0 run reverb_tsan setarch $(uname -m) -R $O/reverb_stress_tsan 3
     [ -f $O/concurrency_tsan ] && TSAN_OPTIONS=halt_on_error=0 run concurrency_tsan setarch $(uname -m) -R $O/concurrency_tsan 4
   else
     TSAN_OPTIONS=halt_on_error=0 run sampler_tsan $O/sampler_stress_tsan 5
+    [ -f $O/reverb_stress_tsan ] && TSAN_OPTIONS=halt_on_error=0 run reverb_tsan $O/reverb_stress_tsan 3
     [ -f $O/concurrency_tsan ] && TSAN_OPTIONS=halt_on_error=0 run concurrency_tsan $O/concurrency_tsan 4
   fi
   [ -f $O/concurrency_tsan ] || fail "build: concurrency_tsan"
+  [ -f $O/reverb_stress_tsan ] || fail "build: reverb_stress_tsan"
 else
   fail "build: sampler_stress_tsan"
 fi

@@ -19,6 +19,7 @@
 // pretending otherwise is where every JSON library's edge cases live.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,8 @@
 #include <map>
 #include <string>
 #include <vector>
+
+#include "number_text.h"
 
 namespace sonore {
 
@@ -39,33 +42,79 @@ namespace sonore {
  */
 class JsonValue {
 public:
-  enum class Kind { Null, Bool, Number, String, Array, Object };
+  /** What a value holds: the six JSON types. */
+  enum class Kind {
+    Null,   ///< `null`, and what a missing key or a failed parse gives.
+    Bool,   ///< `true` or `false`.
+    Number, ///< Any number, held as a double.
+    String, ///< A UTF-8 string.
+    Array,  ///< An ordered list of values.
+    Object  ///< String keys to values, kept sorted by key.
+  };
 
+  /** A null value. */
   JsonValue() = default;
+  /** A Bool. */
   JsonValue(bool v) : kind_(Kind::Bool), bool_(v) {}
+  /** A Number. NaN and infinity are kept, but toString() writes them as
+   *  `null`, the only thing JSON has for them. */
   JsonValue(double v) : kind_(Kind::Number), number_(v) {}
+  /** A Number: the int is held as a double, which every int fits exactly. */
   JsonValue(int v) : kind_(Kind::Number), number_((double) v) {}
+  /** A String, copied. A null pointer gives an empty string, not a null
+   *  value. */
   JsonValue(const char* v) : kind_(Kind::String), string_(v ? v : "") {}
+  /** A String. The bytes are kept as given and are expected to be UTF-8. */
   JsonValue(std::string v) : kind_(Kind::String), string_(std::move(v)) {}
 
+  /** A deep copy: a JsonValue owns its whole tree. */
+  JsonValue(const JsonValue&) = default;
+  /** Takes the tree; `other` is left valid but unspecified. */
+  JsonValue(JsonValue&&) = default;
+  /** Takes the tree; `other` is left valid but unspecified. */
+  JsonValue& operator=(JsonValue&&) = default;
+  /** Copies `other` BEFORE anything of this value is freed: `other` may be
+   *  part of it. Walking down a path is `node = node["key"]`, and the
+   *  memberwise assignment cleared the map that held the child while it was
+   *  still copying from it -- freed memory read, and the result null or
+   *  garbage. */
+  JsonValue& operator=(const JsonValue& other) {
+    if (this != &other) {
+      JsonValue copy(other);
+      *this = std::move(copy);
+    }
+    return *this;
+  }
+
+  /** An empty Array, which writes as `[]`. A default value becomes an Array
+   *  only on its first append(), so an empty list built from one writes
+   *  `null`. */
   static JsonValue array() {
     JsonValue v;
     v.kind_ = Kind::Array;
     return v;
   }
+  /** An empty Object, which writes as `{}`. A default value becomes an
+   *  Object only on its first set(), so an empty one built from it writes
+   *  `null`. */
   static JsonValue object() {
     JsonValue v;
     v.kind_ = Kind::Object;
     return v;
   }
 
+  /** Which of the six JSON types this value holds. */
   Kind kind() const { return kind_; }
+  ///@{
+  /** True when kind() is that type. The as...() readers do not convert
+   *  between types, so test first when the type itself matters. */
   bool isNull() const { return kind_ == Kind::Null; }
   bool isBool() const { return kind_ == Kind::Bool; }
   bool isNumber() const { return kind_ == Kind::Number; }
   bool isString() const { return kind_ == Kind::String; }
   bool isArray() const { return kind_ == Kind::Array; }
   bool isObject() const { return kind_ == Kind::Object; }
+  ///@}
 
   /**
    * Readers that take a fallback rather than throwing or asserting.
@@ -78,27 +127,53 @@ public:
   bool asBool(bool fallback = false) const {
     return kind_ == Kind::Bool ? bool_ : fallback;
   }
+  /** The number, or `fallback` when this is not a Number. A string such as
+   *  "0.5" is not converted. */
   double asNumber(double fallback = 0.0) const {
     return kind_ == Kind::Number ? number_ : fallback;
   }
+  /** asNumber() narrowed to float, or `fallback` when this is not a
+   *  Number. SATURATED, as asInt() is: a finite number beyond float's range
+   *  reads as the largest float of its sign (1e300 is valid JSON, and
+   *  narrowing a double outside float's range is undefined behaviour --
+   *  MSVC gave infinity). An infinity or a NaN is kept. */
   float asFloat(float fallback = 0.0f) const {
-    return kind_ == Kind::Number ? (float) number_ : fallback;
+    if (kind_ != Kind::Number) return fallback;
+    const double kMaxFloat = 3.4028234663852886e38;
+    if (number_ > kMaxFloat && number_ <= 1.7976931348623157e308) return 3.40282347e38f;
+    if (number_ < -kMaxFloat && number_ >= -1.7976931348623157e308) return -3.40282347e38f;
+    return (float) number_;
   }
+  /** Truncated toward zero, and SATURATED: a settings file is user-editable,
+   *  1e300 is valid JSON, and converting a double outside int's range is
+   *  undefined behaviour -- MSVC happened to give INT_MIN for 1e300, a huge
+   *  number read back as the most negative one. NaN has no int and gives the
+   *  fallback. */
   int asInt(int fallback = 0) const {
-    return kind_ == Kind::Number ? (int) number_ : fallback;
+    if (kind_ != Kind::Number || number_ != number_) return fallback;
+    if (number_ >= 2147483647.0) return 2147483647;
+    if (number_ <= -2147483648.0) return -2147483647 - 1;
+    return (int) number_;
   }
+  /** A copy of the string, or `fallback` when this is not a String. A
+   *  Number is not formatted: use toString() for that. */
   std::string asString(const std::string& fallback = std::string()) const {
     return kind_ == Kind::String ? string_ : fallback;
   }
 
   // ── Arrays ───────────────────────────────────────────────────────────────
 
+  /** The elements of an Array or the members of an Object; 0 for any other
+   *  kind. */
   size_t size() const {
     if (kind_ == Kind::Array) return array_.size();
     if (kind_ == Kind::Object) return object_.size();
     return 0;
   }
 
+  /** Adds `v` at the end. A value that is not an Array becomes one first,
+   *  so a null value appended to is a one-element array; what it held as
+   *  another kind is no longer written. */
   void append(JsonValue v) {
     kind_ = Kind::Array;
     array_.push_back(std::move(v));
@@ -113,11 +188,16 @@ public:
 
   // ── Objects ──────────────────────────────────────────────────────────────
 
+  /** Sets `key` to `v`, replacing any value it had. A value that is not an
+   *  Object becomes one first; what it held as another kind is no longer
+   *  written. */
   void set(const std::string& key, JsonValue v) {
     kind_ = Kind::Object;
     object_[key] = std::move(v);
   }
 
+  /** True when this is an Object with `key`, even if the key's value is
+   *  null. */
   bool has(const std::string& key) const {
     return kind_ == Kind::Object && object_.find(key) != object_.end();
   }
@@ -131,6 +211,10 @@ public:
     return it == object_.end() ? null : it->second;
   }
 
+  /** The members of an Object in key order, for iterating over keys a
+   *  reader does not know in advance. Empty for a value that was never an
+   *  Object. The reference is valid until this value changes or is
+   *  destroyed. */
   const std::map<std::string, JsonValue>& members() const { return object_; }
 
   // ── Writing ──────────────────────────────────────────────────────────────
@@ -230,10 +314,15 @@ private:
       return;
     }
     char buffer[40];
-    if (number_ == (double) (long long) number_ && number_ < 1e15 && number_ > -1e15) {
+    // The range FIRST: converting a double of 2^63 or more to long long is
+    // undefined behaviour, and the comparison used to do exactly that before
+    // it looked at the range.
+    if (number_ < 1e15 && number_ > -1e15 && number_ == (double) (long long) number_) {
       std::snprintf(buffer, sizeof(buffer), "%lld", (long long) number_);
     } else {
-      std::snprintf(buffer, sizeof(buffer), "%.17g", number_);
+      // Not printf alone: a host that set a comma locale would make this
+      // [0,5] -- two numbers to every other reader of the file.
+      numtext::format(buffer, sizeof(buffer), number_);
     }
     out += buffer;
   }
@@ -265,6 +354,10 @@ private:
     out += '"';
   }
 
+  /** One parse() call's state: the text, the position and the first error.
+   *  Recursive descent, one call per level of nesting, refused past
+   *  kMaxDepth. Holds a reference to the text, so it lives inside parse()
+   *  and nowhere else. */
   struct Parser {
     explicit Parser(const std::string& t) : text(t) {}
 
@@ -393,7 +486,39 @@ private:
         error = "expected a JSON value";
         return JsonValue();
       }
-      return JsonValue(std::atof(text.substr(from, at - from).c_str()));
+      // Not atof: under a host's comma locale it stops at the '.', and every
+      // fraction in a settings file read back truncated.
+      //
+      // ALL of the span, or it is not a number. The scan above is generous
+      // and the conversion stops where the number does, so the rest was
+      // dropped without a word: [1-2] read as [1], {"gain":0.5.7} as 0.5.
+      // And finite: 1e999 is +inf, which no JSON writer produces and no
+      // setting means.
+      double value = 0.0;
+      if (numtext::parse(text.data() + from, at - from, &value) != at - from ||
+          !std::isfinite(value)) {
+        error = "malformed JSON number";
+        return JsonValue();
+      }
+      return JsonValue(value);
+    }
+
+    /** Exactly four hex digits at `pos`, or false. strtoul took any prefix --
+     *  "0x41", " 041", "12zz", "-001" -- and read what it liked of it. */
+    bool hex4(size_t pos, uint32_t* code) const {
+      if (pos + 4 > text.size()) return false;
+      uint32_t v = 0;
+      for (size_t i = pos; i < pos + 4; ++i) {
+        const char c = text[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t) (c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t) (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint32_t) (c - 'A' + 10);
+        else return false;
+        v = v * 16 + d;
+      }
+      *code = v;
+      return true;
     }
 
     std::string parseString() {
@@ -423,23 +548,26 @@ private:
           case 'r': out += '\r'; break;
           case 't': out += '\t'; break;
           case 'u': {
-            if (at + 4 > text.size()) {
-              error = "truncated \\u escape";
+            uint32_t code = 0;
+            if (!hex4(at, &code)) {
+              error = at + 4 > text.size() ? "truncated \\u escape" : "malformed \\u escape";
               return out;
             }
-            uint32_t code = (uint32_t) std::strtoul(text.substr(at, 4).c_str(), nullptr, 16);
             at += 4;
             // A surrogate PAIR is two escapes and one character. Emitting each
             // half separately produces bytes no UTF-8 reader accepts, which is
             // how an emoji in a preset name becomes two question marks.
+            uint32_t low = 0;
             if (code >= 0xd800 && code <= 0xdbff && at + 6 <= text.size() &&
-                text[at] == '\\' && text[at + 1] == 'u') {
-              const uint32_t low =
-                  (uint32_t) std::strtoul(text.substr(at + 2, 4).c_str(), nullptr, 16);
-              if (low >= 0xdc00 && low <= 0xdfff) {
-                code = 0x10000u + ((code - 0xd800u) << 10) + (low - 0xdc00u);
-                at += 6;
-              }
+                text[at] == '\\' && text[at + 1] == 'u' && hex4(at + 2, &low) &&
+                low >= 0xdc00 && low <= 0xdfff) {
+              code = 0x10000u + ((code - 0xd800u) << 10) + (low - 0xdc00u);
+              at += 6;
+            } else if (code >= 0xd800 && code <= 0xdfff) {
+              // Half a pair is no character at all. Encoded as it stood it was
+              // ED A0 80, which is not UTF-8; the replacement character is
+              // what every reader shows for it anyway.
+              code = 0xFFFD;
             }
             appendUtf8(out, code);
             break;
@@ -489,6 +617,8 @@ private:
  * here puts state in a URL and two alphabets is two things to get wrong.
  */
 struct Base64 {
+  /** `size` bytes at `data` as padded Base64, 4 characters per 3 bytes and
+   *  no line breaks. `data` may be null when `size` is 0. */
   static std::string encode(const uint8_t* data, size_t size) {
     static const char* kAlphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -517,6 +647,7 @@ struct Base64 {
     return out;
   }
 
+  /** The same, for a whole vector. */
   static std::string encode(const std::vector<uint8_t>& bytes) {
     return encode(bytes.data(), bytes.size());
   }
@@ -528,10 +659,25 @@ struct Base64 {
     out.reserve(text.size() / 4 * 3);
     uint32_t buffer = 0;
     int bits = 0;
+    // Padding counted, not skipped: it was ignored wherever it fell, so a
+    // truncated quad ("AAECA") or data after the padding ("QQ==QUJD") decoded
+    // to true and a few bytes -- the partial output this promises never to
+    // give.
+    size_t symbols = 0, padding = 0;
+    auto refuse = [&out]() {
+      out.clear();
+      return false;
+    };
     for (char c : text) {
-      if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+      if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+      if (c == '=') {
+        if (++padding > 2) return refuse();
+        continue;
+      }
+      if (padding) return refuse(); // data after the padding
       const int value = valueOf(c);
-      if (value < 0) return false;
+      if (value < 0) return refuse();
+      ++symbols;
       buffer = (buffer << 6) | (uint32_t) value;
       bits += 6;
       if (bits >= 8) {
@@ -539,6 +685,11 @@ struct Base64 {
         out.push_back((uint8_t) ((buffer >> bits) & 0xff));
       }
     }
+    // Whole quads when padded; unpadded, a last group of two or three
+    // symbols is unambiguous, one is not. And the bits left over are the
+    // encoder's zero fill -- anything else is a different, damaged input.
+    if (padding ? (symbols + padding) % 4 != 0 : symbols % 4 == 1) return refuse();
+    if (bits > 0 && (buffer & ((1u << bits) - 1u)) != 0) return refuse();
     return true;
   }
 

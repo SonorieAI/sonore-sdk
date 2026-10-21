@@ -42,6 +42,18 @@
 namespace sonore {
 namespace gfx {
 
+/**
+ * Sizes a row or column of items between limits, and remembers where the
+ * user dragged the boundaries -- the reference's StretchableLayoutManager.
+ * The file comment gives the size convention (positive is pixels, negative a
+ * fraction of the total) and the algorithm.
+ *
+ * Describe every item with setItemLayout -- the resizer bars too, as items of
+ * fixed size -- then call layOutComponents from the owner's resized(). A
+ * StretchableLayoutResizerBar moves a boundary through setBoundaryPosition
+ * and asks the owner to lay out again. A plain object, not a component: it
+ * owns no components and touches only the ones handed to layOutComponents.
+ */
 class StretchableLayoutManager {
 public:
   /**
@@ -61,6 +73,7 @@ public:
     item.set = true;
   }
 
+  /** How many items there are, counting the gaps a later index created. */
   int numItems() const { return (int) items_.size(); }
 
   /** The size item `index` was last given, in pixels. */
@@ -77,6 +90,7 @@ public:
    */
   void layOut(double total) {
     sizes_.assign(items_.size(), 0.0);
+    laidOutTotal_ = total;
     if (items_.empty() || total <= 0.0) return;
 
     // Fractions resolve against the total ONCE, here, so everything below is
@@ -205,6 +219,17 @@ public:
     items_[(size_t) secondIndex].explicitSize = pairTotal - first;
   }
 
+  /** Where item `index` begins, from the start of the layout, as last laid
+   *  out. */
+  double itemStart(int index) const {
+    double at = 0.0;
+    for (int i = 0; i < index && i < (int) sizes_.size(); ++i) at += sizes_[(size_t) i];
+    return at;
+  }
+
+  /** The extent the last layOut() spread the items over; 0 before the first. */
+  double laidOutTotal() const { return laidOutTotal_; }
+
   /** Forget a dragged position and go back to the preference. What a "reset
    *  layout" command does. */
   void clearExplicitSizes() {
@@ -212,6 +237,10 @@ public:
   }
 
 private:
+  /** One item's limits and preference as given to setItemLayout, in the
+   *  file's convention, and the pixel size a drag pinned it to. `set` marks
+   *  an item that was described, as opposed to one created as a gap by
+   *  describing a later index. */
   struct Item {
     double minSize = 0.0, maxSize = 0.0, preferred = 0.0;
     /** What a drag pinned this to, or -1. */
@@ -226,6 +255,7 @@ private:
 
   std::vector<Item> items_;
   std::vector<double> sizes_;
+  double laidOutTotal_ = 0.0;
 };
 
 /**
@@ -238,6 +268,9 @@ private:
  */
 class StretchableLayoutResizerBar : public Widget {
 public:
+  /** The bar that is item `itemIndex` of `manager`, which is not owned and
+   *  must outlive it. `vertical`: an upright bar between items laid out across,
+   *  dragged sideways; otherwise a flat one, dragged up and down. */
   StretchableLayoutResizerBar(StretchableLayoutManager* manager, int itemIndex, bool vertical)
       : manager_(manager), index_(itemIndex), vertical_(vertical) {
     // The cursor is the only thing that says this thin strip is draggable at
@@ -249,17 +282,24 @@ public:
    *  the panes does the laying out; this only knows the boundary moved. */
   std::function<void()> onMoved;
 
-  void mouseDown(const MouseEvent&) override {
-    if (Component* p = parent()) totalAtDown_ = vertical_ ? p->bounds().w : p->bounds().h;
-    startPosition_ = vertical_ ? bounds().x : bounds().y;
+  void mouseDown(const MouseEvent& e) override {
+    // Where the boundary is in the LAYOUT, and the extent it was laid out
+    // over -- both from the manager. The bar's x in its parent is that plus
+    // wherever the row starts, and the parent's width is not the row's.
+    totalAtDown_ = manager_ ? manager_->laidOutTotal() : 0.0;
+    if (totalAtDown_ <= 0.0)
+      if (Component* p = parent()) totalAtDown_ = vertical_ ? p->bounds().w : p->bounds().h;
+    startPosition_ = manager_ ? manager_->itemStart(index_) : 0.0;
+    downRoot_ = vertical_ ? e.rootPosition.x : e.rootPosition.y;
   }
 
   void mouseDrag(const MouseEvent& e) override {
     if (!manager_) return;
-    const float moved = vertical_ ? (e.position.x - e.downPosition.x)
-                                  : (e.position.y - e.downPosition.y);
-    manager_->setBoundaryPosition(index_, (double) (startPosition_ + moved),
-                                  (double) totalAtDown_);
+    // In ROOT coordinates, which stay put while the bar moves. Measured in
+    // the bar's own, each re-layout moved the origin the next move was
+    // measured from, and the boundary jumped back on every other event.
+    const float moved = (vertical_ ? e.rootPosition.x : e.rootPosition.y) - downRoot_;
+    manager_->setBoundaryPosition(index_, startPosition_ + (double) moved, totalAtDown_);
     if (onMoved) onMoved();
   }
 
@@ -281,14 +321,16 @@ public:
     return info;
   }
 
+  /** A bar's usual thickness, logical pixels. */
   static constexpr float kThickness = 6.0f;
 
 private:
   StretchableLayoutManager* manager_;
   int index_;
   bool vertical_;
-  float startPosition_ = 0.0f;
-  float totalAtDown_ = 0.0f;
+  double startPosition_ = 0.0;
+  double totalAtDown_ = 0.0;
+  float downRoot_ = 0.0f;
 };
 
 } // namespace gfx

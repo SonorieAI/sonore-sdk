@@ -216,10 +216,171 @@ function checkSysexReach() {
   }
 }
 
+// ── Rule: no device callback allocates ──────────────────────────────────────
+//
+// The DSP entry points above are not the only code on an audio thread: every
+// platform backend has a callback the DEVICE calls, and it runs before any of
+// them. CoreAudio's capture callback grew its scratch buffer whenever the
+// device's IO buffer passed 512 frames -- which any other app can set -- and
+// nothing said so, because nothing looked. A body that names an allocating
+// call is a body that will allocate on the day its condition comes true.
+function checkDeviceCallbacks() {
+  console.log("\n── no device callback allocates ──");
+  const callbacks = [
+    ["audio_wasapi.h", "void renderLoop()"],
+    ["audio_wasapi_input.h", "void captureLoop()"],
+    ["audio_coreaudio.h", "static OSStatus renderThunk("],
+    ["audio_coreaudio_input.h", "static OSStatus inputProc("],
+    ["audio_alsa.h", "void renderLoop()"],
+    ["audio_alsa_input.h", "void captureLoop()"],
+    ["audio_jack.h", "static int processTrampoline("],
+    ["audio_asio.h", "onBufferSwitch("],
+    // A plugin's render callback is the host's device callback by another
+    // name: the AU's grew its sidechain and aux scratch inside it.
+    ["au_wrapper.h", "inline OSStatus render("],
+  ];
+  const allocating = [
+    [/\.(assign|resize|reserve|push_back|emplace_back|insert|append)\s*\(/, "a growing container call"],
+    [/\bnew\s+[A-Za-z_:<]/, "new"],
+    [/\b(malloc|calloc|realloc)\s*\(/, "a C allocation"],
+    [/std::(make_unique|make_shared|string\s*\(|vector\s*<)/, "a standard allocation"],
+  ];
+  for (const [file, signature] of callbacks) {
+    const source = read(file);
+    // The DEFINITION: the occurrence followed by a body, not a declaration or
+    // an address taken for registration.
+    let at = -1, open = -1;
+    for (let from = 0; ; ) {
+      const i = source.indexOf(signature, from);
+      if (i < 0) break;
+      const brace = source.indexOf("{", i), semi = source.indexOf(";", i);
+      if (brace >= 0 && (semi < 0 || brace < semi)) {
+        at = i;
+        open = brace;
+        break;
+      }
+      from = i + signature.length;
+    }
+    if (at < 0) {
+      console.log(`  FAIL ${file.padEnd(24)} ${signature} not found -- renamed, or this rule checks nothing`);
+      ++failures;
+      continue;
+    }
+    let depth = 0, end = open;
+    for (; end < source.length; ++end) {
+      if (source[end] === "{") depth++;
+      else if (source[end] === "}" && --depth === 0) break;
+    }
+    // Comments say what used to be wrong; only code counts.
+    const body = source.slice(open, end).replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const hit = allocating.find(([re]) => re.test(body));
+    if (hit) {
+      console.log(`  FAIL ${file.padEnd(24)} ${signature} -- ${hit[1]} in a device callback`);
+      console.log(`       size it when the device opens; the callback runs on the device's clock`);
+      ++failures;
+    } else {
+      console.log(`  ok   ${file.padEnd(24)} ${signature}`);
+    }
+  }
+}
+
+// ── Rule: the pull-model sources keep the rule they claim ───────────────────
+//
+// audio_source.h is a family of sources that call each other on the audio
+// thread: a player calls a transport, which calls a resampler, which calls a
+// read-ahead buffer. One allocation or one lock anywhere in that chain is in
+// every chain built from it. The reference takes a lock in five of these
+// callbacks; the header says it takes none, and marks every function that
+// runs on the audio thread "[audio thread]" at the top of its comment. This
+// reads those bodies.
+//
+// A wait is checked as well as a lock. The family's whole design is that the
+// thread making a change waits for the audio thread and never the other way
+// round, and a waitForBlocksInFlight() that drifted into a callback would be
+// a callback waiting for itself.
+function checkPullSources() {
+  console.log("\n── audio_source.h: no [audio thread] body allocates, locks or waits ──");
+  const file = "audio_source.h";
+  const source = read(file);
+  const forbidden = [
+    [/\.(assign|resize|reserve|push_back|emplace_back|insert|append|setSize)\s*\(/, "a growing container call"],
+    [/\bnew\s+[A-Za-z_:<]/, "new"],
+    [/\b(malloc|calloc|realloc)\s*\(/, "a C allocation"],
+    [/std::(make_unique|make_shared|string\s*\(|vector\s*<|function\s*<)/, "a standard allocation"],
+    [/\b(lock_guard|unique_lock|scoped_lock|shared_lock)\b|\.(lock|try_lock)\s*\(/, "a lock"],
+    [/\.wait(_for|_until)?\s*\(|\b(sleep_for|sleep_until|yield)\s*\(|notify_(one|all)\s*\(/, "a wait"],
+    [/\b(waitForBlocksInFlight|waitForNextAudioBlockReady|waitUntil|moveToFrontOfQueue|wakeReader|addTimeSliceClient|removeTimeSliceClient)\s*\(/,
+     "a call that waits for another thread"],
+    [/\b(fopen|fread|fwrite|fclose|fseek|printf|fprintf)\s*\(/, "file or console I/O"],
+  ];
+  // Every doc comment whose text starts with [audio thread], and the body of
+  // the function it documents: the first "{" after the comment, provided the
+  // text in between is a signature (it has a parameter list and no ";" -- a
+  // pure virtual or a class has nothing to check).
+  // The marker may open the comment or its second line, after the " * ".
+  const marker = /\/\*\*[\s*]*\[audio thread\][\s\S]*?\*\//g;
+  let checked = 0;
+  for (const m of source.matchAll(marker)) {
+    const after = m.index + m[0].length;
+    const open = source.indexOf("{", after);
+    if (open < 0) continue;
+    const signature = source.slice(after, open);
+    if (signature.includes(";") || !signature.includes("(")) continue;
+    let depth = 0, end = open;
+    for (; end < source.length; ++end) {
+      if (source[end] === "{") depth++;
+      else if (source[end] === "}" && --depth === 0) break;
+    }
+    const name = (signature.match(/([~\w]+)\s*\(/) || [, "?"])[1];
+    const line = source.slice(0, m.index).split("\n").length;
+    const body = source.slice(open, end).replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const hit = forbidden.find(([re]) => re.test(body));
+    ++checked;
+    if (hit) {
+      console.log(`  FAIL ${file}:${line} ${name} -- ${hit[1]} in an [audio thread] body`);
+      console.log(`       size it in prepareToPlay(); hand changes over by atomic, SeqBox or BlockEpoch`);
+      ++failures;
+    } else {
+      console.log(`  ok   ${file}:${String(line).padEnd(5)} ${name}`);
+    }
+  }
+  // A rule that finds nothing passes by finding nothing.
+  if (checked < 20) {
+    console.log(`  FAIL only ${checked} [audio thread] bodies found; there should be at least 20`);
+    ++failures;
+  }
+
+  // The player's device entry points are device callbacks like any other,
+  // and flush denormals as the DSP entry points do.
+  const player = source.slice(source.indexOf("class AudioSourcePlayer"));
+  for (const entry of ["void audioDeviceIOCallback(", "void render(", "void renderWithInput("]) {
+    const at = player.indexOf(entry);
+    const open = at < 0 ? -1 : player.indexOf("{", at);
+    if (open < 0) {
+      console.log(`  FAIL AudioSourcePlayer::${entry.slice(5, -1)} not found -- renamed, or this rule checks nothing`);
+      ++failures;
+      continue;
+    }
+    let depth = 0, end = open;
+    for (; end < player.length; ++end) {
+      if (player[end] === "{") depth++;
+      else if (player[end] === "}" && --depth === 0) break;
+    }
+    if (/ScopedNoDenormals\s+\w+\s*;/.test(player.slice(open, end))) {
+      console.log(`  ok   AudioSourcePlayer::${entry.slice(5, -1)} declares ScopedNoDenormals`);
+    } else {
+      console.log(`  FAIL AudioSourcePlayer::${entry.slice(5, -1)} -- no ScopedNoDenormals in a device entry point`);
+      ++failures;
+    }
+  }
+}
+
 checkDenormalGuards();
 checkMidiFilter();
 checkSysexReach();
 checkGuardRestores();
+checkDeviceCallbacks();
+checkPullSources();
 
 console.log();
 if (failures > 0) {

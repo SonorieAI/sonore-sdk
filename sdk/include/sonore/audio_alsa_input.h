@@ -28,6 +28,11 @@ namespace standalone {
 
 class AlsaInput {
 public:
+  /** True once since a read failed past recovery -- a USB microphone
+   *  unplugged, the server under the alias gone. Polled by the standalone,
+   *  which then closes the input. */
+  bool takeDeviceLost() { return lost_.exchange(false, std::memory_order_acq_rel); }
+
   ~AlsaInput() { stop(); }
 
   /** The same names the output backend offers. Enumerating the real card list
@@ -37,7 +42,8 @@ public:
     if (!lib) return {};
     // Not dlclosed: audio libraries register atexit handlers and unloading
     // them is a classic shutdown crash.
-    return {"default", "sysdefault", "hw:0,0", "hw:1,0", "pulse", "pipewire"};
+    // plughw, as the output's list says why.
+    return {"default", "sysdefault", "plughw:0,0", "plughw:1,0", "pulse", "pipewire"};
   }
 
   double sampleRate() const { return sampleRate_; }
@@ -45,8 +51,17 @@ public:
   const std::string& error() const { return error_; }
   uint64_t droppedFrames() const { return ring_.droppedFrames(); }
   uint64_t starvedFrames() const { return ring_.starvedFrames(); }
+  /** Frames read() would deliver now -- none while the cushion is filling:
+   *  what a reader paced by the device, rather than by the computer's clock,
+   *  waits for. [reader] */
+  size_t availableFrames() const { return ring_.readable(); }
 
   bool open(int deviceIndex, double wantedRate) {
+    // Whatever was open goes first, as the WASAPI input's open() does: a
+    // second open() leaked the first PCM and reset the ring under a running
+    // capture thread. And the last failure is not this one's.
+    stop();
+    error_.clear();
     lib_ = dlopen("libasound.so.2", RTLD_LAZY);
     if (!lib_) {
       error_ = "libasound.so.2 is not available";
@@ -63,8 +78,7 @@ public:
       return false;
     }
 
-    const std::vector<std::string> devices = {"default", "sysdefault", "hw:0,0",
-                                              "hw:1,0",  "pulse",      "pipewire"};
+    const std::vector<std::string> devices = listDevices();
     deviceName_ = (deviceIndex > 0 && (size_t) deviceIndex < devices.size())
                       ? devices[(size_t) deviceIndex]
                       : devices[0];
@@ -89,12 +103,19 @@ public:
     }
 
     ring_.reset(kBlock * 8);
+    // The cushion the WASAPI input has, for the same two clocks: the reader
+    // waits for two blocks before its first read, and again after a short
+    // one, rather than coming up short at start-up and wherever the phases
+    // of capture and playback cross -- a crackle each time.
+    ring_.setPrime(kBlock * 2);
+    block_.assign(kBlock * 2, 0.0f);
     return true;
   }
 
   bool run() {
     if (!pcm_) return false;
     running_.store(true, std::memory_order_release);
+    lost_.store(false, std::memory_order_relaxed);
     if (start_) start_(pcm_);
     thread_ = std::thread([this] { captureLoop(); });
     return true;
@@ -123,17 +144,21 @@ private:
   using StartFn = int (*)(void*);
 
   void captureLoop() {
-    std::vector<float> buffer(kBlock * 2);
+    float* const buffer = block_.data(); // sized in open(), before the thread
     while (running_.load(std::memory_order_acquire)) {
-      const long got = readi_(pcm_, buffer.data(), kBlock);
+      const long got = readi_(pcm_, buffer, kBlock);
       if (got < 0) {
         // An overrun is normal under load and recoverable; anything the
         // recovery does not fix ends the loop rather than spinning on an
-        // error forever.
-        if (!recover_ || recover_(pcm_, (int) got, 1) < 0) break;
+        // error forever. It used to end it silently, leaving the input
+        // "open" with a ring nothing would fill again; it is reported now.
+        if (!recover_ || recover_(pcm_, (int) got, 1) < 0) {
+          lost_.store(true, std::memory_order_release);
+          return;
+        }
         continue;
       }
-      if (got > 0) ring_.write(buffer.data(), (size_t) got);
+      if (got > 0) ring_.write(buffer, (size_t) got);
     }
   }
 
@@ -148,7 +173,9 @@ private:
 
   std::thread thread_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> lost_{false};
   AudioRing ring_;
+  std::vector<float> block_;
   double sampleRate_ = 0.0;
   std::string deviceName_, error_;
 };

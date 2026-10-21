@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Sonore SDK: macOS audio output (the default-output AudioUnit).
 //
-// Compiled on macOS since 2026-09-01: the standalone builds there and its
-// offline `--verify` passes under ctest.
+// Compiled on macOS since 2026-09-01 (the standalone builds there and its
+// offline `--verify` passes under ctest), but never HEARD: the offline modes
+// open no device and a CI runner has no audio hardware. A human hearing output
+// through it is the moment this becomes real; until then it is written, not
+// proven.
 //
 // The output path on macOS IS an AudioUnit (AUHAL's default output), so this
 // file speaks the same AudioComponent API as au_wrapper.h, just from the other
@@ -22,6 +25,8 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+#include "audio_workgroup.h"
 
 // kAudioObjectPropertyElementMain arrived in the macOS 12 SDK; before that the
 // same constant was spelled ...Master, and it is still what older SDKs define.
@@ -43,6 +48,10 @@ public:
   double sampleRate() const { return sampleRate_; }
   uint32_t channels() const { return channels_; }
   const std::string& error() const { return error_; }
+  /** True once since the device stopped being alive (a listener on
+   *  kAudioDevicePropertyDeviceIsAlive, registered in run()). Polled by the
+   *  standalone's UI tick, which reopens the default device. */
+  bool takeDeviceLost() { return lost_.exchange(false, std::memory_order_acq_rel); }
   const std::string& deviceName() const { return deviceName_; }
 
   /** Which device the next open() will use. -1 (the default) means the one
@@ -66,6 +75,11 @@ public:
 
   /** Negotiate the unit; no audio flows until run(). */
   bool open(RenderFn render) {
+    // Whatever was open goes first, as the WASAPI and ASIO outputs' open()
+    // do: a second open() replaced render_ under a running stream and
+    // leaked the first output unit. And the last failure is not this one's.
+    stop();
+    error_.clear();
     render_ = std::move(render);
 
     // HALOutput rather than DefaultOutput, so a device can be NAMED. The
@@ -118,6 +132,7 @@ public:
       return false;
     }
     deviceName_ = nameOf(device);
+    device_ = device;
 
     // Interleaved float stereo at the DEVICE's own rate. Asking for our format
     // on the INPUT scope of the output element is how AUHAL is driven.
@@ -164,6 +179,44 @@ public:
     return true;
   }
 
+  /** kAudioDevicePropertyIOThreadOSWorkgroup ('oswg', macOS 11): spelled
+   *  here because older SDKs lack the name. tests/mac_host_constants.h checks
+   *  it against Apple's on a Mac. */
+  static constexpr AudioObjectPropertySelector kIOThreadOSWorkgroup = 0x6F737767;
+
+  /**
+   * The os_workgroup the open device's IO thread belongs to: what a DSP's
+   * helper threads join to be scheduled with the render (audio_workgroup.h).
+   *
+   * Empty, with `why`, when no device is open, the macOS is older than 11, or
+   * the HAL will not say. The HAL hands the workgroup over retained, and the
+   * AudioWorkgroup returned owns that reference. Compiled, never run: there
+   * is no Mac in this loop.
+   */
+  AudioWorkgroup ioWorkgroup(std::string* why = nullptr) const {
+    if (device_ == kAudioObjectUnknown) {
+      if (why) *why = "no audio device is open";
+      return AudioWorkgroup();
+    }
+    if (!AudioWorkgroup::isSupported()) {
+      if (why) *why = AudioWorkgroup::unavailableReason();
+      return AudioWorkgroup();
+    }
+    const AudioObjectPropertyAddress addr = address(kIOThreadOSWorkgroup);
+    void* workgroup = nullptr;
+    UInt32 size = sizeof(workgroup);
+    const OSStatus status =
+        AudioObjectGetPropertyData(device_, &addr, 0, nullptr, &size, &workgroup);
+    if (status != noErr || !workgroup) {
+      if (why)
+        *why = "kAudioDevicePropertyIOThreadOSWorkgroup gave none (OSStatus " +
+               std::to_string((int) status) + ")";
+      return AudioWorkgroup();
+    }
+    if (why) why->clear();
+    return AudioWorkgroup::adopting(workgroup);
+  }
+
   bool run() {
     if (!unit_) return false;
     if (AudioUnitInitialize(unit_) != noErr || AudioOutputUnitStart(unit_) != noErr) {
@@ -171,11 +224,22 @@ public:
       return false;
     }
     running_.store(true, std::memory_order_release);
+    // Told when the device dies -- unplugged, or its driver gone -- so the
+    // standalone can reopen the default rather than sit "open" and silent.
+    lost_.store(false, std::memory_order_relaxed);
+    const AudioObjectPropertyAddress alive = address(kAudioDevicePropertyDeviceIsAlive);
+    listening_ = device_ != kAudioObjectUnknown &&
+                 AudioObjectAddPropertyListener(device_, &alive, &aliveChanged, this) == noErr;
     return true;
   }
 
   void stop() {
     if (!unit_) return;
+    if (listening_) {
+      const AudioObjectPropertyAddress alive = address(kAudioDevicePropertyDeviceIsAlive);
+      AudioObjectRemovePropertyListener(device_, &alive, &aliveChanged, this);
+      listening_ = false;
+    }
     running_.store(false, std::memory_order_release);
     AudioOutputUnitStop(unit_);
     AudioUnitUninitialize(unit_);
@@ -293,8 +357,22 @@ private:
     return noErr;
   }
 
+  /** On a HAL notification thread: read whether the device still lives, and
+   *  say so if it does not. Nothing else may happen here. */
+  static OSStatus aliveChanged(AudioObjectID id, UInt32, const AudioObjectPropertyAddress*,
+                               void* client) {
+    UInt32 alive = 1, size = sizeof(alive);
+    const AudioObjectPropertyAddress addr = address(kAudioDevicePropertyDeviceIsAlive);
+    if (AudioObjectGetPropertyData(id, &addr, 0, nullptr, &size, &alive) != noErr || !alive)
+      ((CoreAudioOutput*) client)->lost_.store(true, std::memory_order_release);
+    return noErr;
+  }
+
   RenderFn render_;
   AudioUnit unit_ = nullptr;
+  AudioDeviceID device_ = kAudioObjectUnknown;
+  bool listening_ = false;
+  std::atomic<bool> lost_{false};
   std::atomic<bool> running_{false};
   double sampleRate_ = 48000.0;
   uint32_t channels_ = 2;

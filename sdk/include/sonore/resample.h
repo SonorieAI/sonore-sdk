@@ -42,17 +42,198 @@ class HalfBandFilter {
   static_assert(Taps >= 7, "too few taps to filter anything");
 
 public:
+  /** Builds the Blackman-windowed kernel, normalised to unity at DC; the
+   *  state starts silent. No allocation. */
   HalfBandFilter() { buildKernel(); }
 
+  /** Clear every history, process()'s and the polyphase paths' alike; the
+   *  kernel is kept. No allocation. */
   void reset() {
     for (int i = 0; i < Taps; ++i) state_[i] = 0.0f;
     write_ = 0;
+    for (int i = 0; i < kRing; ++i) evenHist_[i] = 0.0f;
+    for (int i = 0; i < 2 * kRing; ++i) upAhead_[i] = upBehind_[i] = oddAhead_[i] = oddBehind_[i] = 0.0f;
+    upW_ = upR_ = downW_ = oddW_ = oddR_ = 0;
   }
 
   /** Group delay, in samples AT THIS FILTER'S OWN RATE. Linear phase, so it
    *  is the same at every frequency, which is what makes it exact. */
   static constexpr int latency() { return (Taps - 1) / 2; }
 
+  /**
+   * One sample in at the low rate, two out at the high rate: the same two
+   * values as process(u) then process(0) -- zero-stuffing and filtering --
+   * computed without the arithmetic on zeros.
+   *
+   * With the centre at an even offset, an even output meets only the centre
+   * tap (every other tap lands on a stuffed zero), so it is the input scaled
+   * and delayed; an odd output meets only the odd taps, so it is an FIR of
+   * Taps/4 symmetric pairs over the low-rate history. That is a third of
+   * the multiplies, and summed in the same order process() sums them, so
+   * the results are the same bits. `u` is the input already scaled for the
+   * zero-stuffing (the caller's x2). Low-rate state of its own: a filter is
+   * driven through process() or through upsample(), never both.
+   */
+  inline void upsample(float u, float& even, float& odd) {
+    if constexpr (kCentre % 2 != 0) {
+      even = process(u);
+      odd = process(0.0f);
+    } else {
+      const int w = (upW_ + 1) & kMask, r = (upR_ - 1) & kMask;
+      upW_ = w;
+      upR_ = r;
+      put(upAhead_, upBehind_, w, r, u);
+      const float* ahead = upAhead_ + w + kRing; // ahead[-b]: b samples back
+      even = flushDenormal(kernel_[kCentre] * ahead[-kHalf]);
+      // The centre meets a stuffed zero; multiplied anyway so the sum starts
+      // from the same signed zero process() starts from. Pair q (k = 2q + 1)
+      // is the samples kHalf - 1 - q and kHalf + q back.
+      odd = flushDenormal(pairSum(kernel_[kCentre] * 0.0f, ahead - (kHalf - 1),
+                                  upBehind_ + r + kHalf, pairKernel_));
+    }
+  }
+
+  /**
+   * Two samples in at the high rate, one out at the low rate: the value
+   * process(v0) returns when process(v1) is then called and discarded, as a
+   * decimator keeps phase 0. Only the kept output is computed -- the centre
+   * against the even samples, the odd taps against the odd ones -- in
+   * process()'s summation order, so it is the same bits for half the work.
+   */
+  inline float downsample(float v0, float v1) {
+    if constexpr (kCentre % 2 != 0) {
+      const float y = process(v0);
+      process(v1);
+      return y;
+    } else {
+      const int e = (downW_ + 1) & kMask, w = oddW_, r = oddR_;
+      downW_ = e;
+      evenHist_[e] = v0;
+      // Pair q is the odd samples kHalf - q and kHalf + 1 + q pairs back,
+      // counting the previous pair's as one back: the newest in the rings.
+      const float acc = pairSum(kernel_[kCentre] * lowBack(evenHist_, e, kHalf),
+                                oddAhead_ + w + kRing - (kHalf - 1), oddBehind_ + r + kHalf, pairKernel_);
+      // This pair's odd sample after: it is newer than the output.
+      oddW_ = (w + 1) & kMask;
+      oddR_ = (r - 1) & kMask;
+      put(oddAhead_, oddBehind_, oddW_, oddR_, v1);
+      return flushDenormal(acc);
+    }
+  }
+
+  /**
+   * upsample() over a block: `n` inputs from `u` (already scaled, as for
+   * upsample()), 2n outputs to `out`, the same bits as n calls. The polyphase
+   * sums are the same sums in the same order, worked four outputs at a time
+   * from a straight copy of the history rather than one output at a time from
+   * the ring: each output's sum was a chain of dependent adds, and the ring
+   * was written and read back for every sample. Shares upsample()'s state, so
+   * the two can be mixed on one filter.
+   */
+  void upsampleBlock(const float* u, int n, float* out) {
+    if constexpr (kCentre % 2 != 0) {
+      for (int i = 0; i < n; ++i) upsample(u[i], out[2 * i], out[2 * i + 1]);
+    } else {
+      // Reach: the odd sum goes back (kCentre - 1 + kCentre) / 2 samples.
+      constexpr int R = kCentre - 1;
+      float lin[R + kBlock];
+      while (n > 0) {
+        const int m = n < kBlock ? n : kBlock;
+        const float* ahead = upAhead_ + upW_ + kRing; // already in time order
+        for (int b = 0; b < R; ++b) lin[b] = ahead[b - (R - 1)];
+        for (int i = 0; i < m; ++i) lin[R + i] = u[i];
+        const float* h = lin + R; // h[i] is input i; h[i - b] is b before it
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+          const simd::Vec4f even =
+              simd::Vec4f::splat(kernel_[kCentre]) * simd::Vec4f::load(h + i - kCentre / 2);
+          simd::Vec4f acc = simd::Vec4f::splat(kernel_[kCentre]) * simd::Vec4f::zero();
+          for (int k = 1; k <= kCentre; k += 2)
+            acc = acc + simd::Vec4f::splat(kernel_[kCentre + k]) *
+                            (simd::Vec4f::load(h + i - (kCentre - 1 - k) / 2) +
+                             simd::Vec4f::load(h + i - (kCentre - 1 + k) / 2));
+          float e[4], o[4];
+          even.store(e);
+          acc.store(o);
+          for (int q = 0; q < 4; ++q) {
+            out[2 * (i + q)] = flushDenormal(e[q]);
+            out[2 * (i + q) + 1] = flushDenormal(o[q]);
+          }
+        }
+        for (; i < m; ++i) {
+          out[2 * i] = flushDenormal(kernel_[kCentre] * h[i - kCentre / 2]);
+          float acc = kernel_[kCentre] * 0.0f;
+          for (int k = 1; k <= kCentre; k += 2)
+            acc += kernel_[kCentre + k] * (h[i - (kCentre - 1 - k) / 2] + h[i - (kCentre - 1 + k) / 2]);
+          out[2 * i + 1] = flushDenormal(acc);
+        }
+        putLatest(upAhead_, upBehind_, upW_, upR_, u, m);
+        u += m;
+        out += 2 * m;
+        n -= m;
+      }
+    }
+  }
+
+  /**
+   * downsample() over a block: 2n inputs from `v`, n outputs to `y`, the same
+   * bits as n calls, four outputs at a time (see upsampleBlock()).
+   */
+  void downsampleBlock(const float* v, int n, float* y) {
+    if constexpr (kCentre % 2 != 0) {
+      for (int i = 0; i < n; ++i) y[i] = downsample(v[2 * i], v[2 * i + 1]);
+    } else {
+      // The even sample is read kCentre/2 back from the newest, the odd ones
+      // from 1 to kCentre back: the current pair's odd sample enters after.
+      constexpr int RE = kCentre / 2, RO = kCentre;
+      float even[RE + kBlock], odd[RO + kBlock];
+      while (n > 0) {
+        const int m = n < kBlock ? n : kBlock;
+        for (int b = 0; b < RE; ++b) even[RE - 1 - b] = lowBack(evenHist_, downW_, b);
+        const float* ahead = oddAhead_ + oddW_ + kRing; // already in time order
+        for (int b = 0; b < RO; ++b) odd[b] = ahead[b - (RO - 1)];
+        for (int i = 0; i < m; ++i) {
+          even[RE + i] = v[2 * i];
+          odd[RO + i] = v[2 * i + 1];
+        }
+        const float* e = even + RE; // e[i]: pair i's even sample
+        const float* o = odd + RO;  // o[i - b]: the odd sample b pairs back
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+          simd::Vec4f acc = simd::Vec4f::splat(kernel_[kCentre]) * simd::Vec4f::load(e + i - kCentre / 2);
+          for (int k = 1; k <= kCentre; k += 2)
+            acc = acc + simd::Vec4f::splat(kernel_[kCentre + k]) *
+                            (simd::Vec4f::load(o + i - (kCentre + 1 - k) / 2) +
+                             simd::Vec4f::load(o + i - (kCentre + 1 + k) / 2));
+          float r[4];
+          acc.store(r);
+          for (int q = 0; q < 4; ++q) y[i + q] = flushDenormal(r[q]);
+        }
+        for (; i < m; ++i) {
+          float acc = kernel_[kCentre] * e[i - kCentre / 2];
+          for (int k = 1; k <= kCentre; k += 2)
+            acc += kernel_[kCentre + k] * (o[i - (kCentre + 1 - k) / 2] + o[i - (kCentre + 1 + k) / 2]);
+          y[i] = flushDenormal(acc);
+        }
+        // Only the newest kHalf even samples are ever read back.
+        const int fromEven = m > kHalf ? m - kHalf : 0;
+        downW_ = (downW_ + fromEven) & kMask;
+        for (int j = fromEven; j < m; ++j) {
+          downW_ = (downW_ + 1) & kMask;
+          evenHist_[downW_] = e[j];
+        }
+        putLatest(oddAhead_, oddBehind_, oddW_, oddR_, o, m);
+        v += 2 * m;
+        y += m;
+        n -= m;
+      }
+    }
+  }
+
+  /** [audio-thread] One sample through the filter at its own rate, out
+   *  latency() samples later. A filter is driven through this or through
+   *  the upsample() and downsample() calls, never both: they keep separate
+   *  histories. No allocation. */
   inline float process(float x) {
     state_[write_] = x;
     // Only the centre tap and the ODD offsets contribute; the rest are zero by
@@ -71,6 +252,81 @@ public:
 
 private:
   static constexpr int kCentre = (Taps - 1) / 2;
+  /** Low-rate history for the polyphase paths: a power of two past the
+   *  deepest reach, kCentre samples back, so the wrap is a mask. */
+  static constexpr int ringFor(int need) {
+    int size = 4;
+    while (size < need) size <<= 1;
+    return size;
+  }
+  static constexpr int kRing = ringFor(kCentre + 2);
+  static constexpr int kMask = kRing - 1;
+  static constexpr int kBlock = 64; // the block functions' working size
+
+  /** The low-rate sample `back` positions before the newest at `newest`. */
+  static inline float lowBack(const float* ring, int newest, int back) {
+    return ring[(newest - back) & kMask];
+  }
+
+  /** The odd taps' symmetric pairs: kHalf of them, k = 1, 3, ... kCentre - 1. */
+  static constexpr int kHalf = kCentre / 2;
+
+  /**
+   * A low-rate sample into a history kept twice over, so that the per-sample
+   * paths read their taps as straight runs instead of one masked index each.
+   *
+   * `ahead` holds the samples in time order and `behind` in reverse. The
+   * newest goes to slot w of one -- a step up each sample -- and slot r of
+   * the other -- a step down -- and again one ring further on in each, so
+   * that from it ahead[w + kRing - b] and behind[r + b] are the sample b
+   * back, for every b under kRing, with no wrap. A pair's two taps sit either
+   * side of the filter's centre, one walking back as the other walks forward,
+   * which is why the reversed copy: both halves of four pairs are then one
+   * load each.
+   */
+  static inline void put(float* ahead, float* behind, int w, int r, float x) {
+    ahead[w] = x;
+    ahead[w + kRing] = x;
+    behind[r] = x;
+    behind[r + kRing] = x;
+  }
+
+  /** `n` samples in at once, x[n - 1] the newest, for the block paths. Every
+   *  read of these histories reaches at most kCentre back, so only that many
+   *  are written; the slots behind them are passed over, never read. */
+  static inline void putLatest(float* ahead, float* behind, int& w, int& r, const float* x, int n) {
+    const int from = n > kCentre ? n - kCentre : 0;
+    int wi = (w + from) & kMask, ri = (r - from) & kMask;
+    for (int j = from; j < n; ++j) {
+      wi = (wi + 1) & kMask;
+      ri = (ri - 1) & kMask;
+      put(ahead, behind, wi, ri, x[j]);
+    }
+    w = wi;
+    r = ri;
+  }
+
+  /**
+   * acc plus pair[q] * (left[q] + right[q]) for every pair, added one at a
+   * time in pair order: process()'s sums, the same bits. Only the pair sums
+   * and the products -- which no order touches -- are worked four at a time;
+   * the chain of additions is left as it was.
+   */
+  static inline float pairSum(float acc, const float* left, const float* right, const float* pair) {
+    int q = 0;
+    for (; q + 4 <= kHalf; q += 4) {
+      float t[4];
+      ((simd::Vec4f::load(left + q) + simd::Vec4f::load(right + q)) * simd::Vec4f::load(pair + q))
+          .store(t);
+      acc += t[0];
+      acc += t[1];
+      acc += t[2];
+      acc += t[3];
+    }
+    if constexpr (kHalf % 4 != 0)
+      for (; q < kHalf; ++q) acc += pair[q] * (left[q] + right[q]);
+    return acc;
+  }
 
   /** The sample `offset` positions back from the newest one. */
   inline float tap(int offset) const {
@@ -107,11 +363,20 @@ private:
     if (sum > 1e-12) {
       for (int n = 0; n < Taps; ++n) kernel_[n] = (float) (kernel_[n] / sum);
     }
+    for (int q = 0; q < kHalf; ++q) pairKernel_[q] = kernel_[kCentre + 1 + 2 * q];
   }
 
   float kernel_[Taps]{};
+  float pairKernel_[kHalf > 0 ? kHalf : 1]{}; // kernel_[kCentre + 1 + 2q], pair q's tap
   float state_[Taps]{};
   int write_ = 0;
+  // The polyphase paths' low-rate histories: upsample()'s input, and
+  // downsample()'s even and odd samples. The two read as pairs are kept
+  // twice over (see put()); the even one is read at a single tap.
+  float upAhead_[2 * kRing]{}, upBehind_[2 * kRing]{};
+  float oddAhead_[2 * kRing]{}, oddBehind_[2 * kRing]{};
+  float evenHist_[kRing]{};
+  int upW_ = 0, upR_ = 0, downW_ = 0, oddW_ = 0, oddR_ = 0;
 };
 
 /**
@@ -124,9 +389,10 @@ private:
  *
  * where A₀ and A₁ are cascades of second-order allpass sections. Because
  * allpass sections are unit-gain by construction, the filtering costs ONE
- * multiply per section per sample: roughly a quarter of the FIR's work for the
- * same stopband, and the phase response is minimum-phase, so the delay is a
- * fraction of a sample rather than sixteen of them.
+ * multiply per section per sample (roughly a quarter of the FIR's work for the
+ * same stopband), and the phase response is minimum-phase, so the delay is a
+ * few samples, varying with frequency, rather than the FIR's sixteen (see
+ * latency()).
  *
  * The trade against the FIR path is real and worth stating: phase is NOT
  * linear, so this is the wrong choice when a plugin is summed against a dry
@@ -145,6 +411,7 @@ class PolyphaseIirHalfBand {
   static_assert(Order >= 3 && Order <= 15, "order outside the useful range");
 
 public:
+  /** Allpass sections across both branches: (Order - 1) / 2. */
   static constexpr int kSectionsTotal = (Order - 1) / 2;
 
   /** Minimum phase: the delay varies with frequency, so there is no single
@@ -166,13 +433,14 @@ public:
    *  choice between the two filters, and it was buried under a sentence that
    *  made this one sound free.
    *
-   *  sdk_tests pins the measured figure, so it cannot grow unnoticed
-   *  for host compensation, and being able to say that is the whole reason
-   *  to choose this over the FIR. */
+   *  sdk_tests pins the measured figure, so it cannot grow unnoticed. */
   static constexpr int latency() { return 0; }
 
+  /** Derives the allpass coefficients for this order; the state starts
+   *  silent. No allocation. */
   PolyphaseIirHalfBand() { design(); }
 
+  /** Clear both branches' state; the design is kept. */
   void reset() {
     for (int i = 0; i < kSectionsTotal; ++i) sections_[i].reset();
     delay_ = 0.0f;
@@ -190,6 +458,21 @@ public:
     float b = x;
     for (int i = branch0_; i < kSectionsTotal; ++i) b = sections_[i].process(b);
     return 0.5f * (a + b);
+  }
+
+  /** The oversampler's interface, as HalfBandFilter offers it: here simply
+   *  the filter run on the stuffed and on the discarded samples, as before. */
+  inline void upsample(float u, float& even, float& odd) {
+    even = process(u);
+    odd = process(0.0f);
+  }
+  /** Two samples in at the high rate, one out: the output for `v0`, with
+   *  `v1` filtered and discarded, keeping phase 0 as HalfBandFilter's
+   *  downsample() does. */
+  inline float downsample(float v0, float v1) {
+    const float y = process(v0);
+    process(v1);
+    return y;
   }
 
   /**
@@ -210,18 +493,26 @@ public:
   }
 
 private:
-  /** Allpass of the form (a + z⁻²)/(1 + a·z⁻²). Two state words, one multiply. */
+  /** Allpass of the form (a + z⁻²)/(1 + a·z⁻²). Four state words, one multiply. */
   struct Allpass2 {
     float a = 0.0f, x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+    /** Clear the state; the coefficient `a` is kept. */
     void reset() { x1 = x2 = y1 = y2 = 0.0f; }
+    /** One sample through the section. */
     inline float process(float x) {
       // (a + z^-2) / (1 + a z^-2)  =>  y[n] = a*x[n] + x[n-2] - a*y[n-2].
       // The signs are the whole filter: get them wrong and the section is still
       // stable and still unit-gain, so it LOOKS fine and simply does not filter.
       const float y = a * (x - y2) + x2;
       x2 = x1; x1 = x;
-      y2 = y1; y1 = y;
-      return flushDenormal(y);
+      // The STATE flushed, not only what is returned. y1 kept the raw value,
+      // so one NaN or infinity came back through every later sample -- the
+      // section returned 0 from then on and the IIR oversampler was silent
+      // for good -- and a decaying tail sat in the feedback as denormals.
+      // The input's own copies leave after two samples; this is the one that
+      // fed itself.
+      y2 = y1; y1 = flushDenormal(y);
+      return y1;
     }
   };
 
@@ -268,7 +559,7 @@ private:
 /**
  * Oversampling by 2^Stages, built from cascaded half-band stages.
  *
- * Usage is one sample in, one sample out: the shaper simply runs `2^Stages`
+ * Usage is one sample in, one sample out. The shaper simply runs `2^Stages`
  * times in between:
  *
  *   float y = os.process(x, [drive](float s) { return std::tanh(s * drive); });
@@ -287,12 +578,21 @@ class OversamplerT {
   // 32x (Stages = 5) is the ceiling, and the reason is the LATENCY, not taste:
   // the cascade delay is (Taps-1)·(1 − 2^−Stages), which stays a whole number
   // of samples only while 2^Stages divides (Taps-1). With the default 33 taps
-  // that holds to 32x (31 samples) and breaks at 64x (31.5), and half a sample
+  // that holds to 32x (31 samples) and breaks at 64x (31.5). And half a sample
   // cannot be reported to a host, so the plugin would be permanently
   // mis-compensated. A deeper factor needs a longer kernel, deliberately chosen.
   static_assert(Stages >= 0 && Stages <= 5, "beyond 32x the cascade latency stops being an integer");
+  // The same rule for any tap count, not only the default: Oversampler<2, 31>
+  // measured 22.5 samples and declared 22, and <3, 35> 29.81 against 29 --
+  // a plugin reporting either would be mis-compensated for good.
+  static_assert(Stages == 0 || Filter::latency() == 0 ||
+                    (2 * Filter::latency() * ((1 << Stages) - 1)) % (1 << Stages) == 0,
+                "this tap count gives a fractional latency at this factor: (Taps - 1) must be a "
+                "multiple of 2^Stages");
 
 public:
+  /** The oversampling factor, 2^Stages: how many times process() calls its
+   *  shaper for each input sample. */
   static constexpr int factor() { return 1 << Stages; }
 
   /** Delay through the up/down filter chain, in samples at the BASE rate.
@@ -305,6 +605,7 @@ public:
                : (2 * Filter::latency() * ((1 << Stages) - 1)) / (1 << Stages);
   }
 
+  /** Clear every stage's filters. No allocation. */
   void reset() {
     for (int s = 0; s < Stages; ++s) {
       up_[s].reset();
@@ -312,6 +613,11 @@ public:
     }
   }
 
+  /** [audio-thread] One sample at the base rate: raised by factor(), each
+   *  of the factor() samples passed through `shaper` (any callable taking
+   *  and returning a float), and brought back down. The result is
+   *  latencySamples() late. The working buffers are on the stack: no
+   *  allocation. */
   template <typename Shaper>
   inline float process(float x, Shaper&& shaper) {
     if (Stages == 0) return shaper(x);
@@ -326,9 +632,9 @@ public:
       float expanded[factor()];
       for (int i = 0; i < count; ++i) {
         // Order matters: the filter is stateful, so samples must reach it in
-        // time order. Filling forwards is the only correct direction.
-        expanded[i * 2] = up_[s].process(buffer[i] * 2.0f);
-        expanded[i * 2 + 1] = up_[s].process(0.0f);
+        // time order. Filling forwards is the only correct direction. The
+        // polyphase form computes the pair without filtering the stuffed zero.
+        up_[s].upsample(buffer[i] * 2.0f, expanded[i * 2], expanded[i * 2 + 1]);
       }
       count *= 2;
       for (int i = 0; i < count; ++i) buffer[i] = expanded[i];
@@ -338,23 +644,89 @@ public:
     for (int i = 0; i < count; ++i) buffer[i] = shaper(buffer[i]);
 
     // ── Down ──────────────────────────────────────────────────────────────
-    // Every sample must go through the filter to keep its state coherent; only
-    // every second result is kept.
+    // Every sample enters the filter's state; only every second result is
+    // kept, and only that one is computed.
     for (int s = Stages - 1; s >= 0; --s) {
       const int half = count / 2;
       for (int i = 0; i < half; ++i) {
         // Keep phase 0: the FIRST of each pair. Keeping the second lands the
         // cascade's symmetric peak between two output samples and makes the
         // total delay a half-integer, which cannot be reported to a host.
-        buffer[i] = down_[s].process(buffer[i * 2]);
-        down_[s].process(buffer[i * 2 + 1]);
+        // The polyphase form computes only the kept output.
+        buffer[i] = down_[s].downsample(buffer[i * 2], buffer[i * 2 + 1]);
       }
       count = half;
     }
     return buffer[0];
   }
 
+  /**
+   * process() over a block, in place: the same bits as n calls, for a fraction
+   * of the cost when the filter has the polyphase block path (HalfBandFilter;
+   * the IIR half-band falls back to its per-sample calls). Each stage runs over
+   * the whole block before the next, which every filter sees as the same
+   * sequence it would have seen sample by sample. 64-sample pieces, so the
+   * working buffers stay on the stack: 64 x factor() floats.
+   */
+  template <typename Shaper>
+  void processBlock(float* io, int n, Shaper&& shaper) {
+    if constexpr (Stages == 0) {
+      for (int i = 0; i < n; ++i) io[i] = shaper(io[i]);
+    } else {
+      constexpr int kPiece = 64;
+      float a[kPiece * factor()], b[kPiece * factor()];
+      while (n > 0) {
+        const int m = n < kPiece ? n : kPiece;
+        // Up, a stage at a time; x2 restores what zero-stuffing halves.
+        for (int i = 0; i < m; ++i) a[i] = io[i] * 2.0f;
+        int count = m;
+        float* src = a;
+        float* dst = b;
+        for (int s = 0; s < Stages; ++s) {
+          upBlock(up_[s], src, count, dst);
+          count *= 2;
+          if (s + 1 < Stages)
+            for (int i = 0; i < count; ++i) dst[i] *= 2.0f;
+          float* t = src;
+          src = dst;
+          dst = t;
+        }
+        for (int i = 0; i < count; ++i) src[i] = shaper(src[i]);
+        // Down, keeping phase 0, as process() does.
+        for (int s = Stages - 1; s >= 0; --s) {
+          downBlock(down_[s], src, count / 2, dst);
+          count /= 2;
+          float* t = src;
+          src = dst;
+          dst = t;
+        }
+        for (int i = 0; i < m; ++i) io[i] = src[i];
+        io += m;
+        n -= m;
+      }
+    }
+  }
+
 private:
+  /** A filter's block path when it has one, else its per-sample calls. */
+  template <typename F, typename = void>
+  struct HasBlock : std::false_type {};
+  /** The match for HasBlock: F declares upsampleBlock(), so the block path
+   *  is used (downsampleBlock() is assumed beside it). */
+  template <typename F>
+  struct HasBlock<F, std::void_t<decltype(std::declval<F&>().upsampleBlock(nullptr, 0, nullptr))>>
+      : std::true_type {};
+  static void upBlock(Filter& f, const float* u, int n, float* out) {
+    if constexpr (HasBlock<Filter>::value) f.upsampleBlock(u, n, out);
+    else
+      for (int i = 0; i < n; ++i) f.upsample(u[i], out[2 * i], out[2 * i + 1]);
+  }
+  static void downBlock(Filter& f, const float* v, int n, float* y) {
+    if constexpr (HasBlock<Filter>::value) f.downsampleBlock(v, n, y);
+    else
+      for (int i = 0; i < n; ++i) y[i] = f.downsample(v[2 * i], v[2 * i + 1]);
+  }
+
   Filter up_[Stages > 0 ? Stages : 1];
   Filter down_[Stages > 0 ? Stages : 1];
 };
@@ -368,7 +740,7 @@ private:
  *                    must stay phase-coherent.
  *
  *   OversamplerIir   minimum phase, latency small enough to report as zero, and
- *                    2-4 multiplies per pass instead of 17. The right choice for
+ *                    2–4 multiplies per pass instead of 17. The right choice for
  *                    saturation where a few samples of frequency-dependent
  *                    delay does not matter, at the cost of a phase response
  *                    that is not flat. NOT latency-free: about three samples
@@ -378,24 +750,34 @@ private:
 template <int Stages = 1, int Taps = 33>
 using Oversampler = OversamplerT<Stages, HalfBandFilter<Taps>>;
 
+/** The minimum-phase flavour: 2^Stages oversampling through polyphase IIR
+ *  half-bands of `Order` (9 by default), latency reported as 0. */
 template <int Stages = 1, int Order = 9>
 using OversamplerIir = OversamplerT<Stages, PolyphaseIirHalfBand<Order>>;
 
+/** 2x, linear phase, 33 taps: 16 samples of latency at the base rate. */
 using Oversampler2x = Oversampler<1>;
+/** 4x, linear phase: 24 samples of latency at the base rate. */
 using Oversampler4x = Oversampler<2>;
+/** 8x, linear phase: 28 samples of latency at the base rate. */
 using Oversampler8x = Oversampler<3>;
-/** 16x. Worth it only for something violently nonlinear: a hard clipper, a
- *  fold-back: where even 8x leaves audible folded product. It costs about
+/** 16x. Worth it only for something violently nonlinear (a hard clipper, a
+ *  fold-back) where even 8x leaves audible folded product. It costs about
  *  twice 8x for a few dB, so it is a deliberate choice, not a default. */
 using Oversampler16x = Oversampler<4>;
 /** 32x. The ceiling, and past the point of audible return: measured gain
  *  over 8x is a handful of dB for four times the work. Here because being
  *  unable to do it would be a limitation; not because it is a good default. */
 using Oversampler32x = Oversampler<5>;
+/** 2x, minimum phase: reports 0, delays about three samples (measured). */
 using OversamplerIir2x = OversamplerIir<1>;
+/** 4x, minimum phase: reports 0, delays more than the 2x does. */
 using OversamplerIir4x = OversamplerIir<2>;
+/** 8x, minimum phase: reports 0; the real delay grows with the stages. */
 using OversamplerIir8x = OversamplerIir<3>;
+/** 16x, minimum phase: reports 0; the real delay grows with the stages. */
 using OversamplerIir16x = OversamplerIir<4>;
+/** 32x, minimum phase: reports 0; the real delay grows with the stages. */
 using OversamplerIir32x = OversamplerIir<5>;
 
 /**
@@ -416,7 +798,12 @@ public:
   /** How many output samples `inputLength` will produce at this ratio. */
   static size_t outputLength(size_t inputLength, double ratio) {
     if (ratio <= 0.0) return 0;
-    return (size_t) std::floor((double) inputLength * ratio);
+    // A hair above, relative: a ratio p/q is itself rounded, so n * ratio for
+    // an n that IS a multiple of q lands a few ulps under the integer --
+    // 49 * (1/49) is 0.99999... -- and floor() took the sample away. A true
+    // fraction is at least 1/q under the next integer, far more than this.
+    const double exact = (double) inputLength * ratio;
+    return (size_t) std::floor(exact + exact * 1e-12);
   }
 
   /**
@@ -437,13 +824,20 @@ public:
     // content between the two Nyquists folds back as alias.
     const double cutoff = ratio < 1.0 ? ratio : 1.0;
     const double step = 1.0 / ratio;
+    // ...and widen the kernel by the same factor. A sinc stretched by
+    // 1/cutoff has its zero crossings that much further apart, so a span of
+    // halfWidth INPUT samples held fewer crossings the harder it decimated:
+    // at 192k -> 48k, a quarter of them. A 30 kHz tone then aliased to 18 kHz
+    // at -17 dB, and a 20 kHz tone in the passband lost 2.4 dB. Measured in
+    // crossings of the stretched sinc, the filter is the same at every ratio.
+    const int span = (int) std::ceil((double) halfWidth / cutoff);
 
     for (size_t o = 0; o < count; ++o) {
       const double centre = (double) o * step;
       const long base = (long) std::floor(centre);
       double acc = 0.0;
       double norm = 0.0;
-      for (int k = -halfWidth + 1; k <= halfWidth; ++k) {
+      for (int k = -span + 1; k <= span; ++k) {
         const long index = base + k;
         if (index < 0 || index >= (long) inLength) continue;
         const double distance = centre - (double) index;
@@ -463,8 +857,9 @@ private:
     const double pi = (double) kPi;
     const double x = distance * cutoff;
     const double sinc = (std::fabs(x) < 1e-9) ? 1.0 : std::sin(pi * x) / (pi * x);
-    // Blackman again, over the kernel's own span.
-    const double t = (distance + halfWidth) / (2.0 * halfWidth);
+    // Blackman again, over the kernel's own span -- in crossings of the
+    // stretched sinc, which is `x`, so the window widens with the kernel.
+    const double t = (x + halfWidth) / (2.0 * halfWidth);
     if (t < 0.0 || t > 1.0) return 0.0;
     const double w = 0.42 - 0.5 * std::cos(2.0 * pi * t) + 0.08 * std::cos(4.0 * pi * t);
     return sinc * w * cutoff;

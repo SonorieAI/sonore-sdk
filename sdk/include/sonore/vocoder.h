@@ -25,6 +25,9 @@
 //
 // Included by dsp.h.
 #pragma once
+#ifndef SONORE_DSP_H_INCLUDED
+#error "vocoder.h is part of dsp.h and needs what it includes first: include <sonore/dsp.h> instead."
+#endif
 #include <cmath>
 #include "audio.h"
 
@@ -46,8 +49,13 @@ class ChannelVocoder {
   static_assert(Bands >= 4 && Bands <= 64, "4..64 bands");
 
 public:
+  /** The number of bands, 4..64: the template's Bands. */
   static constexpr int kBands = Bands;
 
+  /** The rate in Hz; one of 1 or less, or NaN, is taken as 48000. The bands
+   *  and the envelope times are set up again for it from the last range and
+   *  times (80 Hz .. 8 kHz, 5 ms and 30 ms until told otherwise). Call it
+   *  before setRange(), whose limits depend on the rate. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     for (int b = 0; b < Bands; ++b) {
@@ -60,6 +68,11 @@ public:
     setRange(lowHz_, highHz_);
     setTimes(attackMs_, releaseMs_);
   }
+  /** The centres of the lowest and highest band, in Hz: the low one held to
+   *  20 Hz .. 0.4 x the rate, the high one to at least twice the low and at
+   *  most 0.45 x the rate. The bands between are spaced evenly in log
+   *  frequency, and their Q follows from the spacing. The filters' state is
+   *  kept. */
   void setRange(float lowHz, float highHz) {
     lowHz_ = clampf(lowHz, 20.0f, sr_ * 0.4f);
     highHz_ = clampf(highHz, lowHz_ * 2.0f, sr_ * 0.45f);
@@ -76,12 +89,17 @@ public:
       }
     }
   }
+  /** The modulator envelopes' attack and release, ms to 63% (at least
+   *  0.01 ms each): fast enough to follow consonants, slow enough not to
+   *  ripple at the voice's pitch. */
   void setTimes(float attackMs, float releaseMs) {
     attackMs_ = attackMs;
     releaseMs_ = releaseMs;
     for (int b = 0; b < Bands; ++b) env_[b].setTimes(attackMs, releaseMs);
   }
+  /** A linear gain on the summed output, 1 by default; not clamped. */
   void setOutputGain(float g) { gain_ = g; }
+  /** Silence: every band's filters and envelope cleared, the settings kept. */
   void reset() {
     for (int b = 0; b < Bands; ++b) {
       for (int s = 0; s < 2; ++s) {
@@ -91,10 +109,15 @@ public:
       env_[b].reset();
     }
   }
+  /** Band b's centre in Hz, b 0-based from the lowest; 0 outside
+   *  0..Bands-1. */
   float bandCentre(int b) const { return b >= 0 && b < Bands ? centre_[b] : 0.0f; }
   /** The modulator's envelope in band b, as of the last sample. */
   float bandLevel(int b) const { return b >= 0 && b < Bands ? env_[b].value() : 0.0f; }
 
+  /** [audio-thread] One sample: the carrier through every band, each at the
+   *  modulator's level in that band, summed and scaled by the output gain.
+   *  Allocation-free. */
   inline float process(float modulator, float carrier) {
     float out = 0.0f;
     for (int b = 0; b < Bands; ++b) {
@@ -103,7 +126,12 @@ public:
       const float level = env_[b].process(mod_[b][1].bp * norm_);
       car_[b][0].process(carrier);
       car_[b][1].process(car_[b][0].bp * norm_);
-      out += car_[b][1].bp * norm_ * level;
+      // Every other band inverted. Each is two bandpasses in cascade, so
+      // where two neighbours cross they are 180 degrees apart, and summed
+      // as they were they cancelled: 10.6 dB of ripple through open bands,
+      // notches between every pair of centres. Inverted, they add.
+      const float sign = (b & 1) ? -1.0f : 1.0f;
+      out += sign * car_[b][1].bp * norm_ * level;
     }
     return out * gain_;
   }
@@ -126,8 +154,17 @@ private:
  */
 class FormantFilter {
 public:
-  enum Vowel { A = 0, E = 1, I = 2, O = 3, U = 4 };
+  /** The five vowels, at their positions on setVowel()'s 0..4 scale. */
+  enum Vowel {
+    A = 0, ///< position 0, the default: first two formants at 800 and 1150 Hz
+    E = 1, ///< position 1: 350 and 2000 Hz
+    I = 2, ///< position 2: 270 and 2140 Hz
+    O = 3, ///< position 3: 450 and 800 Hz
+    U = 4  ///< position 4: 325 and 700 Hz
+  };
 
+  /** The rate in Hz; one of 1 or less, or NaN, is taken as 48000. The
+   *  current vowel is installed again for it. */
   void setSampleRate(float sr) {
     sr_ = sr > 1.0f ? sr : 48000.0f;
     for (auto& f : filter_) f.setSampleRate(sr_);
@@ -152,13 +189,17 @@ public:
       centre_[f] = hz;
     }
   }
+  /** Exactly one vowel, unmorphed. */
   void setVowel(Vowel v) { setVowel((float) v); }
+  /** Clear the five resonators; the vowel stays. */
   void reset() {
     for (auto& f : filter_) f.reset();
   }
   /** Formant f's centre as installed (interpolated), for the curious. */
   float formantHz(int f) const { return f >= 0 && f < kFormants ? centre_[f] : 0.0f; }
 
+  /** [audio-thread] One sample through the five resonances in parallel,
+   *  summed. Allocation-free. */
   inline float process(float x) {
     float out = 0.0f;
     for (int f = 0; f < kFormants; ++f) {
@@ -170,7 +211,9 @@ public:
 
 private:
   static constexpr int kFormants = 5;
-  struct Formant { float hz, db, bw; };
+  /** One formant of a vowel in the table: centre in Hz, level in dB against
+   *  the first formant, bandwidth in Hz. */
+  struct Formant { float hz, /**< centre, Hz */ db, /**< level against the first formant, dB */ bw; /**< bandwidth, Hz */ };
   // Soprano, from the Csound manual's formant table.
   static constexpr Formant kTable[5][kFormants] = {
     {{800.0f, 0.0f, 80.0f}, {1150.0f, -6.0f, 90.0f}, {2900.0f, -32.0f, 120.0f}, {3900.0f, -20.0f, 130.0f}, {4950.0f, -50.0f, 140.0f}},  // A
