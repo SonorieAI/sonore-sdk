@@ -2407,12 +2407,18 @@ inline void markDirtyIfNeeded(Plugin* plugin) {
  * hear a smeared mix and blame the plugin.
  */
 inline void notifyLatencyIfChanged(Plugin* plugin) {
-  if (!clapwrap::HasLatency<SonoreDsp>::value || !plugin->handler) return;
-  const uint32_t latency = clapwrap::dspLatency(plugin->shared.dsp);
-  if (latency == plugin->shared.reportedLatency) return;
-  plugin->shared.reportedLatency = latency;
-  plugin->handler->lpVtbl->restartComponent(plugin->handler,
-                                            Steinberg_Vst_RestartFlags_kLatencyChanged);
+  // `if constexpr` on the trait: MSVC 2022 calls `!Trait || x` a constant
+  // condition (C4127) for a DSP with no latency, and /W4 /WX stops on it.
+  if constexpr (clapwrap::HasLatency<SonoreDsp>::value) {
+    if (!plugin->handler) return;
+    const uint32_t latency = clapwrap::dspLatency(plugin->shared.dsp);
+    if (latency == plugin->shared.reportedLatency) return;
+    plugin->shared.reportedLatency = latency;
+    plugin->handler->lpVtbl->restartComponent(plugin->handler,
+                                              Steinberg_Vst_RestartFlags_kLatencyChanged);
+  } else {
+    (void) plugin;
+  }
 }
 
 /**

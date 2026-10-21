@@ -31,8 +31,10 @@
 // kAudioObjectPropertyElementMain arrived in the macOS 12 SDK; before that the
 // same constant was spelled ...Master, and it is still what older SDKs define.
 // Naming it once here means the rest of this file reads the modern way and
-// still compiles against an older toolchain.
-#ifndef kAudioObjectPropertyElementMain
+// still compiles against an older toolchain. Decided by the SDK's version, not
+// by #ifndef: in the 12 SDK the constant is an enumerator, never a macro, so
+// #ifndef always took the old name and every build warned it was deprecated.
+#if !defined(MAC_OS_VERSION_12_0) && !defined(kAudioObjectPropertyElementMain)
 #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
 #endif
 

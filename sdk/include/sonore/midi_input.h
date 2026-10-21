@@ -269,12 +269,12 @@ public:
     std::vector<std::string> names;
     HMODULE lib = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) return names;
-    auto numDevs = (UINT(WINAPI*)()) GetProcAddress(lib, "midiInGetNumDevs");
+    auto numDevs = (UINT(WINAPI*)()) (void*) GetProcAddress(lib, "midiInGetNumDevs");
     // The wide call: the A one answers in the ANSI code page, not UTF-8, so
     // an accented name came out as bytes no UTF-8 reader takes and one
     // outside the code page as question marks.
     auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSW*, UINT))
-        GetProcAddress(lib, "midiInGetDevCapsW");
+        (void*) GetProcAddress(lib, "midiInGetDevCapsW");
     if (numDevs && getCaps) {
       const UINT count = numDevs();
       for (UINT i = 0; i < count; ++i) {
@@ -313,19 +313,19 @@ public:
       error_ = "winmm.dll is not available";
       return false;
     }
-    auto getNumDevs = (UINT(WINAPI*)()) GetProcAddress(lib_, "midiInGetNumDevs");
+    auto getNumDevs = (UINT(WINAPI*)()) (void*) GetProcAddress(lib_, "midiInGetNumDevs");
     midiInOpen_ = (MMRESULT(WINAPI*)(HMIDIIN*, UINT, DWORD_PTR, DWORD_PTR, DWORD))
-        GetProcAddress(lib_, "midiInOpen");
-    midiInStart_ = (MMRESULT(WINAPI*)(HMIDIIN)) GetProcAddress(lib_, "midiInStart");
+        (void*) GetProcAddress(lib_, "midiInOpen");
+    midiInStart_ = (MMRESULT(WINAPI*)(HMIDIIN)) (void*) GetProcAddress(lib_, "midiInStart");
     midiInPrepareHeader_ = (MMRESULT(WINAPI*)(HMIDIIN, MIDIHDR*, UINT))
-        GetProcAddress(lib_, "midiInPrepareHeader");
+        (void*) GetProcAddress(lib_, "midiInPrepareHeader");
     midiInUnprepareHeader_ = (MMRESULT(WINAPI*)(HMIDIIN, MIDIHDR*, UINT))
-        GetProcAddress(lib_, "midiInUnprepareHeader");
+        (void*) GetProcAddress(lib_, "midiInUnprepareHeader");
     midiInAddBuffer_ = (MMRESULT(WINAPI*)(HMIDIIN, MIDIHDR*, UINT))
-        GetProcAddress(lib_, "midiInAddBuffer");
-    midiInReset_ = (MMRESULT(WINAPI*)(HMIDIIN)) GetProcAddress(lib_, "midiInReset");
-    midiInStop_ = (MMRESULT(WINAPI*)(HMIDIIN)) GetProcAddress(lib_, "midiInStop");
-    midiInClose_ = (MMRESULT(WINAPI*)(HMIDIIN)) GetProcAddress(lib_, "midiInClose");
+        (void*) GetProcAddress(lib_, "midiInAddBuffer");
+    midiInReset_ = (MMRESULT(WINAPI*)(HMIDIIN)) (void*) GetProcAddress(lib_, "midiInReset");
+    midiInStop_ = (MMRESULT(WINAPI*)(HMIDIIN)) (void*) GetProcAddress(lib_, "midiInStop");
+    midiInClose_ = (MMRESULT(WINAPI*)(HMIDIIN)) (void*) GetProcAddress(lib_, "midiInClose");
     if (!getNumDevs || !midiInOpen_ || !midiInStart_) {
       error_ = "winmm is missing its MIDI entry points";
       return false;
@@ -477,7 +477,7 @@ private:
   std::string nameOf(UINT index) const {
     if (!lib_) return std::string();
     auto getCaps = (MMRESULT(WINAPI*)(UINT_PTR, MIDIINCAPSW*, UINT))
-        GetProcAddress(lib_, "midiInGetDevCapsW");
+        (void*) GetProcAddress(lib_, "midiInGetDevCapsW");
     MIDIINCAPSW caps{};
     if (getCaps && getCaps(index, &caps, sizeof(caps)) == MMSYSERR_NOERROR)
       return ::sonore::pathio::narrow(caps.szPname, MAXPNAMELEN);

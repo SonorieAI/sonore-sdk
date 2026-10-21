@@ -20,8 +20,8 @@
 #include <CoreAudio/CoreAudio.h>
 
 // The macOS 12 SDK's spelling, from the older one where it is missing -- as
-// audio_coreaudio.h does; whichever header comes first defines it.
-#ifndef kAudioObjectPropertyElementMain
+// audio_coreaudio.h does, by the SDK's version; whichever comes first defines it.
+#if !defined(MAC_OS_VERSION_12_0) && !defined(kAudioObjectPropertyElementMain)
 #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
 #endif
 

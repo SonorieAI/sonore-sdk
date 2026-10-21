@@ -462,7 +462,7 @@ private:
     typedef HRESULT(WINAPI * GetDpiForMonitorFn)(HMONITOR, int, UINT*, UINT*);
     static GetDpiForMonitorFn fn = [] {
       HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-      return shcore ? (GetDpiForMonitorFn) GetProcAddress(shcore, "GetDpiForMonitor") : nullptr;
+      return shcore ? (GetDpiForMonitorFn) (void*) GetProcAddress(shcore, "GetDpiForMonitor") : nullptr;
     }();
     UINT dpiX = 0, dpiY = 0;
     if (fn && monitor && SUCCEEDED(fn(monitor, 0 /* MDT_EFFECTIVE_DPI */, &dpiX, &dpiY)) && dpiX > 0)
@@ -762,7 +762,7 @@ private:
     typedef UINT(WINAPI * GetDpiForWindowFn)(HWND);
     static GetDpiForWindowFn fn = [] {
       HMODULE user32 = GetModuleHandleW(L"user32.dll");
-      return user32 ? (GetDpiForWindowFn) GetProcAddress(user32, "GetDpiForWindow") : nullptr;
+      return user32 ? (GetDpiForWindowFn) (void*) GetProcAddress(user32, "GetDpiForWindow") : nullptr;
     }();
     if (fn && hwnd) {
       const UINT dpi = fn(hwnd);

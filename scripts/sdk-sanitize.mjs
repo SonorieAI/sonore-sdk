@@ -21,12 +21,17 @@
 // the sanitizer's own report above it with a stack. A hang in a fuzzed parser
 // exits 99 and names the input it wrote next to the binary.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sdk = join(root, "sdk");
+// sdk_tests checks version.h against the CMake project's version, which
+// CMake hands it as SONORE_TEST_PROJECT_VERSION. This build is not CMake's,
+// so it reads the same line CMake does; without it sdk_tests did not compile.
+const projectVersion =
+  (readFileSync(join(sdk, "CMakeLists.txt"), "utf8").match(/project\(SonoreSDK VERSION ([0-9.]+)/) || [])[1] || "0.0.0";
 const log = (s) => process.stdout.write(s + "\n");
 
 // The whole leg is one bash script. Written to a file and run by path, never
@@ -96,7 +101,7 @@ echo "== building the hosts, the suites and the apps"
 build $O/clap_host_test $S/tests/clap_host_test.cpp $INC -ldl
 build $O/vst3_host_test $S/tests/vst3_host_test.cpp $INC $VINC -ldl
 build $O/lv2_host_test $S/tests/lv2_host_test.cpp $INC $LINC -ldl
-build $O/sdk_tests $S/tests/sdk_tests.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" $INC $VINC
+build $O/sdk_tests $S/tests/sdk_tests.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" -DSONORE_TEST_PROJECT_VERSION="\\"${projectVersion}\\"" $INC $VINC
 build $O/fuzz_parsers $S/tests/fuzz_parsers.cpp -pthread -DSONORE_TEST_DATA_DIR="\\"$S/tests/data\\"" $INC $VINC $LINC -ldl
 build $O/fuzz_state $S/tests/fuzz_state.cpp -pthread $INC -ldl
 for fx in synth ducker splitter; do

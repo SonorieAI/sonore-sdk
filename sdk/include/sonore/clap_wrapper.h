@@ -290,9 +290,16 @@ inline bool wantsMidiIn() {
 /** How many aux output buses this plugin really has: what the descriptor
  *  declares, but only for a DSP that can actually be handed them. */
 inline uint32_t numAuxOutputs() {
-  if (!TakesContext<SonoreDsp>::value || !kDesc.auxOutputs) return 0;
-  const int n = kDesc.numAuxOutputs;
-  return (uint32_t) (n < 0 ? 0 : (n > 32 ? 32 : n));
+  // `if constexpr` on the trait, the plain `if` on the rest: MSVC 2022 calls
+  // `!Trait || x` a constant condition (C4127) in a plugin whose DSP does not
+  // have the trait, and a /W4 /WX build stops on it.
+  if constexpr (!TakesContext<SonoreDsp>::value) {
+    return 0;
+  } else {
+    if (!kDesc.auxOutputs) return 0;
+    const int n = kDesc.numAuxOutputs;
+    return (uint32_t) (n < 0 ? 0 : (n > 32 ? 32 : n));
+  }
 }
 
 inline uint32_t auxBusChannels(uint32_t index) {
@@ -2833,9 +2840,13 @@ inline void announceLatency(Instance* inst) {
  * activate(), which is where the new number is allowed to be spoken.
  */
 inline void requestRestartIfLatencyChanged(Instance* inst) {
-  if (!HasLatency<SonoreDsp>::value || !inst->host) return;
-  if (dspLatency(inst->dsp) == inst->reportedLatency) return;
-  inst->host->request_restart(inst->host);
+  if constexpr (HasLatency<SonoreDsp>::value) { // see numAuxOutputs()
+    if (!inst->host) return;
+    if (dspLatency(inst->dsp) == inst->reportedLatency) return;
+    inst->host->request_restart(inst->host);
+  } else {
+    (void) inst;
+  }
 }
 
 inline uint32_t latencyGet(const clap_plugin_t* plugin) {
@@ -2921,15 +2932,19 @@ inline uint32_t dspTail(const T& dsp) {
  * with a stale short tail cuts the reverb off mid-decay.
  */
 inline void announceTailIfChanged(Instance* inst) {
-  if (!HasTail<SonoreDsp>::value || !inst->host) return;
-  const uint32_t tail = dspTail(inst->dsp);
-  if (inst->tailReported && tail == inst->reportedTail) return;
-  inst->reportedTail = tail;
-  inst->tailReported = true;
-  if (const auto* ext =
-          static_cast<const clap_host_tail_t*>(inst->host->get_extension(inst->host,
-                                                                        CLAP_EXT_TAIL)))
-    ext->changed(inst->host);
+  if constexpr (HasTail<SonoreDsp>::value) { // see numAuxOutputs()
+    if (!inst->host) return;
+    const uint32_t tail = dspTail(inst->dsp);
+    if (inst->tailReported && tail == inst->reportedTail) return;
+    inst->reportedTail = tail;
+    inst->tailReported = true;
+    if (const auto* ext =
+            static_cast<const clap_host_tail_t*>(inst->host->get_extension(inst->host,
+                                                                          CLAP_EXT_TAIL)))
+      ext->changed(inst->host);
+  } else {
+    (void) inst;
+  }
 }
 
 inline uint32_t tailGet(const clap_plugin_t* plugin) {
@@ -3026,7 +3041,7 @@ inline bool pluginActivate(const clap_plugin_t* plugin, double sampleRate,
   prepareDsp(inst); // the one place allocation is allowed
   inst->bypass.prepare(sampleRate, maxFrames, dspLatency(inst->dsp), inst->mainChannels);
   if (TakesSidechain<SonoreDsp>::value) inst->scSilence.assign(maxFrames > 0 ? maxFrames : 1, 0.0f);
-  if (TakesSidechain<SonoreDsp>::value && supportsDouble())
+  if constexpr (TakesSidechain<SonoreDsp>::value && supportsDouble()) // see numAuxOutputs()
     inst->scSilence64.assign(maxFrames > 0 ? maxFrames : 1, 0.0);
   // The one moment changed() may be called.
   announceLatency(inst);

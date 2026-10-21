@@ -241,7 +241,7 @@ inline std::string osVersion() {
   typedef LONG(WINAPI * RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
   if (!ntdll) return {};
-  RtlGetVersionFn get = (RtlGetVersionFn) GetProcAddress(ntdll, "RtlGetVersion");
+  RtlGetVersionFn get = (RtlGetVersionFn) (void*) GetProcAddress(ntdll, "RtlGetVersion");
   if (!get) return {};
   RTL_OSVERSIONINFOW info{};
   info.dwOSVersionInfoSize = sizeof(info);

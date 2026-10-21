@@ -7,7 +7,13 @@
 // with a real unistd.h (MinGW, Linux) nothing here may shadow it. MSVC has
 // none, and declares a few of these itself under their POSIX names.
 #pragma once
+// MSVC has no __attribute__; clang-cl does, and its own intrinsic headers
+// (mmintrin.h, pulled in by <intrin.h>) are built on vector_size attributes,
+// so defining it away there turned every vector type into a scalar and the
+// Windows-clangcl build of these targets failed in clang's headers.
+#if !defined(__clang__)
 #define __attribute__(x)
+#endif
 #include <process.h>
 #include <sys/stat.h>
 #include <sys/types.h>

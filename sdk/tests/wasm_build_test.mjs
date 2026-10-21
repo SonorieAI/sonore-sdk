@@ -43,7 +43,12 @@ function buildWasm(name, sourcePath, extraFlags = []) {
   const source = readFileSync(sourcePath, "utf8");
   // Drop the native-only tail (descriptor + clap wrapper); wasm needs the DSP
   // and the param count only: exactly what /api/compile sends.
+  // An example that wraps its native tail in #if !defined(SONORE_EXAMPLE_DSP_ONLY)
+  // (the reverb, the sampler) is cut at that #if: cut at the include inside
+  // it, the tail took the #endif with it and left the #if open, which em++
+  // refused as an unterminated conditional.
   const dspOnly = source
+    .replace(/#if !defined\(SONORE_EXAMPLE_DSP_ONLY\)[\s\S]*$/, "")
     .replace(/#include <sonore\/plugin\.h>[\s\S]*$/, "")
     .replace(/#include <sonore\/formats\.h>[\s\S]*$/, "")
     .replace(/#include <sonore\/clap_wrapper\.h>[\s\S]*$/, "");

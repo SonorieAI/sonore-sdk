@@ -90,6 +90,12 @@ const args = (file) => [
   "--checks=-*,clang-diagnostic-*,readability-avoid-unconditional-preprocessor-if",
   "--header-filter=sonore",
   "--extra-arg=/W4", "--extra-arg=-Wno-unknown-pragmas",
+  // Two-phase lookup, as gcc and clang on Linux and macOS do it. clang-cl
+  // defaults to MSVC's delayed template parsing, which never looks at a
+  // template body that is not instantiated: a branch of an `if constexpr`
+  // that one TU never takes went unchecked here and failed both of CI's
+  // non-Windows compilers (a stb_vorbis macro, R, in resample.h).
+  "--extra-arg=/Zc:twoPhase",
   file,
 ];
 

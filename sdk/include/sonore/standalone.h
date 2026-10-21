@@ -2587,9 +2587,9 @@ inline int runInteractive(App& app, const Options& opt) {
   if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
     using SetCtxFn = BOOL(WINAPI*)(HANDLE);
     using DpiFn = UINT(WINAPI*)();
-    if (auto setCtx = (SetCtxFn) GetProcAddress(user32, "SetProcessDpiAwarenessContext"))
+    if (auto setCtx = (SetCtxFn) (void*) GetProcAddress(user32, "SetProcessDpiAwarenessContext"))
       setCtx((HANDLE) (intptr_t) -4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */);
-    if (auto getDpi = (DpiFn) GetProcAddress(user32, "GetDpiForSystem"))
+    if (auto getDpi = (DpiFn) (void*) GetProcAddress(user32, "GetDpiForSystem"))
       dpiScale = (double) getDpi() / 96.0;
   }
   HWND hwnd = createAppWindow(app, dpiScale);

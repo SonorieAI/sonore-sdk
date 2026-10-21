@@ -656,11 +656,16 @@ inline OSStatus getPropertyInfo(void* self, AudioUnitPropertyID property, AudioU
       // is how a unit tells the OS it renders on helper threads of its own.
       // CLAP, VST3 and LV2 have no equivalent, so there the hook is never
       // called -- said in audio_workgroup.h.
-      if (!::sonore::detail::HasWorkgroupHook<SonoreDsp>::value || !unit->contextObserverReady)
+      // The trait by `if constexpr`: MSVC 2022 calls `!Trait || x` a constant
+      // condition (C4127) for a DSP without the hook.
+      if constexpr (!::sonore::detail::HasWorkgroupHook<SonoreDsp>::value) {
         return kAudioUnitErr_InvalidProperty;
-      if (!globalOnly(scope, element)) return kAudioUnitErr_InvalidScope;
-      size = sizeof(void*);
-      break;
+      } else {
+        if (!unit->contextObserverReady) return kAudioUnitErr_InvalidProperty;
+        if (!globalOnly(scope, element)) return kAudioUnitErr_InvalidScope;
+        size = sizeof(void*);
+        break;
+      }
     default:
       return kAudioUnitErr_InvalidProperty;
   }
@@ -1576,8 +1581,9 @@ inline OSStatus initialize(void* self) {
   // The sidechain and aux scratch too, at the largest slice: render() grew
   // them on demand, which is a malloc on the audio thread the first time a
   // host renders. The sidechain's only for a DSP render() pulls one for.
-  if (clapwrap::TakesSidechain<SonoreDsp>::value && !kDesc.isInstrument)
-    for (auto& v : unit->scScratch) v.assign(unit->maxFrames, 0.0f);
+  if constexpr (clapwrap::TakesSidechain<SonoreDsp>::value) // not `&&` with it: C4127
+    if (!kDesc.isInstrument)
+      for (auto& v : unit->scScratch) v.assign(unit->maxFrames, 0.0f);
   {
     uint32_t flat = 0;
     for (uint32_t b = 0; b < clapwrap::numAuxOutputs(); ++b)
@@ -1755,37 +1761,41 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   // The sidechain, when the DSP wants one: pull element 1 into our scratch.
   // No callback wired means the key input simply stays silent.
   float* scChans[2] = {nullptr, nullptr};
-  if (clapwrap::TakesSidechain<SonoreDsp>::value && !kDesc.isInstrument) {
-    // Sized at initialize(); a slice past it is refused there, so this holds.
-    if (unit->scScratch[0].size() < frames || unit->scScratch[1].size() < frames)
-      return kAudioUnitErr_TooManyFramesToProcess;
-    scChans[0] = unit->scScratch[0].data();
-    scChans[1] = unit->scScratch[1].data();
-    std::memset(scChans[0], 0, sizeof(float) * frames);
-    std::memset(scChans[1], 0, sizeof(float) * frames);
-    if (unit->hasInputCallback[1] || unit->hasInputConnection[1]) {
-      // AudioBufferList declares mBuffers[1] and expects callers to allocate
-      // the real length behind it -- the classic CoreAudio variable-size
-      // struct. Stack storage with room for two.
-      struct {
-        AudioBufferList list;
-        AudioBuffer extra;
-      } scStorage{};
-      AudioBufferList& scList = scStorage.list;
-      // At the width the host declared for it: one buffer for a mono key.
-      const UInt32 scWidth = unit->scInChans == 1 ? 1 : 2;
-      scList.mNumberBuffers = scWidth;
-      for (UInt32 c = 0; c < scWidth; ++c) {
-        scList.mBuffers[c].mNumberChannels = 1;
-        scList.mBuffers[c].mDataByteSize = frames * (UInt32) sizeof(float);
-        scList.mBuffers[c].mData = scChans[c];
+  // The trait by `if constexpr`, the rest by `if`: MSVC 2022 calls `Trait && x`
+  // a constant condition (C4127) for a DSP with no sidechain.
+  if constexpr (clapwrap::TakesSidechain<SonoreDsp>::value) {
+    if (!kDesc.isInstrument) {
+      // Sized at initialize(); a slice past it is refused there, so this holds.
+      if (unit->scScratch[0].size() < frames || unit->scScratch[1].size() < frames)
+        return kAudioUnitErr_TooManyFramesToProcess;
+      scChans[0] = unit->scScratch[0].data();
+      scChans[1] = unit->scScratch[1].data();
+      std::memset(scChans[0], 0, sizeof(float) * frames);
+      std::memset(scChans[1], 0, sizeof(float) * frames);
+      if (unit->hasInputCallback[1] || unit->hasInputConnection[1]) {
+        // AudioBufferList declares mBuffers[1] and expects callers to allocate
+        // the real length behind it -- the classic CoreAudio variable-size
+        // struct. Stack storage with room for two.
+        struct {
+          AudioBufferList list;
+          AudioBuffer extra;
+        } scStorage{};
+        AudioBufferList& scList = scStorage.list;
+        // At the width the host declared for it: one buffer for a mono key.
+        const UInt32 scWidth = unit->scInChans == 1 ? 1 : 2;
+        scList.mNumberBuffers = scWidth;
+        for (UInt32 c = 0; c < scWidth; ++c) {
+          scList.mBuffers[c].mNumberChannels = 1;
+          scList.mBuffers[c].mDataByteSize = frames * (UInt32) sizeof(float);
+          scList.mBuffers[c].mData = scChans[c];
+        }
+        pullInput(unit, 1, timestamp, frames, &scList);
+        // A source may answer with its own buffer rather than fill ours.
+        for (UInt32 c = 0; c < scWidth; ++c)
+          if (scList.mBuffers[c].mData && scList.mBuffers[c].mData != scChans[c])
+            std::memcpy(scChans[c], scList.mBuffers[c].mData, sizeof(float) * frames);
+        if (scWidth == 1) std::memcpy(scChans[1], scChans[0], sizeof(float) * frames);
       }
-      pullInput(unit, 1, timestamp, frames, &scList);
-      // A source may answer with its own buffer rather than fill ours.
-      for (UInt32 c = 0; c < scWidth; ++c)
-        if (scList.mBuffers[c].mData && scList.mBuffers[c].mData != scChans[c])
-          std::memcpy(scChans[c], scList.mBuffers[c].mData, sizeof(float) * frames);
-      if (scWidth == 1) std::memcpy(scChans[1], scChans[0], sizeof(float) * frames);
     }
   }
 

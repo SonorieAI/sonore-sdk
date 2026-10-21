@@ -135,14 +135,18 @@ public:
       for (int i = 0; i < n; ++i) upsample(u[i], out[2 * i], out[2 * i + 1]);
     } else {
       // Reach: the odd sum goes back (kCentre - 1 + kCentre) / 2 samples.
-      constexpr int R = kCentre - 1;
-      float lin[R + kBlock];
+      // Not a one-letter name: stb_vorbis.c defines L, C and R as macros and
+      // leaves them defined, so a plugin that includes its own copy before
+      // this header turned `R` into `(PLAYBACK_RIGHT | PLAYBACK_MONO)` here,
+      // which gcc and clang refuse even in a branch never instantiated.
+      constexpr int kReach = kCentre - 1;
+      float lin[kReach + kBlock];
       while (n > 0) {
         const int m = n < kBlock ? n : kBlock;
         const float* ahead = upAhead_ + upW_ + kRing; // already in time order
-        for (int b = 0; b < R; ++b) lin[b] = ahead[b - (R - 1)];
-        for (int i = 0; i < m; ++i) lin[R + i] = u[i];
-        const float* h = lin + R; // h[i] is input i; h[i - b] is b before it
+        for (int b = 0; b < kReach; ++b) lin[b] = ahead[b - (kReach - 1)];
+        for (int i = 0; i < m; ++i) lin[kReach + i] = u[i];
+        const float* h = lin + kReach; // h[i] is input i; h[i - b] is b before it
         int i = 0;
         for (; i + 4 <= m; i += 4) {
           const simd::Vec4f even =
@@ -620,44 +624,48 @@ public:
    *  allocation. */
   template <typename Shaper>
   inline float process(float x, Shaper&& shaper) {
-    if (Stages == 0) return shaper(x);
-
-    // ── Up ────────────────────────────────────────────────────────────────
-    // Each stage doubles the block by inserting a zero after every sample and
-    // filtering. The ×2 restores the amplitude zero-stuffing halved.
-    float buffer[factor()];
-    buffer[0] = x;
-    int count = 1;
-    for (int s = 0; s < Stages; ++s) {
-      float expanded[factor()];
-      for (int i = 0; i < count; ++i) {
-        // Order matters: the filter is stateful, so samples must reach it in
-        // time order. Filling forwards is the only correct direction. The
-        // polyphase form computes the pair without filtering the stuffed zero.
-        up_[s].upsample(buffer[i] * 2.0f, expanded[i * 2], expanded[i * 2 + 1]);
+    // `if constexpr`: Stages is a template argument, and MSVC 2022 calls a
+    // plain `if` on it a constant condition (C4127) in every instance.
+    if constexpr (Stages == 0) {
+      return shaper(x);
+    } else {
+      // ── Up ────────────────────────────────────────────────────────────────
+      // Each stage doubles the block by inserting a zero after every sample and
+      // filtering. The ×2 restores the amplitude zero-stuffing halved.
+      float buffer[factor()];
+      buffer[0] = x;
+      int count = 1;
+      for (int s = 0; s < Stages; ++s) {
+        float expanded[factor()];
+        for (int i = 0; i < count; ++i) {
+          // Order matters: the filter is stateful, so samples must reach it in
+          // time order. Filling forwards is the only correct direction. The
+          // polyphase form computes the pair without filtering the stuffed zero.
+          up_[s].upsample(buffer[i] * 2.0f, expanded[i * 2], expanded[i * 2 + 1]);
+        }
+        count *= 2;
+        for (int i = 0; i < count; ++i) buffer[i] = expanded[i];
       }
-      count *= 2;
-      for (int i = 0; i < count; ++i) buffer[i] = expanded[i];
-    }
 
-    // ── The nonlinearity, at the oversampled rate ─────────────────────────
-    for (int i = 0; i < count; ++i) buffer[i] = shaper(buffer[i]);
+      // ── The nonlinearity, at the oversampled rate ─────────────────────────
+      for (int i = 0; i < count; ++i) buffer[i] = shaper(buffer[i]);
 
-    // ── Down ──────────────────────────────────────────────────────────────
-    // Every sample enters the filter's state; only every second result is
-    // kept, and only that one is computed.
-    for (int s = Stages - 1; s >= 0; --s) {
-      const int half = count / 2;
-      for (int i = 0; i < half; ++i) {
-        // Keep phase 0: the FIRST of each pair. Keeping the second lands the
-        // cascade's symmetric peak between two output samples and makes the
-        // total delay a half-integer, which cannot be reported to a host.
-        // The polyphase form computes only the kept output.
-        buffer[i] = down_[s].downsample(buffer[i * 2], buffer[i * 2 + 1]);
+      // ── Down ──────────────────────────────────────────────────────────────
+      // Every sample enters the filter's state; only every second result is
+      // kept, and only that one is computed.
+      for (int s = Stages - 1; s >= 0; --s) {
+        const int half = count / 2;
+        for (int i = 0; i < half; ++i) {
+          // Keep phase 0: the FIRST of each pair. Keeping the second lands the
+          // cascade's symmetric peak between two output samples and makes the
+          // total delay a half-integer, which cannot be reported to a host.
+          // The polyphase form computes only the kept output.
+          buffer[i] = down_[s].downsample(buffer[i * 2], buffer[i * 2 + 1]);
+        }
+        count = half;
       }
-      count = half;
+      return buffer[0];
     }
-    return buffer[0];
   }
 
   /**

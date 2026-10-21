@@ -279,9 +279,9 @@ public:
     std::vector<std::string> names;
     HMODULE lib = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) return names;
-    auto getNumDevs = (UINT(WINAPI*)()) GetProcAddress(lib, "midiOutGetNumDevs");
+    auto getNumDevs = (UINT(WINAPI*)()) (void*) GetProcAddress(lib, "midiOutGetNumDevs");
     auto getDevCaps = (MMRESULT(WINAPI*)(UINT_PTR, LPMIDIOUTCAPSW, UINT))
-        GetProcAddress(lib, "midiOutGetDevCapsW");
+        (void*) GetProcAddress(lib, "midiOutGetDevCapsW");
     if (getNumDevs && getDevCaps) {
       const UINT n = getNumDevs();
       for (UINT i = 0; i < n; ++i) {
@@ -324,13 +324,13 @@ public:
       error_ = "winmm.dll is not available";
       return false;
     }
-    auto getNumDevs = (UINT(WINAPI*)()) GetProcAddress(lib_, "midiOutGetNumDevs");
+    auto getNumDevs = (UINT(WINAPI*)()) (void*) GetProcAddress(lib_, "midiOutGetNumDevs");
     midiOutOpen_ = (MMRESULT(WINAPI*)(HMIDIOUT*, UINT, DWORD_PTR, DWORD_PTR, DWORD))
-        GetProcAddress(lib_, "midiOutOpen");
+        (void*) GetProcAddress(lib_, "midiOutOpen");
     midiOutShortMsg_ =
-        (MMRESULT(WINAPI*)(HMIDIOUT, DWORD)) GetProcAddress(lib_, "midiOutShortMsg");
-    midiOutReset_ = (MMRESULT(WINAPI*)(HMIDIOUT)) GetProcAddress(lib_, "midiOutReset");
-    midiOutClose_ = (MMRESULT(WINAPI*)(HMIDIOUT)) GetProcAddress(lib_, "midiOutClose");
+        (MMRESULT(WINAPI*)(HMIDIOUT, DWORD)) (void*) GetProcAddress(lib_, "midiOutShortMsg");
+    midiOutReset_ = (MMRESULT(WINAPI*)(HMIDIOUT)) (void*) GetProcAddress(lib_, "midiOutReset");
+    midiOutClose_ = (MMRESULT(WINAPI*)(HMIDIOUT)) (void*) GetProcAddress(lib_, "midiOutClose");
     if (!getNumDevs || !midiOutOpen_ || !midiOutShortMsg_) {
       error_ = "winmm is missing its MIDI output entry points";
       release();

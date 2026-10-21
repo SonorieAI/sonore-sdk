@@ -296,7 +296,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/msvc")
       target_compile_definitions(sonore_mac_syntax_${_mac} PRIVATE __APPLE__=1
         SONORE_APPLE_SYNTAX_CHECK=1 _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
-      target_compile_options(sonore_mac_syntax_${_mac} PRIVATE /U_WIN32 /W4
+      # /bigobj: these link nothing, so they do not get sonore_sdk's, and a
+      # Debug build of the plugin, the standalone and the showcase passes
+      # 65,279 sections (C1128 on CI's Windows-Debug job).
+      target_compile_options(sonore_mac_syntax_${_mac} PRIVATE /U_WIN32 /W4 /bigobj
         "/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/msvc/posix_compat.h")
     endforeach()
     # The system layer's POSIX halves (sockets, spawn, mmap), read as macOS.
