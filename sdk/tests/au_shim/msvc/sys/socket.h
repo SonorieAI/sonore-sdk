@@ -45,6 +45,7 @@ struct sockaddr {
 #define SOCK_DGRAM 2
 #define SHUT_RDWR 2
 #define SOMAXCONN 128
+#define MSG_PEEK 0x2
 extern "C" {
 int socket(int, int, int);
 int bind(int, const struct sockaddr*, socklen_t);

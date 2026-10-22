@@ -95,6 +95,15 @@ elseif(SONORE_GUI)
   message(STATUS "Sonore GUI: no webview backend for this platform yet: "
                  "plugins build headless (hosts show generic controls)")
 endif()
+if(APPLE)
+  # The audio and MIDI headers call CoreAudio, AudioToolbox and CoreMIDI
+  # directly (system_volume.h, system_audio_format.h, the device and MIDI
+  # backends), so anything that includes them links these, GUI or not: the
+  # first macOS CI run failed to link audio_io_test without them. The plugin
+  # helpers name them as well; the linker takes each once.
+  target_link_libraries(sonore_sdk INTERFACE "-framework AudioToolbox" "-framework AudioUnit"
+    "-framework CoreAudio" "-framework CoreMIDI" "-framework CoreFoundation" objc)
+endif()
 
 # ── The sonore_add_* helpers ─────────────────────────────────────────────────
 # In their own module so that an INSTALLED SDK ships them: find_package()
@@ -920,8 +929,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set_target_properties(SonoreModuleFixture PROPERTIES
     PREFIX "" SUFFIX ".vst3"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
+  # A bare .vst3 file on every platform: describeFile() knows a VST3 by its
+  # extension, and these were named .so on Linux, so the scan never entered
+  # them there. Being .vst3, exported_symbols reads them as plugins, and on
+  # Linux gcc exports the standard library's instantiations without a list.
   if(UNIX AND NOT APPLE)
-    set_target_properties(SonoreModuleFixture PROPERTIES SUFFIX ".so")
+    _sonore_plugin_exports(SonoreModuleFixture GetPluginFactory ModuleEntry ModuleExit)
   endif()
   # VST3 processors written against the C API -- one with a sidechain bus,
   # one that takes stereo only -- counting every block whose buses differ
@@ -932,7 +945,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     PREFIX "" SUFFIX ".vst3"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   if(UNIX AND NOT APPLE)
-    set_target_properties(SonoreVst3BusFixture PROPERTIES SUFFIX ".so")
+    _sonore_plugin_exports(SonoreVst3BusFixture GetPluginFactory ModuleEntry ModuleExit)
   endif()
   add_executable(vst3_bus_test tests/vst3_bus_test.cpp)
   target_link_libraries(vst3_bus_test PRIVATE sonore_sdk)
@@ -951,7 +964,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     PREFIX "" SUFFIX ".vst3"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
   if(UNIX AND NOT APPLE)
-    set_target_properties(SonoreVst3SplitFixture PROPERTIES SUFFIX ".so")
+    _sonore_plugin_exports(SonoreVst3SplitFixture GetPluginFactory ModuleEntry ModuleExit)
   endif()
   add_executable(vst3_split_test tests/vst3_split_test.cpp)
   target_link_libraries(vst3_split_test PRIVATE sonore_sdk)
@@ -982,6 +995,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # A generator expression, so multi-config generators do not add a
     # per-configuration folder between the binary and its manifest.
     LIBRARY_OUTPUT_DIRECTORY "$<1:${_lv2_ports_bundle}>")
+  # It sits in an LV2 bundle, so exported_symbols reads it as a plugin, and
+  # gcc exported its std::vector<uint32_t> instantiations without the list.
+  _sonore_plugin_exports(SonorePortsFixture lv2_descriptor lv2ui_descriptor)
   file(GENERATE OUTPUT "${_lv2_ports_bundle}/manifest.ttl" CONTENT
 "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

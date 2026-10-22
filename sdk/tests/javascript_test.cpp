@@ -15,6 +15,17 @@
 // engine usable.
 #include <sonore/javascript.h>
 
+// MSVC's Debug runtime gives every standard container a proxy object for
+// iterator debugging, so the same script holds several times the memory it
+// does in Release, and a check sized against maximumMemoryBytes ran out of
+// memory first in CI's Windows-Debug job. Those checks get this much more
+// room there; what they test (depth, string and array limits) is unchanged.
+#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0
+static constexpr size_t kDebugRoom = 4;
+#else
+static constexpr size_t kDebugRoom = 1;
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -609,15 +620,19 @@ static void limits() {
     // A long chain of bound functions unwraps by recursion in construct() and
     // instanceof; without a stack check it overflowed the native stack. Now it
     // ends in the stack limit, and the engine stays usable. A separate engine
-    // with room to build the chain (each bind is its own object).
+    // with room to build the chain (each bind is its own object). Where the
+    // thread's stack has room for the whole chain (Linux's 8 MB main thread
+    // does; Windows' 1 MB does not) it is simply constructed.
     {
       JavascriptEngine jsb;
       jsb.maximumMemoryBytes = (size_t) 1 << 30;
       JavascriptEngine::Result rb;
       jsb.execute("var bf = function () {}; for (var i = 0; i < 8000; i++) bf = bf.bind(null);");
       jsb.evaluate("new bf()", &rb);
-      check(rb.failed() && rb.getErrorMessage() == "Maximum call stack size exceeded",
-            "constructing a deep bound chain is refused with the stack limit, not a crash");
+      if (rb.failed() && rb.getErrorMessage() != "Maximum call stack size exceeded")
+        std::printf("    %s\n", rb.getDescription().c_str());
+      check(rb.wasOk() || rb.getErrorMessage() == "Maximum call stack size exceeded",
+            "constructing a deep bound chain ends in the stack limit or a result, not a crash");
       const JsVar inst = jsb.evaluate("({}) instanceof bf", &rb);
       check(rb.wasOk() && !inst.toBool(),
             "instanceof over a deep bound chain is iterative: it returns, no crash");
@@ -827,6 +842,7 @@ static void limits() {
     std::string sum = "1";
     for (int i = 0; i < 100000; ++i) sum += "+1";
     check(js.evaluate(sum).toInt() == 100001, "a sum of 100,001 terms evaluates (a left chain costs no stack)");
+    js.maximumMemoryBytes = ((size_t) 64 << 20) * kDebugRoom; // the default, or room for Debug
     js.evaluate("var deep = []; for (var i = 0; i < 300000; i++) deep = [deep]; var depthOk = true;", &r);
     check(r.wasOk(), "an array nested 300,000 deep can be built");
     js.evaluate("JSON.stringify(deep)", &r);
@@ -838,7 +854,7 @@ static void limits() {
   }
   {
     JavascriptEngine js;
-    js.maximumMemoryBytes = (size_t) 16 << 20;
+    js.maximumMemoryBytes = ((size_t) 16 << 20) * kDebugRoom;
     JavascriptEngine::Result r;
     const auto t0 = std::chrono::steady_clock::now();
     r = js.execute("var a = []; while (true) a.push('item number ' + a.length);");
@@ -850,6 +866,7 @@ static void limits() {
     r = js.execute("var o = {}; for (var i = 0; ; i++) o['key' + i] = i;");
     check(r.failed() && r.getErrorMessage().find("Out of memory") == 0, "an object with endless keys likewise");
     js.execute("o = null;");
+    js.collectGarbage();
     r = js.execute("var s = 'x'; while (true) s += s;");
     check(r.failed() && r.getErrorMessage().find("RangeError: Invalid string length") == 0,
           "doubling a string stops at maximumStringLength");

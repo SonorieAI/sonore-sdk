@@ -510,6 +510,15 @@ static void outputReopen() {
   // that takes one client -- the GS Wavetable Synth -- the second then failed.
   midiout::Device out;
   const bool first = out.open(0);
+  // A listed port that does not open is not this bug: a CI runner lists the
+  // GS Wavetable Synth with no audio device behind it, and Linux lists an
+  // ALSA port with no rawmidi device. The reopen is only testable after one
+  // open has succeeded.
+  if (!first) {
+    std::printf("  skip \"%s\" is listed but does not open here (%s)\n", ports[0].c_str(),
+                out.error().c_str());
+    return;
+  }
   const bool second = out.open(0);
   char msg[200];
   std::snprintf(msg, sizeof(msg), "opening \"%s\" twice succeeds both times (%d, %d: %s)",

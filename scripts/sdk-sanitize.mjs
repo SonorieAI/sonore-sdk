@@ -83,6 +83,9 @@ run() {
   if [ "$code" != 0 ] || [ "$n" != 0 ]; then
     fail "$name (exit $code, $n sanitizer lines; see $O/log_$name.txt)"
     grep -m4 -A8 "runtime error\\|ERROR: AddressSanitizer\\|WARNING: ThreadSanitizer" log_$name.txt | head -48
+    # The failed checks too: on CI the log is gone with the runner, and a
+    # failure with no sanitizer report said nothing else.
+    grep -m12 "FAIL" log_$name.txt
   fi
 }
 

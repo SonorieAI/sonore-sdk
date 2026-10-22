@@ -7131,6 +7131,29 @@ inline void Interp::installNumberBuiltins(Interp& I) {
 
 // ── Math ────────────────────────────────────────────────────────────────────
 
+/** Math.cbrt. glibc's cbrt misses some exact cubes by an ulp (27 gave
+ *  3.0000000000000004) where V8's and MSVC's do not; of the result and its
+ *  two neighbours, the one whose cube is nearest x, the cube measured to
+ *  well past a double's precision with fma. */
+inline double cubeRoot(double x) noexcept {
+  const double r = std::cbrt(x);
+  if (!std::isfinite(r) || r == 0.0) return r;
+  auto miss = [x](double y) {
+    const double y2 = y * y, y2lo = std::fma(y, y, -y2);
+    const double y3 = y2 * y, y3lo = std::fma(y2, y, -y3) + y2lo * y;
+    return std::fabs((y3 - x) + y3lo);
+  };
+  double best = r, bestMiss = miss(r);
+  for (const double y : {std::nextafter(r, -HUGE_VAL), std::nextafter(r, HUGE_VAL)}) {
+    const double m = miss(y);
+    if (m < bestMiss) {
+      best = y;
+      bestMiss = m;
+    }
+  }
+  return best;
+}
+
 inline void Interp::installMathBuiltins(Interp& I) {
   auto math = I.newObject();
   I.global_->put("Math", Access::fromObject(math), 0);
@@ -7155,7 +7178,7 @@ inline void Interp::installMathBuiltins(Interp& I) {
   SONORE_JS_MATH1("asinh", std::asinh(x));
   SONORE_JS_MATH1("atan", std::atan(x));
   SONORE_JS_MATH1("atanh", std::atanh(x));
-  SONORE_JS_MATH1("cbrt", std::cbrt(x));
+  SONORE_JS_MATH1("cbrt", cubeRoot(x));
   SONORE_JS_MATH1("ceil", std::ceil(x));
   SONORE_JS_MATH1("cos", std::cos(x));
   SONORE_JS_MATH1("cosh", std::cosh(x));

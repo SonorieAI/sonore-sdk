@@ -101,7 +101,11 @@ function(_fourcc out word)
   set(code "${word}xxxx")
   string(SUBSTRING "${code}" 0 4 code)
   string(TOLOWER "${code}" code)
-  string(REGEX MATCH "^[0-9]*" digits "${code}")
+  # "+", not "*": a regex that matches the empty string is an error in some
+  # CMake versions (the one on CI's runners; 4.1 accepts it), and a code with
+  # no leading digit stopped the generator there. No match leaves `digits`
+  # empty, length 0.
+  string(REGEX MATCH "^[0-9]+" digits "${code}")
   string(LENGTH "${digits}" at)
   if(at LESS 4)
     string(SUBSTRING "${code}" 0 ${at} head)

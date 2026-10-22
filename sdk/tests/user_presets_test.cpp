@@ -375,13 +375,17 @@ void testStore(const std::string& root) {
           "a trash that refuses leaves the preset where it was -- never deleted instead");
     store.trashFile = nullptr;
 #if !defined(_WIN32) && !defined(__APPLE__)
-    // The freedesktop trash, in a private data home.
+    // The freedesktop trash, in a private data home. The file's own name, not
+    // the preset's: saved as "bass", it is "bass (2).sonorepreset" on a
+    // filesystem that tells the cases apart.
     setEnv("XDG_DATA_HOME", joinPath(root, "xdg"));
     const std::string victim = store.entries()[(size_t) i].path;
+    const std::string leaf = fileName(victim);
+    why.clear();
     const bool moved = store.remove(i, UserPresetStore::Removal::ToTrash, &why) && !fileExists(victim) &&
-                       fileExists(joinPath(root, "xdg/Trash/files/Bass (2).sonorepreset")) &&
-                       fileExists(joinPath(root, "xdg/Trash/info/Bass (2).sonorepreset.trashinfo"));
-    check(moved, "the freedesktop trash: files/ and info/ (" + why + ")");
+                       fileExists(joinPath(root, "xdg/Trash/files/" + leaf)) &&
+                       fileExists(joinPath(root, "xdg/Trash/info/" + leaf + ".trashinfo"));
+    check(moved, "the freedesktop trash: files/ and info/ (" + leaf + (why.empty() ? "" : ": " + why) + ")");
 #else
     if (pathio::environment("SONORE_TEST_TRASH") == "1") {
       const std::string victim = store.entries()[(size_t) i].path;

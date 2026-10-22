@@ -380,10 +380,16 @@ public:
       const int r = ::poll(p, 2, remaining(start, timeOutMilliseconds));
       if (r < 0 && errno == EINTR) continue;
       if (r <= 0 || (p[1].revents & POLLIN)) return done > 0 ? done : -1;
+      // MSG_DONTWAIT: the descriptor blocks, and a blocking send waits until
+      // ALL of it is in the peer's buffer, past the timeout for as long as
+      // the reader is busy. A megabyte to a reader 2 s in a handler was sent
+      // after 2 s on Linux, under a 1 s timeout. Now what fits goes, and the
+      // poll above waits for room within what is left of the timeout.
 #if defined(MSG_NOSIGNAL)
-      const ssize_t wrote = ::send(connection_, data + done, (size_t) (numBytesToWrite - done), MSG_NOSIGNAL);
+      const ssize_t wrote =
+          ::send(connection_, data + done, (size_t) (numBytesToWrite - done), MSG_NOSIGNAL | MSG_DONTWAIT);
 #else
-      const ssize_t wrote = ::send(connection_, data + done, (size_t) (numBytesToWrite - done), 0);
+      const ssize_t wrote = ::send(connection_, data + done, (size_t) (numBytesToWrite - done), MSG_DONTWAIT);
 #endif
       if (wrote < 0 && (errno == EINTR || errno == EAGAIN)) continue;
       if (wrote <= 0) {
@@ -478,6 +484,20 @@ private:
       if (client < 0) {
         if (errno == EINTR || errno == EAGAIN || errno == ECONNABORTED) continue;
         return false;
+      }
+      // A client that connected and hung up before it was accepted has
+      // nothing to say, and another process's createNewPipe() asking whether
+      // this name is served is exactly that. Taken as THE client, its hang-up
+      // ended the connection at the first read, and the real client's bytes
+      // waited behind it. Skipped, as Windows skips one that came and went.
+      pollfd gone;
+      gone.fd = client;
+      gone.events = POLLIN;
+      gone.revents = 0;
+      char peek = 0;
+      if (::poll(&gone, 1, 0) == 1 && ::recv(client, &peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
+        ::close(client);
+        continue;
       }
 #if defined(SO_NOSIGPIPE)
       const int one = 1;

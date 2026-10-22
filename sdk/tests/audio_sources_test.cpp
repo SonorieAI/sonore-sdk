@@ -48,8 +48,20 @@ namespace {
 thread_local bool t_inAudioCallback = false;
 std::atomic<long> g_audioAllocations{0};
 
-void noteAllocation() {
-  if (t_inAudioCallback) g_audioAllocations.fetch_add(1, std::memory_order_relaxed);
+// MSVC's Debug runtime gives every standard container a heap proxy for
+// iterator debugging, so even an empty std::vector made on the audio thread
+// allocates one there. Those are the debug runtime's, not the code's (all 68
+// of CI's Windows-Debug count were that size), and a Release build has none;
+// the audit counts everything else.
+#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0
+constexpr std::size_t kDebugProxySize = sizeof(std::_Container_proxy);
+#else
+constexpr std::size_t kDebugProxySize = 0;
+#endif
+
+void noteAllocation(std::size_t n) {
+  if (t_inAudioCallback && (kDebugProxySize == 0 || n != kDebugProxySize))
+    g_audioAllocations.fetch_add(1, std::memory_order_relaxed);
 }
 
 /** Marks the current thread as inside an audio callback for its lifetime. */
@@ -76,7 +88,7 @@ struct LifoHeap {
 } // namespace
 
 void* operator new(std::size_t n) {
-  noteAllocation();
+  noteAllocation(n);
   if (t_lifoHeap && t_lastFreed && t_lastFreedSize == n) {
     void* p = t_lastFreed;
     t_lastFreed = nullptr;
@@ -88,7 +100,7 @@ void* operator new(std::size_t n) {
 }
 void* operator new[](std::size_t n) { return ::operator new(n); }
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-  noteAllocation();
+  noteAllocation(n);
   return std::malloc(n ? n : 1);
 }
 void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept { return ::operator new(n, t); }
