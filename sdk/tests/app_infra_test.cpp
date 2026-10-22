@@ -1538,6 +1538,14 @@ static gfx::PremulColour renderAt(gfx::Component& c, int w, int h, int x, int y,
 static void testPreferencesPanel() {
   std::printf("\n-- PreferencesPanel --\n");
   using namespace sonore::gfx;
+#if defined(__APPLE__)
+  // Apple's MacTypes.h declares a global Rect and Point too, and the
+  // CoreFoundation headers bring it in: unqualified, both are ambiguous. A
+  // local alias hides the outer two (a file-scope one would redeclare
+  // Apple's typedef), as sdk_tests' geometry tests do.
+  using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
+#endif
   auto face = systemTypeface();
   Font font = face ? Font(face, 13.0f) : Font();
   if (!face) check(true, "no system font: labels are not drawn, the rest still is");

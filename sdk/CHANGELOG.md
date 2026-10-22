@@ -32,6 +32,7 @@ Everything since the last release, newest work included. Short hashes point at t
 - `PluginGraph` that is unprepared now outputs silence instead of the uncompensated dry input. This covers a graph never prepared, after a refused re-prepare, and after `connect()`. `needsPrepare()` becomes true after a wiring change, a node's restart request or a node's latency change; re-prepare with audio stopped. Blocks longer than the prepared size are run in slices. (70dbef8, 8eb1fbf)
 - Web editor pages, including any frame in them, may only navigate to `about:`, `data:` and `blob:`; http(s), `file:` and dropped files are refused, and `window.open` returns null. A page must carry its own content. (10f7c55, d36e952)
 - When a pitch is below the window's reach at the current sample rate, `PitchDetector::frequency()` and `confidence()` now return 0 instead of the clamped floor. Use the new `lowestHz()` to check the reach. (ce99981)
+- `osc::Type::Nil` is deprecated; the 'N' tag is `osc::Type::Null`. `<objc/objc.h>` defines `Nil` as a macro, and on a Mac most of the SDK's headers include it, so `Type::Nil` did not compile there. `Nil` still works elsewhere, with a deprecation warning. (004b39e)
 
 #### Sound
 
@@ -362,6 +363,14 @@ Measured against the previous build on one machine (MSVC /O2, SSE2), each bit-id
 - `npm run docs` counts a member documented as part of a `///@{` group as documented; it left such groups out of its count. (ac139bf)
 
 ### Fixed
+
+#### Found by the first CI runs on Linux and macOS
+
+- Linux and macOS, `NamedPipe`: `createNewPipe()` checks whether a name is already served by connecting to it, and that probe stayed in the live server's queue. The server accepted it as its client, saw it hang up at the first read, and the real client's bytes waited behind it. A client that has already hung up is now skipped. A write also blocked past its timeout until the whole buffer was taken; it now returns at the timeout. (5861d85)
+- Linux, JavaScript: `Math.cbrt` gives exact cubes exactly. glibc's `cbrt(27)` is 3.0000000000000004. (5861d85)
+- macOS: the `sonore_sdk` target links AudioToolbox, AudioUnit, CoreAudio, CoreMIDI and CoreFoundation, which its audio and MIDI headers call directly. A program that used them outside a plugin target failed to link. (5861d85)
+- `sonore_new_plugin.cmake` stopped on CMake versions that refuse a regular expression matching the empty string. (5861d85)
+- Windows: a WebView2 download that failed once and then succeeded on a retry still failed the configure, because `file(DOWNLOAD ... EXPECTED_HASH)` reports a failed attempt as an error. The hash is now checked after each attempt. (004b39e)
 
 #### Found while documenting every header (round 36)
 

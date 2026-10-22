@@ -5632,7 +5632,7 @@ static void testOsc() {
     Argument r; r.type = Type::Rgba; r.intValue = (int32_t) 0xFF8000FFu;
     Argument mi; mi.type = Type::Midi; mi.intValue = 0x00903C64;
     Argument f; f.type = Type::BoolFalse;
-    Argument n; n.type = Type::Nil;
+    Argument n; n.type = Type::Null;
     Argument i; i.type = Type::Impulse;
     for (const Argument& a : {h, d, sym, c, r, mi, f, n, i}) all.arguments.push_back(a);
     all.arguments.push_back(Argument::makeFloat(0.5f));
@@ -5643,7 +5643,7 @@ static void testOsc() {
               back.arguments[1].doubleValue == 0.125 && back.arguments[2].stringValue == "sym" &&
               back.arguments[3].intValue == 'x' && back.arguments[4].intValue == (int32_t) 0xFF8000FFu &&
               back.arguments[5].intValue == 0x00903C64 && back.arguments[6].type == Type::BoolFalse &&
-              back.arguments[7].type == Type::Nil && back.arguments[8].type == Type::Impulse &&
+              back.arguments[7].type == Type::Null && back.arguments[8].type == Type::Impulse &&
               back.arguments[9].floatValue == 0.5f,
           "h, d, S, c, r, m, F, N and I round-trip, and the float after them is still in place");
 
@@ -14193,6 +14193,7 @@ static void testGfxStroke() {
   // both outer declarations; a file-scope one cannot, because it would
   // redeclare Apple's typedef as a different type.
   using Rect = sonore::gfx::Rect;
+  using Point = sonore::gfx::Point;
   #endif
   std::printf("\n[gfx stroke]\n");
   char msg[220];

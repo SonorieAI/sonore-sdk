@@ -86,18 +86,25 @@ if(NOT EXISTS "${_wv2_root}/build/native/include/WebView2.h" OR NOT EXISTS "${_w
   endif()
   set(_wv2_code 1)
   foreach(_wv2_try RANGE 1 3)
-    if(SONORE_WEBVIEW2_SHA256)
-      file(DOWNLOAD "${_wv2_url}" "${_wv2_zip}" SHOW_PROGRESS STATUS _wv2_status
-           INACTIVITY_TIMEOUT 60 EXPECTED_HASH SHA256=${SONORE_WEBVIEW2_SHA256})
-    else()
-      file(DOWNLOAD "${_wv2_url}" "${_wv2_zip}" SHOW_PROGRESS STATUS _wv2_status
-           INACTIVITY_TIMEOUT 60)
-    endif()
+    # The hash is checked HERE, not by EXPECTED_HASH: given a download that
+    # failed, EXPECTED_HASH raises "cannot compute hash on failed download" as
+    # an error in current CMake, STATUS or not, and the configure was failed
+    # by a first attempt that the second had already made good.
+    file(DOWNLOAD "${_wv2_url}" "${_wv2_zip}" SHOW_PROGRESS STATUS _wv2_status
+         INACTIVITY_TIMEOUT 60)
     list(GET _wv2_status 0 _wv2_code)
+    list(GET _wv2_status 1 _wv2_msg)
+    if(_wv2_code EQUAL 0 AND SONORE_WEBVIEW2_SHA256)
+      file(SHA256 "${_wv2_zip}" _wv2_got)
+      string(TOLOWER "${SONORE_WEBVIEW2_SHA256}" _wv2_want)
+      if(NOT _wv2_got STREQUAL _wv2_want)
+        set(_wv2_code 1)
+        set(_wv2_msg "SHA256 ${_wv2_got}, expected ${_wv2_want}")
+      endif()
+    endif()
     if(_wv2_code EQUAL 0)
       break()
     endif()
-    list(GET _wv2_status 1 _wv2_msg)
     message(STATUS "WebView2 SDK download attempt ${_wv2_try}/3 failed: ${_wv2_msg}")
     # A partial or hash-mismatched file must not be retried into place.
     file(REMOVE "${_wv2_zip}")
@@ -106,7 +113,6 @@ if(NOT EXISTS "${_wv2_root}/build/native/include/WebView2.h" OR NOT EXISTS "${_w
     endif()
   endforeach()
   if(NOT _wv2_code EQUAL 0)
-    list(GET _wv2_status 1 _wv2_msg)
     message(FATAL_ERROR "WebView2 SDK download failed after 3 attempts: ${_wv2_msg}\n"
                         "It is only needed for a plugin with a web page of its own. Offline, either "
                         "configure with -DSONORE_GUI=OFF (no webview; the native editor still opens), "

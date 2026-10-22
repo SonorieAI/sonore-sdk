@@ -30,6 +30,31 @@ typedef const void* CFTypeRef;
 typedef const struct __CFAllocator* CFAllocatorRef;
 
 enum { noErr = 0 };
+
+// MacTypes.h, which every CoreFoundation include brings in, declares these at
+// GLOBAL scope as well. Code that says `using namespace sonore::gfx` and then
+// names Rect or Point unqualified is ambiguous on a Mac, and was found so
+// only by the first macOS CI run because the shim did not declare them.
+typedef long Size;
+typedef char* Ptr;
+typedef Ptr* Handle;
+typedef unsigned char Byte;
+typedef signed char SignedByte;
+typedef SInt32 Fixed;
+typedef SInt32 Duration;
+typedef unsigned char Style;
+typedef struct Point {
+  short v;
+  short h;
+} Point;
+typedef struct Rect {
+  short top;
+  short left;
+  short bottom;
+  short right;
+} Rect;
+enum { v = 0, h = 1 };
+enum { normal = 0, bold = 1, italic = 2, underline = 4, outline = 8, shadow = 0x10, condense = 0x20, extend = 0x40 };
 enum { kCFStringEncodingUTF8 = 0x08000100 };
 #define kCFAllocatorDefault ((CFAllocatorRef) nullptr)
 

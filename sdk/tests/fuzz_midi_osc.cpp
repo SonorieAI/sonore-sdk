@@ -581,7 +581,7 @@ osc::Argument randomArgument(Rng& r) {
     case 5: a.type = osc::Type::Int64; a.int64Value = (int64_t) r.u32() << 20; return a;
     case 6: a.type = osc::Type::Double; a.doubleValue = r.below(100) * 0.5; return a;
     case 7: a.type = osc::Type::BoolTrue; a.intValue = 1; return a;
-    case 8: a.type = osc::Type::Nil; return a;
+    case 8: a.type = osc::Type::Null; return a;
     default: a.type = osc::Type::Midi; a.intValue = (int32_t) r.u32(); return a;
   }
 }

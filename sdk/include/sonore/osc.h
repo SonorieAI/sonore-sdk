@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include "version.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -70,6 +72,11 @@ namespace osc {
  *  with any other tag was refused -- and a bundle is all or nothing, so one
  *  TouchOSC toggle (",T") in a bundle lost every message beside it. A tag
  *  outside this list is still refused, never skipped blindly. */
+// <objc/objc.h> defines Nil as a macro, and on a Mac most of the SDK's
+// platform code includes it, so the old name of 'N' is declared here with the
+// macro set aside, and code that has seen objc.h says Null.
+#pragma push_macro("Nil")
+#undef Nil
 enum class Type : char {
   Int32 = 'i',     ///< intValue.
   Float32 = 'f',   ///< floatValue.
@@ -84,9 +91,12 @@ enum class Type : char {
   Midi = 'm',      ///< intValue: port id, status, data1, data2, high byte first.
   BoolTrue = 'T',  ///< No payload; intValue 1 (not "True": Xlib defines that as a macro).
   BoolFalse = 'F', ///< No payload; intValue 0.
-  Nil = 'N',       ///< No payload.
+  Null = 'N',      ///< No payload: OSC's Nil (not "Nil": <objc/objc.h> defines that as a macro).
   Impulse = 'I',   ///< No payload ("bang").
+  /** The old name of Null, which a Mac build cannot spell. */
+  Nil SONORE_DEPRECATED("1.1: use Type::Null; on a Mac <objc/objc.h> defines Nil as a macro") = 'N',
 };
+#pragma pop_macro("Nil")
 
 /**
  * The 'r' argument: a 32-bit colour, red in the high byte and alpha in the
@@ -332,7 +342,7 @@ inline std::vector<uint8_t> encode(const Message& message) {
         break;
       case Type::BoolTrue:
       case Type::BoolFalse:
-      case Type::Nil:
+      case Type::Null:
       case Type::Impulse:
         break; // the tag is the whole value
       case Type::Blob: {
@@ -414,7 +424,7 @@ inline bool decodeMessage(const uint8_t* data, size_t size, Message* out) {
         a.intValue = tags[i] == 'T' ? 1 : 0;
         break;
       case 'N':
-        a.type = Type::Nil;
+        a.type = Type::Null;
         break;
       case 'I':
         a.type = Type::Impulse;

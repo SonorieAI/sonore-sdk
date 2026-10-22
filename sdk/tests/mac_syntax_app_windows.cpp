@@ -50,6 +50,9 @@ SONORE_START_APPLICATION(App)
 // Referenced so every inline body above is instantiated.
 void sonoreMacSyntaxAppWindows() {
   using namespace sonore::gfx;
+  // MacTypes.h's global Rect (declared by the shim as by Apple) would make
+  // the unqualified name ambiguous; a local alias hides it.
+  using Rect = sonore::gfx::Rect;
   DocumentWindow w("x", Colour(0, 0, 0), DocumentWindow::allButtons);
   w.setResizable(true, true);
   w.setResizeLimits(100, 100, 800, 600);
