@@ -1869,13 +1869,16 @@ void testConnections() {
     sender.sendMessage(bytesOf("wait"));
     while (receiver.count() == 0 && msSince(t0) < 3000) sleepMs(5);
     sender.sendMessage(bytesOf("stall")); // read with the start of the next frame, then 2 s in its handler
-    // 32 MB, not one: the send has to be one no buffer can take while the
-    // reader is busy. A megabyte was that on Linux and Windows; macOS lets a
-    // local socket's buffers grow toward kern.ipc.maxsockbuf (8 MB), and the
-    // first macOS run saw the megabyte AND every chunk after it accepted
-    // within the timeout -- 24 messages delivered whole, nothing cut short,
-    // so nothing was tested.
-    const std::vector<uint8_t> big((size_t) 32 << 20, 'B'), later = bytesOf("later"), chunk(64 * 1024, 'z');
+    // A megabyte. Linux's and Windows' local buffers cannot take it while
+    // the reader is busy, so the send is cut short, which is what this is
+    // here to exercise. macOS's can: its first run saw the megabyte AND every
+    // chunk after it accepted within the timeout, 24 messages delivered
+    // whole. Sending more is not the answer: the run that sent 32 MB lost the
+    // macOS runner ("lost communication with the server") for the rest of its
+    // job, which is what kernel buffers shared with the network running dry
+    // would look like. So both outcomes are checked, each for what it must
+    // guarantee, and the log says which one this machine produced.
+    const std::vector<uint8_t> big(1 << 20, 'B'), later = bytesOf("later"), chunk(64 * 1024, 'z');
     const bool bigSent = sender.sendMessage(big); // times out after 1 s, part of it taken
     const bool laterSent = sender.sendMessage(later);
     int chunksSent = 0;
@@ -1884,9 +1887,11 @@ void testConnections() {
     while ((sender.lost.load() == 0 || receiver.lost.load() == 0) && msSince(t1) < 5000) sleepMs(20);
     std::lock_guard<std::mutex> lock(receiver.mutex);
     bool onlySent = true, laterArrived = false;
+    int chunksArrived = 0;
     for (const auto& m : receiver.messages) {
       onlySent = onlySent && (textOf(m) == "wait" || textOf(m) == "stall" || m == later || m == chunk || m == big);
       laterArrived = laterArrived || m == later;
+      chunksArrived += m == chunk ? 1 : 0;
     }
     // The numbers that decide both lines, printed with them: the first macOS
     // run failed both with nothing to say whether the pipe came up, whether
@@ -1897,10 +1902,21 @@ void testConnections() {
                   " (up %d, big sent %d, later sent %d, chunks sent %d, lost %d/%d, received %zu, only sent %d)",
                   up ? 1 : 0, bigSent ? 1 : 0, laterSent ? 1 : 0, chunksSent, sender.lost.load(),
                   receiver.lost.load(), receiver.messages.size(), onlySent ? 1 : 0);
-    check(up && !bigSent && onlySent && (!laterSent || laterArrived),
-          (std::string("a pipe send cut short: nothing is delivered that was not sent, nothing reported sent goes missing") + state).c_str());
-    check(!laterSent && chunksSent == 0 && sender.lost.load() == 1 && receiver.lost.load() == 1,
-          (std::string("...because it ends the connection, at both ends") + state).c_str());
+    if (!bigSent) {
+      check(up && onlySent && (!laterSent || laterArrived),
+            (std::string("a pipe send cut short: nothing is delivered that was not sent, nothing reported sent goes missing") + state).c_str());
+      check(!laterSent && chunksSent == 0 && sender.lost.load() == 1 && receiver.lost.load() == 1,
+            (std::string("...because it ends the connection, at both ends") + state).c_str());
+    } else {
+      // Nothing was cut short, so nothing may be lost either: every message
+      // reported sent arrived whole, nothing arrived that was not sent, and
+      // the connection is still up at both ends.
+      check(up && onlySent && laterSent && laterArrived && chunksSent == 20 && chunksArrived == 20 &&
+                sender.lost.load() == 0 && receiver.lost.load() == 0,
+            (std::string("a pipe send the buffers took whole: everything reported sent arrived, whole, and nothing else") + state).c_str());
+      std::printf("  ---- the local socket's buffers took the whole megabyte here, so a send cut short was not "
+                  "reached; that path is checked on Windows and Linux ----\n");
+    }
   }
 }
 
