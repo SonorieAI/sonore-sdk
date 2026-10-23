@@ -265,6 +265,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
   # plugin_state loads a LADSPA gain built here, through the host it tests.
   add_library(ladspa_gain_plugin MODULE tests/ladspa_gain_plugin.cpp)
+  # This and the raw-API fixtures further down link nothing of the SDK's, so
+  # they do not get sonore_sdk's C++17, and AppleClang's default is C++98: the
+  # first macOS build stopped at the first constexpr. Each asks for it itself.
+  target_compile_features(ladspa_gain_plugin PRIVATE cxx_std_17)
   target_include_directories(ladspa_gain_plugin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   add_executable(plugin_state_test tests/plugin_state_test.cpp)
   target_link_libraries(plugin_state_test PRIVATE sonore_sdk Threads::Threads)
@@ -853,6 +857,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # A CLAP editor that reports itself destroyed, written against the raw API
   # because the SDK's wrapper never does: host.h must answer with destroy().
   add_library(SonoreGuiClosedFixture MODULE tests/gui_closed_fixture.cpp)
+  target_compile_features(SonoreGuiClosedFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreGuiClosedFixture PRIVATE
     "${SONORE_SDK_DIR}/third_party/clap/include")
   set_target_properties(SonoreGuiClosedFixture PROPERTIES
@@ -871,6 +876,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # A CLAP plugin that counts flush() calls landing inside process(), against
   # the raw API: host.h must never make one while audio runs.
   add_library(SonoreFlushFixture MODULE tests/flush_fixture.cpp)
+  target_compile_features(SonoreFlushFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreFlushFixture PRIVATE
     "${SONORE_SDK_DIR}/third_party/clap/include")
   set_target_properties(SonoreFlushFixture PROPERTIES
@@ -890,6 +896,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # every parameter every block: the host's id-to-position lookup must not
   # scale with the count.
   add_library(SonoreParamsFixture MODULE tests/params_fixture.cpp)
+  target_compile_features(SonoreParamsFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreParamsFixture PRIVATE
     "${SONORE_SDK_DIR}/third_party/clap/include")
   set_target_properties(SonoreParamsFixture PROPERTIES
@@ -908,6 +915,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # CLAP plugins with a sidechain, stereo-only and mono-only ports, each
   # counting every block whose buffers do not match what it declared.
   add_library(SonoreBusFixture MODULE tests/bus_fixture.cpp)
+  target_compile_features(SonoreBusFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreBusFixture PRIVATE
     "${SONORE_SDK_DIR}/third_party/clap/include")
   set_target_properties(SonoreBusFixture PROPERTIES
@@ -926,6 +934,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # A VST3 binary that is nothing but its module entry and exit, counting
   # both: host.h must call the exit once per entry that succeeded.
   add_library(SonoreModuleFixture MODULE tests/module_fixture.cpp)
+  target_compile_features(SonoreModuleFixture PRIVATE cxx_std_17)
   set_target_properties(SonoreModuleFixture PROPERTIES
     PREFIX "" SUFFIX ".vst3"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
@@ -940,6 +949,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # one that takes stereo only -- counting every block whose buses differ
   # from the arrangements they agreed to.
   add_library(SonoreVst3BusFixture MODULE tests/vst3_bus_fixture.cpp)
+  target_compile_features(SonoreVst3BusFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreVst3BusFixture PRIVATE "${SONORE_SDK_DIR}/third_party/vst3")
   set_target_properties(SonoreVst3BusFixture PROPERTIES
     PREFIX "" SUFFIX ".vst3"
@@ -959,6 +969,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # A VST3 plugin with a separate controller class, against the C API: the
   # controller's edits must reach the processor and the halves be connected.
   add_library(SonoreVst3SplitFixture MODULE tests/vst3_split_fixture.cpp)
+  target_compile_features(SonoreVst3SplitFixture PRIVATE cxx_std_17)
   target_include_directories(SonoreVst3SplitFixture PRIVATE "${SONORE_SDK_DIR}/third_party/vst3")
   set_target_properties(SonoreVst3SplitFixture PROPERTIES
     PREFIX "" SUFFIX ".vst3"
@@ -989,6 +1000,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # path it is given and any port left unconnected at run().
   set(_lv2_ports_bundle "${CMAKE_CURRENT_BINARY_DIR}/fixtures/SonorePortsFixture.lv2")
   add_library(SonorePortsFixture MODULE tests/lv2_ports_fixture.cpp)
+  target_compile_features(SonorePortsFixture PRIVATE cxx_std_17)
   target_include_directories(SonorePortsFixture PRIVATE "${SONORE_SDK_DIR}/third_party/lv2/include")
   set_target_properties(SonorePortsFixture PROPERTIES
     PREFIX ""
