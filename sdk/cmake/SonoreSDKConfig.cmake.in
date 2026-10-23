@@ -29,6 +29,12 @@ endif()
 if(MSVC)
   target_compile_options(SonoreSDK::sonore_sdk INTERFACE /utf-8 /bigobj)
 endif()
+# And floating point rounded as written, by a GNU-style compiler: no fused
+# multiply-add the browser build could not reproduce (see the SDK's
+# CMakeLists).
+if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(SonoreSDK::sonore_sdk INTERFACE -ffp-contract=off)
+endif()
 
 # WebView2 is not in the export set on purpose (see the SDK's CMakeLists):
 # fetch it into this build, exactly as the SDK does into its own -- and, as

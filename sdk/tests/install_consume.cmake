@@ -240,7 +240,9 @@ if(NOT CTEST)
 endif()
 execute_process(COMMAND "${CTEST}" --test-dir "${generated}/build" -C "${CONFIG}" --output-on-failure
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
-if(NOT rc EQUAL 0 OR NOT out MATCHES "100% tests passed, 0 tests failed out of 1")
+# Newer CTest prints "100% tests passed out of 1", with no ", 0 tests failed":
+# the summary is matched in both forms, or a run that passed reads as failed.
+if(NOT rc EQUAL 0 OR NOT out MATCHES "100% tests passed(, 0 tests failed)? out of 1")
   message(FATAL_ERROR "the generated project's self-check failed against the install (${rc}):\n${out}")
 endif()
 

@@ -150,21 +150,14 @@ jobs:
       - name: Build
         run: cmake --build sdk/build --config ${{ matrix.config || 'Release' }}
 
-      # A desktop session the editor can attach to. Without one the GUI tests
-      # skip, and a green run would mean less than it appears to.
-      - name: Test (Linux, virtual display)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
-
-      - name: Test
-        if: runner.os != 'Linux'
-        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
-
-      # Apple's own validator - the gate Logic and GarageBand apply before
-      # they will even list a plugin. auval only sees INSTALLED and REGISTERED
-      # components, so the bundles are copied where a user's DAW would find
-      # them and the registrar is then asked whether it agrees they exist.
-      - name: auval (Apple's AU validator)
+      # An AU is found and loaded through the system's REGISTRY, never by file:
+      # a .component in the build folder is described by a scan (its Info.plist)
+      # and cannot be loaded until macOS has registered it. So the bundles are
+      # installed where a user's DAW would find them BEFORE the tests -- the
+      # hosting, instances and hosted-call fuzz tests load every AU the scan
+      # finds -- and the registrar is asked whether it agrees they exist.
+      # Installed after the tests, as this was, those three failed on all nine.
+      - name: Install and register the AUs
         if: runner.os == 'macOS'
         run: |
           set -x
@@ -178,7 +171,7 @@ jobs:
           find sdk/build -name "*.component" -exec cp -R {} ~/Library/Audio/Plug-Ins/Components/ \;
           ls -la ~/Library/Audio/Plug-Ins/Components/
           if [ -z "$(ls -A ~/Library/Audio/Plug-Ins/Components/)" ]; then
-            echo "no .component bundles installed - the auval runs below would be meaningless"
+            echo "no .component bundles installed - the AU tests and auval would be meaningless"
             ls -la sdk/build | head -40
             exit 1
           fi
@@ -199,6 +192,24 @@ jobs:
             cat ~/Library/Audio/Plug-Ins/Components/SonoreSaturatorAU.component/Contents/Info.plist || true
             exit 1
           fi
+
+      # A desktop session the editor can attach to. Without one the GUI tests
+      # skip, and a green run would mean less than it appears to.
+      - name: Test (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
+
+      # Apple's own validator - the gate Logic and GarageBand apply before
+      # they will even list a plugin. It sees only INSTALLED and REGISTERED
+      # components, which the step before the tests made them.
+      - name: auval (Apple's AU validator)
+        if: runner.os == 'macOS'
+        run: |
+          set -x
           auval -v aufx Sat1 Sonr
           auval -v aumu Syn1 Sonr
           auval -v aufx Duk1 Sonr

@@ -1149,8 +1149,17 @@ void testHttp(const std::string& dir) {
         "credentials in the URL become a Basic Authorization header");
   {
     WebInputStream s(URL(base + "/chunked"));
-    check(s.connect() && s.getTotalLength() == -1 && s.readEntireStreamAsString() == "chunk-one|chunk-two|three",
-          "a chunked body (with a chunk extension and a trailer) arrives decoded, length unknown");
+    // Each part apart, and said: the first macOS run failed this line with
+    // nothing to show which of the three it was.
+    const bool connected = s.connect();
+    const int64_t total = connected ? s.getTotalLength() : -2;
+    const std::string body = connected ? s.readEntireStreamAsString() : std::string();
+    char why[320];
+    std::snprintf(why, sizeof(why),
+                  "a chunked body (with a chunk extension and a trailer) arrives decoded, length unknown"
+                  " (connected %d, length %lld, body \"%.60s\")",
+                  connected ? 1 : 0, (long long) total, body.c_str());
+    check(connected && total == -1 && body == "chunk-one|chunk-two|three", why);
   }
   {
     std::vector<int64_t> seen;
@@ -1842,10 +1851,19 @@ void testConnections() {
       onlySent = onlySent && (textOf(m) == "wait" || textOf(m) == "stall" || m == later || m == chunk || m == big);
       laterArrived = laterArrived || m == later;
     }
+    // The numbers that decide both lines, printed with them: the first macOS
+    // run failed both with nothing to say whether the pipe came up, whether
+    // the megabyte fitted into the socket's buffers whole, or which end
+    // never saw the connection go.
+    char state[256];
+    std::snprintf(state, sizeof(state),
+                  " (up %d, big sent %d, later sent %d, chunks sent %d, lost %d/%d, received %zu, only sent %d)",
+                  up ? 1 : 0, bigSent ? 1 : 0, laterSent ? 1 : 0, chunksSent, sender.lost.load(),
+                  receiver.lost.load(), receiver.messages.size(), onlySent ? 1 : 0);
     check(up && !bigSent && onlySent && (!laterSent || laterArrived),
-          "a pipe send cut short: nothing is delivered that was not sent, nothing reported sent goes missing");
+          (std::string("a pipe send cut short: nothing is delivered that was not sent, nothing reported sent goes missing") + state).c_str());
     check(!laterSent && chunksSent == 0 && sender.lost.load() == 1 && receiver.lost.load() == 1,
-          "...because it ends the connection, at both ends");
+          (std::string("...because it ends the connection, at both ends") + state).c_str());
   }
 }
 

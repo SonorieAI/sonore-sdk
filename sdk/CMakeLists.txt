@@ -52,6 +52,22 @@ if(MSVC)
   target_compile_definitions(sonore_sdk INTERFACE _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# The same floating point on every machine. GCC and Clang CONTRACT a*b + c
+# into one fused multiply-add wherever the target has the instruction -- every
+# arm64 CPU, and x86 built with -mfma -- and a fused result is rounded once
+# where the written expression is rounded twice. The browser build never
+# contracts (WebAssembly has no FMA), so a plugin on Apple Silicon computed
+# different bits from its own preview, and the first macOS test run found it
+# everywhere two paths are meant to agree exactly: an APVTS default snapped
+# to its 0.1 grid read -60 + 600 * 0.1f as 8.9e-7 instead of 0, the polyphase
+# oversampler stopped matching its direct form, a filter given a fallback rate
+# stopped matching one given that rate. Off, every compiler rounds as written.
+# A build-interface flag for the reason /utf-8 is; SonoreSDKConfig.cmake adds
+# it again by the consumer's own compiler.
+if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(sonore_sdk INTERFACE $<BUILD_INTERFACE:-ffp-contract=off>)
+endif()
+
 # advapi32 is the registry, and the registry is where a licensed build reads
 # MachineGuid (sonore/license_runtime.h). Linked for EVERY Windows build, not
 # just a GUI one: the licence gate is what the DSP path uses, and a headless

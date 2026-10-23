@@ -14,10 +14,16 @@
 // format's entry points fails, and a binary with NO recognised entry point
 // fails too, because that is what a broken parser looks like.
 //
-//   exports_test <dir> [<dir>...]      every .clap/.vst3/.so/.dll below them
+//   exports_test <dir> [<dir>...]      every .clap/.vst3/.so/.dll below them,
+//                                      and every binary inside a .clap, .vst3
+//                                      or .component bundle
 //
-// Mach-O is not parsed here: no Mac builds on this box, and a parser nobody
-// can run is a parser nobody can trust. macOS CI runs `nm -gU` instead.
+// Mach-O is not parsed by hand: a parser nobody here can run is a parser
+// nobody can trust. On a Mac the exports are read with the system's own
+// `nm -gUj` (external, defined, names only). This used to say macOS CI ran
+// nm itself; it did not, so on a Mac every binary was skipped and the test
+// failed on "0 plugin binaries examined" -- and a macOS plugin's exports
+// were checked by nothing.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +34,43 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+/** Whether the bytes start a Mach-O image: thin 32/64-bit, or a universal
+ *  ("fat") file holding several, as a macOS plugin built for arm64 and
+ *  x86_64 is. */
+static bool isMachO(const std::vector<uint8_t>& b) {
+  if (b.size() < 4) return false;
+  const bool thin = (b[0] == 0xCF || b[0] == 0xCE) && b[1] == 0xFA && b[2] == 0xED && b[3] == 0xFE;
+  const bool fat = b[0] == 0xCA && b[1] == 0xFE && b[2] == 0xBA && (b[3] == 0xBE || b[3] == 0xBF);
+  return thin || fat;
+}
+
+#if defined(__APPLE__)
+/** A Mach-O image's exports, by `nm -gUj`: one name per line, with the
+ *  leading underscore every C symbol carries on this platform taken off, and
+ *  the "(for architecture ...)" headers of a universal file skipped. False if
+ *  nm could not read it. */
+static bool machOExports(const fs::path& p, std::vector<std::string>& names) {
+  std::string quoted = "'";
+  for (char c : p.string()) {
+    if (c == '\'') quoted += "'\\''";
+    else quoted += c;
+  }
+  quoted += "'";
+  FILE* pipe = popen(("nm -gUj " + quoted + " 2>/dev/null").c_str(), "r");
+  if (!pipe) return false;
+  std::set<std::string> seen;
+  char line[2048];
+  while (std::fgets(line, sizeof(line), pipe)) {
+    std::string s(line);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    if (s.empty() || (s.size() > 2 && s.compare(s.size() - 2, 2, "):") == 0)) continue;
+    if (s[0] == '_') s.erase(0, 1);
+    if (seen.insert(s).second) names.push_back(s);
+  }
+  return pclose(pipe) == 0;
+}
+#endif
 
 static int g_checks = 0, g_failures = 0;
 static void check(bool ok, const std::string& what) {
@@ -139,10 +182,14 @@ int main(int argc, char** argv) {
       "ModuleEntry", "ModuleExit",                    // VST3 (Linux)
       "bundleEntry", "bundleExit",                    // VST3 (macOS)
       "lv2_descriptor", "lv2ui_descriptor", "lv2_lib_descriptor", // LV2
+      "SonoreAUFactory",                              // AU (macOS), Info.plist's factoryFunction
   };
   // The linker's own bookkeeping on ELF: defined, global, default, and not ours.
   static const std::set<std::string> kLinkerNoise = {"_init", "_fini", "__bss_start", "_edata",
-                                                    "_end", "__gmon_start__"};
+                                                    "_end", "__gmon_start__",
+                                                    // and Mach-O's, less their underscore
+                                                    "_mh_bundle_header", "_mh_dylib_header",
+                                                    "_mh_execute_header", "radr://5614542"};
   int binaries = 0;
   for (int a = 1; a < argc; ++a) {
     std::error_code ec;
@@ -155,19 +202,34 @@ int main(int argc, char** argv) {
       if (full.find("/_deps/") != std::string::npos || full.find("/CMakeFiles/") != std::string::npos)
         continue;
       const std::string ext = it->path().extension().string();
-      if (ext != ".clap" && ext != ".vst3" && ext != ".so" && ext != ".dll") continue;
-      // A bare .so or .dll is a plugin only inside an LV2 bundle.
-      if ((ext == ".so" || ext == ".dll") &&
-          it->path().parent_path().extension().string() != ".lv2")
-        continue;
+      // A macOS bundle keeps its binary at <name>.<ext>/Contents/MacOS/<name>,
+      // with no extension of its own: it is judged by the bundle's.
+      const fs::path parent = it->path().parent_path();
+      const bool inBundle = parent.filename() == "MacOS" && parent.parent_path().filename() == "Contents";
+      const fs::path bundle = inBundle ? parent.parent_path().parent_path() : fs::path();
+      const std::string bundleExt = inBundle ? bundle.extension().string() : std::string();
+      if (inBundle) {
+        if (bundleExt != ".clap" && bundleExt != ".vst3" && bundleExt != ".component") continue;
+      } else {
+        if (ext != ".clap" && ext != ".vst3" && ext != ".so" && ext != ".dll" && ext != ".dylib") continue;
+        // A bare .so, .dylib or .dll is a plugin only inside an LV2 bundle.
+        if ((ext == ".so" || ext == ".dll" || ext == ".dylib") &&
+            it->path().parent_path().extension().string() != ".lv2")
+          continue;
+      }
       const std::vector<uint8_t> bytes = readAll(it->path());
       std::vector<std::string> names;
       bool parsed = false;
       if (bytes.size() > 4 && bytes[0] == 'M' && bytes[1] == 'Z') parsed = peExports(bytes, names);
       else if (bytes.size() > 4 && bytes[0] == 0x7f && bytes[1] == 'E') parsed = elfExports(bytes, names);
-      else continue; // a Mach-O, a text file, a symlink target that is not a binary
+#if defined(__APPLE__)
+      else if (isMachO(bytes)) parsed = machOExports(it->path(), names);
+#else
+      else if (isMachO(bytes)) continue; // a Mach-O off a Mac: no nm here to read it
+#endif
+      else continue; // a text file, a symlink target that is not a binary
       ++binaries;
-      const std::string leaf = it->path().filename().string();
+      const std::string leaf = (inBundle ? bundle : it->path()).filename().string();
       if (!parsed) {
         check(false, leaf + ": the binary could not be parsed");
         continue;

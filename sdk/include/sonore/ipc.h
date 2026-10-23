@@ -213,8 +213,15 @@ public:
     }
     ::unlink(address.sun_path);
     listener_ = openUnixSocket();
+    // A backlog of more than one. A probe like the one above, from a second
+    // createNewPipe(), connects and hangs up, and stays in this queue until
+    // it is accepted and skipped. Linux queues backlog + 1 and makes a
+    // connect wait for room; macOS refuses a connect to a full queue at once,
+    // so with a backlog of 1 the probe took the only place and the real
+    // client after it was refused ("openExisting connects to it" failed, the
+    // NEXT client worked). Clients are still served one at a time.
     if (listener_ < 0 || ::bind(listener_, (const sockaddr*) &address, sizeof(address)) != 0 ||
-        ::listen(listener_, 1) != 0) {
+        ::listen(listener_, 8) != 0) {
       closeHandles();
       return false;
     }

@@ -106,6 +106,7 @@
 #include <CoreFoundation/CFRunLoop.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <unistd.h>
 #else
 #include <cerrno>
@@ -1594,7 +1595,9 @@ inline void MessageManager::runDispatchLoop() {
   }
 #elif defined(__APPLE__)
   using detail::msgloop::objcSend;
-  id app = detail::msgloop::applicationOrNil();
+  // NSApp's -run is the MAIN thread's (see runDispatchLoopUntil); a message
+  // thread elsewhere runs its own run loop.
+  id app = pthread_main_np() ? detail::msgloop::applicationOrNil() : (id) 0;
   while (!quitReceived_.load(std::memory_order_acquire)) {
     if (app) objcSend<void>(app, "run"); // returns after -stop:
     else CFRunLoopRun();                 // returns after CFRunLoopStop
@@ -1648,7 +1651,13 @@ inline bool MessageManager::runDispatchLoopUntil(int milliseconds) {
       break;
     }
     const double slice = (double) (std::min)(remaining, 10LL) / 1000.0;
-    if (id app = detail::msgloop::applicationOrNil()) {
+    // AppKit's event queue belongs to the MAIN thread: nextEventMatchingMask
+    // anywhere else throws, and so does creating NSApp there, which
+    // applicationOrNil() does. A message thread moved to another thread
+    // (setCurrentThreadAsMessageThread) aborted the process on its first
+    // dispatch. Off the main thread the loop runs that thread's own run loop,
+    // which is where the wake source was moved to.
+    if (id app = pthread_main_np() ? detail::msgloop::applicationOrNil() : (id) 0) {
       id pool = objcSend<id>(objcSend<id>((id) objc_getClass("NSAutoreleasePool"), "alloc"), "init");
       id until = objcSend<id>((id) objc_getClass("NSDate"), "dateWithTimeIntervalSinceNow:", slice);
       id event = objcSend<id>(app, "nextEventMatchingMask:untilDate:inMode:dequeue:",
