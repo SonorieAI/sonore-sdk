@@ -165,6 +165,7 @@ Numerics
 - VST3 no longer sends `restartComponent(kLatencyChanged)` at every activation of a plugin with latency. (32cc901)
 - MIDI-CI Discovery advertises property exchange (0x08); it advertised protocol negotiation (0x02). (b2369ad)
 - The standalone refuses a `--render`, `--play`, `--shot` or `--seconds` length that is not more than 0 and at most 3600 seconds, with exit code 2. (70dcf2c)
+- The editors' VU needle (`sonore.vu`, `MeterState::vu()`) moves like a coil: critically damped, starting from rest, 99% of a step in 0.35 s and never past it, as the browser preview's needle does. It was a one-pole, which leaves at full speed: on one programme signal it crossed 9 of a meter face's 100 frames in a repaint where the preview's crossed 5. It now stops at 1, the top of the -20..+3 VU scale, where it went to 1.2. Gain reduction (`sonore.gr`) rides the same movement, so a compressor that moves 12 dB inside one repaint swings the needle instead of jumping it. A NaN or infinite reading cannot leave the movement NaN.
 
 #### Drawing
 

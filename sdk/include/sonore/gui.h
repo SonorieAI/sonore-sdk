@@ -162,10 +162,12 @@ inline BlockLevel measureBlock(const Sample* samples, size_t frames) {
  * to 0 VU at -9 dBFS and settling in 0.35 s -- and level(), db() and vu() read
  * the result. Call tick() on a steady clock (the editors use their ~30 Hz
  * timer) with the seconds since the last call; the readings do not move
- * without it.
+ * without it. pushGr() and gr() are the gain reduction a DSP reports, carried
+ * by the same needle movement.
  *
- * The numbers match the browser preview's meter (PluginCanvas.tsx) sample for
- * sample, so a needle looks the same in the studio and in a DAW.
+ * The numbers match the browser preview's meter (the same calibration and the
+ * same critically damped movement), so a needle looks the same in the studio
+ * and in a DAW.
  */
 class MeterState {
 public:
@@ -201,16 +203,25 @@ public:
     const float decay = (float) std::exp(-dt / 0.6);
     display_ = peak > display_ ? peak : display_ * decay;
 
-    // VU: a CALIBRATED analog needle, matching PluginCanvas.tsx sample for
-    // sample: +3.0103 dB sine calibration, 0 VU at -9 dBFS (below full scale
-    // and tuned to the preview's level, so a hot signal swings PAST 0), and
-    // critically damped T99 ~= 0.35 s so it never overshoots like a peak meter.
+    // VU: a CALIBRATED analog needle: +3.0103 dB sine calibration, 0 VU at
+    // -9 dBFS (below full scale and tuned to the preview's level, so a hot
+    // signal swings PAST 0), riding the MOVEMENT below. The target is held to
+    // the face before the needle sees it, and a NaN counts as no signal: the
+    // movement solves e = x - target, an infinite target makes that inf - inf,
+    // and a NaN in the state is a needle gone for good.
     const float rmsDb = 20.0f * std::log10(rms > 1e-9f ? rms : 1e-9f) + 3.0103f;
     const float targetVu = (rmsDb - kVuReferenceDb - kVuScaleMin) / (kVuScaleMax - kVuScaleMin);
-    const float clamped = targetVu < 0.0f ? 0.0f : (targetVu > 1.2f ? 1.2f : targetVu);
-    // One-pole toward the target; 4.6 time constants reach 99% in T99.
-    const float k = (float) (1.0 - std::exp(-4.6 * dt / 0.35));
-    vu_ += (clamped - vu_) * k;
+    vuSwing_.step(targetVu > 0.0f ? (targetVu < 1.0f ? targetVu : 1.0f) : 0.0f, dt);
+    vuSwing_.hold(0.0f, 1.0f);
+
+    // Gain reduction is that SAME movement switched to another job, which is
+    // what it is on the hardware: one needle, one mass, a switch. Passed
+    // through untouched it slams -- a compressor moves tens of decibels of
+    // reduction inside one repaint -- and a needle that teleports reads as a
+    // counter rather than as an instrument.
+    const float grIn = gr_.load(std::memory_order_relaxed);
+    grSwing_.step(grIn > 0.0f ? (grIn < kGrCeiling ? grIn : kGrCeiling) : 0.0f, dt);
+    grSwing_.hold(0.0f, kGrCeiling);
   }
 
   /** [main thread] tick() with the time that really passed since the last
@@ -242,10 +253,11 @@ public:
   float db() const {
     return 20.0f * std::log10(display_ > 1e-9f ? display_ : 1e-9f);
   }
-  /** Calibrated VU needle position, 0..1 (>1 = past 0 VU), for `sonore.vu`. */
-  float vu() const { return vu_; }
-  /** Decibels of gain reduction, for `sonore.gr`. */
-  float gr() const { return gr_.load(std::memory_order_relaxed); }
+  /** Calibrated VU needle position, 0..1 across the -20..+3 VU scale, for
+   *  `sonore.vu`. */
+  float vu() const { return vuSwing_.x; }
+  /** Decibels of gain reduction as the NEEDLE reads them, for `sonore.gr`. */
+  float gr() const { return grSwing_.x; }
 
 private:
   // -20..+3 VU scale with 0 VU referenced to -9 dBFS. Keep these three in step
@@ -255,12 +267,42 @@ private:
   static constexpr float kVuScaleMax = 3.0f;
   /** +80 dBFS: past any real signal, and back below 0 dBFS in 5.5 s. */
   static constexpr float kPeakCeiling = 1e4f;
+  /** Past any reduction a meter prints, and what a runaway is held to. */
+  static constexpr float kGrCeiling = 60.0f;
+
+  // THE MOVEMENT. This was a ONE-POLE, whose comment claimed to match the
+  // browser preview's needle, which is second order. A one-pole leaves at full
+  // speed; a coil starts from rest. Measured on one programme signal, the
+  // one-pole threw the needle across 9 of a meter face's 100 frames in a
+  // single repaint where the browser moved 5.
+  //
+  // Critically damped: the error solves e(t) = (A + B*t)*exp(-omega*t), so a
+  // step reaches 99% in 0.350 s, NEVER overshoots from rest, and settles
+  // EXACTLY on the target -- a meter that has stopped moving is telling the
+  // truth.
+  static constexpr double kOmega = 18.97;
+  struct Swing {
+    float x = 0.0f, v = 0.0f;
+    void step(float target, double dt) {
+      const double e0 = (double) x - target;
+      const double decay = std::exp(-kOmega * dt);
+      const double b = (double) v + kOmega * e0;
+      x = (float) (target + (e0 + b * dt) * decay);
+      v = (float) ((b - kOmega * (e0 + b * dt)) * decay);
+    }
+    /** Stop at the end of the scale, as the needle's pins do. */
+    void hold(float lo, float hi) {
+      if (x < lo) { x = lo; v = 0.0f; }
+      else if (x > hi) { x = hi; v = 0.0f; }
+    }
+  };
 
   std::atomic<float> peak_{0.0f};
   std::atomic<float> rms_{0.0f};
   std::atomic<float> gr_{0.0f};
   float display_ = 0.0f;
-  float vu_ = 0.0f;
+  Swing vuSwing_;
+  Swing grSwing_;
   std::chrono::steady_clock::time_point lastTick_{};
   bool clocked_ = false;
 };

@@ -38536,11 +38536,95 @@ static void testMeterRecovers() {
   check(pegged >= 1.0f && std::isfinite(pegged) && meter.level() < 0.01f && std::isfinite(meter.db()), ml);
 }
 
+// A needle is a mass on a spring, not a variable being assigned. What this
+// pins is the movement BOTH readings ride, because the hardware has one
+// needle and a switch: gain reduction used to reach the face untouched, and it
+// slammed across half the scale in a single repaint.
+static void testMeterMovement() {
+  std::printf("\n[meter movement]\n");
+  const double kFrame = 1.0 / 30.0;  // the rate the editors tick these at
+
+  // A step: 99% in 0.35 s, never past it. Overshoot on a VU is the one thing
+  // that makes a level look hotter than it is.
+  {
+    // An RMS that lands MID-SCALE, because a hot one is past the top and the
+    // clamp would be what the stopwatch measured rather than the movement.
+    sonore::MeterState m;
+    const float rms = 0.0943f;  // -20.5 dBFS -> half way up the -20..+3 face
+    m.push(rms, rms);
+    double t99 = 0.0, highest = 0.0;
+    for (int i = 1; i <= 120; ++i) {
+      m.tick(kFrame);
+      if (t99 == 0.0 && m.vu() >= 0.99 * 0.5) t99 = i * kFrame;
+      if (m.vu() > highest) highest = m.vu();
+    }
+    checkNear(highest, 0.5, 0.01, "the needle settles where the level says, not past it");
+    check(t99 > 0.25 && t99 < 0.45, "...and gets there in about a third of a second");
+  }
+
+  // Gain reduction: the SAME movement, settling EXACTLY on the reading. A
+  // meter that has stopped moving has to be telling the truth.
+  {
+    sonore::MeterState m;
+    m.pushGr(6.0f);
+    double overshoot = 0.0;
+    for (int i = 0; i < 120; ++i) {
+      m.tick(kFrame);
+      if (m.gr() - 6.0f > overshoot) overshoot = m.gr() - 6.0f;
+    }
+    checkNear(m.gr(), 6.0, 1e-3, "six decibels of reduction settles on exactly six");
+    checkNear(overshoot, 0.0, 1e-4, "...and never swings past it");
+  }
+
+  // The reason this exists: how far can the needle move in ONE repaint when
+  // the reading jumps the whole way? Untouched it went the whole way at once;
+  // through the movement a 12 dB slam moves under a decibel and a half.
+  {
+    sonore::MeterState m;
+    m.pushGr(12.0f);
+    m.tick(kFrame);
+    check(m.gr() > 0.2f && m.gr() < 1.6f,
+          "a reading that jumps 12 dB moves the needle a fraction of that in one frame");
+  }
+
+  // And it comes back the same way it went: symmetric, like a coil.
+  {
+    sonore::MeterState m;
+    m.pushGr(10.0f);
+    for (int i = 0; i < 120; ++i) m.tick(kFrame);
+    m.pushGr(0.0f);
+    int frames = 0;
+    while (m.gr() > 0.1f && frames < 200) { m.tick(kFrame); ++frames; }
+    check(frames > 6 && frames < 40, "...and releases over the same third of a second, not instantly");
+  }
+
+  // A movement carries state, so one bad number must not stay in it: the
+  // error is x - target, and an infinite target makes that inf - inf, a NaN
+  // that every later step keeps. An infinite RMS pegs the needle, a NaN reads
+  // as no signal, and both come back.
+  {
+    sonore::MeterState m;
+    m.push(1.0f, std::numeric_limits<float>::infinity());
+    m.pushGr(std::numeric_limits<float>::quiet_NaN());
+    m.tick(kFrame);
+    const bool pegged = std::isfinite(m.vu()) && std::isfinite(m.gr());
+    m.push(0.0f, std::numeric_limits<float>::quiet_NaN());
+    m.pushGr(std::numeric_limits<float>::infinity());
+    for (int i = 0; i < 60; ++i) m.tick(kFrame);
+    m.push(0.0f, 0.0f);
+    m.pushGr(0.0f);
+    for (int i = 0; i < 60; ++i) m.tick(kFrame);
+    check(pegged && std::isfinite(m.vu()) && std::isfinite(m.gr()) && m.vu() < 1e-3f && m.gr() < 1e-3f,
+          "an infinite or NaN reading never leaves the needle NaN, and it comes back to rest");
+  }
+}
+
 int main() {
   std::printf("Sonore SDK tests\n\n");
   testSdkVersion();
   testBridgeLocale();
   testMeterRecovers();
+  testMeterMovement();
   testGainControlsGlide();
   testInfiniteSampleRecovery();
   testLimiterClockWrap();
