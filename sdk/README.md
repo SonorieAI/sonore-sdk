@@ -341,13 +341,14 @@ void setTransport(const sonore::TransportInfo& t);
 The rest of the optional hooks work the same way: declare one and the
 wrappers find it at compile time; leave it out and nothing is paid. The
 `const` matters -- the wrappers look for these on a const DSP, and a
-non-const `latencySamples()`, `tailSamples()` or `saveState()` is a compile
-error that says so.
+non-const `latencySamples()`, `tailSamples()`, `saveState()` or
+`gainReduction()` is a compile error that says so.
 
 | Declare | and |
 | --- | --- |
 | `int latencySamples() const` | the host is told the delay, and told again when it changes |
 | `int tailSamples() const` | a reverb or delay is not cut off at stop or at the end of a render |
+| `float gainReduction() const` | the page's `sonore.gr` / `onGR(cb)` shows it, in positive dB: forward a dynamics class's own (`return comp.gainReduction();`) and a gain-reduction meter has something to read |
 | `void reset()` | a host's "start over" calls it instead of `prepare()` (see below) |
 | `void saveState(sonore::StateBag&) const` / `void loadState(const sonore::StateBag&)` | extra state (a file path, a learned value) is saved with the session; include `<sonore/state_bag.h>` before the struct |
 | `bool consumeStateDirty()` | the host is told the extra state changed, so it offers to save |
@@ -469,6 +470,7 @@ What the page gets:
 | `sonore.begin(i)` / `end(i)` | gestures: one undo step per drag |
 | `sonore.on(cb)` | `cb(values, index, value)` on any change, from the UI *or* host automation |
 | `sonore.onLevel(cb)` / `onVU(cb)` | meters, up to ~30 times a second -- when the level moves; a silent or steady signal sends nothing new, so do not use it as a clock |
+| `sonore.onGR(cb)` / `sonore.gr` | gain reduction in positive dB, from a DSP that declares `gainReduction() const`; 0 otherwise |
 | `sonore.format(i, v)` | the same text the host shows |
 | `sonore.noteOn/noteOff` | on-screen keyboards for instruments |
 | `sonore.presets` / `loadPreset(i)` | factory preset names, applied C++-side |

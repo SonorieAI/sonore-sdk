@@ -69,11 +69,15 @@ function buildWasm(name, sourcePath, extraFlags = []) {
     // How many blocks the output guard has played as silence: the module has
     // no log of its own, so the host reads this and says so.
     "_sonore_output_guard_trips",
+    // How far the DSP is turning the signal down, for a compressor's meter.
+    // Nothing measured from the output can tell compression from a gain knob,
+    // so the DSP reports it, and a DSP that does not reads 0.
+    "_sonore_gain_reduction",
   ];
   // The pooled entry points, only when the build asked for slots. Exporting
   // them unconditionally would fail to link every ordinary plugin.
   if (extraFlags.some((f) => String(f).includes("SONORE_MAX_INSTANCES")))
-    exports.push("_sonore_latency_at", "_sonore_output_guard_trips_at",
+    exports.push("_sonore_latency_at", "_sonore_output_guard_trips_at", "_sonore_gain_reduction_at",
                  "_sonore_new", "_sonore_delete", "_sonore_max_instances",
                  "_sonore_init_at", "_sonore_process_at", "_sonore_in_ptr_at",
                  "_sonore_out_ptr_at", "_sonore_params_ptr_at",
@@ -165,6 +169,11 @@ for (const [name, rel, kind] of [
   const lat = typeof ex.sonore_latency === "function" ? ex.sonore_latency() : -1;
   check(lat >= 0 && Number.isInteger(lat),
         `the ABI reports its latency (${lat} samples)`);
+  // None of these compresses either, so the reading is exactly 0: the honest
+  // answer for a DSP that does not declare gainReduction(). The one that does
+  // is proved below, against the number its ratio predicts.
+  check(typeof ex.sonore_gain_reduction === "function" && ex.sonore_gain_reduction() === 0,
+        "the ABI reports no gain reduction for a DSP that declares none");
   check(
     ex.sonore_wants_midi() === (isInstrument || isNoteEffect || isContextEffect ? 1 : 0),
     isInstrument ? "the instrument advertises wantsMidi"
@@ -332,6 +341,47 @@ for (const [name, rel, kind] of [
   }
   check(new Set(level.map((v) => v.toFixed(4))).size > 1,
         `slots driven differently sound different (${level.map((v) => v.toFixed(4)).join(" ")})`);
+}
+
+// ── gain reduction through the ABI ─────────────────────────────────────────
+//
+// A compressor's meter can only show what the DSP reports, so the export is
+// proved against a known answer: a 4:1 compressor with a -20 dB threshold and
+// a hard knee, fed a level 12 dB over, reduces (1 - 1/4) * 12 = 9 dB, in
+// POSITIVE decibels, as every dynamics class here reports it. Silence reads 0.
+// And pooled, each slot is its own needle: one driven hot, one silent.
+{
+  console.log("gain reduction");
+  const fixture = join(sdk, "tests", "gr_fixture.cpp");
+  const drive = (x, h, level, blocks) => {
+    const stride = x.sonore_max_frames();
+    const at = h !== undefined;
+    const ip = (at ? x.sonore_in_ptr_at(h) : x.sonore_in_ptr()) / 4;
+    for (let b = 0; b < blocks; ++b) {
+      const m = new Float32Array(x.memory.buffer);
+      for (let i = 0; i < stride; ++i) { m[ip + i] = level; m[ip + stride + i] = level; }
+      if (at) x.sonore_process_at(h, stride);
+      else x.sonore_process(stride);
+    }
+  };
+  const hot = Math.pow(10, -8 / 20);
+
+  const one = await instantiate(buildWasm("gr_fixture", fixture));
+  one.sonore_init(48000);
+  drive(one, undefined, 0, 40);
+  check(one.sonore_gain_reduction() === 0, "a compressor fed silence reports no reduction");
+  drive(one, undefined, hot, 40);
+  near(one.sonore_gain_reduction(), 9.0, 0.5, "a 4:1 compressor 12 dB over reports 9 dB, positive");
+
+  const pool = await instantiate(buildWasm("gr_fixture_pooled", fixture, ["-DSONORE_MAX_INSTANCES=2"]));
+  const a = pool.sonore_new(), b = pool.sonore_new();
+  pool.sonore_init_at(a, 48000);
+  pool.sonore_init_at(b, 48000);
+  drive(pool, a, hot, 40);
+  drive(pool, b, 0, 40);
+  near(pool.sonore_gain_reduction_at(a), 9.0, 0.5, "the slot driven hot reads its own reduction");
+  check(pool.sonore_gain_reduction_at(b) === 0, "...and the silent slot beside it reads none");
+  check(pool.sonore_gain_reduction_at(7) === 0, "a handle that is not a slot reads 0, not garbage");
 }
 
 console.log(`${checks} checks, ${failures} failure(s)`);

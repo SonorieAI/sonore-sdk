@@ -2706,6 +2706,43 @@ inline uint32_t dspLatency(const T& dsp) {
   }
 }
 
+// ── Gain reduction ───────────────────────────────────────────────────────────
+//
+// How far the DSP is turning the signal down, for a compressor's meter.
+// Nothing about the OUTPUT can supply it: no measurement of the output tells
+// 6 dB of compression from a gain knob, so the DSP has to say. Every dynamics
+// class in the SDK answers gainReduction() in positive decibels, so a plugin
+// forwards its own:
+//
+//     float gainReduction() const { return comp.gainReduction(); }
+//
+// Detected like latency, so a DSP that does not compress declares nothing and
+// the meter rests on 0, which is what a compressor's meter shows when it is
+// not compressing, not a fault.
+/** Whether T reports gain reduction: true when it declares
+ *  `gainReduction() const`, in positive decibels. The editors show it as
+ *  `sonore.gr`. Without the const it is not seen, which a static_assert
+ *  below reports. */
+template <typename T, typename = void>
+struct HasGainReduction : std::false_type {};
+/** The match for HasGainReduction: T declares `gainReduction() const`. */
+template <typename T>
+struct HasGainReduction<T, std::void_t<decltype(std::declval<const T&>().gainReduction())>>
+    : std::true_type {};
+
+/** The DSP's gain reduction in positive decibels, 0 when it declares none.
+ *  A NaN, a negative number or a runaway is not a reading and reads 0. */
+template <typename T>
+inline float dspGainReduction(const T& dsp) {
+  if constexpr (HasGainReduction<T>::value) {
+    const float g = (float) dsp.gainReduction();
+    return (g > 0.0f && g < 200.0f) ? g : 0.0f;
+  } else {
+    (void) dsp;
+    return 0.0f;
+  }
+}
+
 // ── The state the host cannot see ────────────────────────────────────────────
 //
 // A host knows the session changed when it MOVED something: a parameter it
@@ -2889,6 +2926,10 @@ struct AnySaveState : std::false_type {};
 template <typename T>
 struct AnySaveState<T, std::void_t<decltype(std::declval<T&>().saveState(std::declval<StateBag&>()))>>
     : std::true_type {};
+template <typename T, typename = void>
+struct AnyGainReduction : std::false_type {};
+template <typename T>
+struct AnyGainReduction<T, std::void_t<decltype(std::declval<T&>().gainReduction())>> : std::true_type {};
 } // namespace hookdetail
 static_assert(HasLatency<SonoreDsp>::value || !hookdetail::AnyLatency<SonoreDsp>::value,
               "SonoreDsp::latencySamples() must be const -- `int latencySamples() const` -- or no "
@@ -2899,6 +2940,9 @@ static_assert(HasTail<SonoreDsp>::value || !hookdetail::AnyTail<SonoreDsp>::valu
 static_assert(HasStateBag<SonoreDsp>::value || !hookdetail::AnySaveState<SonoreDsp>::value,
               "SonoreDsp::saveState() must be const -- `void saveState(sonore::StateBag&) const` -- "
               "or the state is never saved and loadState() never called");
+static_assert(HasGainReduction<SonoreDsp>::value || !hookdetail::AnyGainReduction<SonoreDsp>::value,
+              "SonoreDsp::gainReduction() must be const -- `float gainReduction() const` -- or no "
+              "wrapper sees it and the meter reads no reduction");
 
 template <typename T>
 inline uint32_t dspTail(const T& dsp) {
@@ -3941,12 +3985,14 @@ inline std::string uiTickScript(Instance& inst) {
     }
   }
 
+  inst.meter.pushGr(dspGainReduction(inst.dsp));
   inst.meter.tickNow(); // the time that passed: a 33 ms timer does not tick every 33 ms
-  char lv[40], db[40], vu[40], meterCall[160];
+  char lv[40], db[40], vu[40], gr[40], meterCall[200];
   jsNumber(lv, sizeof(lv), (double) inst.meter.level());
   jsNumber(db, sizeof(db), (double) inst.meter.db());
   jsNumber(vu, sizeof(vu), (double) inst.meter.vu());
-  std::snprintf(meterCall, sizeof(meterCall), "window.sonore.__meter(%s,%s,%s);", lv, db, vu);
+  jsNumber(gr, sizeof(gr), (double) inst.meter.gr());
+  std::snprintf(meterCall, sizeof(meterCall), "window.sonore.__meter(%s,%s,%s,%s);", lv, db, vu, gr);
   if (inst.uiLastMeter != meterCall) {
     inst.uiLastMeter = meterCall;
     js += meterCall;

@@ -643,7 +643,7 @@ static void testDynamics() {
     comp.process(level * (float) std::sin(2.0 * kTestPi * 100.0 * i / sr));
   // Drive it at the peak so the detector sees the full level.
   for (int i = 0; i < 1000; ++i) comp.process(level);
-  checkNear(comp.gainReduction(), -9.0, 1.0, "4:1 compressor reduces ~9 dB at 12 over");
+  checkNear(comp.gainReduction(), 9.0, 1.0, "4:1 compressor reduces ~9 dB at 12 over");
 
   // Below threshold it must do nothing at all.
   sonore::Compressor quiet;
@@ -655,6 +655,47 @@ static void testDynamics() {
   quiet.setRelease(50.0f);
   for (int i = 0; i < 4000; ++i) quiet.process(sonore::dbToGain(-40.0f));
   checkNear(quiet.gainReduction(), 0.0, 0.01, "compressor is transparent below threshold");
+
+  // ONE NAME, ONE MEANING. gainReduction() used to be two conventions: the
+  // hardware models in compressors.h returned POSITIVE decibels of reduction
+  // and the generic ones (Compressor, Expander, DeEsser, Limiter,
+  // TruePeakLimiter) returned the SIGNED gain change. Nothing in the SDK
+  // noticed, because nothing displayed it, but a plugin forwarding it to a
+  // meter is a coin flip between a needle that falls and one that sits dead,
+  // and its author cannot tell which without reading the header. Every class
+  // that reports reduction is measured against the same rule here, so a
+  // future one cannot quietly pick the other sign.
+  {
+    const float hot = sonore::dbToGain(-8.0f);       // 12 dB over a -20 threshold
+    sonore::Compressor c1; c1.setSampleRate((float) sr); c1.setThreshold(-20.0f);
+    c1.setRatio(4.0f); c1.setKnee(0.0f); c1.setAttack(1.0f); c1.setRelease(50.0f);
+    for (int i = 0; i < 4000; ++i) c1.process(hot);
+
+    sonore::VcaCompressor c2; c2.setSampleRate((float) sr); c2.setThreshold(-20.0f);
+    c2.setRatio(4.0f); c2.setKnee(0.0f); c2.setAttack(1.0f); c2.setRelease(50.0f);
+    for (int i = 0; i < 4000; ++i) c2.process(hot);
+
+    sonore::Expander ex; ex.setSampleRate((float) sr); ex.setThreshold(-20.0f);
+    ex.setRatio(2.0f); ex.setKnee(0.0f); ex.setAttack(1.0f); ex.setRelease(50.0f);
+    for (int i = 0; i < 4000; ++i) ex.process(sonore::dbToGain(-30.0f));
+
+    sonore::ProcessSpec limSpec{};
+    limSpec.sampleRate = sr;
+    sonore::Limiter lim;
+    lim.prepare(limSpec);
+    lim.setCeiling(-14.0f);   // 6 dB under the -8 dBFS level
+    for (int i = 0; i < 4000; ++i) { float l = hot, r = hot; lim.process(l, r); }
+
+    check(c1.gainReduction() > 1.0f, "Compressor reports reduction as a POSITIVE number of decibels");
+    check(c2.gainReduction() > 1.0f, "VcaCompressor agrees with it");
+    check(ex.gainReduction() > 1.0f, "Expander agrees with it");
+    check(lim.gainReduction() > 1.0f, "Limiter agrees with it");
+    // And the reading has to BE the gain, not merely share its sign: a 4:1
+    // compressor 12 dB over reduces 9, and the two implementations of that law
+    // must land on the same number.
+    checkNear((double) c1.gainReduction(), (double) c2.gainReduction(), 1.0,
+              "...and the generic and hardware compressors measure the same reduction");
+  }
 
   // ADSR: attack rises, sustain holds, release falls to silence.
   sonore::ADSR env;
@@ -4543,26 +4584,26 @@ static void testEffects() {
     comp.setRelease(100.0f);
     comp.reset();
 
-    // A step to 12 dB over threshold. The settled reduction is -9 dB, and the
+    // A step to 12 dB over threshold. The settled reduction is 9 dB, and the
     // attack time is conventionally the ONE TIME CONSTANT point -- 63% of the
     // way there -- which is what a manufacturer's spec sheet means by it.
     const float hot = sonore::dbToGain(-8.0f);
     int reached = -1;
     for (int i = 0; i < (int) sr; ++i) {
       comp.computeGain(hot);
-      if (reached < 0 && comp.gainReduction() <= -9.0f * 0.63f) reached = i;
+      if (reached < 0 && comp.gainReduction() >= 9.0f * 0.63f) reached = i;
     }
     const double attackMs = reached >= 0 ? 1000.0 * reached / sr : -1.0;
     std::printf("  ---- compressor attack: declared 10.0 ms, measured %.2f ms ----\n", attackMs);
     check(reached >= 0, "the compressor reaches its target reduction");
     checkNear(attackMs, 10.0, 4.0, "…in about the attack time it was given");
-    checkNear((double) comp.gainReduction(), -9.0, 0.5,
+    checkNear((double) comp.gainReduction(), 9.0, 0.5,
               "…and settles where the ratio says it should");
 
     int released = -1;
     for (int i = 0; i < (int) sr; ++i) {
       comp.computeGain(sonore::dbToGain(-60.0f));
-      if (released < 0 && comp.gainReduction() > -9.0f * 0.37f) released = i;
+      if (released < 0 && comp.gainReduction() < 9.0f * 0.37f) released = i;
     }
     const double releaseMs = released >= 0 ? 1000.0 * released / sr : -1.0;
     std::printf("  ---- compressor release: declared 100.0 ms, measured %.2f ms ----\n",
@@ -30307,11 +30348,11 @@ static void testDynamicsFamily() {
     const float level = sonore::dbToGain(-30.0f);
     for (int i = 0; i < (int) (sr * 0.5); ++i) ex.process(level * (float) std::sin(2.0 * kTestPi * 100.0 * i / sr));
     for (int i = 0; i < 1000; ++i) ex.process(level);
-    checkNear(ex.gainReduction(), -10.0, 1.0, "a 2:1 expander 10 dB under threshold reduces ~10 dB");
+    checkNear(ex.gainReduction(), 10.0, 1.0, "a 2:1 expander 10 dB under threshold reduces ~10 dB");
     ex.setRange(6.0f);
     // 100 ms: a range moved while running glides there (10 ms time constant).
     for (int i = 0; i < 4800; ++i) ex.process(level);
-    checkNear(ex.gainReduction(), -6.0, 0.5, "…and no further than its range");
+    checkNear(ex.gainReduction(), 6.0, 0.5, "…and no further than its range");
     ex.setRange(60.0f);
     for (int i = 0; i < (int) (sr * 0.5); ++i) ex.process(sonore::dbToGain(-6.0f));
     checkNear(ex.gainReduction(), 0.0, 0.05, "above threshold it is transparent");
@@ -37035,7 +37076,7 @@ static void testLibraryRoundD() {
     std::printf("  ---- hostile fs/4 tone through a -1 dB ceiling: true peak %.2f dBTP (sample-peak limiter: %.2f) ----\n", outTp, outSp);
     check(outTp <= -0.95, "the ceiling holds in dBTP, measured by 16x reconstruction -- not by the limiter's own detector");
     check(outSp > -0.30, "...where the sample-peak limiter, seeing only -3.1 dBFS, does nothing and ships -0.1 dBTP");
-    checkNear(g_libTpl.gainReduction(), -1.0, 0.4, "the reduction is the ~1 dB the samples could not see");
+    checkNear(g_libTpl.gainReduction(), 1.0, 0.4, "the reduction is the ~1 dB the samples could not see");
     // Transparency: under the ceiling it is a pure delay of the reported latency.
     g_libTpl.prepare(spec);
     g_libTpl.setCeiling(-1.0f);

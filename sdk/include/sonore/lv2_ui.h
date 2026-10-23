@@ -194,7 +194,7 @@ struct UiInstance {
    *  Owned HERE rather than in the plugin: this module has the clock a needle
    *  should be driven by, and the plugin has only the audio thread. */
   MeterState meter;
-  float meterPeak = 0.0f, meterRms = 0.0f;
+  float meterPeak = 0.0f, meterRms = 0.0f, meterGr = 0.0f;
 
   /** The URIDs this interface needs to say anything structured. Zero means
    *  the host gave no urid:map, which is legal and leaves the atom half of
@@ -531,6 +531,12 @@ inline void portEvent(Lv2UiHandle handle, uint32_t portIndex, uint32_t bufferSiz
     if (portIndex == (uint32_t) lv2::portMeterRms()) ui->meter.push(ui->meterPeak, ui->meterRms);
     return;
   }
+  // Gain reduction is not measured from the audio, so it has no second half to
+  // wait for: the plugin wrote what it took off and the interface shows it.
+  if (lv2::grPorts() && portIndex == (uint32_t) lv2::portMeterGr()) {
+    ui->meterGr = *(const float*) buffer;
+    return;
+  }
 
   // Everything below is a float control port. An atom arriving here would be
   // read as a number, which is the shape of bug that shows up as a knob
@@ -587,12 +593,14 @@ inline int idle(Lv2UiHandle handle) {
   // rate it likes, so the ballistics are advanced by the time that passed
   // rather than by a 30 Hz tick the host never promised.
   if (ui->webview.ready()) {
+    ui->meter.pushGr(ui->meterGr);
     ui->meter.tickNow();
-    char lv[40], db[40], vu[40], call[160];
+    char lv[40], db[40], vu[40], gr[40], call[200];
     jsNumber(lv, sizeof(lv), (double) ui->meter.level());
     jsNumber(db, sizeof(db), (double) ui->meter.db());
     jsNumber(vu, sizeof(vu), (double) ui->meter.vu());
-    std::snprintf(call, sizeof(call), "window.sonore.__meter(%s,%s,%s);", lv, db, vu);
+    jsNumber(gr, sizeof(gr), (double) ui->meter.gr());
+    std::snprintf(call, sizeof(call), "window.sonore.__meter(%s,%s,%s,%s);", lv, db, vu, gr);
     if (ui->lastMeter != call) {
       ui->lastMeter = call;
       ui->webview.eval(call);

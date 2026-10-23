@@ -200,6 +200,37 @@ static int sonore_latency_of(const T& dsp) {
   else { (void) dsp; return 0; }
 }
 
+/** Does this DSP measure how much it is turning the signal down? Every
+ *  dynamics class in the SDK already answers that in positive decibels
+ *  (Compressor, Expander, DeEsser, the hardware models in compressors.h,
+ *  Limiter and TruePeakLimiter), so a plugin opts in by forwarding it:
+ *
+ *      float gainReduction() const { return comp.gainReduction(); }
+ *
+ *  Detected the same way as latency and MIDI, so a DSP that does not compress
+ *  pays nothing and needs no stub. Without it the host reads 0 dB, which is
+ *  the honest answer: the needle is not broken, nothing is being reduced. */
+template <typename T, typename = void>
+struct SonoreHasGainReduction : std::false_type {};
+/** The match for SonoreHasGainReduction: T declares `gainReduction() const`. */
+template <typename T>
+struct SonoreHasGainReduction<T, std::void_t<decltype(std::declval<const T&>().gainReduction())>>
+    : std::true_type {};
+
+/** In a template for the reason sonore_latency_of is. A NaN, a negative
+ *  number or a runaway is not a reading and reads 0, as in the native
+ *  wrappers. */
+template <typename T>
+static float sonore_gain_reduction_of(const T& dsp) {
+  if constexpr (SonoreHasGainReduction<T>::value) {
+    const float g = (float) dsp.gainReduction();
+    return (g > 0.0f && g < 200.0f) ? g : 0.0f;
+  } else {
+    (void) dsp;
+    return 0.0f;
+  }
+}
+
 // Turn a host's inlet into sonore_midi_events. Shared by the instrument and
 // the context paths; consuming it (count -> 0) means a stale block can't replay.
 // The inlet is a parameter, not the module's: in a pooled module each handle
@@ -414,6 +445,13 @@ void sonore_set_time_sig(int numerator, int denominator) {
  *  reports anyway. */
 int sonore_latency() { return sonore_latency_of(sonore_dsp_instance); }
 
+/** Gain reduction, in positive decibels, as of the last processed block: what
+ *  a compressor's meter shows. 0 means none, and means it for a DSP that
+ *  never declared the hook as well, so a meter simply rests rather than
+ *  reporting a fault. Exported unconditionally, like the latency, so a host
+ *  can always link it. */
+float sonore_gain_reduction() { return sonore_gain_reduction_of(sonore_dsp_instance); }
+
 /** 1 = this build consumes MIDI (an instrument/midi-aware effect). A context
  *  DSP reads MIDI through ctx.midi, so it counts too -- without a descriptor
  *  here the preview cannot tell a context instrument from a context effect, and
@@ -593,6 +631,13 @@ float* sonore_sidechain_ptr_at(int h) { return sonore_handle_ok(h) ? sonore_key_
 int sonore_latency_at(int h) {
   if (!sonore_handle_ok(h)) return 0;
   return sonore_latency_of(sonore_dsp_at(h));
+}
+
+/** The gain reduction of one pooled instance: four compressors in one module
+ *  are four needles. */
+float sonore_gain_reduction_at(int h) {
+  if (!sonore_handle_ok(h)) return 0.0f;
+  return sonore_gain_reduction_of(sonore_dsp_at(h));
 }
 
 void sonore_midi_count_at(int h, int n) {

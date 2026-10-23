@@ -162,6 +162,8 @@ struct Plugin {
    *  reached through ports. */
   float* meterPeakOut = nullptr;
   float* meterRmsOut = nullptr;
+  /** The DSP's gain reduction, when it declares one (grPorts()). */
+  float* meterGrOut = nullptr;
 
   /** The interface's two atom ports. */
   const LV2_Atom_Sequence* uiControlIn = nullptr;
@@ -388,6 +390,10 @@ inline void connectPort(LV2_Handle handle, uint32_t port, void* data) {
   }
   if (port == (uint32_t) portMeterRms()) {
     self->meterRmsOut = (float*) data;
+    return;
+  }
+  if (grPorts() && port == (uint32_t) portMeterGr()) {
+    self->meterGrOut = (float*) data;
     return;
   }
   // Ports BOTH kinds of plugin have come before the instrument branch, which
@@ -970,6 +976,9 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
     if (self->meterPeakOut) *self->meterPeakOut = level.peak;
     if (self->meterRmsOut) *self->meterRmsOut = level.rms;
   }
+  // Not a measurement of the output: the DSP is the only thing that knows how
+  // much it took off, so it reports it or there is no port.
+  if (self->meterGrOut) *self->meterGrOut = clapwrap::dspGainReduction(self->shared.dsp);
 }
 
 /** [worker-thread or main-thread] The output guard's report, once: a warning
@@ -1271,8 +1280,8 @@ inline void lv2Symbol(const char* id, char* out, size_t capacity) {
  *  name it can write (in_/out_ l, r, 3..8 and x, sc_l and sc_r, auxB_C). */
 inline bool lv2ReservedSymbol(const char* symbol) {
   static const char* const kFixed[] = {"enabled", "freewheel", "latency",  "meterPeak", "meterRms",
-                                       "midi_in", "midi_out",  "time_in",  "uiControl", "uiNotify",
-                                       "sc_l",    "sc_r"};
+                                       "meterGr", "midi_in",   "midi_out", "time_in",   "uiControl",
+                                       "uiNotify", "sc_l",     "sc_r"};
   for (const char* fixed : kFixed)
     if (std::strcmp(symbol, fixed) == 0) return true;
   static const char* const kChannels[] = {"l", "r", "3", "4", "5", "6", "7", "8", "x"};
@@ -1736,6 +1745,19 @@ inline void writeTtl(std::FILE* out, const char* binaryName) {
                  "        lv2:name \"Transport\" ;\n"
                  "        lv2:portProperty lv2:connectionOptional ;\n",
                  portTimeIn());
+  }
+  if (grPorts()) {
+    separator();
+    std::fprintf(out,
+                 "        a lv2:OutputPort , lv2:ControlPort ;\n"
+                 "        lv2:index %d ;\n"
+                 "        lv2:symbol \"meterGr\" ;\n"
+                 "        lv2:name \"Gain Reduction\" ;\n"
+                 "        lv2:minimum 0.0 ;\n"
+                 "        lv2:maximum 60.0 ;\n"
+                 "        lv2:default 0.0 ;\n"
+                 "        lv2:portProperty lv2:connectionOptional ;\n",
+                 portMeterGr());
   }
   if (latencyPorts()) {
     separator();

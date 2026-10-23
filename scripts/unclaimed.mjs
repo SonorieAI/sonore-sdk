@@ -65,8 +65,9 @@ const NOT_A_CAPABILITY = new Set([
   "TakesMidi", "TakesSidechain", "TakesContext", "TakesDouble", "TakesDoubleCtx",
   "WantsTransport", "WantsHostInfo", "WantsTrackInfo", "WantsFile", "HasVoiceCapacity",
   "HasActiveVoices", "HasStateBag", "HasLatency", "HasTail", "HasPrepare", "HasReset",
+  "HasGainReduction",
   "SonoreTakesMidi", "SonoreTakesContext", "SonoreTakesSidechain",
-  "SonoreWantsTransport", "SonoreHasLatency",
+  "SonoreWantsTransport", "SonoreHasLatency", "SonoreHasGainReduction",
 
   // ── Conditional storage ──
   //

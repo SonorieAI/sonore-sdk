@@ -109,10 +109,16 @@ interface Sonore {
   onLevel(callback: (level: number, db: number) => void): void;
   /** The same, as a VU reading 0..1. */
   onVU(callback: (vu: number) => void): void;
+  /** How far the plugin is turning the signal down, in positive decibels
+   *  (6 means 6 dB quieter), for a compressor's meter. 0 from a plugin
+   *  whose DSP does not declare gainReduction(), which is also what a
+   *  compressor reads when it is not compressing. */
+  onGR(callback: (db: number) => void): void;
   /** The latest of each, for a page that draws on its own schedule. */
   readonly level: number;
   readonly db: number;
   readonly vu: number;
+  readonly gr: number;
 
   /** On-screen keyboards for an instrument. Velocity 1..127, 100 when not
    *  given. */

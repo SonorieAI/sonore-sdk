@@ -179,6 +179,12 @@ public:
     rms_.store(rms, std::memory_order_relaxed);
   }
 
+  /** [main thread] How much the DSP is turning the signal down, in decibels
+   *  (positive = reduction). Read off the DSP by whoever drives the tick,
+   *  because nothing measured from the output can tell it apart from a gain
+   *  knob. */
+  void pushGr(float db) { gr_.store(db, std::memory_order_relaxed); }
+
   /** [main thread] Advance the ballistics and read the display values.
    *  `dt` is the seconds since the last call. */
   void tick(double dt) {
@@ -238,6 +244,8 @@ public:
   }
   /** Calibrated VU needle position, 0..1 (>1 = past 0 VU), for `sonore.vu`. */
   float vu() const { return vu_; }
+  /** Decibels of gain reduction, for `sonore.gr`. */
+  float gr() const { return gr_.load(std::memory_order_relaxed); }
 
 private:
   // -20..+3 VU scale with 0 VU referenced to -9 dBFS. Keep these three in step
@@ -250,6 +258,7 @@ private:
 
   std::atomic<float> peak_{0.0f};
   std::atomic<float> rms_{0.0f};
+  std::atomic<float> gr_{0.0f};
   float display_ = 0.0f;
   float vu_ = 0.0f;
   std::chrono::steady_clock::time_point lastTick_{};
@@ -359,6 +368,9 @@ inline bool webviewMayNavigate(const std::string& uri) {
  *                                or UI); values maps each id to its value
  *   sonore.onLevel(cb)           cb(level, db) ~30 Hz
  *   sonore.onVU(cb)              cb(vu) ~30 Hz, calibrated needle
+ *   sonore.onGR(cb)              cb(dB) ~30 Hz, gain reduction in positive
+ *                                decibels (0 if the DSP does not declare
+ *                                gainReduction())
  *   sonore.noteOn/noteOff        instruments with an on-screen keyboard
  *   'sonore:ready' event         fired once the bridge is populated
  *
@@ -566,7 +578,7 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
   js += "function fireChange(p){var v=vals();for(var i=0;i<changeCbs.length;i++){"
         "try{changeCbs[i](v,p?p.__i:-1,p?p.value:0);}catch(e){}}}\n";
   js += "var stateSeen=false;\n";
-  js += "var changeCbs=[],levelCbs=[],vuCbs=[],noteCbs=[],fileCbs=[],stateCbs=[],"
+  js += "var changeCbs=[],levelCbs=[],vuCbs=[],grCbs=[],noteCbs=[],fileCbs=[],stateCbs=[],"
         "deviceCbs=[],cpuCbs=[];\n";
   // Every member is typed for a page in TypeScript by sonore.d.ts, beside this
   // header, and scripts/bridge-types.mjs fails the build when the two differ:
@@ -595,6 +607,11 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
   js += "  on:function(cb){if(typeof cb==='function')changeCbs.push(cb);},\n";
   js += "  onLevel:function(cb){if(typeof cb==='function')levelCbs.push(cb);},\n";
   js += "  onVU:function(cb){if(typeof cb==='function')vuCbs.push(cb);},\n";
+  // Gain reduction, in positive decibels, from a DSP that declares
+  // gainReduction(). 0 from one that does not, which is also what a
+  // compressor reads when it is not compressing, so a meter bound to this is
+  // right either way.
+  js += "  onGR:function(cb){if(typeof cb==='function')grCbs.push(cb);},\n";
   js += "  noteOn:function(n,v){post({type:'noteOn',note:n|0,velocity:v===undefined?100:v|0});},\n";
   js += "  noteOff:function(n){post({type:'noteOff',note:n|0});},\n";
   // Right-click on a control -> the HOST's menu, not ours. MIDI learn, "remove
@@ -675,7 +692,7 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
         "var span=p.max-p.min,d=span>=100?0:(span>=10?1:2);"
         "var a=Math.abs(v),e=(a===0||a>=10)?0:(a>=1?1:(a>=0.1?2:3));if(e>d)d=e;"
         "return v.toFixed(d)+(p.unit?' '+p.unit:'');},\n";
-  js += "  level:0, db:-100, vu:0,\n";
+  js += "  level:0, db:-100, vu:0, gr:0,\n";
   // How much of the audio deadline this plugin is using, 0..1 and beyond.
   // A generated DSP has nobody who profiled it; the page can show what it
   // costs, and an interface that never asks pays nothing.
@@ -762,9 +779,13 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
         "deviceCbs.forEach(function(cb){try{cb(api.audioDevices);}catch(e){}});};\n";
   js += "api.__cpu=function(load,peak,xruns){api.cpu=load;api.cpuPeak=peak;"
         "api.xruns=xruns;cpuCbs.forEach(function(cb){try{cb(load,peak,xruns);}catch(e){}});};\n";
-  js += "api.__meter=function(level,db,vu){api.level=level;api.db=db;api.vu=vu;"
+  // The fourth argument arrived later than the other three; a host build that
+  // still calls it with three leaves gr at its last value rather than NaN.
+  js += "api.__meter=function(level,db,vu,gr){api.level=level;api.db=db;api.vu=vu;"
+        "if(typeof gr==='number')api.gr=gr;"
         "levelCbs.forEach(function(cb){try{cb(level,db);}catch(e){}});"
-        "vuCbs.forEach(function(cb){try{cb(vu);}catch(e){}});};\n";
+        "vuCbs.forEach(function(cb){try{cb(vu);}catch(e){}});"
+        "grCbs.forEach(function(cb){try{cb(api.gr);}catch(e){}});};\n";
   js += "window.sonore=api;\n";
   // Asked for before the page is told it is ready, so a listener registered
   // in the ready handler is already in place when the answer arrives.

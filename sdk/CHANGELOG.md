@@ -33,6 +33,7 @@ Everything since the last release, newest work included. Short hashes point at t
 - Web editor pages, including any frame in them, may only navigate to `about:`, `data:` and `blob:`; http(s), `file:` and dropped files are refused, and `window.open` returns null. A page must carry its own content. (10f7c55, d36e952)
 - When a pitch is below the window's reach at the current sample rate, `PitchDetector::frequency()` and `confidence()` now return 0 instead of the clamped floor. Use the new `lowestHz()` to check the reach. (ce99981)
 - `osc::Type::Nil` is deprecated; the 'N' tag is `osc::Type::Null`. `<objc/objc.h>` defines `Nil` as a macro, and on a Mac most of the SDK's headers include it, so `Type::Nil` did not compile there. `Nil` still works elsewhere, with a deprecation warning. (004b39e)
+- `gainReduction()` means one thing on every dynamics class: decibels of reduction, POSITIVE (6 is 6 dB quieter). `Compressor`, `Expander`, `DeEsser`, `Limiter` and `TruePeakLimiter` returned the signed gain change, negative while reducing, where the hardware models in compressors.h already returned positive decibels, so a meter fed one class fell and fed another sat still. Code that negated the reading, or compared it with a negative number, now reads it the wrong way round; the signed change is `-gainReduction()`. `UpwardCompressor::gainChange()` stays signed, because it can add gain. A `SonoreDsp::gainReduction()` declared without `const` is a compile error, as `latencySamples()` is.
 
 #### Sound
 
@@ -296,6 +297,7 @@ Numerics
 - `sonore_add_au` takes `NAME`, `VENDOR` and `BUNDLE_ID`; `sonore_add_plugin` passes `AU_NAME`, `AU_VENDOR` and `AU_BUNDLE_ID`. (e1e2ccf)
 - `clapwrap::pluginDescriptorProblem()`: `descriptorProblem()` plus a check that `numParams` matches `SONORE_NUM_PARAMS`. (920fec3)
 - `SONORE_STANDALONE_NO_MAIN` lets a test include a standalone build without its entry point. (a091080)
+- Gain reduction reaches the interface. A DSP that declares `float gainReduction() const` (forwarding a dynamics class's own is one line) is read by every wrapper: the web editor gets `sonore.gr` and `sonore.onGR(cb)` in CLAP, VST3, AU, the standalone and LV2; the browser build exports `sonore_gain_reduction()` and `sonore_gain_reduction_at(h)`; and an LV2 plugin gets an output control port `meterGr`, placed after every other port so no existing index moves, and declared only by a DSP that reports one. Nothing measured from the output can stand in for it: it cannot tell compression from a gain knob. A DSP without the hook reads 0.
 
 ### Faster
 

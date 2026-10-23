@@ -102,8 +102,10 @@ public:
   }
   /** [audio-thread] One sample, expanded by its own level. No allocation. */
   inline float process(float x) { return x * computeGain(x); }
-  /** Last gain reduction in dB (negative = attenuating). */
-  float gainReduction() const { return grDb_; }
+  /** Gain reduction in dB, POSITIVE (6 means 6 dB quieter), which is what a
+   *  meter reads and what every other dynamics class here reports. The signed
+   *  gain change is `-gainReduction()`. */
+  float gainReduction() const { return grDb_ < 0.0f ? -grDb_ : 0.0f; }
 
 private:
   float sr_ = 48000.0f;
@@ -363,7 +365,7 @@ public:
     split_.process(x, low, high);
     return low + high * gain;
   }
-  /** The last gain reduction in dB (negative = ducking). */
+  /** The last gain reduction in dB, positive while ducking. */
   float gainReduction() const { return comp_.gainReduction(); }
 
 private:

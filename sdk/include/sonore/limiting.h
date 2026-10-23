@@ -52,7 +52,7 @@ namespace sonore {
  * process(): the same look-ahead again is free, a different one clears the
  * state. The signal comes out latencySamples() late, the look-ahead plus
  * the detector's 32-sample centre; report it to the host, and again when
- * the look-ahead changes. gainReduction() is in dB, negative while limiting.
+ * the look-ahead changes. gainReduction() is in dB, positive while limiting.
  */
 class TruePeakLimiter {
 public:
@@ -122,9 +122,9 @@ public:
   }
   /** Look-ahead plus the interpolator's centre: report it. */
   int latencySamples() const { return lookahead_ + kDetectorLag; }
-  /** The gain applied to the last frame, in dB: 0 at rest, negative while
-   *  limiting. */
-  float gainReduction() const { return gainToDb(gain_); }
+  /** The reduction applied to the last frame, in dB: 0 at rest, POSITIVE
+   *  while limiting, like every other dynamics class here. */
+  float gainReduction() const { const float d = gainToDb(gain_); return d < 0.0f ? -d : 0.0f; }
 
   /** [audio-thread] One stereo frame, in place, latencySamples() late, both
    *  channels at the same gain. Allocation-free. */

@@ -183,5 +183,14 @@ inline int portMidiIn() { return portFreeWheel() + freeWheelPorts(); }
  *  no port before it moves for the plugins that have it. */
 inline int timePorts() { return clapwrap::WantsTransport<SonoreDsp>::value ? 1 : 0; }
 inline int portTimeIn() { return portUiNotify() + 1; }
+/** How far the plugin is turning the signal down, in positive decibels, for
+ *  a DSP that declares gainReduction(). Its own port rather than a field in
+ *  the UI atom, for the reason the level has one: an LV2 interface is a
+ *  separate module that can only see what the ports carry, and a number the
+ *  host can read too is worth more than a private message. After every other
+ *  port, so no index moves for the plugins that do not have it, and declared
+ *  only by a DSP with something to report. */
+inline int grPorts() { return clapwrap::HasGainReduction<SonoreDsp>::value ? 1 : 0; }
+inline int portMeterGr() { return portTimeIn() + timePorts(); }
 } // namespace lv2
 } // namespace sonore

@@ -508,11 +508,11 @@ public:
   }
   /** Latency the host must be told about: the look-ahead IS a delay. */
   int latencySamples() const { return lookahead_; }
-  /** lastGain() in dB, for a meter: 0 when not limiting, negative while
-   *  limiting (-6 is 6 dB of reduction), floored at -180. A plain member:
-   *  an editor reads it through something the DSP publishes, such as an
-   *  atomic. */
-  float gainReduction() const { return gainToDb(gain_); }
+  /** lastGain() as decibels of reduction, for a meter: 0 when not
+   *  limiting, POSITIVE while limiting (6 is 6 dB of reduction), like every
+   *  other dynamics class here. A plain member: an editor reads it through
+   *  something the DSP publishes, such as an atomic. */
+  float gainReduction() const { const float d = gainToDb(gain_); return d < 0.0f ? -d : 0.0f; }
   /** The gain applied to the sample that just left, before the safety clamp. */
   float lastGain() const { return gain_; }
 

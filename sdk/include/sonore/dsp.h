@@ -1123,8 +1123,9 @@ private:
 };
 
 /** Feed-forward compressor with a peak detector, soft knee and makeup.
- *  `gainReduction()` reports the last computed GR in dB; the acceptance gates
- *  measure exactly this number. */
+ *  `gainReduction()` reports the last computed GR in positive dB, as every
+ *  dynamics class here does; the acceptance gates measure exactly this
+ *  number. */
 class Compressor {
 public:
   /** -18 dB threshold, 4:1, a 6 dB knee, no makeup, and the detector's
@@ -1201,8 +1202,10 @@ public:
    *  sidechain, or one gain for linked channels, call computeGain() with the
    *  detector signal and multiply each channel by it. */
   inline float process(float x) { return x * computeGain(x); }
-  /** Last gain reduction, in dB (negative = attenuating). */
-  float gainReduction() const { return grDb_; }
+  /** Gain reduction in dB, POSITIVE (6 means 6 dB quieter), which is what a
+   *  meter reads and what every other dynamics class here reports. The signed
+   *  gain change is `-gainReduction()`. */
+  float gainReduction() const { return grDb_ < 0.0f ? -grDb_ : 0.0f; }
 
 private:
   float sr_ = 48000.0f;

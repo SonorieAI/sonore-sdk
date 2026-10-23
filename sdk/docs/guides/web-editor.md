@@ -102,6 +102,7 @@ thread through a lock-free queue.
 | `on(cb)` | `cb(values, index, value)` on any change |
 | `format(p, v)`, `toNormalised(p, v)`, `fromNormalised(p, n)` | the host's text, and its automation curve |
 | `onLevel(cb)`, `onVU(cb)` | meters, up to about thirty times a second while the level moves (not a clock) |
+| `onGR(cb)`, `gr` | gain reduction in positive dB, from a DSP that declares `float gainReduction() const`; 0 from one that does not |
 | `noteOn(note, velocity)`, `noteOff(note)`, `onNotes(cb)` | on-screen keyboards for an instrument |
 | `presets`, `loadPreset(i)` | factory presets by name, applied in the plugin |
 | `chooseFile(purpose)`, `onFile(cb)` | a native file dialog; the path also reaches the DSP's `loadFile(purpose, path)` |
