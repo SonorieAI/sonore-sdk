@@ -96,7 +96,7 @@ thread through a lock-free queue.
 
 | Member | |
 | --- | --- |
-| `sonore.name`, `sonore.vendor`, `sonore.params` | identity, and every parameter in the plugin's order: `id`, `label`, `unit`, `min`, `max`, `default`, `step`, `skew`, `readOnly`, `value`, `names` |
+| `sonore.name`, `sonore.vendor`, `sonore.params` | identity, and every parameter in the plugin's order: `id`, `label`, `unit`, `min`, `max`, `default`, `step`, `skew`, `readOnly`, `value`, `names`, `options` (a stepped control's positions; null for a continuous one), `curve` (`'log'` or `'linear'`), `group` |
 | `get(p)`, `set(p, v)` | plain values; a parameter is named by index, id, label or the object itself |
 | `begin(p)`, `end(p)` | a gesture around a drag |
 | `on(cb)` | `cb(values, index, value)` on any change |

@@ -4914,6 +4914,37 @@ static void testSdkVersion() {
         "...and its parts and its single number say the same");
 }
 
+// The studio's bridge gives a page { ..., options, curve, group } for every
+// parameter, and a page approved there loops over `options` to draw a
+// stepped control. Here they were missing, and an exported 1176's ratio
+// buttons threw on `undefined` and took the knobs after them down with it.
+static void testBridgeParamShape() {
+  std::printf("bridge parameter shape\n");
+  static const char* const kModes[] = {"Lowpass", "Bandpass"};
+  static sonore::ParamInfo params[4] = {
+      {"mode", "Mode", "", 0.0f, 1.0f, 0.0f, 2},
+      {"poles", "Poles", "", 2.0f, 8.0f, 2.0f, 4},
+      {"freq", "Freq", "Hz", 20.0f, 20000.0f, 1000.0f, 0},
+      {"mix", "Mix", "%", 0.0f, 100.0f, 50.0f, 0},
+  };
+  params[0].valueNames = kModes;
+  params[0].numValueNames = 2;
+  params[0].group = "Filter";
+  params[2].skew = sonore::skewForCentre(20.0f, 20000.0f, 632.0f);
+  sonore::PluginDescriptor desc;
+  desc.name = "Shape Probe";
+  desc.params = params;
+  desc.numParams = 4;
+  const std::string js = sonore::bridgeScript(desc);
+  const auto has = [&js](const char* s) { return js.find(s) != std::string::npos; };
+  check(has("options:['Lowpass','Bandpass']"), "a named stepped control's options are its names");
+  check(has("options:['2','4','6','8']"),
+        "...an unnamed one's are its values, so a loop over them never meets a null");
+  check(has("options:null"), "...and a continuous control has none");
+  check(has("curve:'log'") && has("curve:'linear'"), "a skewed control is 'log', the rest 'linear'");
+  check(has("group:'Filter'") && has("group:null"), "a parameter carries its group, or null");
+}
+
 static void testBridgeLocale() {
   // And a number at all: inf and nan are no JS or JSON literal, and one
   // infinite sample in a float WAV made the waveform's JSON unparseable.
@@ -38623,6 +38654,7 @@ int main() {
   std::printf("Sonore SDK tests\n\n");
   testSdkVersion();
   testBridgeLocale();
+  testBridgeParamShape();
   testMeterRecovers();
   testMeterMovement();
   testGainControlsGlide();

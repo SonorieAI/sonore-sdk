@@ -465,7 +465,7 @@ What the page gets:
 
 | API | |
 | --- | --- |
-| `sonore.name` / `sonore.params` | identity and the parameter table; a parameter the plugin reports (a meter) has `readOnly`, and `set`, `begin` and `end` ignore it |
+| `sonore.name` / `sonore.params` | identity and the parameter table; a parameter the plugin reports (a meter) has `readOnly`, and `set`, `begin` and `end` ignore it; a stepped one lists its positions in `options`, and each has a `curve` (`'log'`/`'linear'`) and a `group` |
 | `sonore.get(i)` / `set(i, v)` | plain-value access |
 | `sonore.begin(i)` / `end(i)` | gestures: one undo step per drag |
 | `sonore.on(cb)` | `cb(values, index, value)` on any change, from the UI *or* host automation |

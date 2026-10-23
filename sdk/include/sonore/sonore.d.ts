@@ -47,6 +47,16 @@ interface SonoreParam {
   /** For a stepped control, the name of each step, or null where a step has
    *  none: "Lowpass", "Bandpass" ... */
   readonly names: ReadonlyArray<string | null>;
+  /** A stepped control's positions, in order, as a page draws them: each
+   *  step's name, or its value as text where it has none, so a loop over
+   *  them never meets a null. Null for a continuous control. The same field
+   *  the studio's bridge gives a page. */
+  readonly options: ReadonlyArray<string> | null;
+  /** 'log' for a skewed control (a log one puts its centre at the
+   *  geometric mean), 'linear' otherwise. */
+  readonly curve: "log" | "linear";
+  /** The parameter's display group, or null at the top level. */
+  readonly group: string | null;
 }
 
 /** A parameter named by the parameter itself, its index, its id or its

@@ -402,9 +402,14 @@ inline bool webviewMayNavigate(const std::string& uri) {
  * discover at export time that a method it used doesn't exist here.
  *
  *   sonore.name                  plugin name
- *   sonore.params                [{id,label,min,max,default,unit,step,readOnly}]
+ *   sonore.params                [{id,label,min,max,default,unit,step,readOnly,
+ *                                  options,curve,group}]
  *                                readOnly: one the plugin reports (a meter);
- *                                set, begin and end ignore it
+ *                                set, begin and end ignore it. options: a
+ *                                stepped control's positions by name (its
+ *                                value where a step has none), null for a
+ *                                continuous one; curve: 'log' or 'linear';
+ *                                group: the parameter's group or null
  *   sonore.get(i) / set(i, v)    plain-value parameter access
  *   sonore.on(cb)                cb(values, index, value) on any change (host
  *                                or UI); values maps each id to its value
@@ -537,7 +542,45 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
       if (name) js += "'" + escapeForJs(name) + "'";
       else js += "null";
     }
-    js += "]}";
+    js += "]";
+    // THE STUDIO'S SHAPE: { ..., options, curve, group }. A generated
+    // interface is written, previewed and approved against the studio's
+    // bridge, whose params carry `options` (a stepped control's positions, by
+    // name), `curve` and `group`, and this bridge had none of the three. An
+    // 1176 built its ratio buttons with `ratioParam.options.forEach(...)`,
+    // which threw here on `undefined` and took the four knobs after it down
+    // with it: the exported plugin showed a meter over an empty panel, while
+    // the preview was complete.
+    //
+    // `options` is an array for EVERY stepped control, never holding a null:
+    // a step with no name is labelled by its value, so a page that loops over
+    // the options cannot meet an undefined one. Null for a continuous control.
+    if (p.stepCount > 0) {
+      js += ",options:[";
+      for (int n = 0; n < p.stepCount; ++n) {
+        const char* name = paramValueName(p, n);
+        if (n) js += ",";
+        if (name) {
+          js += "'" + escapeForJs(name) + "'";
+        } else {
+          char sv[40];
+          jsNumber(sv, sizeof(sv), (double) stepValueOf(p, n));
+          js += "'";
+          js += sv;
+          js += "'";
+        }
+      }
+      js += "]";
+    } else {
+      js += ",options:null";
+    }
+    // The studio turns a 'log' knob logarithmically. Here that is any skewed
+    // parameter: a log control is written with the skew that puts its centre
+    // at the geometric mean, which is where a log knob puts it.
+    js += (p.skew != 1.0f && p.skew > 0.0f) ? ",curve:'log'" : ",curve:'linear'";
+    js += ",group:";
+    js += (p.group && *p.group) ? "'" + escapeForJs(p.group) + "'" : std::string("null");
+    js += "}";
   }
   js += "];\n";
   // Preset NAMES only: the values live on the C++ side and are applied there,

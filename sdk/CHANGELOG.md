@@ -299,6 +299,7 @@ Numerics
 - `clapwrap::pluginDescriptorProblem()`: `descriptorProblem()` plus a check that `numParams` matches `SONORE_NUM_PARAMS`. (920fec3)
 - `SONORE_STANDALONE_NO_MAIN` lets a test include a standalone build without its entry point. (a091080)
 - Gain reduction reaches the interface. A DSP that declares `float gainReduction() const` (forwarding a dynamics class's own is one line) is read by every wrapper: the web editor gets `sonore.gr` and `sonore.onGR(cb)` in CLAP, VST3, AU, the standalone and LV2; the browser build exports `sonore_gain_reduction()` and `sonore_gain_reduction_at(h)`; and an LV2 plugin gets an output control port `meterGr`, placed after every other port so no existing index moves, and declared only by a DSP that reports one. Nothing measured from the output can stand in for it: it cannot tell compression from a gain knob. A DSP without the hook reads 0.
+- Each entry of `sonore.params` carries `options`, `curve` and `group`, as the studio's bridge does: `options` lists a stepped control's positions by name (its value, as text, where a step has none) and is null for a continuous control; `curve` is `'log'` for a skewed control and `'linear'` otherwise; `group` is the parameter's group or null. A page approved in the studio and drawing its stepped controls from `options` threw on `undefined` here.
 
 ### Faster
 
