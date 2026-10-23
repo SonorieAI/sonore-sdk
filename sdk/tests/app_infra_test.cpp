@@ -948,6 +948,18 @@ static void testApplicationProperties() {
 #if defined(_WIN32)
   setEnv("APPDATA", u8(appdata));
   setEnv("ProgramData", u8(programdata));
+#elif defined(__APPLE__)
+  // macOS names no variable for either place: the user's file is under
+  // $HOME/Library and the shared one under /Library, as Apple asks. HOME can
+  // be pointed here; /Library cannot, and writing it takes an administrator,
+  // so the checks that WRITE the machine-wide file run on Windows and Linux
+  // only (kSharedWritable below) -- the read-through they prove is the same
+  // code on every platform. This test once set the XDG variables here too,
+  // which macOS never reads, and expected the Linux paths: every check after
+  // the first failed on the first macOS run, about a test, not a bug.
+  const char* homeWas = std::getenv("HOME");
+  const std::string savedHome = homeWas ? homeWas : "";
+  setEnv("HOME", u8(appdata));
 #else
   setEnv("XDG_CONFIG_HOME", u8(appdata));
   setEnv("XDG_CONFIG_DIRS", u8(programdata));
@@ -959,10 +971,18 @@ static void testApplicationProperties() {
   options.filenameSuffix = "settings";
   options.millisecondsBeforeSaving = 500;
 
+#if defined(__APPLE__)
+  const std::string expectedUser =
+      u8(appdata / "Library" / "Application Support" / "Sonore" / "Test" / "Sonore Test App.settings");
+  const std::string expectedCommon = "/Library/Application Support/Sonore/Test/Sonore Test App.settings";
+  constexpr bool kSharedWritable = false;
+#else
   const std::string expectedUser =
       u8(appdata / "Sonore" / "Test" / "Sonore Test App.settings");
   const std::string expectedCommon =
       u8(programdata / "Sonore" / "Test" / "Sonore Test App.settings");
+  constexpr bool kSharedWritable = true;
+#endif
   {
     std::snprintf(msg, sizeof(msg), "the user file goes in the user's folder: %s",
                   options.getDefaultFile().c_str());
@@ -990,7 +1010,7 @@ static void testApplicationProperties() {
     user->setValue("enabled", true);
     check(user->needsToBeSaved() && user->isSavePending(), "a change marks it dirty and starts the save clock");
     check(user->hasPendingChange(), "and is a ChangeBroadcaster change");
-    check(!props.advance(300.0) && !fs::exists(appdata / "Sonore" / "Test"),
+    check(!props.advance(300.0) && !fs::exists(fs::u8path(expectedUser).parent_path()),
           "300 ms after: not yet written");
     user->setValue("volume", 0.8);
     user->setValue("volume", 0.75);
@@ -1009,13 +1029,18 @@ static void testApplicationProperties() {
 
     PropertiesFile* common = props.getCommonSettings(false);
     check(common && common->getFile() == expectedCommon, "the machine-wide file opens beside it");
-    common->setValue("licence", "LIC-123");
-    common->setValue("volume", 0.1);
-    check(common->save(), "and can be saved here (the folder is writable)");
-    check(user->getValue("licence") == "LIC-123" && !user->containsKey("licence"),
-          "the user's file reads through to the machine's for a key it lacks");
-    check(user->getDoubleValue("volume") == 0.75, "and its own value wins where it has one");
-    check(props.getCommonSettings(true) == common, "writable, getCommonSettings(true) is the shared file");
+    if constexpr (kSharedWritable) {
+      common->setValue("licence", "LIC-123");
+      common->setValue("volume", 0.1);
+      check(common->save(), "and can be saved here (the folder is writable)");
+      check(user->getValue("licence") == "LIC-123" && !user->containsKey("licence"),
+            "the user's file reads through to the machine's for a key it lacks");
+      check(user->getDoubleValue("volume") == 0.75, "and its own value wins where it has one");
+      check(props.getCommonSettings(true) == common, "writable, getCommonSettings(true) is the shared file");
+    } else {
+      std::printf("  ---- macOS: the machine-wide file is under /Library, which takes an administrator "
+                  "to write; writing it and reading through to it are checked on Windows and Linux ----\n");
+    }
   }
 
   {
@@ -1026,7 +1051,7 @@ static void testApplicationProperties() {
     check(user->getDoubleValue("volume") == 0.75 && user->getIntValue("count") == 42 &&
               user->getBoolValue("enabled") && user->getValue("name") == tricky,
           "every value exactly: the double, the int, the bool, and the awkward string");
-    check(user->getValue("licence") == "LIC-123", "and the shared one through the fallback");
+    if constexpr (kSharedWritable) check(user->getValue("licence") == "LIC-123", "and the shared one through the fallback");
     check(user->getIntValue("missing", -5) == -5 && user->getIntValue("name", 7) == 7,
           "a missing or non-numeric value gives the fallback");
   }
@@ -1148,8 +1173,9 @@ static void testApplicationProperties() {
 
   // The machine-wide file could not be read -- another process held its lock
   // for longer than a read waits. Asking whether it is writable must not
-  // answer by saving the empty copy over it.
-  {
+  // answer by saving the empty copy over it. (It writes the machine-wide
+  // file to set up, so not on macOS: see kSharedWritable.)
+  if constexpr (kSharedWritable) {
     {
       ApplicationProperties setup;
       setup.setStorageParameters(options);
@@ -1206,6 +1232,9 @@ static void testApplicationProperties() {
     check(readText(expectedUser).find("name=\"closing\" val=\"saved\"") != std::string::npos,
           "closeFiles writes a change the clock had not reached yet");
   }
+#if defined(__APPLE__)
+  setEnv("HOME", savedHome);
+#endif
 }
 
 // ── FileBasedDocument ───────────────────────────────────────────────────────

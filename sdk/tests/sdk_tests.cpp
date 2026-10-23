@@ -37473,7 +37473,15 @@ static void testZeroSampleRates() {
   };
   for (float bad : {0.0f, -48000.0f}) {
     auto same = [&](const char* name, auto&& fresh) {
-      auto a = fresh(bad), b = fresh(48000.0f);
+      // The twin's rate through a volatile. A literal 48000 let the compiler
+      // work out the twin's exp() at COMPILE time, correctly rounded, while
+      // the bad-rate one called the platform's expf at run time -- and
+      // Apple's is not correctly rounded everywhere, so on macOS an Expander
+      // at a rate of 0 and one at 48 kHz disagreed in the last bit of a
+      // coefficient that is the same number. glibc's is, which is why Linux
+      // never saw it. Both are worked out at run time now, by one function.
+      volatile float reference = 48000.0f;
+      auto a = fresh(bad), b = fresh((float) reference);
       bool match = true;
       for (int i = 0; i < 2048 && match; ++i) {
         const float x = input(i);

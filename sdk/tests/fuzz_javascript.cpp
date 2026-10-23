@@ -210,6 +210,14 @@ void runCase(const std::string& code, uint32_t variant) {
     // And the engine is still usable after whatever the script did.
     if (variant % 5 == 0) {
       js.maximumExecutionTime = 1.0;
+      // Room to work in, on top of whatever the script left ALIVE. A script
+      // that fills its 24 MB with an object held by a global keeps it: the
+      // collector cannot free what is reachable, so "1 + 1" ran out of
+      // memory too. Whether a case gets there depends on the machine -- the
+      // 50 ms limit and the 24 MB one race -- which is why it surfaced on one
+      // CI run and not the one before. The time limit is lifted here for the
+      // same reason.
+      js.maximumMemoryBytes = js.getMemoryUsage() + kMemoryLimit;
       JavascriptEngine::Result r2;
       const JsVar two = js.evaluate("1 + 1", &r2);
       if (!r2.wasOk() || two.toInt() != 2) {

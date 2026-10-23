@@ -3231,6 +3231,12 @@ public:
         I.stack_.limit = stackBudget(I.stack_.base, I.maxStack);
         I.depth_ = 0;
         I.ticks_ = 0;
+        // Where an error is said to be: this run's, not the last one's. An
+        // error raised before the first node is visited -- out of memory on
+        // the first allocation -- reported the position the PREVIOUS script
+        // had reached ("Line 3, column 54" for an `1 + 1` of one line).
+        I.line_ = 1;
+        I.col_ = 1;
         I.stopFlag.store(false);
         I.hasDeadline_ = I.timeLimit > 0 && I.timeLimit == I.timeLimit;
         if (I.hasDeadline_) {

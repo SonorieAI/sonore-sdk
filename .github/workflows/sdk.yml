@@ -195,13 +195,21 @@ jobs:
 
       # A desktop session the editor can attach to. Without one the GUI tests
       # skip, and a green run would mean less than it appears to.
+      #
+      # One retry, as verify:sdk has always run them: a few tests race two
+      # threads or two limits on purpose (a reader against a writer publishing
+      # as fast as it can, a 50 ms limit against a 24 MB one), and on a shared
+      # two-core runner how that race falls changes from run to run -- the
+      # same commit failed on Windows in one run and passed in the one before.
+      # A real defect fails both tries; a check that is flaky by design should
+      # be fixed, and the retry is reported in the log when it happens.
       - name: Test (Linux, virtual display)
         if: runner.os == 'Linux'
-        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
+        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2
 
       - name: Test
         if: runner.os != 'Linux'
-        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure
+        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2
 
       # Apple's own validator - the gate Logic and GarageBand apply before
       # they will even list a plugin. It sees only INSTALLED and REGISTERED
