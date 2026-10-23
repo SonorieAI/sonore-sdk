@@ -203,17 +203,17 @@ jobs:
       # same commit failed on Windows in one run and passed in the one before.
       # A real defect fails both tries; a check that is flaky by design should
       # be fixed, and the retry is reported in the log when it happens.
-      # And ten minutes a test: one that hangs fails on its own and the log
-      # still arrives. Without it a hung test ran on until the macOS runner
+      # And ten minutes a test (thirty in Debug, where sdk_tests alone takes
+      # fourteen): one that hangs fails on its own and the log still arrives. Without it a hung test ran on until the macOS runner
       # "lost communication with the server" 49 minutes later, and nothing
       # of that run's output was ever uploaded.
       - name: Test (Linux, virtual display)
         if: runner.os == 'Linux'
-        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2 --timeout 600
+        run: xvfb-run -a ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2 --timeout ${{ matrix.config == 'Debug' && 1800 || 600 }}
 
       - name: Test
         if: runner.os != 'Linux'
-        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2 --timeout 600
+        run: ctest --test-dir sdk/build -C ${{ matrix.config || 'Release' }} --output-on-failure --repeat until-pass:2 --timeout ${{ matrix.config == 'Debug' && 1800 || 600 }}
 
       # Apple's own validator - the gate Logic and GarageBand apply before
       # they will even list a plugin. It sees only INSTALLED and REGISTERED
