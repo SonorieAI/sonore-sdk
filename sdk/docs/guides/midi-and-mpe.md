@@ -5,8 +5,11 @@ Notes in, expression per note, and MIDI out.
 ## An instrument
 
 Setting `isInstrument` in the descriptor gives the plugin a note input, drops
-its audio input bus and files it with the instruments in every format. The DSP
-takes the notes in a third argument:
+its audio input bus and files it with the instruments in CLAP, VST3 and LV2.
+An Audio Unit is filed by its CMake call instead: a project generated with
+`-DTYPE=instrument` passes `AU_TYPE aumu` to `sonore_add_plugin`, and one
+written by hand must too, or the AU registers as an effect. The DSP takes the
+notes in a third argument:
 
 ```
 void process(sonore::AudioBlock<float>& io, const float* p, sonore::MidiBuffer& midi);
@@ -31,8 +34,9 @@ velocity)`, `noteOff()`, `bool isActive()` and `float render()`.
 ## MPE
 
 An MPE controller bends, presses and brightens each finger on its own.
-`supportsMpe = true` in the descriptor declares MPE to the hosts that ask,
-decodes MPE's channel-per-note MIDI into expression events, and fills
+`supportsMpe = true` in the descriptor declares MPE to CLAP and VST3 hosts (an
+Audio Unit does not report `kAudioUnitProperty_SupportsMPE`), decodes MPE's
+channel-per-note MIDI into expression events in every format, and fills
 `ctx.expression`. It needs the `ProcessContext` form: the simpler signatures
 have nowhere to put the expression. Match each event to its voice by key AND
 channel -- under MPE two fingers on the same key are two notes:

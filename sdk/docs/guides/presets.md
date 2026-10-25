@@ -67,7 +67,8 @@ static const sonore::PluginDescriptor kDesc = {
 ```
 
 Each format lists them where its hosts look: CLAP through preset discovery
-(written out as files beside the user's folder), VST3 as a program list, Audio
+(written out as preset files in the OS's cache folder, or declared inside the
+plugin when that folder cannot be written), VST3 as a program list, Audio
 Units as factory presets, LV2 as `pset:Preset` entries in the bundle's
 `presets.ttl`. A web page sees them as `sonore.presets` and loads one with
 `sonore.loadPreset(i)`.
@@ -78,15 +79,16 @@ A plugin built with the SDK gets the user's own presets with nothing to write:
 the native editor's preset bar saves and browses them, and CLAP hosts find the
 folder through preset discovery. (A web page sees the factory list only.) A user
 preset is a file holding the plugin's whole state -- the same bytes a host saves
-in a session, so a sampler's preset carries its sample -- inside a small
-versioned container with a name, author, comment, category, tags and a checksum.
+in a session, so a sampler's preset names its sample, and the audio file stays
+where it is -- inside a small versioned container with a name, author, comment,
+category, tags and a checksum.
 The folder is one per plugin:
 
 | | |
 | --- | --- |
 | Windows | `Documents\<Vendor>\<Plugin>\Presets` |
 | macOS | `~/Library/Audio/Presets/<Vendor>/<Plugin>` |
-| Linux | `$XDG_DATA_HOME/<vendor>/<plugin>/presets` (`~/.local/share` when unset) |
+| Linux | `$XDG_DATA_HOME/<Vendor>/<Plugin>/presets` (`~/.local/share` when unset) |
 
 The environment variable `SONORE_PRESET_ROOT` moves every plugin's folder under
 one root (`<root>/<Vendor>/<Plugin>/Presets`), which is what tests and validators

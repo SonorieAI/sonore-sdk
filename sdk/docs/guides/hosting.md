@@ -9,7 +9,7 @@ drives it with audio, MIDI, parameters and state.
 | CLAP | always compiled in |
 | VST3, LV2 | compiled in where their C headers are on the include path: `sonore_enable_hosting(<target>)` in CMake arranges it |
 | LADSPA | always compiled in: audio and control ports, which is all the format has |
-| Audio Units (v2 and v3) | macOS, through `host_au.h`; compiled for macOS and not yet run |
+| Audio Units (v2 and v3) | macOS, through `host_au.h`; tested in CI on macOS (`sdk/tests/mac_host_selftest.cpp`, and the hosting tests with the example AUs) |
 | VST2 | never |
 
 Without `sonore_enable_hosting` a host still builds, hosts CLAP, and finds no

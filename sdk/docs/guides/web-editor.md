@@ -110,6 +110,10 @@ thread through a lock-free queue.
 | `contextMenu(p, x, y)` | the HOST's menu for a control: MIDI learn, automation |
 | `captureKeys(on)` | take the keyboard for something that reads keys and is not a text field; a focused text field takes it by itself |
 
+In an Audio Unit, `chooseFile` and `contextMenu` do nothing: no dialog opens,
+`onFile` is never called, and AU gives a plugin no way to ask its host for a
+menu. CLAP and VST3 do both.
+
 The complete list, with types, is `sonore/sonore.d.ts`, installed with the
 headers: reference it from TypeScript and the compiler checks the page against
 it. `npm run verify:bridge-types` checks that file against the bridge `gui.h`
@@ -126,9 +130,10 @@ generates, member for member.
   `https://<plugin id>-<hash>.sonore.invalid/editor.html`, which never leaves
   the process: it reloads like any page, and `localStorage` and IndexedDB
   work, kept per plugin (shared by its instances, not by other plugins) and
-  across sessions. Keep anything the session must restore in the plugin's
-  state (`sonore.state`), not there: a project moved to another machine does
-  not carry it.
+  across sessions. Keep anything the session must restore in a parameter or in
+  the plugin's own state (what its `saveState` writes; the page reads it as
+  `sonore.state` and cannot write it), not there: a project moved to another
+  machine does not carry it.
 - **Linux**: GTK3 and WebKitGTK, loaded at run time, newest WebKit first, so
   the plugin loads on distributions with either version and builds with no GTK
   development packages installed.

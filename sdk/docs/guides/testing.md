@@ -76,10 +76,12 @@ What a host vendor or a store runs first:
 - **clap-validator** (github.com/free-audio/clap-validator):
   `clap-validator validate MyFilter.clap`.
 - **pluginval** (github.com/Tracktion/pluginval):
-  `pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3`. The SDK's
-  examples pass at strictness 10, editor tests included on Windows.
+  `pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3` (on macOS
+  the bundle is `MyFilterVST3.vst3`, with no `vst3/` folder). The SDK's examples
+  pass at strictness 10, editor tests included on Windows.
 - **auval** on macOS, for the Audio Unit: `auval -v aufx <subtype> <manufacturer>`
-  after copying the `.component` into `~/Library/Audio/Plug-Ins/Components`.
+  (`aumu` for an instrument) after copying the `.component` into
+  `~/Library/Audio/Plug-Ins/Components`.
 
 On Windows, clap-validator refuses a preset location that does not begin with
 `/`, which every drive-letter path fails, so its preset-discovery checks fail
@@ -89,12 +91,15 @@ validator accepts it.
 
 ## A real DAW
 
-`npm run verify:reaper` (from the repository root, with REAPER installed and a
-Release build of the SDK) hands the CLAP, VST3 and LV2 build of every SDK
-example to REAPER and checks what REAPER made of them: the scan, offline renders
-against the SDK's own host, automation, a session saved and reopened, latency
-compensation, editors opening and closing. It runs REAPER with a profile of its
-own and never touches yours; `--only`, `--skip-editor` and `--rates` narrow it.
+`npm run verify:reaper` hands the CLAP, VST3 and LV2 builds of the SDK's
+examples to REAPER (the trim has no LV2 build) and checks what REAPER made of
+them: the scan, offline renders against the SDK's own host, automation, a
+session saved and reopened, latency compensation, editors opening and closing.
+It runs on Windows, from the repository root, with REAPER installed
+(`SONORE_REAPER` points at it outside the default folder) and a Release build
+in `sdk/build/Release` (`--build <dir>` names another); anywhere else it skips.
+It runs REAPER with a profile of its own and never touches yours; `--only`,
+`--skip-editor` and `--rates` narrow it.
 It is the check to run after changing anything in a process path, state,
 parameters, presets or latency in the SDK itself.
 

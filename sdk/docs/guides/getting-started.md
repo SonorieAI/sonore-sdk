@@ -119,7 +119,8 @@ The names are fixed: the DSP is `SonoreDsp`, the descriptor `kDesc`, and
 `process()` is parameter `i`'s plain value, in its own units, held still for the
 block. The same file becomes every format: `formats.h` includes the CLAP wrapper
 always, and the VST3, AU, LV2 or standalone wrapper when the CMake target asks
-for it (`sonore_add_plugin` in the generated `CMakeLists.txt`).
+for it (`sonore_add_plugin` and `sonore_add_standalone` in the generated
+`CMakeLists.txt`).
 
 ## 4. Into a DAW
 

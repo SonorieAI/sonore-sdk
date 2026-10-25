@@ -37,9 +37,12 @@ before the struct, and make `saveState` `const`: the wrappers look for it on a
 const DSP.
 
 A host only knows a session changed when the host changed something. A plugin
-that changes its own state -- a file picked in its editor -- says so through
+that changes its own state where the wrapper cannot see it -- a file opened
+from its native editor, a choice the DSP makes by itself -- says so through
 `consumeStateDirty()`, which returns true once per change, or the DAW closes
-without offering to save.
+without offering to save. A file a web page picks with `sonore.chooseFile`
+already marks the session in CLAP and VST3; the example declares the hook
+anyway, which costs nothing.
 
 ```cpp
 // test-run

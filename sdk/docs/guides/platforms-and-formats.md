@@ -19,9 +19,11 @@ state, the page bridge -- and every other format adapts it, so a plugin cannot
 behave differently depending on which format a host loaded. `sonore_add_plugin`
 compiles the source once and links that object into each format's bundle.
 
-VST3 is built against Steinberg's one-file C API header (BSD-3-Clause), so the
-plugin links no Steinberg SDK; distributing a VST3 commercially still means
-registering with Steinberg, which is their licence, not the header's. The
+VST3 is built against Steinberg's one-file C API header (VST 3.8.1,
+BSD-3-Clause), so the plugin links no Steinberg SDK. Since VST 3.8 (October
+2025) Steinberg asks for no agreement to distribute a VST3, commercially or
+not; the VST name and logo are optional, and using them means following
+Steinberg's usage guidelines. The
 browser build takes the DSP half of the source -- everything before
 `#include <sonore/plugin.h>` -- so the preview runs the same DSP code as the
 shipped plugin; the SDK's [README](../../README.md) has the emscripten command
@@ -37,12 +39,14 @@ line and the functions the worklet calls.
   the GUI tests under a virtual X display, the validators as an advisory step --
   and under WSL by `npm run verify:sdk` on Windows. Window embedding is proven in a container
   (`sdk/tests/linux-gui.Dockerfile`).
-- **macOS**: compiled. The Audio Unit wrapper passed Apple's `auval` on six of
-  the eight example AUs in a macOS CI job that is not running at the moment.
-  The macOS-only code written since -- Audio Unit hosting, audio workgroups,
-  VoiceOver, input methods -- has been compiled against the repository's Apple
-  header shims and never run; `sdk/tests/mac_host_selftest.cpp` and
-  `sdk/tests/mac_input_selftest.cpp` are the first things to run on a Mac.
+- **macOS**: built and tested in CI on macOS 14 -- the same test suite, with
+  the example Audio Units installed so the hosting tests load them -- and the
+  Audio Unit wrapper passes Apple's `auval` on six of the nine example AUs (not
+  yet run on the sampler, the reverb and the showcase). What has not run on a
+  Mac with a person at it: that job runs `sdk/tests/mac_host_selftest.cpp`
+  (Audio Unit hosting, audio workgroups), which reports what a runner cannot do
+  as a skip, and builds `sdk/tests/mac_input_selftest.cpp` (input methods,
+  VoiceOver) without running it. Those two are the first things to run on a Mac.
 
 ## Not available, and why
 

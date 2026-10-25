@@ -193,7 +193,9 @@ an editor with an undo history can make each load one undo step through
 ## Where it appears
 
 CLAP, VST3 and AU open the editor inside the host's window. The standalone
-application and an LV2 interface show the webview instead. The showcase example
+application shows the webview instead, as does an LV2 build's interface on
+Windows; on Linux and macOS an LV2 build promises no interface of its own, and
+the host shows its generic controls. The showcase example
 (`sdk/examples/showcase/`) is a larger editor: menus, a code editor, an SVG
 logo, a colour selector and the APVTS attachments; `sdk/tests/showcase_test.cpp`
 drives it with no window at all, because an editor is a widget and renders into

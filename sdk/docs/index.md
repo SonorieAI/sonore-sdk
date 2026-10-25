@@ -45,7 +45,7 @@ under *Modules*.
 | DSP | filters, dynamics, reverbs, synthesis, analysis | `dsp.h` |
 | Formats and wrappers | CLAP, VST3, AU, LV2, the standalone, the browser ABI | `formats.h` |
 | Hosting plugins | scanning, the scan cache, hosted plugins, a graph | `host.h`, `plugin_cache.h` |
-| Native GUI | components, widgets, LookAndFeel, text, images, windows | `widgets.h`, `plugin_editor.h` |
+| Native GUI | components, widgets, LookAndFeel, text, images, windows | `gfx/widgets.h`, `gfx/plugin_editor.h` |
 | Web editor bridge | the `window.sonore` bridge and the OS webviews | `gui.h` |
 | Files and codecs | paths, streams, audio files, images, zip | `files.h`, `audiofile.h` |
 | MIDI and OSC | MIDI files, sequences, UMP, MIDI-CI, devices, OSC | `midi_file.h`, `ump.h` |

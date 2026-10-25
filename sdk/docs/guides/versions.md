@@ -4,15 +4,17 @@ The SDK follows Semantic Versioning from 1.0.0. What a version number promises
 -- code that built keeps building within 1.x, nothing is removed without a
 deprecation first, and what a user saved keeps loading -- is written down once,
 in the SDK's [README](../../README.md), section *Versions and compatibility*.
-What changed in each version, and which changes can affect an existing plugin's
-sound or a saved session, is in `sdk/CHANGELOG.md`.
+What has changed, and which changes can affect an existing plugin's sound or a
+saved session, is in `sdk/CHANGELOG.md`.
 
 ## In code
 
-`<sonore/version.h>` (included by everything through `audio.h`) says which SDK
-a build has: `SONORE_SDK_VERSION_MAJOR`, `_MINOR`, `_PATCH`,
-`SONORE_SDK_VERSION_STRING`, and `SONORE_SDK_VERSION`, one number to compare
-(major * 10000 + minor * 100 + patch).
+`<sonore/version.h>` says which SDK a build has: `SONORE_SDK_VERSION_MAJOR`,
+`_MINOR`, `_PATCH`, `SONORE_SDK_VERSION_STRING`, and `SONORE_SDK_VERSION`, one
+number to compare (major * 10000 + minor * 100 + patch). `audio.h` includes
+it, so `dsp.h`, `plugin.h` and every plugin have it; anywhere else, include it
+yourself before testing the macros, as the example below does, since an `#if`
+reads a macro that was never defined as 0.
 
 A part of the API on its way out is marked
 `SONORE_DEPRECATED("<version>: use <replacement>")`: it keeps working and warns
