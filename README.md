@@ -52,7 +52,7 @@ both for its Linux and Windows jobs.
 
 ## Writing plugins with a coding agent
 
-Two things in this repository exist for language models rather than for people,
+Three things in this repository exist for language models rather than for people,
 because the way an unfamiliar C++ library usually fails an agent is not refusal,
 it is invention: a class name that sounds like it should exist, a real class
 given a method from a different library, and code that reads perfectly and does
@@ -89,6 +89,19 @@ Or, for any other MCP client:
 | `headers` | Every header with a one-line purpose. |
 | `example` | A complete working plugin: effect, instrument, sidechain, aux outputs, MIDI output, sampler. |
 | `rules` | The shape of a plugin, which `process` signature makes an instrument, latency reporting, and what is forbidden on the audio thread. |
+
+**[A skill](skills/sonore-sdk/SKILL.md)** puts the same map in the agent's own
+context, in the [Agent Skills](https://agentskills.io) format that Claude Code,
+Codex and Cursor read, with the part a map does not have: look a name up before
+writing it, start from a generated project, and do not call a plugin done until
+the validators have run. The same script generates it, so it cannot drift either.
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk
+```
+
+Or copy `skills/sonore-sdk` into `~/.claude/skills/` for Claude Code, or into
+`~/.agents/skills/` for Codex and Cursor.
 
 ## Status
 
