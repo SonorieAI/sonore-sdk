@@ -13,25 +13,33 @@ metadata:
 
 One `plugin.cpp` is a whole plugin: a DSP struct, a parameter table and a
 descriptor. The build turns it into a `.clap`, a `.vst3`, an AUv2
-`.component`, an `.lv2` bundle and a standalone app. The SDK checkout is the
-folder with `llms.txt` at its root; a project reaches it through
-`add_subdirectory` or `find_package(SonoreSDK)`.
+`.component`, an `.lv2` bundle and a standalone app.
+
+A project reaches the SDK in one of two ways. Through `add_subdirectory` it
+is a checkout: the folder with `llms.txt` at its root, the headers in
+`sdk/include/sonore/` and the MCP server in `scripts/mcp-server.mjs`. Through
+`find_package(SonoreSDK)` it is an install, which has the headers (in
+`<prefix>/include/sonore/`) and the CMake helpers but neither of the others;
+for those, clone https://github.com/SonorieAI/sonore-sdk.
 
 ## Look a name up before you write it
 
 Code against an unfamiliar C++ library rarely fails by refusing. It fails by
 invention: a class that sounds right, or a real class given a method from
 another framework. Sonore's DSP is written from the published mathematics, not
-adapted from another library, so its names are its own. Before writing any type
-or method you have not seen in this SDK:
+adapted from another library, so its names are its own. Before writing any
+class, function or method you have not seen in this SDK:
 
-- **With the `sonore-sdk` MCP server connected**, ask it. `search` says
-  whether a name exists, and an empty result is a real answer. `type` gives
-  the exact declaration, `header` the include line, `example` a complete
-  working plugin of a given kind, and `rules` the rules below.
-- **Without it**, read `llms-full.txt` at the SDK root: every public type in
-  every header (270 headers, 726 types). A name that is
-  not in it does not exist. The headers are in `sdk/include/sonore/`.
+- **With the `sonore-sdk` MCP server connected**, ask it. `search` finds
+  classes, functions, aliases and headers, with words in any order, and an empty
+  result is a real answer. `type` gives the exact declaration of any of them,
+  `header` the include line, `example` a complete working plugin of a given
+  kind, and `rules` the rules below.
+- **Without it**, read `llms-full.txt` at the SDK root for the classes and
+  structs: every one in every header (270 headers, 726
+  types), so a class that is not in it does not exist. Functions, aliases and
+  methods are not listed there; search the headers for those before deciding
+  one is missing.
 
 ## Start from a generated project
 
@@ -44,10 +52,11 @@ cmake --build MyFilter/build --config Release
 ctest --test-dir MyFilter/build -C Release
 ```
 
-`-DTYPE=instrument` starts an eight-voice synth instead of a filter. The id
-the generator derives (`com.mycompany.myfilter`) is the plugin's identity in
-every saved session: pass `-DID=` now if that is not the one to keep. To add a
-plugin to an existing CMake project instead, see Building below.
+The plugin is `MyFilter/src/plugin.cpp`. `-DTYPE=instrument` starts an
+eight-voice synth instead of a filter. The id the generator derives
+(`com.mycompany.myfilter`) is the plugin's identity in every saved session:
+pass `-DID=` now if that is not the one to keep. To add a plugin to an
+existing CMake project instead, see Building below.
 
 ## The shape of a plugin
 
@@ -119,13 +128,31 @@ Compiling is not finished. Before calling a plugin done:
 
 1. Build Release and run `ctest`. A generated project's tests include its
    self-checks; built against a checkout, they include the real-time audit.
-2. Run the format owners' validators on what was built:
-   `clap-validator validate MyFilter.clap` and
-   `pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3`.
-   On macOS, `auval -v aufx <subtype> <manufacturer>` after copying the
-   `.component` into `~/Library/Audio/Plug-Ins/Components`.
+2. Run the format owners' validators on what was built, from the folder the
+   build put it in (`MyFilter/build`, or `MyFilter/build/Release` with Visual
+   Studio and Xcode):
+
+   ```
+   clap-validator validate MyFilter.clap
+   pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3
+   ```
+
+   On macOS, copy the `.component` into `~/Library/Audio/Plug-Ins/Components`
+   and run `auval -v aufx <subtype> <manufacturer>` (`aumu` for an instrument).
 3. Report what ran and what it printed. A step that was skipped is said to be
    skipped.
+
+## Before it ships
+
+- The id is this plugin's identity to every host. Pick it for good now:
+  changing it later makes every saved session lose the plugin.
+- The parameter table is positional. Once a version is out, only append.
+- The Audio Unit's codes (`AU_SUBTYPE` / `AU_MANUFACTURER` in
+  CMakeLists.txt) must be unique to you.
+- Keep the version in `src/plugin.cpp` and in `CMakeLists.txt` the same.
+- Run the format owners' validators on the build: clap-validator
+  (github.com/free-audio/clap-validator), pluginval
+  (github.com/Tracktion/pluginval), and `auval` on macOS.
 
 ## Where the rest is
 
@@ -140,25 +167,24 @@ Compiling is not finished. Before calling a plugin done:
 - `sdk/docs/guides/testing.md`: Testing your plugin
 - `sdk/docs/guides/versions.md`: Versions and compatibility
 - `sdk/docs/guides/web-editor.md`: The web editor
-- `sdk/examples/`, complete projects: `arp/plugin.cpp`, `ducker/plugin.cpp`, `guiprobe/plugin.cpp`, `player/main.cpp`, `reverb/plugin.cpp`, `sampler/plugin.cpp`, `saturator/plugin.cpp`, `showcase/plugin.cpp`, `splitter/plugin.cpp`, `synth/plugin.cpp`, `trim/plugin.cpp`.
+- `sdk/examples/`, complete projects: `arp/plugin.cpp`, `ducker/plugin.cpp`, `player/main.cpp`, `reverb/plugin.cpp`, `sampler/plugin.cpp`, `saturator/plugin.cpp`, `showcase/plugin.cpp`, `splitter/plugin.cpp`, `synth/plugin.cpp`, `trim/plugin.cpp`.
 
 ## Connecting the MCP server
 
 `scripts/mcp-server.mjs` in the SDK checkout is plain JSON-RPC over stdio, with no
-dependencies and nothing to install.
+dependencies and nothing to install. Use the checkout's full path.
 
-- Claude Code: `claude mcp add sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs`
-- Codex, in `~/.codex/config.toml`:
-
-  ```toml
-  [mcp_servers.sonore-sdk]
-  command = "node"
-  args = ["/path/to/sonore-sdk/scripts/mcp-server.mjs"]
-  ```
-
-- Cursor (`.cursor/mcp.json`) and other MCP clients:
+- Claude Code: `claude mcp add --scope user sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs`
+- Codex (CLI, IDE extension and the ChatGPT desktop app):
+  `codex mcp add sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs`
+- Cursor, in `~/.cursor/mcp.json`, and Antigravity, in
+  `~/.gemini/config/mcp_config.json`; any other MCP client takes the same:
 
   ```json
   { "mcpServers": { "sonore-sdk": {
       "command": "node", "args": ["/path/to/sonore-sdk/scripts/mcp-server.mjs"] } } }
   ```
+
+This skill installs into any of them with
+`npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a <agent> -g`, where
+`<agent>` is `claude-code`, `codex`, `cursor` or `antigravity`.

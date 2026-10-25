@@ -96,17 +96,17 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [audio_alsa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa.h): Linux audio output (ALSA, dlopened)
 - [audio_alsa_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa_input.h): Linux audio capture (ALSA, dlopened)
 - [audio_asio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_asio.h): ASIO output, without Steinberg's SDK
-- [audio_cd.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_cd.h): . Audio CDs: reading them (AudioCDReader) and burning them
+- [audio_cd.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_cd.h): Audio CDs: reading them (AudioCDReader) and burning them
 - [audio_coreaudio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio.h): macOS audio output (the default-output AudioUnit)
 - [audio_coreaudio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio_input.h): macOS audio capture (AUHAL, input scope)
 - [audio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_input.h): live audio input for the standalone build
 - [audio_jack.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_jack.h): Linux audio output through JACK, dlopened
 - [audio_linux.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_linux.h): the Linux output the standalone actually uses
 - [audio_ring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_ring.h): the one lock-free ring both directions of audio use
-- [audio_source.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_source.h): . The pull model: sources that are ASKED for their next block
+- [audio_source.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_source.h): The pull model: sources that are ASKED for their next block
 - [audio_wasapi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_wasapi.h): Windows audio output (WASAPI, shared mode, event driven)
 - [audio_wasapi_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_wasapi_input.h): Windows audio capture (WASAPI, shared mode, event driven)
-- [audio_workgroup.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_workgroup.h): . Audio workgroups: putting a helper thread under the audio
+- [audio_workgroup.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_workgroup.h): Audio workgroups: putting a helper thread under the audio
 - [audiofile.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile.h): audio files beyond WAV
 - [audiofile_codecs.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile_codecs.h): the lossy decoders, vendored
 - [audiostream.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiostream.h): reading an audio file without holding all of it
@@ -118,14 +118,14 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [clap_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/clap_wrapper.h): the CLAP format wrapper
 - [clipper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/clipper.h): the diode clipper, solved
 - [commands.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/commands.h): Named actions, and the keys that reach them
-- [compressors.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/compressors.h): . The hardware compressors: opto, FET, VCA
+- [compressors.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/compressors.h): The hardware compressors: opto, FET, VCA
 - [crossover.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/crossover.h): a crossover into any number of bands that still sums flat
 - [crypto.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/crypto.h): BlowFish, RSAKey and Primes -- the reference's cryptography -- and the
 - [delay.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/delay.h): the delay as a finished machine
 - [denormals.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/denormals.h): ScopedNoDenormals: turn off denormal arithmetic for the length of a block
 - [distortion.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/distortion.h): distortion as one object
 - [dsp.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dsp.h): the DSP toolkit. Header-only, allocation-free, dependency-free
-- [dynamic_eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dynamic_eq.h): . The dynamic equaliser: a band that compresses itself
+- [dynamic_eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dynamic_eq.h): The dynamic equaliser: a band that compresses itself
 - [dynamics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/dynamics.h): the rest of the dynamics family
 - [effects.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/effects.h): composite effects
 - [eq.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/eq.h): the parametric equaliser, as a machine
@@ -162,7 +162,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [limiting.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/limiting.h): the true-peak limiter
 - [load.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/load.h): LoadMeasurer: how much of the audio deadline a DSP is using
 - [localisation.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/localisation.h): the interface's text in the user's language, looked up by the
-- [lofi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lofi.h): . Degradation on purpose: bit depth, sample rate, wavefolding
+- [lofi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lofi.h): Degradation on purpose: bit depth, sample rate, wavefolding
 - [logger.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/logger.h): A log a user can send you
 - [lv2_atom.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lv2_atom.h): walking an LV2 atom sequence a host filled in
 - [lv2_ports.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/lv2_ports.h): the LV2 port map, in one place

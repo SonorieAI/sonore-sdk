@@ -85,9 +85,11 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 
 ## Every public type, by header
 
-If a name is not in this list, the SDK does not have it. Reaching for a class
-that sounds like it should exist is the most common way generated code fails to
-compile against this library.
+If a class or struct is not in this list, the SDK does not have it. Reaching for
+a class that sounds like it should exist is the most common way generated code
+fails to compile against this library. Functions, aliases and methods are not
+listed here (dbToGain is a function, ProcessContext an alias): look for those in
+the header itself, or ask the MCP server's `search`, which covers them.
 
 ### analytics.h
 
@@ -179,7 +181,7 @@ AsioClockSource, AsioChannelInfo, AsioBufferInfo, AsioTimeStamp, AsioSamples, As
 
 ### audio_cd.h
 
-. Audio CDs: reading them (AudioCDReader) and burning them
+Audio CDs: reading them (AudioCDReader) and burning them
 
 `sdk/include/sonore/audio_cd.h`
 
@@ -235,7 +237,7 @@ AudioRing
 
 ### audio_source.h
 
-. The pull model: sources that are ASKED for their next block
+The pull model: sources that are ASKED for their next block
 
 `sdk/include/sonore/audio_source.h`
 
@@ -259,7 +261,7 @@ WasapiInput
 
 ### audio_workgroup.h
 
-. Audio workgroups: putting a helper thread under the audio
+Audio workgroups: putting a helper thread under the audio
 
 `sdk/include/sonore/audio_workgroup.h`
 
@@ -355,7 +357,7 @@ Shortcut, CommandInfo, CommandManager
 
 ### compressors.h
 
-. The hardware compressors: opto, FET, VCA
+The hardware compressors: opto, FET, VCA
 
 `sdk/include/sonore/compressors.h`
 
@@ -411,7 +413,7 @@ Smooth, Glide, LogRamp, OnePole, Biquad, IirSection, SvfSection, SVF, LadderFilt
 
 ### dynamic_eq.h
 
-. The dynamic equaliser: a band that compresses itself
+The dynamic equaliser: a band that compresses itself
 
 `sdk/include/sonore/dynamic_eq.h`
 
@@ -1515,7 +1517,7 @@ LocalisedStrings
 
 ### lofi.h
 
-. Degradation on purpose: bit depth, sample rate, wavefolding
+Degradation on purpose: bit depth, sample rate, wavefolding
 
 `sdk/include/sonore/lofi.h`
 

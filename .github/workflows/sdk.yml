@@ -54,6 +54,10 @@ jobs:
       # from the API, and an agent that reads a class which no longer exists
       # writes code that cannot compile and does it confidently.
       - run: npm run verify:llms
+      # The MCP server tells an agent "nothing matches" to stop it using a
+      # name, so that answer is checked against every public type and every
+      # name the rules of a plugin use.
+      - run: npm run verify:mcp
 
   # The API reference and the guides (sdk/docs), built with Doxygen. Fails on a
   # warning about the public headers or the guides -- a comment Doxygen cannot

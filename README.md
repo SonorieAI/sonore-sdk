@@ -61,47 +61,81 @@ not compile.
 **[llms.txt](llms.txt)** is the map, in the [llmstxt.org](https://llmstxt.org)
 convention: what this is, the shape of a plugin, the rules that cannot be
 guessed from the API, and one line per header.
-**[llms-full.txt](llms-full.txt)** adds every public type in every header, which
-is the part that settles whether a name exists. Both are generated from the
-headers by `scripts/llms-txt.mjs`, so they cannot describe an API the code does
-not have, and `npm run verify:llms` fails if they have drifted.
+**[llms-full.txt](llms-full.txt)** adds every class and struct in every header,
+which is the part that settles whether a class exists. Both are generated from
+the headers by `scripts/llms-txt.mjs`, so they cannot describe an API the code
+does not have, and `npm run verify:llms` fails if they have drifted.
 
 **An MCP server** lets an agent ask instead of guess. No dependencies, no
-install: it is plain JSON-RPC over stdio.
-
-```
-claude mcp add sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs
-```
-
-Or, for any other MCP client:
-
-```json
-{ "mcpServers": { "sonore-sdk": {
-    "command": "node",
-    "args": ["/path/to/sonore-sdk/scripts/mcp-server.mjs"] } } }
-```
+install: it is plain JSON-RPC over stdio, and every tool only reads the checkout.
 
 | Tool | What it answers |
 | --- | --- |
-| `search` | Does this class or concept exist here, and where. An empty result is a real answer. |
-| `type` | The actual declaration of a public type, with the comment explaining why it exists. |
+| `search` | Does this class, function, alias or concept exist here, and where. Words match in any order ("ladder filter" finds `LadderFilter`). An empty result is a real answer. |
+| `type` | The actual declaration of a class, function, alias or enum, with the comment explaining why it exists. |
 | `header` | What one header is for, its public types, and the include line. |
 | `headers` | Every header with a one-line purpose. |
-| `example` | A complete working plugin: effect, instrument, sidechain, aux outputs, MIDI output, sampler. |
+| `example` | A complete working plugin and the local headers it includes: effect, instrument, sidechain, aux outputs, MIDI output, sampler, flexible channels, reverb, native editor, or the player app. |
 | `rules` | The shape of a plugin, which `process` signature makes an instrument, latency reporting, and what is forbidden on the audio thread. |
+
+"An empty result is a real answer" holds only if search never misses a name the
+headers have, so `npm run verify:mcp` checks it: every public type reads back
+through `type`, and every name the rules of a plugin use is found by `search`.
 
 **[A skill](skills/sonore-sdk/SKILL.md)** puts the same map in the agent's own
 context, in the [Agent Skills](https://agentskills.io) format that Claude Code,
-Codex and Cursor read, with the part a map does not have: look a name up before
-writing it, start from a generated project, and do not call a plugin done until
-the validators have run. The same script generates it, so it cannot drift either.
+Codex, Cursor and Antigravity read, with the part a map does not have: look a
+name up before writing it, start from a generated project, and do not call a
+plugin done until the validators have run. The same script generates it, so it
+cannot drift either.
+
+### Installing both for your agent
+
+The MCP server runs from a checkout, so clone the SDK first; `"$HOME"` reads the
+same in bash, zsh and PowerShell.
 
 ```
-npx skills add SonorieAI/sonore-sdk --skill sonore-sdk
+git clone https://github.com/SonorieAI/sonore-sdk "$HOME/sonore-sdk"
 ```
 
-Or copy `skills/sonore-sdk` into `~/.claude/skills/` for Claude Code, or into
-`~/.agents/skills/` for Codex and Cursor.
+**Claude Code**
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a claude-code -g
+claude mcp add --scope user sonore-sdk -- node "$HOME/sonore-sdk/scripts/mcp-server.mjs"
+```
+
+**Codex** (the CLI, the IDE extension and the ChatGPT desktop app share this)
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a codex -g
+codex mcp add sonore-sdk -- node "$HOME/sonore-sdk/scripts/mcp-server.mjs"
+```
+
+**Cursor** and **Antigravity**: the skill with `-a cursor` or `-a antigravity`,
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a cursor -g
+```
+
+then the server in `~/.cursor/mcp.json` (Cursor) or
+`~/.gemini/config/mcp_config.json` (Antigravity), with the full path to your
+clone; JSON does not expand `$HOME`. Any other MCP client takes the same:
+
+```json
+{
+  "mcpServers": {
+    "sonore-sdk": {
+      "command": "node",
+      "args": ["/path/to/sonore-sdk/scripts/mcp-server.mjs"]
+    }
+  }
+}
+```
+
+Without the `skills` CLI, copy `skills/sonore-sdk` into `~/.claude/skills/`
+(Claude Code), `~/.agents/skills/` (Codex, Cursor) or
+`~/.gemini/config/skills/` (Antigravity).
 
 ## Status
 

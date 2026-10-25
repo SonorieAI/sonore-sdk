@@ -52,7 +52,7 @@ function purposeOf(text) {
     if (!line.startsWith("//")) continue;
     const body = line.replace(/^\/+\s?/, "").trim();
     if (!body || /^SPDX/i.test(body)) continue;
-    return body.replace(/^Sonore SDK[:,]?\s*/i, "").replace(/\.$/, "");
+    return body.replace(/^Sonore SDK[:,.]?\s*/i, "").replace(/^[.\s]+/, "").replace(/\.$/, "");
   }
   return "";
 }
@@ -263,9 +263,11 @@ function llmsFullTxt(headers) {
   return `${preamble(headers)}
 ## Every public type, by header
 
-If a name is not in this list, the SDK does not have it. Reaching for a class
-that sounds like it should exist is the most common way generated code fails to
-compile against this library.
+If a class or struct is not in this list, the SDK does not have it. Reaching for
+a class that sounds like it should exist is the most common way generated code
+fails to compile against this library. Functions, aliases and methods are not
+listed here (dbToGain is a function, ProcessContext an alias): look for those in
+the header itself, or ask the MCP server's \`search\`, which covers them.
 
 ${body}
 `;
@@ -290,8 +292,30 @@ function examples() {
   const dir = join(ROOT, "sdk", "examples");
   return readdirSync(dir).sort().flatMap((d) => {
     const main = ["plugin.cpp", "main.cpp"].find((f) => existsSync(join(dir, d, f)));
-    return main ? [`\`${d}/${main}\``] : [];
+    if (!main) return [];
+    // a test fixture lives here too; it is not a project to start from
+    if (/test fixture/i.test(readFileSync(join(dir, d, main), "utf8").slice(0, 400))) return [];
+    return [`\`${d}/${main}\``];
   });
+}
+
+// The generated project's own "Before you ship" list, so the skill and the
+// README every new project gets cannot disagree. Its placeholders become the
+// names a reader of the skill can look for.
+function beforeYouShip() {
+  const text = readFileSync(join(ROOT, "sdk", "cmake", "templates", "README.md.in"), "utf8");
+  const from = text.indexOf("## Before you ship");
+  if (from < 0) throw new Error("sdk/cmake/templates/README.md.in has no \"## Before you ship\" section for the skill");
+  const rest = text.slice(from).split("\n").slice(1);
+  const end = rest.findIndex((l) => l.startsWith("## "));
+  const section = rest.slice(0, end < 0 ? undefined : end).join("\n").trim()
+    .replaceAll("`@ID@`", "The id")
+    .replaceAll("`@AU_SUBTYPE@`", "`AU_SUBTYPE`")
+    .replaceAll("`@AU_MANUFACTURER@`", "`AU_MANUFACTURER`")
+    .replaceAll("@TARGET@", "MyFilter");
+  const left = section.match(/@[A-Z_]+@/);
+  if (left) throw new Error(`the template's "Before you ship" has a placeholder the skill does not name: ${left[0]}`);
+  return section;
 }
 
 function skillMd(headers) {
@@ -299,6 +323,7 @@ function skillMd(headers) {
     if (!existsSync(join(ROOT, rel))) throw new Error(`the skill points at ${rel}, which does not exist`);
   }
   const typeCount = headers.reduce((n, h) => n + h.types.length, 0);
+  const server = `/path/to/sonore-sdk/${MCP_SERVER}`;
   return `---
 name: sonore-sdk
 description: Writes, extends and debugs audio plugins on the Sonore SDK, the header-only C++17 framework where one plugin.cpp builds CLAP, VST3, AU, LV2 and a standalone app. Use when a project includes <sonore/...> headers or calls sonore_add_plugin, or when asked for an audio effect, instrument or DSP plugin built on Sonore.
@@ -314,25 +339,33 @@ metadata:
 
 One \`plugin.cpp\` is a whole plugin: a DSP struct, a parameter table and a
 descriptor. The build turns it into a \`.clap\`, a \`.vst3\`, an AUv2
-\`.component\`, an \`.lv2\` bundle and a standalone app. The SDK checkout is the
-folder with \`llms.txt\` at its root; a project reaches it through
-\`add_subdirectory\` or \`find_package(SonoreSDK)\`.
+\`.component\`, an \`.lv2\` bundle and a standalone app.
+
+A project reaches the SDK in one of two ways. Through \`add_subdirectory\` it
+is a checkout: the folder with \`llms.txt\` at its root, the headers in
+\`sdk/include/sonore/\` and the MCP server in \`${MCP_SERVER}\`. Through
+\`find_package(SonoreSDK)\` it is an install, which has the headers (in
+\`<prefix>/include/sonore/\`) and the CMake helpers but neither of the others;
+for those, clone https://github.com/SonorieAI/sonore-sdk.
 
 ## Look a name up before you write it
 
 Code against an unfamiliar C++ library rarely fails by refusing. It fails by
 invention: a class that sounds right, or a real class given a method from
 another framework. Sonore's DSP is written from the published mathematics, not
-adapted from another library, so its names are its own. Before writing any type
-or method you have not seen in this SDK:
+adapted from another library, so its names are its own. Before writing any
+class, function or method you have not seen in this SDK:
 
-- **With the \`sonore-sdk\` MCP server connected**, ask it. \`search\` says
-  whether a name exists, and an empty result is a real answer. \`type\` gives
-  the exact declaration, \`header\` the include line, \`example\` a complete
-  working plugin of a given kind, and \`rules\` the rules below.
-- **Without it**, read \`llms-full.txt\` at the SDK root: every public type in
-  every header (${headers.length} headers, ${typeCount} types). A name that is
-  not in it does not exist. The headers are in \`sdk/include/sonore/\`.
+- **With the \`sonore-sdk\` MCP server connected**, ask it. \`search\` finds
+  classes, functions, aliases and headers, with words in any order, and an empty
+  result is a real answer. \`type\` gives the exact declaration of any of them,
+  \`header\` the include line, \`example\` a complete working plugin of a given
+  kind, and \`rules\` the rules below.
+- **Without it**, read \`llms-full.txt\` at the SDK root for the classes and
+  structs: every one in every header (${headers.length} headers, ${typeCount}
+  types), so a class that is not in it does not exist. Functions, aliases and
+  methods are not listed there; search the headers for those before deciding
+  one is missing.
 
 ## Start from a generated project
 
@@ -345,10 +378,11 @@ cmake --build MyFilter/build --config Release
 ctest --test-dir MyFilter/build -C Release
 \`\`\`
 
-\`-DTYPE=instrument\` starts an eight-voice synth instead of a filter. The id
-the generator derives (\`com.mycompany.myfilter\`) is the plugin's identity in
-every saved session: pass \`-DID=\` now if that is not the one to keep. To add a
-plugin to an existing CMake project instead, see Building below.
+The plugin is \`MyFilter/src/plugin.cpp\`. \`-DTYPE=instrument\` starts an
+eight-voice synth instead of a filter. The id the generator derives
+(\`com.mycompany.myfilter\`) is the plugin's identity in every saved session:
+pass \`-DID=\` now if that is not the one to keep. To add a plugin to an
+existing CMake project instead, see Building below.
 
 ## The shape of a plugin
 
@@ -371,13 +405,23 @@ Compiling is not finished. Before calling a plugin done:
 
 1. Build Release and run \`ctest\`. A generated project's tests include its
    self-checks; built against a checkout, they include the real-time audit.
-2. Run the format owners' validators on what was built:
-   \`clap-validator validate MyFilter.clap\` and
-   \`pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3\`.
-   On macOS, \`auval -v aufx <subtype> <manufacturer>\` after copying the
-   \`.component\` into \`~/Library/Audio/Plug-Ins/Components\`.
+2. Run the format owners' validators on what was built, from the folder the
+   build put it in (\`MyFilter/build\`, or \`MyFilter/build/Release\` with Visual
+   Studio and Xcode):
+
+   \`\`\`
+   clap-validator validate MyFilter.clap
+   pluginval --strictness-level 10 --validate vst3/MyFilterVST3.vst3
+   \`\`\`
+
+   On macOS, copy the \`.component\` into \`~/Library/Audio/Plug-Ins/Components\`
+   and run \`auval -v aufx <subtype> <manufacturer>\` (\`aumu\` for an instrument).
 3. Report what ran and what it printed. A step that was skipped is said to be
    skipped.
+
+## Before it ships
+
+${beforeYouShip()}
 
 ## Where the rest is
 
@@ -388,23 +432,22 @@ ${guides().join("\n")}
 ## Connecting the MCP server
 
 \`${MCP_SERVER}\` in the SDK checkout is plain JSON-RPC over stdio, with no
-dependencies and nothing to install.
+dependencies and nothing to install. Use the checkout's full path.
 
-- Claude Code: \`claude mcp add sonore-sdk -- node /path/to/sonore-sdk/${MCP_SERVER}\`
-- Codex, in \`~/.codex/config.toml\`:
-
-  \`\`\`toml
-  [mcp_servers.sonore-sdk]
-  command = "node"
-  args = ["/path/to/sonore-sdk/${MCP_SERVER}"]
-  \`\`\`
-
-- Cursor (\`.cursor/mcp.json\`) and other MCP clients:
+- Claude Code: \`claude mcp add --scope user sonore-sdk -- node ${server}\`
+- Codex (CLI, IDE extension and the ChatGPT desktop app):
+  \`codex mcp add sonore-sdk -- node ${server}\`
+- Cursor, in \`~/.cursor/mcp.json\`, and Antigravity, in
+  \`~/.gemini/config/mcp_config.json\`; any other MCP client takes the same:
 
   \`\`\`json
   { "mcpServers": { "sonore-sdk": {
-      "command": "node", "args": ["/path/to/sonore-sdk/${MCP_SERVER}"] } } }
+      "command": "node", "args": ["${server}"] } } }
   \`\`\`
+
+This skill installs into any of them with
+\`npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a <agent> -g\`, where
+\`<agent>\` is \`claude-code\`, \`codex\`, \`cursor\` or \`antigravity\`.
 `;
 }
 

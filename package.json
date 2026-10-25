@@ -43,6 +43,7 @@
     "docs:fetch": "node scripts/fetch-doxygen.mjs",
     "llms": "node scripts/llms-txt.mjs",
     "verify:llms": "node scripts/llms-txt.mjs --check",
-    "mcp": "node scripts/mcp-server.mjs"
+    "mcp": "node scripts/mcp-server.mjs",
+    "verify:mcp": "node scripts/mcp-server.mjs --check"
   }
 }
