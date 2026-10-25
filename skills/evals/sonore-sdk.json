@@ -1,0 +1,39 @@
+{
+  "skill": "sonore-sdk",
+  "about": "Evaluations for skills/sonore-sdk, in the shape Anthropic's skill guide suggests: a request, and behaviour that can be checked. Run each with the skill and the sonore-sdk MCP server installed, in a fresh SDK checkout, on more than one model.",
+  "evaluations": [
+    {
+      "query": "Make me a stereo gain plugin with a dB control from -24 to +12, built on the Sonore SDK.",
+      "expected_behavior": [
+        "Starts from sdk/cmake/sonore_new_plugin.cmake rather than writing CMake by hand",
+        "Converts decibels with sonore::dbToGain and smooths the control with sonore::Smooth",
+        "Allocates nothing in process(); any buffer is sized in prepare()",
+        "Builds in Release, runs ctest, and runs clap-validator and pluginval at strictness 10, or says which of them were not run"
+      ]
+    },
+    {
+      "query": "Add a look-ahead limiter with 5 ms of look-ahead to my Sonore plugin.",
+      "expected_behavior": [
+        "Looks the limiter up (sonore_search) before naming a class",
+        "Declares int latencySamples() const and returns the look-ahead in samples at the current rate",
+        "Computes the look-ahead from the sample rate in prepare(), not from a fixed 44100 or 48000"
+      ]
+    },
+    {
+      "query": "Use the SDK's CompressorPro class to add a compressor.",
+      "expected_behavior": [
+        "Searches for CompressorPro and reports that the SDK has no such class",
+        "Does not write code that uses CompressorPro",
+        "Offers what the SDK does have (Compressor, or the compressors in compressors.h) after reading its declaration"
+      ]
+    },
+    {
+      "query": "Turn my Sonore effect into a polyphonic instrument.",
+      "expected_behavior": [
+        "Changes the process signature to take a sonore::MidiBuffer&, which is what makes it an instrument",
+        "Sets the descriptor's instrument flag to true",
+        "Reads an instrument example (sonore_example with kind instrument) or starts from -DTYPE=instrument"
+      ]
+    }
+  ]
+}

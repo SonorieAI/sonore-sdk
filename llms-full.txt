@@ -89,7 +89,7 @@ If a class or struct is not in this list, the SDK does not have it. Reaching for
 a class that sounds like it should exist is the most common way generated code
 fails to compile against this library. Functions, aliases and methods are not
 listed here (dbToGain is a function, ProcessContext an alias): look for those in
-the header itself, or ask the MCP server's `search`, which covers them.
+the header itself, or ask the MCP server's `sonore_search`, which covers them.
 
 ### analytics.h
 

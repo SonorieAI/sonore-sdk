@@ -67,20 +67,22 @@ the headers by `scripts/llms-txt.mjs`, so they cannot describe an API the code
 does not have, and `npm run verify:llms` fails if they have drifted.
 
 **An MCP server** lets an agent ask instead of guess. No dependencies, no
-install: it is plain JSON-RPC over stdio, and every tool only reads the checkout.
+install: it is plain JSON-RPC over stdio, speaks both MCP 2026-07-28 and the
+legacy `initialize` protocol, and every tool only reads the checkout.
 
 | Tool | What it answers |
 | --- | --- |
-| `search` | Does this class, function, alias or concept exist here, and where. Words match in any order ("ladder filter" finds `LadderFilter`). An empty result is a real answer. |
-| `type` | The actual declaration of a class, function, alias or enum, with the comment explaining why it exists. |
-| `header` | What one header is for, its public types, and the include line. |
-| `headers` | Every header with a one-line purpose. |
-| `example` | A complete working plugin and the local headers it includes: effect, instrument, sidechain, aux outputs, MIDI output, sampler, flexible channels, reverb, native editor, or the player app. |
-| `rules` | The shape of a plugin, which `process` signature makes an instrument, latency reporting, and what is forbidden on the audio thread. |
+| `sonore_search` | Does this class, function, alias or concept exist here, and where. Words match in any order ("ladder filter" finds `LadderFilter`). An empty result is a real answer. |
+| `sonore_declaration` | The actual declaration of a class, function, alias or enum, with the comment explaining why it exists. |
+| `sonore_header` | What one header is for, its public types, and the include line. |
+| `sonore_headers` | Every header with a one-line purpose. |
+| `sonore_example` | A complete working plugin, one file per call, then the local headers it includes by name: effect, instrument, sidechain, aux outputs, MIDI output, sampler, flexible channels, reverb, native editor, or the player app. |
+| `sonore_rules` | The shape of a plugin, which `process` signature makes an instrument, latency reporting, and what is forbidden on the audio thread. |
 
 "An empty result is a real answer" holds only if search never misses a name the
 headers have, so `npm run verify:mcp` checks it: every public type reads back
-through `type`, and every name the rules of a plugin use is found by `search`.
+through `sonore_declaration`, every name the rules of a plugin use is found by
+`sonore_search`, and both protocol eras answer as the spec says.
 
 **[A skill](skills/sonore-sdk/SKILL.md)** puts the same map in the agent's own
 context, in the [Agent Skills](https://agentskills.io) format that Claude Code,

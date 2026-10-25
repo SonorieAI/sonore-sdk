@@ -5,14 +5,20 @@
 // C++ library is not that it refuses: it invents. It reaches for a class name
 // that sounds like it should exist, gives a real class a method from a different
 // library, and hands you code that reads perfectly and does not compile. The
-// answer is not a better prompt, it is letting the agent ASK. `type` returns the
-// real declaration; `search` says whether a name exists at all.
+// answer is not a better prompt, it is letting the agent ASK. `sonore_search`
+// says whether a name exists at all; `sonore_declaration` returns the real one.
 //
 // THE ONE PROMISE. "Nothing matches" tells an agent to stop using a name, so it
 // must never be said about a name the headers contain. Search therefore looks
 // at every declaration, not only classes (dbToGain is a function, ProcessContext
-// an alias), matches words in any order ("ladder filter" finds LadderFilter),
-// and before giving up reads the code and the comments line by line.
+// an alias), matches words in any order and by stem ("ladder filter" finds
+// LadderFilter, "oversampling" OversamplerT), and before giving up reads the
+// code and the comments line by line. `npm run verify:mcp` holds it to that.
+//
+// BOTH ERAS OF THE PROTOCOL. A request carrying `_meta` with a protocol version
+// is served statelessly, as MCP 2026-07-28 defines; an `initialize` handshake
+// selects the legacy protocol (2025-11-25 and earlier) for the life of the
+// process. Clients of either kind work, which the spec calls dual-era.
 //
 // NO DEPENDENCIES, on purpose. This repository has none, and an MCP server that
 // dragged in a package tree to speak a line-delimited JSON protocol would be a
@@ -41,10 +47,14 @@ const VERSION = (() => {
     return readFileSync(join(ROOT, "sdk", "CMakeLists.txt"), "utf8").match(/project\(SonoreSDK VERSION ([\d.]+)/)?.[1] ?? "0.0.0";
   } catch { return "0.0.0"; }
 })();
+const SERVER_INFO = { name: "sonore-sdk", title: "Sonore SDK", version: VERSION };
 
-// Newest first. A client asking for one of these gets it; any other request
-// gets the newest, and the client decides whether it can speak that.
-const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+// Newest first. Modern versions are per-request; legacy ones are negotiated
+// once, by `initialize`.
+const MODERN_VERSIONS = ["2026-07-28"];
+const LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const META_VERSION = "io.modelcontextprotocol/protocolVersion";
+const META_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 
 // ── The index, built once at startup ────────────────────────────────────────
 
@@ -115,7 +125,6 @@ const HEADERS = walk(INC).map((file) => {
     name: file.split(sep).pop(),
     purpose: purposeOf(text),
     types: publicTypes(text),
-    text,
     lines: text.split("\n"),
     code: codeOnly(text).split("\n"),
   };
@@ -195,25 +204,44 @@ const clip = (s, n) =>
 const snippet = (s) => clip(s.trim().replace(/\s+/g, " "), 110).split("\n")[0];
 const where = (h, i) => `${h.rel}:${i + 1}`;
 
+// ── Arguments ───────────────────────────────────────────────────────────────
+
+/** A mistake in how a tool was called. It goes back as a tool result with
+ *  isError set, worded so the model can correct the call, rather than as a
+ *  protocol error that would only abort it. */
+class UsageError extends Error {}
+
+function text(args, key, { required = false, max = 200 } = {}) {
+  const v = args[key];
+  if (v === undefined || v === null || v === "") {
+    if (required) throw new UsageError(`"${key}" is required.`);
+    return "";
+  }
+  if (typeof v !== "string") throw new UsageError(`"${key}" must be a string, not ${typeof v}.`);
+  if (v.length > max) throw new UsageError(`"${key}" is ${v.length} characters; keep it under ${max}.`);
+  return v.trim();
+}
+
 // ── Tool implementations ────────────────────────────────────────────────────
 
-function toolSearch({ query = "", limit = 30 }) {
+function toolSearch(args) {
+  const query = text(args, "query", { required: true });
   const words = wordsOf(query);
-  if (!words.length) return "Give a query: a class or function name, a word from a header, or a concept.";
-  const max = Math.min(Math.max(Math.trunc(Number(limit)) || 30, 1), 200);
-  const exact = String(query).trim().split("::").pop().toLowerCase();
+  if (!words.length) throw new UsageError(`"query" has no letters or digits: give a name, words or a concept.`);
+  let max = 30;
+  if (args.limit !== undefined) {
+    if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 200) throw new UsageError(`"limit" must be a whole number from 1 to 200.`);
+    max = args.limit;
+  }
+  const exact = query.split("::").pop().toLowerCase();
   const first = (a, b) => (b.toLowerCase() === exact) - (a.toLowerCase() === exact);
 
-  const types = HEADERS.flatMap((h) => h.types.filter((t) => matches(words, t)).map((t) => [t, `${t}  (${h.rel})`]));
-  const decls = DECLS.filter((d) => matches(words, d.name))
-    .map((d) => [d.name, `${d.name}  ${d.kind}, ${where(d.h, d.line)}  ${snippet(d.h.lines[d.line])}`]);
-  const headers = HEADERS.filter((h) => matches(words, h.name) || matches(words, h.purpose))
-    .map((h) => [h.name, `${h.name}${h.purpose ? `: ${h.purpose}` : ""}  (${h.rel})`]);
-
   const sections = [
-    ["Types", types.sort((a, b) => first(a[0], b[0]))],
-    ["Functions, aliases, enums and constants", decls.sort((a, b) => first(a[0], b[0]))],
-    ["Headers", headers],
+    ["Types", HEADERS.flatMap((h) => h.types.filter((t) => matches(words, t)).map((t) => [t, `${t}  (${h.rel})`])).sort((a, b) => first(a[0], b[0]))],
+    ["Functions, aliases, enums and constants", DECLS.filter((d) => matches(words, d.name))
+      .map((d) => [d.name, `${d.name}  ${d.kind}, ${where(d.h, d.line)}  ${snippet(d.h.lines[d.line])}`]).sort((a, b) => first(a[0], b[0]))],
+    ["Headers", HEADERS.filter((h) => matches(words, h.name) || matches(words, h.purpose))
+      .map((h) => [h.name, `${h.name}${h.purpose ? `: ${h.purpose}` : ""}  (${h.rel})`])],
   ].filter(([, rows]) => rows.length);
   if (sections.length) {
     let left = max;
@@ -225,8 +253,8 @@ function toolSearch({ query = "", limit = 30 }) {
   }
 
   // Not declared under that name. Before saying so, read the code itself, then
-  // the comments: a name the SDK calls but you write (latencySamples), or one
-  // its prose explains, is not "nothing".
+  // the comments: a name the SDK calls but you write (latencySamples on your
+  // own DSP), or one its prose explains, is not "nothing".
   const word = new RegExp(`\\b${words.join("\\W*")}\\b`, "i");
   const inCode = [], inComments = [];
   for (const h of HEADERS) {
@@ -237,7 +265,7 @@ function toolSearch({ query = "", limit = 30 }) {
   }
   if (inCode.length) {
     return `The SDK declares nothing called "${query}", but its code uses the name. ` +
-      `It may be something your plugin declares and the SDK looks for, which the "rules" tool explains:\n\n` +
+      `It may be something your plugin declares and the SDK looks for, which sonore_rules explains:\n\n` +
       inCode.slice(0, max).join("\n");
   }
   if (inComments.length) {
@@ -248,7 +276,7 @@ function toolSearch({ query = "", limit = 30 }) {
   return `Nothing in the SDK matches "${query}".\n\n` +
     (near.length ? `Did you mean: ${near.join(", ")}?\n\n` : "") +
     `That is an answer, not a failure: the SDK does not have it, so do not write code ` +
-    `that assumes it does. Try a broader word, or call the "headers" tool to see the surface.`;
+    `that assumes it does. Try a broader word, or sonore_headers to see the surface.`;
 }
 
 /** The lines that declare something: its doc comment above, any template line,
@@ -270,9 +298,9 @@ function declarationBlock(h, start, { body }) {
   return h.lines.slice(from, end + 1).join("\n");
 }
 
-function toolType({ name = "" }) {
-  const want = String(name).trim().split("::").pop();
-  if (!want) return "Give a name, e.g. LadderFilter.";
+function toolDeclaration(args) {
+  const want = text(args, "name", { required: true }).split("::").pop();
+  if (!/^[A-Za-z_]\w*$/.test(want)) throw new UsageError(`"name" must be one C++ identifier, e.g. LadderFilter; for words, use sonore_search.`);
   for (const h of HEADERS) {
     if (!h.types.includes(want)) continue;
     const start = h.lines.findIndex((l) =>
@@ -286,32 +314,32 @@ function toolType({ name = "" }) {
     return decls.slice(0, 4).map((d) => {
       const block = declarationBlock(d.h, d.line, { body: d.kind === "enum" });
       const target = d.kind === "alias" ? d.h.code[d.line].match(/=\s*(?:typename\s+)?([A-Z]\w*)/)?.[1] : null;
-      const more = target && target !== want ? `\n\nThat is an alias: ask "type" for ${target} to see its members.` : "";
+      const more = target && target !== want ? `\n\nThat is an alias: ask sonore_declaration for ${target} to see its members.` : "";
       return `${where(d.h, d.line)}  (${d.kind})\n\n${clip(block, 4000)}${more}`;
     }).join("\n\n---\n\n");
   }
   const near = nearMisses(want);
   return `Nothing public is called "${want}".` +
-    (near.length ? ` Did you mean: ${near.join(", ")}?` : ` Use "search" to find the real name;`) +
+    (near.length ? ` Did you mean: ${near.join(", ")}?` : ` Use sonore_search to find the real name;`) +
     ` Inventing a name is the most common way code fails to compile here.`;
 }
 
-function toolHeader({ name = "" }) {
-  const want = String(name).trim().replace(/^<|>$/g, "").replace(/^sonore\//, "");
-  if (!want) return `Give a header name, e.g. dsp.h. Call "headers" for the list.`;
+function toolHeader(args) {
+  const want = text(args, "name", { required: true }).replace(/^<|>$/g, "").replace(/^sonore\//, "");
   const h = HEADERS.find((x) => x.name === want || x.rel.endsWith(`/${want}`));
-  if (!h) return `No header called "${want}". Call "headers" for the list.`;
+  if (!h) throw new UsageError(`No header called "${want}". sonore_headers lists them all.`);
   return `${h.rel}\n${h.purpose ? `\n${h.purpose}\n` : ""}\n` +
     `Public types (${h.types.length}):\n${h.types.join(", ") || "(none)"}\n\n` +
     `Include as: #include <sonore/${h.rel.split("include/sonore/")[1]}>`;
 }
 
-function toolHeaders({ filter = "" }) {
+function toolHeaders(args) {
+  const filter = text(args, "filter");
   const words = wordsOf(filter);
   const rows = HEADERS
     .filter((h) => !words.length || matches(words, h.name) || matches(words, h.purpose))
     .map((h) => `${h.rel.split("include/sonore/")[1]}${h.purpose ? `: ${h.purpose}` : ""}`);
-  return rows.length ? rows.join("\n") : `No header matches "${filter}".`;
+  return rows.length ? rows.join("\n") : `No header matches "${filter}". Call it without a filter for all ${HEADERS.length}.`;
 }
 
 // What each kind of plugin is called in sdk/examples.
@@ -321,106 +349,204 @@ const EXAMPLE_KINDS = {
   "flexible-channels": "trim", reverb: "reverb", "native-editor": "showcase", app: "player",
 };
 
-function toolExample({ kind = "effect" }) {
-  const dir = EXAMPLE_KINDS[String(kind)] ?? String(kind);
+/** An example's main source, and the local headers it pulls in (generated
+ *  data headers are listed but marked, never printed). */
+function exampleFiles(dir) {
   const folder = join(EXAMPLES, dir);
   const main = ["plugin.cpp", "main.cpp"].find((f) => existsSync(join(folder, f)));
-  if (!/^[\w-]+$/.test(dir) || !main) {
-    return `No example for "${kind}". Kinds: ${Object.keys(EXAMPLE_KINDS).join(", ")}.`;
-  }
-  // The example and the local headers it includes, so it is complete; a
-  // generated data header is named but not printed.
-  const parts = [];
+  if (!main) return null;
+  const files = [];
   const visit = (file) => {
-    if (parts.some((p) => p.file === file) || !existsSync(join(folder, file))) return;
-    const text = readFileSync(join(folder, file), "utf8");
-    const generated = /^\/\/.*\bGenerated by\b/m.test(text.split("\n").slice(0, 3).join("\n"));
-    parts.push({ file, text: generated ? `// (generated data, ${text.length} characters, not shown)` : text });
-    if (!generated) for (const m of text.matchAll(/^\s*#\s*include\s+"([^"]+)"/gm)) visit(m[1]);
+    if (files.some((f) => f.file === file) || !existsSync(join(folder, file))) return;
+    const body = readFileSync(join(folder, file), "utf8");
+    const generated = /^\/\/.*\bGenerated by\b/m.test(body.split("\n").slice(0, 3).join("\n"));
+    files.push({ file, body, generated });
+    if (!generated) for (const m of body.matchAll(/^\s*#\s*include\s+"([^"]+)"/gm)) visit(m[1]);
   };
   visit(main);
-  const body = parts.map((p) => `==> sdk/examples/${dir}/${p.file} <==\n${p.text}`).join("\n\n");
-  return clip(body, 60000);
+  return files;
+}
+
+function toolExample(args) {
+  const kind = text(args, "kind") || "effect";
+  const dir = Object.hasOwn(EXAMPLE_KINDS, kind) ? EXAMPLE_KINDS[kind] : kind;
+  const files = /^[\w-]+$/.test(dir) ? exampleFiles(dir) : null;
+  if (!files) throw new UsageError(`No example for "${kind}". Kinds: ${Object.keys(EXAMPLE_KINDS).join(", ")}.`);
+  // One file per call, so a large example never floods the context: the main
+  // source by default, any of its local headers by name.
+  const want = text(args, "file") || files[0].file;
+  const f = files.find((x) => x.file === want);
+  if (!f) throw new UsageError(`sdk/examples/${dir} has no file "${want}" in this example. Files: ${files.map((x) => x.file).join(", ")}.`);
+  if (f.generated) return `sdk/examples/${dir}/${f.file} is generated data (${f.body.length} characters), not source to read.`;
+  const others = files.filter((x) => x !== f)
+    .map((x) => `${x.file} (${Math.round(x.body.length / 1024)} KB${x.generated ? ", generated data" : ""})`);
+  return `sdk/examples/${dir}/${f.file}\n\n${clip(f.body, 40000)}` +
+    (others.length ? `\n\nAlso part of this example: ${others.join(", ")}. Ask again with "file" to read one.` : "");
 }
 
 function toolRules() {
   const path = join(ROOT, "llms.txt");
   if (!existsSync(path)) return "llms.txt is missing. Run: node scripts/llms-txt.mjs";
-  const text = readFileSync(path, "utf8");
-  const from = text.indexOf("## The shape of a plugin");
-  const to = text.indexOf("## Headers");
-  return from < 0 ? text : text.slice(from, to > from ? to : undefined);
+  const all = readFileSync(path, "utf8");
+  const from = all.indexOf("## The shape of a plugin");
+  const to = all.indexOf("## Headers");
+  return from < 0 ? all : all.slice(from, to > from ? to : undefined);
 }
 
 // Every tool only reads the checkout: hosts that honour the hints can call
 // them without asking each time.
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const schema = (properties, required = []) =>
+  ({ type: "object", properties, ...(required.length ? { required } : {}), additionalProperties: false });
 
 const TOOLS = [
-  { name: "search", title: "Search the SDK",
+  { name: "sonore_search", alias: "search", title: "Search the SDK",
     description:
-      "Search the SDK for a class, function, alias, header or concept. Use this BEFORE " +
-      "naming anything you have not verified. Words match in any order, so \"ladder filter\" " +
-      "finds LadderFilter. An empty result means the SDK does not have it, which is a real answer.",
-    inputSchema: { type: "object", properties: {
-      query: { type: "string", description: "A name (LadderFilter, dbToGain), words (ladder filter) or a concept (oversampling)." },
+      "Search the Sonore SDK for a class, function, alias, header or concept. Use it BEFORE " +
+      "naming anything you have not verified. Words match in any order and by stem, so " +
+      "\"ladder filter\" finds LadderFilter. An empty result means the SDK does not have it, " +
+      "which is a real answer.",
+    inputSchema: schema({
+      query: { type: "string", maxLength: 200, description: "A name (LadderFilter, dbToGain), words (ladder filter) or a concept (oversampling)." },
       limit: { type: "integer", minimum: 1, maximum: 200, description: "Maximum results (default 30)." },
-    }, required: ["query"] },
+    }, ["query"]),
     run: toolSearch },
 
-  { name: "type", title: "Read a declaration",
+  { name: "sonore_declaration", alias: "type", title: "Read a declaration",
     description:
-      "The real declaration of a public class, struct, function, alias or enum, with the " +
-      "comment that explains why it exists. Use this to get exact signatures rather than " +
+      "The real declaration of a public class, struct, function, alias or enum in the Sonore SDK, " +
+      "with the comment that explains why it exists. Use it for exact signatures instead of " +
       "guessing them from another library.",
-    inputSchema: { type: "object", properties: {
-      name: { type: "string", description: "Exact name, e.g. LadderFilter, dbToGain or ProcessContext." },
-    }, required: ["name"] },
-    run: toolType },
+    inputSchema: schema({
+      name: { type: "string", maxLength: 200, description: "One exact name, e.g. LadderFilter, dbToGain or ProcessContext." },
+    }, ["name"]),
+    run: toolDeclaration },
 
-  { name: "header", title: "Describe a header",
-    description: "What one header is for, every public type in it, and the include line.",
-    inputSchema: { type: "object", properties: {
-      name: { type: "string", description: "Header file name, e.g. dsp.h or gfx/canvas.h." },
-    }, required: ["name"] },
+  { name: "sonore_header", alias: "header", title: "Describe a header",
+    description: "What one Sonore SDK header is for, every public type in it, and the include line.",
+    inputSchema: schema({
+      name: { type: "string", maxLength: 200, description: "Header file name, e.g. dsp.h or gfx/canvas.h." },
+    }, ["name"]),
     run: toolHeader },
 
-  { name: "headers", title: "List the headers",
-    description: "Every header with a one-line purpose. Optionally filtered by words.",
-    inputSchema: { type: "object", properties: {
-      filter: { type: "string", description: "Optional words, e.g. audio input." },
-    } },
+  { name: "sonore_headers", alias: "headers", title: "List the headers",
+    description: "Every Sonore SDK header with a one-line purpose, optionally filtered by words.",
+    inputSchema: schema({
+      filter: { type: "string", maxLength: 200, description: "Optional words, e.g. audio input." },
+    }),
     run: toolHeaders },
 
-  { name: "example", title: "Get a working example",
+  { name: "sonore_example", alias: "example", title: "Read a working example",
     description:
-      "A complete working source from sdk/examples, with the local headers it includes. " +
+      "A complete working source from the SDK's examples, one file per call: the main source " +
+      "by default, then any local header it includes by name. " +
       `Kinds: ${Object.keys(EXAMPLE_KINDS).join(", ")}.`,
-    inputSchema: { type: "object", properties: {
-      kind: { type: "string", description: `Which example (default: effect): ${Object.keys(EXAMPLE_KINDS).join(", ")}, or a folder name in sdk/examples.` },
-    } },
+    inputSchema: schema({
+      kind: { type: "string", maxLength: 200, description: `Which example (default: effect): ${Object.keys(EXAMPLE_KINDS).join(", ")}, or a folder name in sdk/examples.` },
+      file: { type: "string", maxLength: 200, description: "One of the example's files, as listed at the end of the first answer (default: the main source)." },
+    }),
     run: toolExample },
 
-  { name: "rules", title: "The rules of a plugin",
+  { name: "sonore_rules", alias: "rules", title: "The rules of a plugin",
     description:
-      "The shape of a plugin and the rules that are not guessable from the API: " +
-      "which process signature makes an instrument, latency reporting, what is " +
-      "forbidden on the audio thread, and which objects are too big for the stack.",
-    inputSchema: { type: "object", properties: {} },
+      "The shape of a Sonore plugin and the rules that are not guessable from the API: which " +
+      "process signature makes an instrument, latency reporting, what is forbidden on the audio " +
+      "thread, and which objects are too big for the stack. Read it once before writing a plugin.",
+    inputSchema: schema({}),
     run: toolRules },
 ];
 
 const INSTRUCTIONS =
-  "The Sonore SDK, looked up instead of guessed. Before writing plugin code, call `rules` once " +
-  "for the shape of a plugin. Before naming any class, function or method you have not seen in " +
-  "this SDK, `search` for it: an empty result means it does not exist. Use `type` for exact " +
-  "signatures and `example` for a complete plugin of the kind you are writing.";
+  "The Sonore SDK, looked up instead of guessed. Before writing plugin code, call sonore_rules once " +
+  "for the shape of a plugin. Before naming any class, function or method you have not seen in this " +
+  "SDK, call sonore_search: an empty result means it does not exist. Use sonore_declaration for exact " +
+  "signatures and sonore_example for a complete plugin of the kind you are writing.";
+
+const listedTools = () => TOOLS.map(({ name, title, description, inputSchema }) =>
+  ({ name, title, description, inputSchema, annotations: { title, ...READ_ONLY } }));
+
+// Generous for an agent, which calls a few times a turn; a runaway loop is
+// told to stop rather than served forever.
+const RATE = { calls: 120, perMs: 10_000 };
+const recent = [];
+
+function callTool(params) {
+  if (typeof params?.name !== "string") return { error: [-32602, "tools/call needs the name of a tool."] };
+  // The names from before the tools were namespaced still work.
+  const tool = TOOLS.find((t) => t.name === params.name || t.alias === params.name);
+  if (!tool) return { error: [-32602, `Unknown tool "${params.name}". Tools: ${TOOLS.map((t) => t.name).join(", ")}.`] };
+  if (params.arguments !== undefined && (typeof params.arguments !== "object" || params.arguments === null || Array.isArray(params.arguments))) {
+    return { result: { content: [{ type: "text", text: "\"arguments\" must be an object." }], isError: true } };
+  }
+  const now = Date.now();
+  while (recent.length && now - recent[0] > RATE.perMs) recent.shift();
+  if (recent.length >= RATE.calls) {
+    return { result: { content: [{ type: "text", text: `More than ${RATE.calls} calls in ${RATE.perMs / 1000} seconds. Wait a moment, then call again.` }], isError: true } };
+  }
+  recent.push(now);
+  try {
+    return { result: { content: [{ type: "text", text: String(tool.run(params.arguments ?? {})) }] } };
+  } catch (err) {
+    const message = err instanceof UsageError ? err.message : `Tool failed: ${err?.message ?? err}`;
+    return { result: { content: [{ type: "text", text: message }], isError: true } };
+  }
+}
 
 // ── JSON-RPC 2.0 over stdio ─────────────────────────────────────────────────
 
 const ok = (id, result) => ({ jsonrpc: "2.0", id, result });
-const fail = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
+const fail = (id, code, message, data) => ({ jsonrpc: "2.0", id, error: { code, message, ...(data ? { data } : {}) } });
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+const answer = (id, r, extra = {}) => (r.error ? fail(id, ...r.error) : ok(id, { ...extra, ...r.result }));
+
+// Set by an `initialize`: from then on, requests without `_meta` are legacy.
+let legacy = null;
+
+/** The 2026-07-28 protocol: every request says its version and capabilities. */
+function respondModern(id, method, params, meta) {
+  const version = meta[META_VERSION];
+  if (typeof version !== "string" || !meta[META_CAPABILITIES] || typeof meta[META_CAPABILITIES] !== "object") {
+    return fail(id, -32602, `params._meta needs "${META_VERSION}" and "${META_CAPABILITIES}".`);
+  }
+  if (!MODERN_VERSIONS.includes(version)) {
+    return fail(id, -32022, "Unsupported protocol version", { supported: MODERN_VERSIONS, requested: version });
+  }
+  const done = { resultType: "complete" };
+  // The tools never change while the process runs: a client may cache them.
+  const cache = { ttlMs: 3_600_000, cacheScope: "public" };
+  switch (method) {
+    case "server/discover":
+      return ok(id, {
+        ...done, supportedVersions: MODERN_VERSIONS, capabilities: { tools: {} }, instructions: INSTRUCTIONS, ...cache,
+        _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO },
+      });
+    case "tools/list":
+      return ok(id, { ...done, tools: listedTools(), ...cache });
+    case "tools/call":
+      return answer(id, callTool(params), done);
+    default:
+      return fail(id, -32601, `Unsupported method "${method}".`);
+  }
+}
+
+/** The legacy protocol: one `initialize`, then plain requests. */
+function respondLegacy(id, method, params) {
+  switch (method) {
+    case "initialize": {
+      const asked = params?.protocolVersion;
+      legacy = LEGACY_VERSIONS.includes(asked) ? asked : LEGACY_VERSIONS[0];
+      return ok(id, { protocolVersion: legacy, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
+    }
+    case "ping":
+      return ok(id, {});
+    case "tools/list":
+      return ok(id, { tools: listedTools() });
+    case "tools/call":
+      return answer(id, callTool(params));
+    default:
+      return fail(id, -32601, `Unsupported method "${method}".`);
+  }
+}
 
 /** The reply to one message, or null when it takes none. */
 function respond(msg) {
@@ -431,43 +557,17 @@ function respond(msg) {
   // A response to a request this server never makes: nothing to answer.
   if (method === undefined && ("result" in msg || "error" in msg)) return null;
   if (typeof method !== "string") return fail(id ?? null, -32600, "Invalid request: no method.");
-  // A notification has no id and takes no reply. `notifications/initialized`
-  // arrives right after the handshake and answering it is a protocol error.
+  // A notification takes no reply: notifications/initialized (legacy) and
+  // notifications/cancelled (both eras; every call here answers at once).
   if (id === undefined) return null;
 
-  switch (method) {
-    case "initialize": {
-      const asked = params?.protocolVersion;
-      return ok(id, {
-        protocolVersion: PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[0],
-        capabilities: { tools: {} },
-        serverInfo: { name: "sonore-sdk", title: "Sonore SDK", version: VERSION },
-        instructions: INSTRUCTIONS,
-      });
-    }
-    case "ping":
-      return ok(id, {});
-    case "tools/list":
-      return ok(id, {
-        tools: TOOLS.map(({ name, title, description, inputSchema }) =>
-          ({ name, title, description, inputSchema, annotations: READ_ONLY })),
-      });
-    case "tools/call": {
-      if (typeof params?.name !== "string") return fail(id, -32602, "tools/call needs the name of a tool.");
-      const tool = TOOLS.find((t) => t.name === params.name);
-      if (!tool) return fail(id, -32602, `No tool called "${params.name}". Tools: ${TOOLS.map((t) => t.name).join(", ")}.`);
-      const args = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
-      try {
-        return ok(id, { content: [{ type: "text", text: String(tool.run(args)) }] });
-      } catch (err) {
-        // Reported as tool output rather than a protocol error: the agent can
-        // read it and try something else, where a JSON-RPC error just aborts.
-        return ok(id, { content: [{ type: "text", text: `Tool failed: ${err?.message ?? err}` }], isError: true });
-      }
-    }
-    default:
-      return fail(id, -32601, `Unsupported method "${method}".`);
-  }
+  const meta = params?._meta;
+  if (meta && typeof meta === "object" && META_VERSION in meta) return respondModern(id, method, params, meta);
+  if (method === "initialize" || legacy) return respondLegacy(id, method, params);
+  if (method === "server/discover") return respondModern(id, method, params, meta ?? {});
+  return fail(id, -32602,
+    `No protocol version for "${method}": send "initialize" first (protocol ${LEGACY_VERSIONS[0]} and earlier), ` +
+    `or put "${META_VERSION}" in params._meta (${MODERN_VERSIONS[0]}).`);
 }
 
 function onLine(line) {
@@ -475,7 +575,7 @@ function onLine(line) {
   try { msg = JSON.parse(line); }
   catch { return send(fail(null, -32700, "Parse error: that line is not JSON.")); }
   if (Array.isArray(msg)) {
-    // A batch, which protocol versions before 2025-06-18 allow.
+    // A batch, which protocol 2025-03-26 allowed.
     if (!msg.length) return send(fail(null, -32600, "Invalid request: an empty batch."));
     const replies = msg.map(respond).filter(Boolean);
     if (replies.length) send(replies);
@@ -486,14 +586,19 @@ function onLine(line) {
 }
 
 // ── npm run verify:mcp ──────────────────────────────────────────────────────
-// The one promise, checked: every public type reads back through `type`, and
-// every name the shape and rules of a plugin use is found by `search`. A false
-// "nothing matches" would tell an agent to delete code that was right.
+// The one promise, checked: every public type reads back through
+// sonore_declaration, and every name the shape and rules of a plugin use is
+// found by sonore_search. A false "nothing matches" would tell an agent to
+// delete code that was right. The protocol is checked in both eras too.
 
 if (process.argv.includes("--check")) {
+  // the check calls every tool hundreds of times; the limit is for clients
+  RATE.calls = Infinity;
   const failures = [];
+  const call = (name, args) => callTool({ name, arguments: args }).result;
+  const textOf = (r) => r?.content?.[0]?.text ?? "";
   for (const h of HEADERS) {
-    for (const t of h.types) if (/^Nothing public/.test(toolType({ name: t }))) failures.push(`type ${t} (${h.rel})`);
+    for (const t of h.types) if (/^Nothing public/.test(textOf(call("sonore_declaration", { name: t })))) failures.push(`sonore_declaration ${t} (${h.rel})`);
   }
   const rules = toolRules();
   const used = new Set([
@@ -503,19 +608,40 @@ if (process.argv.includes("--check")) {
   ]);
   const names = [...used].filter((n) => n.length > 2 && n !== "new");
   for (const name of names) {
-    if (/^Nothing in the SDK matches/.test(toolSearch({ query: name }))) failures.push(`search ${name}`);
+    if (/^Nothing in the SDK matches/.test(textOf(call("sonore_search", { query: name })))) failures.push(`sonore_search ${name}`);
   }
   for (const kind of Object.keys(EXAMPLE_KINDS)) {
-    if (/^No example/.test(toolExample({ kind }))) failures.push(`example ${kind}`);
+    if (call("sonore_example", { kind }).isError) failures.push(`sonore_example ${kind}`);
   }
-  const init = respond({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "1999-01-01" } });
-  if (init?.result?.protocolVersion !== PROTOCOL_VERSIONS[0]) failures.push("initialize does not fall back to the newest protocol version");
+  for (const t of TOOLS) {
+    if (t.inputSchema.additionalProperties !== false) failures.push(`${t.name}: inputSchema allows unknown arguments`);
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(t.name)) failures.push(`${t.name}: not a valid tool name`);
+    if (call(t.alias, {}).isError === undefined && t.inputSchema.required) failures.push(`${t.alias}: alias accepts a call missing its required argument`);
+  }
+  if (!call("sonore_search", {}).isError) failures.push("a missing required argument is not reported with isError");
+
+  const meta = { [META_VERSION]: MODERN_VERSIONS[0], [META_CAPABILITIES]: {} };
+  const expect = (label, reply, test) => { if (!test(reply)) failures.push(`${label}: ${JSON.stringify(reply).slice(0, 160)}`); };
+  expect("request with no version before initialize", respond({ jsonrpc: "2.0", id: 1, method: "tools/list" }), (r) => r?.error?.code === -32602);
+  expect("server/discover", respond({ jsonrpc: "2.0", id: 2, method: "server/discover", params: { _meta: meta } }),
+    (r) => r?.result?.resultType === "complete" && r.result.supportedVersions?.includes(MODERN_VERSIONS[0]) && typeof r.result.ttlMs === "number" && r.result.cacheScope && r.result._meta?.["io.modelcontextprotocol/serverInfo"]?.name === "sonore-sdk");
+  expect("server/discover without _meta", respond({ jsonrpc: "2.0", id: 3, method: "server/discover" }), (r) => r?.error?.code === -32602);
+  expect("modern tools/list", respond({ jsonrpc: "2.0", id: 4, method: "tools/list", params: { _meta: meta } }), (r) => r?.result?.tools?.length === TOOLS.length && r.result.resultType === "complete");
+  expect("modern tools/call", respond({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { _meta: meta, name: "sonore_search", arguments: { query: "dbToGain" } } }), (r) => r?.result?.resultType === "complete" && /dbToGain/.test(textOf(r.result)));
+  expect("unsupported modern version", respond({ jsonrpc: "2.0", id: 6, method: "tools/list", params: { _meta: { ...meta, [META_VERSION]: "2099-01-01" } } }),
+    (r) => r?.error?.code === -32022 && r.error.data?.supported?.length && r.error.data.requested === "2099-01-01");
+  expect("missing client capabilities", respond({ jsonrpc: "2.0", id: 7, method: "tools/list", params: { _meta: { [META_VERSION]: MODERN_VERSIONS[0] } } }), (r) => r?.error?.code === -32602);
+  expect("legacy initialize falls back to the newest legacy version", respond({ jsonrpc: "2.0", id: 8, method: "initialize", params: { protocolVersion: "1999-01-01" } }), (r) => r?.result?.protocolVersion === LEGACY_VERSIONS[0]);
+  expect("legacy tools/call by old name", respond({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "search", arguments: { query: "ladder filter" } } }), (r) => /LadderFilter/.test(textOf(r?.result)));
+  expect("unknown tool", respond({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "nope" } }), (r) => r?.error?.code === -32602);
+
   if (failures.length) {
     console.error(`✗ the MCP server would answer these wrongly:\n  ${failures.join("\n  ")}`);
     process.exit(1);
   }
   const types = HEADERS.reduce((n, h) => n + h.types.length, 0);
-  console.log(`✓ MCP server: ${types} types read back, ${names.length} names from the rules found, ${Object.keys(EXAMPLE_KINDS).length} example kinds resolve.`);
+  console.log(`✓ MCP server: ${types} types read back, ${names.length} names from the rules found, ` +
+    `${Object.keys(EXAMPLE_KINDS).length} example kinds resolve, protocol ${MODERN_VERSIONS[0]} and legacy answer correctly.`);
   process.exit(0);
 }
 

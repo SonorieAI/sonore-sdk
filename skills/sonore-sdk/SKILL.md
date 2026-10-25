@@ -22,19 +22,35 @@ is a checkout: the folder with `llms.txt` at its root, the headers in
 `<prefix>/include/sonore/`) and the CMake helpers but neither of the others;
 for those, clone https://github.com/SonorieAI/sonore-sdk.
 
+## Workflow
+
+Copy this into your answer and tick it off as you go:
+
+```
+- [ ] Read the rules: sonore-sdk:sonore_rules, or "The shape of a plugin" below
+- [ ] Looked up every SDK name before using it
+- [ ] Release build succeeds
+- [ ] ctest passes
+- [ ] clap-validator and pluginval (strictness 10) pass, or are reported as not run
+```
+
+When a build, a test or a validator fails, fix what it names and run that step
+again before moving on.
+
 ## Look a name up before you write it
 
-Code against an unfamiliar C++ library rarely fails by refusing. It fails by
-invention: a class that sounds right, or a real class given a method from
-another framework. Sonore's DSP is written from the published mathematics, not
-adapted from another library, so its names are its own. Before writing any
-class, function or method you have not seen in this SDK:
+Sonore's DSP is written from the published mathematics, not adapted from
+another framework, so its names are its own: a name that sounds right from
+another library is usually wrong here. Before writing any class, function or
+method you have not seen in this SDK:
 
-- **With the `sonore-sdk` MCP server connected**, ask it. `search` finds
-  classes, functions, aliases and headers, with words in any order, and an empty
-  result is a real answer. `type` gives the exact declaration of any of them,
-  `header` the include line, `example` a complete working plugin of a given
-  kind, and `rules` the rules below.
+- **With the `sonore-sdk` MCP server connected**, ask it.
+  `sonore-sdk:sonore_search` finds classes, functions, aliases and headers,
+  with words in any order, and an empty result is a real answer.
+  `sonore-sdk:sonore_declaration` gives the exact declaration of any of them,
+  `sonore-sdk:sonore_header` the include line, `sonore-sdk:sonore_example`
+  a complete working plugin of a given kind, and `sonore-sdk:sonore_rules`
+  the rules below.
 - **Without it**, read `llms-full.txt` at the SDK root for the classes and
   structs: every one in every header (270 headers, 726
   types), so a class that is not in it does not exist. Functions, aliases and
@@ -139,6 +155,10 @@ Compiling is not finished. Before calling a plugin done:
 
    On macOS, copy the `.component` into `~/Library/Audio/Plug-Ins/Components`
    and run `auval -v aufx <subtype> <manufacturer>` (`aumu` for an instrument).
+   Neither validator ships with the SDK. If one is not installed, say so and
+   leave its box unticked rather than skipping it quietly; both publish
+   binaries on their GitHub releases (github.com/free-audio/clap-validator,
+   github.com/Tracktion/pluginval).
 3. Report what ran and what it printed. A step that was skipped is said to be
    skipped.
 
@@ -172,7 +192,9 @@ Compiling is not finished. Before calling a plugin done:
 ## Connecting the MCP server
 
 `scripts/mcp-server.mjs` in the SDK checkout is plain JSON-RPC over stdio, with no
-dependencies and nothing to install. Use the checkout's full path.
+dependencies and nothing to install. Register it as `sonore-sdk`, the name
+this skill uses for its tools (Claude Code lists them as
+`mcp__sonore-sdk__sonore_search` and so on), with the checkout's full path.
 
 - Claude Code: `claude mcp add --scope user sonore-sdk -- node /path/to/sonore-sdk/scripts/mcp-server.mjs`
 - Codex (CLI, IDE extension and the ChatGPT desktop app):
