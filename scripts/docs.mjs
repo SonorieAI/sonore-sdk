@@ -96,11 +96,12 @@ const AREAS = [
   {
     id: "formats",
     title: "Formats and wrappers",
-    brief: "One source, every format: CLAP, VST3, AU, LV2, the standalone application and the browser ABI.",
+    brief: "One source, every format: CLAP, VST3, AU, LV2, AAX, the standalone application and the browser ABI.",
     guides: ["getting-started.md", "platforms-and-formats.md"],
     headers: [
       "formats.h", "clap_wrapper.h", "vst3_wrapper.h", "vst3_uid.h", "au_wrapper.h", "au_view.h",
-      "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "standalone.h", "wasm_abi.h",
+      "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "aax_wrapper.h", "standalone.h",
+      "wasm_abi.h",
     ],
   },
   {
