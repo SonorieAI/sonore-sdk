@@ -33,6 +33,10 @@
   <string>@SONORE_IOS_VERSION@</string>
   <key>CFBundleVersion</key>
   <string>@SONORE_IOS_VERSION@</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>@SONORE_IOS_PLATFORM@</string>
+  </array>
   <key>LSRequiresIPhoneOS</key>
   <true/>
   <key>MinimumOSVersion</key>

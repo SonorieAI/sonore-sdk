@@ -100,7 +100,7 @@ const AREAS = [
     guides: ["getting-started.md", "platforms-and-formats.md"],
     headers: [
       "formats.h", "clap_wrapper.h", "vst3_wrapper.h", "vst3_uid.h", "au_wrapper.h", "au_view.h",
-      "auv3_wrapper.h", "android_app.h", "standalone_android.h", "standalone_ios.h", "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "aax_wrapper.h", "standalone.h",
+      "auv3_wrapper.h", "android_app.h", "android_jni.h", "standalone_android.h", "standalone_ios.h", "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "aax_wrapper.h", "standalone.h",
       "wasm_abi.h",
     ],
   },
@@ -123,7 +123,7 @@ const AREAS = [
     title: "Web editor bridge",
     brief: "A page as the plugin's face: the window.sonore bridge and the three OS webviews.",
     guides: ["web-editor.md"],
-    headers: ["gui.h", "webview_win32.h", "webview_gtk.h", "webview_cocoa.h"],
+    headers: ["gui.h", "webview_win32.h", "webview_gtk.h", "webview_cocoa.h", "webview_android.h"],
   },
   {
     id: "files",

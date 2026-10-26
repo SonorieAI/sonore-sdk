@@ -592,6 +592,16 @@ function(_sonore_android_app TARGET)
   endif()
 endfunction()
 
+# The platform an iOS bundle says it is for, as Xcode writes it: what the
+# simulator and a device each check when the app is installed.
+function(_sonore_ios_platform out)
+  if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+    set(${out} "iPhoneSimulator" PARENT_SCOPE)
+  else()
+    set(${out} "iPhoneOS" PARENT_SCOPE)
+  endif()
+endfunction()
+
 # ── _sonore_ios_app(<target> SOURCES ... [NAME n] [BUNDLE_ID id] [VERSION v] [MIN_IOS 15.0]) ──
 # A plugin's standalone as an iPhone and iPad app: <target>.app, the same
 # binary as every standalone (standalone.h's main, so `--verify` runs it
@@ -625,6 +635,7 @@ function(_sonore_ios_app TARGET)
   _sonore_xml_escape(SONORE_IOS_BUNDLE_ID "${ARG_BUNDLE_ID}")
   set(SONORE_IOS_VERSION "${ARG_VERSION}")
   set(SONORE_IOS_MIN "${ARG_MIN_IOS}")
+  _sonore_ios_platform(SONORE_IOS_PLATFORM)
   _sonore_xml_escape(SONORE_IOS_MIC_USAGE
     "${ARG_NAME} processes what the microphone hears, while the sound goes to headphones.")
   configure_file("${SONORE_SDK_DIR}/cmake/iOS-App-Info.plist.in"
@@ -1174,7 +1185,9 @@ function(sonore_add_auv3 TARGET)
   set(SONORE_AUV3_FACTORY_CLASS "${_factory}")
   set(SONORE_AUV3_TAG "${_tag}")
   if(_ios)
-    set(SONORE_AUV3_PLATFORM_KEYS "  <key>MinimumOSVersion</key>\n  <string>${ARG_MIN_IOS}</string>")
+    _sonore_ios_platform(_platform)
+    set(SONORE_AUV3_PLATFORM_KEYS
+        "  <key>MinimumOSVersion</key>\n  <string>${ARG_MIN_IOS}</string>\n  <key>CFBundleSupportedPlatforms</key>\n  <array>\n    <string>${_platform}</string>\n  </array>\n  <key>UIDeviceFamily</key>\n  <array>\n    <integer>1</integer>\n    <integer>2</integer>\n  </array>")
   else()
     set(SONORE_AUV3_PLATFORM_KEYS "  <key>LSMinimumSystemVersion</key>\n  <string>${ARG_MIN_MACOS}</string>")
   endif()
