@@ -443,6 +443,28 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b
       - name: Test (in the simulator)
         run: ctest --test-dir sdk/build-ios --output-on-failure --timeout 900
+      - name: The crashed thread of any test that crashed
+        if: failure()
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os
+          reports = glob.glob(os.path.expanduser("~/Library/Logs/DiagnosticReports/*.ips"))
+          for path in sorted(reports, key=os.path.getmtime)[-8:]:
+              header, _, body = open(path, errors="replace").read().partition("\n")
+              try:
+                  report = json.loads(body)
+              except ValueError:
+                  continue
+              print("==", os.path.basename(path), report.get("exception"))
+              images = report.get("usedImages", [])
+              threads = report.get("threads", [])
+              faulting = report.get("faultingThread", 0)
+              for frame in (threads[faulting].get("frames", []) if faulting < len(threads) else [])[:30]:
+                  index = frame.get("imageIndex", -1)
+                  image = images[index].get("name", "?") if 0 <= index < len(images) else "?"
+                  print("   %-28s %s +%s" % (image, frame.get("symbol", hex(frame.get("imageOffset", 0))),
+                                           frame.get("symbolLocation", "")))
+          EOF
       - name: Launch the apps and photograph them
         if: always()
         run: |
@@ -452,6 +474,9 @@ jobs:
             path=$(find sdk/build-ios -maxdepth 3 -name "$app.app" -type d | head -1)
             [ -n "$path" ] && xcrun simctl install "$UDID" "$path"
           done
+          # The effect asks for the microphone first; allowed here, so the
+          # photograph is of its page rather than of the question.
+          xcrun simctl privacy "$UDID" grant microphone com.sonorie.saturator || true
           for id in com.sonorie.synth com.sonorie.saturator; do
             xcrun simctl launch "$UDID" "$id" || true
             sleep 8

@@ -28809,8 +28809,9 @@ static void testLogger() {
         if (ms < best) best = ms;
       }
       // 20 ms in a debug build, where formatting 256 lines alone came to
-      // 5.3: still far below 256 opens of the file, which is what this guards.
-      const double bound = kOptimisedBuild ? 5.0 : 20.0;
+      // 5.3, and on CI, where the iOS simulator on a shared runner once took
+      // 5.2: still far below 256 opens of the file, which is what this guards.
+      const double bound = kOptimisedBuild && !std::getenv("CI") ? 5.0 : 20.0;
       std::snprintf(msg, sizeof(msg), "draining %d audio lines to the file takes %.2f ms (best "
                     "of five, under %.0f)", moved, best, bound);
       check(moved == (int) Logger::kRingLines && best < bound, msg);

@@ -195,6 +195,9 @@ bool setBusFormat(id busArray, unsigned long index, uint32_t channels) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // Unbuffered: a crash then leaves every check before it in the log, where
+  // a buffer would take them all down with it (simctl's stdout is a pipe).
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool effect = true, midiOut = false;
   int params = -1, presets = -1;
   const char* type = nullptr;
