@@ -352,8 +352,8 @@ int main(int argc, char** argv) {
     id data = send<id>(state, "objectForKey:", str("SonoreState"));
     check(data != nil, "it carries the SNRS blob every format writes");
     id typeNumber = send<id>(state, "objectForKey:", str("type"));
-    checkf(typeNumber && (OSType) send<int>(typeNumber, "intValue") == desc.componentType,
-           "and the unit's type, as AUv2's ClassInfo does");
+    check(typeNumber && (OSType) send<int>(typeNumber, "intValue") == desc.componentType,
+          "and the unit's type, as AUv2's ClassInfo does");
     send<void>(state, "retain");
   }
   if (p0 && state) {
@@ -411,7 +411,7 @@ int main(int argc, char** argv) {
     id names = send<id>(h.unit, "MIDIOutputNames");
     check(names && send<unsigned long>(names, "count") == 1, "a MIDI-producing plugin names one MIDI output");
   }
-  checkf(send<BOOL>(h.unit, "providesUserInterface") != NO, "it says it has an editor");
+  check(send<BOOL>(h.unit, "providesUserInterface") != NO, "it says it has an editor");
 
   send<void>(h.unit, "deallocateRenderResources");
   send<void>(h.unit, "release");
