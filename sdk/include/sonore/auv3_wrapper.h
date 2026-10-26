@@ -1506,7 +1506,7 @@ inline void addOverride(Class cls, Class base, const char* name, IMP imp, const 
   class_addMethod(cls, s, imp, types ? types : fallback);
 }
 
-/** BOOL's encoding: `c` where it is a signed char, `B` where it is bool. */
+// BOOL's encoding: `c` where it is a signed char, `B` where it is bool.
 #if defined(__arm64__) || defined(__aarch64__)
 #define SONORE_AUV3_BOOL "B"
 #else
