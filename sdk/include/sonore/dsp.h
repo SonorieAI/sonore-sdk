@@ -2916,8 +2916,10 @@ inline void renderVoices(VoiceManagerType& voices, ProcessContext& ctx) {
   const size_t n = io.getNumSamples();
   const size_t channels = io.getNumChannels();
   if (channels == 0) return;
-  float* L = io.getChannelPointer(0);
-  float* R = channels > 1 ? io.getChannelPointer(1) : nullptr;
+  // Not L and R: a C library included ahead of this (stb_vorbis's
+  // implementation) defines both as macros.
+  float* outL = io.getChannelPointer(0);
+  float* outR = channels > 1 ? io.getChannelPointer(1) : nullptr;
   auto event = ctx.midi.begin();
   const auto eventEnd = ctx.midi.end();
   const NoteExpressionBuffer::Entry* expr = ctx.expression ? ctx.expression->begin() : nullptr;
@@ -2956,13 +2958,13 @@ inline void renderVoices(VoiceManagerType& voices, ProcessContext& ctx) {
     const size_t len = end - i;
     for (size_t k = 0; k < len; ++k) bufL[k] = bufR[k] = 0.0f;
     voices.renderBlock(bufL, bufR, (int) len);
-    if (R) {
+    if (outR) {
       for (size_t k = 0; k < len; ++k) {
-        L[i + k] = bufL[k];
-        R[i + k] = bufR[k];
+        outL[i + k] = bufL[k];
+        outR[i + k] = bufR[k];
       }
     } else {
-      for (size_t k = 0; k < len; ++k) L[i + k] = 0.5f * (bufL[k] + bufR[k]);
+      for (size_t k = 0; k < len; ++k) outL[i + k] = 0.5f * (bufL[k] + bufR[k]);
     }
     // A release that ran out in the stretch: over by its end.
     if (ctx.endedNotes && voices.hasEndedNotes())
