@@ -109,6 +109,7 @@ enum {
   kCFNumberSInt64Type = 4,
   kCFNumberFloat32Type = 5,
   kCFNumberFloat64Type = 6,
+  kCFNumberLongType = 10,
 };
 
 CFTypeID CFGetTypeID(CFTypeRef);

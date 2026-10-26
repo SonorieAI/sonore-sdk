@@ -59,7 +59,12 @@
 #endif
 
 #if defined(__APPLE__)
+#include "../apple_platform.h"
+#if defined(SONORE_IOS)
+#include "window_uikit.h"
+#else
 #include "window_cocoa.h"
+#endif
 #define SONORE_HAS_NATIVE_WINDOW_BACKEND 1
 #endif
 
@@ -74,6 +79,8 @@ namespace gfx {
  *  macOS, NativeWindowX11 on Linux with the X11 headers. Not declared where
  *  there is no backend. */
 using PlatformWindow = NativeWindow;
+#elif defined(__APPLE__) && defined(SONORE_IOS)
+using PlatformWindow = NativeWindowUIKit;
 #elif defined(__APPLE__)
 using PlatformWindow = NativeWindowCocoa;
 #elif defined(__ANDROID__)
@@ -355,6 +362,8 @@ public:
   static bool isAvailable() {
 #if defined(__linux__) && defined(SONORE_X11_HEADERS)
     return x11::xlib().ok;
+#elif defined(__APPLE__) && defined(SONORE_IOS)
+    return NativeWindowUIKit::isAvailable();
 #elif defined(__APPLE__)
     // Runtime, like X11 and unlike Windows: the peer needs CoreGraphics
     // symbols and an NSView class, and a process without a UI has neither.
@@ -375,6 +384,8 @@ public:
     return "";
 #elif defined(__linux__)
     return "this plugin was built without the X11 headers, so it has no native window";
+#elif defined(__APPLE__) && defined(SONORE_IOS)
+    return NativeWindowUIKit::isAvailable() ? "" : "UIKit is not loaded in this process";
 #elif defined(__APPLE__)
     return NativeWindowCocoa::isAvailable() ? ""
                                             : "CoreGraphics or AppKit is not loaded in this process";

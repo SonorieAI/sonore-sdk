@@ -1822,6 +1822,25 @@ inline cocoa::CGSizeStruct vcPreferredContentSize(id, SEL) {
   return cocoa::CGSizeStruct{(double) width, (double) height};
 }
 
+/** -viewDidLayoutSubviews (UIKit) / -viewDidLayout (AppKit): the host
+ *  resized the editor's view; a native editor lays itself out to it, as a web
+ *  page does by itself. */
+inline void vcViewDidLayout(id self, SEL selector) {
+  sendSuper<void>(self, objc_getClass("AUViewController"), sel_getName(selector));
+  id container = controllerContainer(self);
+  Unit* unit = unitOf(controllerUnit(self));
+  if (!unit || !container || unit->editorView != container || !unit->shared.guiIsNative) return;
+  using Bounds = cocoa::CGRectStruct (*)(id, SEL);
+#if defined(__x86_64__)
+  const cocoa::CGRectStruct b =
+      reinterpret_cast<Bounds>(objc_msgSend_stret)(container, sel("bounds")); // over 16 bytes on x86_64
+#else
+  const cocoa::CGRectStruct b = reinterpret_cast<Bounds>(objc_msgSend)(container, sel("bounds"));
+#endif
+  if (b.size.width >= 1.0 && b.size.height >= 1.0)
+    unit->shared.nativeEditor.setSize((int) b.size.width, (int) b.size.height);
+}
+
 inline void vcDealloc(id self, SEL) {
   id audioUnit = controllerUnit(self);
   if (Unit* unit = unitOf(audioUnit)) {
@@ -1861,6 +1880,11 @@ inline Class viewControllerClass() {
                     "@@:{AudioComponentDescription=IIIII}^@");
     addOverride(c, base, "loadView", (IMP) vcLoadView, "v@:");
     addOverride(c, base, "preferredContentSize", (IMP) vcPreferredContentSize, "{CGSize=dd}@:");
+#if defined(SONORE_IOS)
+    addOverride(c, base, "viewDidLayoutSubviews", (IMP) vcViewDidLayout, "v@:");
+#else
+    addOverride(c, base, "viewDidLayout", (IMP) vcViewDidLayout, "v@:");
+#endif
     addOverride(c, base, "dealloc", (IMP) vcDealloc, "v@:");
     if (Protocol* p = factoryProtocol()) class_addProtocol(c, p);
     objc_registerClassPair(c);

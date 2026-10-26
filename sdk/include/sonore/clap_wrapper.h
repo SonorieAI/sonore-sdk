@@ -4432,8 +4432,10 @@ inline void guiTick(Instance* inst) {
   if (!inst->guiIsNative) {
     const int want = licenseGate().licensed() ? 1 : 0;
     if (inst->licenseUi != want) {
+#if defined(SONORE_HAS_WEBVIEW_BACKEND)
       inst->webview.eval(want ? license::overlayResultScript(true, "")
                               : license::overlayScript(licenseGate().machine()));
+#endif
       inst->licenseUi = want;
     }
   }

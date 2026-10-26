@@ -21,6 +21,9 @@ enum CFNotificationSuspensionBehavior : CFIndex {
 };
 
 CFNotificationCenterRef CFNotificationCenterGetDistributedCenter(void);
+// The process's own center, which IS NSNotificationCenter's default one: how
+// a C++ file hears AVAudioSession's notifications (audio_ios.h).
+CFNotificationCenterRef CFNotificationCenterGetLocalCenter(void);
 void CFNotificationCenterAddObserver(CFNotificationCenterRef center, const void* observer,
                                      CFNotificationCallback callBack, CFStringRef name,
                                      const void* object,

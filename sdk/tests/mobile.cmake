@@ -20,7 +20,23 @@ enable_testing()
 set(_sonore_area_tests dsp_maths midi_osc core_crypto audio_io core_data gui_widgets audio_sources
     gui_infra system modules javascript app_infra)
 
-if(ANDROID)
+set(SONORE_IOS_BUILD FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(SONORE_IOS_BUILD TRUE)
+endif()
+
+if(SONORE_IOS_BUILD)
+  # Every program runs in a booted simulator, through simctl
+  # (tests/ios_run.cmake): SONORE_IOS_SIMULATOR names the device (a UDID, or
+  # "booted" for the one that is).
+  set(SONORE_IOS_SIMULATOR "booted" CACHE STRING "The simulator ctest runs the iOS tests in")
+  set(_sonore_data "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  set(CMAKE_CROSSCOMPILING_EMULATOR "${CMAKE_COMMAND}" "-DSIMULATOR=${SONORE_IOS_SIMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/ios_run.cmake")
+  # CoreAudioKit beside what CMakeLists.txt links for iOS: the AUv3 wrapper's
+  # view controller, which the self-tests and the apps compile in.
+  target_link_libraries(sonore_sdk INTERFACE "-framework CoreAudioKit")
+elseif(ANDROID)
   if(ANDROID_PLATFORM_LEVEL AND ANDROID_PLATFORM_LEVEL LESS 28)
     message(FATAL_ERROR "The Sonore SDK needs Android 9 (API 28) or later: configure with "
                         "-DANDROID_PLATFORM=android-28 (or higher)")
@@ -34,8 +50,6 @@ if(ANDROID)
   set(CMAKE_CROSSCOMPILING_EMULATOR "${CMAKE_COMMAND}" "-DADB=${SONORE_ADB}"
       "-DDATA=${CMAKE_CURRENT_SOURCE_DIR}/tests/data" "-DDEVICE_DIR=${SONORE_DEVICE_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/android_run.cmake")
-else()
-  set(_sonore_data "${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 endif()
 
 add_executable(sonore_sdk_tests tests/sdk_tests.cpp)
@@ -84,3 +98,22 @@ sonore_add_standalone(SonoreSynthApp SOURCES examples/synth/plugin.cpp
   NAME "Sonore Synth" BUNDLE_ID com.sonorie.synth VERSION 1.0.0)
 add_test(NAME standalone_effect COMMAND SonoreSaturatorApp --verify)
 add_test(NAME standalone_instrument COMMAND SonoreSynthApp --verify)
+
+# iOS: each example's AUv3 inside its app, and the AUv3 wrapper driven in
+# process in the simulator by the same self-test CI's Mac runs.
+if(SONORE_IOS_BUILD)
+  sonore_add_auv3(SonoreSaturatorAUv3 SOURCES examples/saturator/plugin.cpp CONTAINER SonoreSaturatorApp
+    SUBTYPE "Sat3" MANUFACTURER "Sonr" VENDOR "Sonorie" NAME "Sonore Saturator"
+    BUNDLE_ID com.sonorie.saturator)
+  sonore_add_auv3(SonoreSynthAUv3 SOURCES examples/synth/plugin.cpp CONTAINER SonoreSynthApp
+    SUBTYPE "Syn3" MANUFACTURER "Sonr" VENDOR "Sonorie" TYPE "aumu" NAME "Sonore Synth"
+    BUNDLE_ID com.sonorie.synth)
+  foreach(_ex saturator synth arp)
+    add_executable(auv3_selftest_${_ex} tests/auv3_selftest.cpp examples/${_ex}/plugin.cpp)
+    target_link_libraries(auv3_selftest_${_ex} PRIVATE sonore_sdk)
+    target_compile_definitions(auv3_selftest_${_ex} PRIVATE SONORE_BUILD_AUV3=1)
+  endforeach()
+  add_test(NAME auv3_effect COMMAND auv3_selftest_saturator --effect --params 4 --presets 3 --subtype Sat9)
+  add_test(NAME auv3_instrument COMMAND auv3_selftest_synth --instrument --params 22 --presets 0 --subtype Syn9)
+  add_test(NAME auv3_midi_out COMMAND auv3_selftest_arp --instrument --midi-out --params 3 --subtype Arp9)
+endif()

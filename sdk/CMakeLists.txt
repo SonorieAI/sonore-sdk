@@ -99,6 +99,12 @@ if(SONORE_GUI AND WIN32)
   # here, and SonoreSDKConfig.cmake runs the same fetch in the consumer's
   # build and links it there, so an installed SDK gets WebView2 the way we do.
   target_link_libraries(sonore_sdk INTERFACE $<BUILD_INTERFACE:sonore_webview2> uiautomationcore oleaut32)
+elseif(SONORE_GUI AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  # The same WKWebView on iOS, and UIKit where the Mac has AppKit: the native
+  # editor's view (gfx/window_uikit.h), its display link (QuartzCore), its
+  # images (CoreGraphics).
+  target_link_libraries(sonore_sdk INTERFACE "-framework WebKit" "-framework UIKit" "-framework Foundation"
+    "-framework CoreGraphics" "-framework QuartzCore" "-framework AVFoundation" objc)
 elseif(SONORE_GUI AND APPLE)
   # WKWebView is driven through the Objective-C runtime, so there is no .mm file
   # and no mixed-language build: just the frameworks.
@@ -367,6 +373,23 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
       # Debug build of the plugin, the standalone and the showcase passes
       # 65,279 sections (C1128 on CI's Windows-Debug job).
       target_compile_options(sonore_mac_syntax_${_mac} PRIVATE /U_WIN32 /W4 /bigobj
+        "/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/msvc/posix_compat.h")
+    endforeach()
+    # The same, read as iOS (SONORE_IOS_SYNTAX_CHECK): the AUv3 with its
+    # UIKit editor peer, and the standalone as an iPhone app -- RemoteIO,
+    # the audio session, the app delegate. Against the same shim, so with the
+    # same limits: the iOS SDK itself is read by CI's iOS job.
+    foreach(_ios auv3 standalone)
+      add_library(sonore_ios_syntax_${_ios} OBJECT tests/mac_syntax_${_ios}.cpp)
+      target_compile_features(sonore_ios_syntax_${_ios} PRIVATE cxx_std_17)
+      target_include_directories(sonore_ios_syntax_${_ios} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${SONORE_SDK_DIR}/third_party/clap/include"
+        "${SONORE_SDK_DIR}/third_party/vst3" "${SONORE_SDK_DIR}/third_party/lv2/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim" "${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/win"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/msvc")
+      target_compile_definitions(sonore_ios_syntax_${_ios} PRIVATE __APPLE__=1
+        SONORE_APPLE_SYNTAX_CHECK=1 SONORE_IOS_SYNTAX_CHECK=1 _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+      target_compile_options(sonore_ios_syntax_${_ios} PRIVATE /U_WIN32 /W4 /bigobj
         "/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/au_shim/msvc/posix_compat.h")
     endforeach()
     # The system layer's POSIX halves (sockets, spawn, mmap), read as macOS.

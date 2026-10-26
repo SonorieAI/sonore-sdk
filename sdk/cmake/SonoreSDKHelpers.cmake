@@ -571,6 +571,57 @@ function(_sonore_android_app TARGET)
   endif()
 endfunction()
 
+# ── _sonore_ios_app(<target> SOURCES ... [NAME n] [BUNDLE_ID id] [VERSION v] [MIN_IOS 15.0]) ──
+# A plugin's standalone as an iPhone and iPad app: <target>.app, the same
+# binary as every standalone (standalone.h's main, so `--verify` runs it
+# offline in a simulator) whose interactive mode is UIKit's
+# (standalone_ios.h). Signed ad hoc, which a simulator runs; a device needs
+# your team's signature (CODE_SIGN_IDENTITY and a provisioning profile in
+# Xcode, or codesign before installing). An AUv3 names this app as its
+# CONTAINER and is embedded in its PlugIns.
+function(_sonore_ios_app TARGET)
+  cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION;MIN_IOS" "SOURCES" ${ARGN})
+  if(NOT ARG_NAME)
+    set(ARG_NAME "${TARGET}")
+  endif()
+  if(NOT ARG_VERSION)
+    set(ARG_VERSION "1.0.0")
+  endif()
+  if(NOT ARG_BUNDLE_ID)
+    string(TOLOWER "com.sonorie.${TARGET}" ARG_BUNDLE_ID)
+  endif()
+  if(NOT ARG_MIN_IOS)
+    set(ARG_MIN_IOS "15.0")
+  endif()
+  add_executable(${TARGET} MACOSX_BUNDLE ${ARG_SOURCES})
+  target_link_libraries(${TARGET} PRIVATE sonore_sdk
+    "-framework UIKit" "-framework Foundation" "-framework CoreGraphics" "-framework QuartzCore"
+    "-framework AVFoundation" "-framework AudioToolbox" "-framework CoreAudio" "-framework CoreMIDI"
+    "-framework CoreFoundation" "-framework WebKit" "-framework CoreAudioKit" objc)
+  target_compile_definitions(${TARGET} PRIVATE SONORE_BUILD_STANDALONE=1)
+  set(SONORE_IOS_EXECUTABLE "${TARGET}")
+  _sonore_xml_escape(SONORE_IOS_DISPLAY_NAME "${ARG_NAME}")
+  _sonore_xml_escape(SONORE_IOS_BUNDLE_ID "${ARG_BUNDLE_ID}")
+  set(SONORE_IOS_VERSION "${ARG_VERSION}")
+  set(SONORE_IOS_MIN "${ARG_MIN_IOS}")
+  _sonore_xml_escape(SONORE_IOS_MIC_USAGE
+    "${ARG_NAME} processes what the microphone hears, while the sound goes to headphones.")
+  configure_file("${SONORE_SDK_DIR}/cmake/iOS-App-Info.plist.in"
+                 "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-Info.plist" @ONLY)
+  set_target_properties(${TARGET} PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER "${ARG_BUNDLE_ID}"
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-Info.plist"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${ARG_BUNDLE_ID}")
+  # Ad hoc, as every Apple bundle here: what a simulator accepts. Re-signed
+  # by sonore_add_auv3 after it embeds an extension.
+  find_program(SONORE_CODESIGN codesign)
+  if(SONORE_CODESIGN)
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND "${SONORE_CODESIGN}" --force --sign - --timestamp=none "$<TARGET_BUNDLE_DIR:${TARGET}>"
+      COMMENT "Ad-hoc signing ${TARGET}.app")
+  endif()
+endfunction()
+
 # ── sonore_add_standalone(<target> SOURCES a.cpp [...] [NAME n] [BUNDLE_ID id] [VERSION v]) ──
 # A runnable app from the same plugin source: window + webview faceplate + OS
 # audio. Also the CI-friendly offline modes (--verify / --render out.wav),
@@ -578,12 +629,18 @@ endfunction()
 #
 # On Android, <target> is that program for an adb shell (it renders, verifies
 # and plays), and the app is <target>.apk beside it: see _sonore_android_app.
-# NAME, BUNDLE_ID and VERSION are the app's label, package and version there,
-# and are not used on the desktop.
+# On iOS, <target>.app is both: see _sonore_ios_app. NAME, BUNDLE_ID and
+# VERSION are the app's label, package and version there, and are not used
+# on the desktop.
 function(sonore_add_standalone TARGET)
   cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION" "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_standalone(${TARGET}): SOURCES is required")
+  endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    _sonore_ios_app(${TARGET} ${ARGN})
+    return()
   endif()
 
   add_executable(${TARGET} ${ARG_SOURCES})

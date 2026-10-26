@@ -286,6 +286,13 @@ const MAP = [
    "audio because somebody opened a plugin", "class LinuxOutput"],
   ["devices", "AudioIODevice (CoreAudio)", "audio_coreaudio.h", "CoreAudioOutput"],
   ["devices", "AudioIODevice (ALSA)", "audio_alsa.h", "AlsaOutput"],
+  ["devices", "AudioIODevice (iOS)",
+   "audio_ios.h: IosAudioOutput and IosAudioInput over ONE RemoteIO unit " +
+   "(RemoteIo), bus 0 out and bus 1 in, under the app's AVAudioSession: 48 kHz " +
+   "and a 5 ms buffer asked for, the record permission, interruptions restarted " +
+   "when they end, a media-services reset reported as a lost device. Run in " +
+   "CI's iOS simulator; never on an iPhone by anyone in this loop",
+   "class IosAudioOutput"],
   ["devices", "AudioIODevice (Android)",
    "audio_aaudio.h: AAudioOutput and AAudioInput, AAudio's low-latency streams " +
    "(exclusive where the device has an MMAP path), float stereo at the device's " +
@@ -841,6 +848,14 @@ const MAP = [
    "SONORE_APPLE_SYNTAX_CHECK"],
   ["client", "LV2 wrapper", "lv2_wrapper.h", "LV2_Descriptor"],
   ["client", "Standalone wrapper", "standalone.h", "inline int runInteractive"],
+  ["client", "iOS app",
+   "standalone_ios.h: a plugin's standalone as an iPhone and iPad app " +
+   "sonore_add_standalone bundles (an AUv3 names it as its CONTAINER) -- " +
+   "UIApplicationMain with a delegate registered at runtime, the editor in the " +
+   "safe area (the page in a WKWebView, else the native editor), RemoteIO while " +
+   "in front, an effect's microphone once allowed and only on a private route. " +
+   "The app's own binary runs --verify in the simulator on CI",
+   "inline int runApp"],
   ["client", "Android app",
    "android_app.h and standalone_android.h: a plugin's standalone as an APK " +
    "sonore_add_standalone packages with the SDK's tools and no Gradle -- " +
@@ -1387,6 +1402,14 @@ const MAP = [
    "nothing about windows -- and cycles where nobody is listening",
    "std::function<void(ComboBox&)> onOpenMenu"],
   ["gui", "ComponentPeer (Windows)", "gfx/window_win32.h: window, blit, input", "class NativeWindow"],
+  ["gui", "ComponentPeer (iOS)",
+   "gfx/window_uikit.h: NativeWindowUIKit, a UIView registered at runtime (no " +
+   ".mm) whose layer is given the rendered frame as a CGImage at the screen's " +
+   "scale; every finger, the Pencil and an iPad's pointer through the same " +
+   "touch path as Android's; a CADisplayLink clock; menus and tooltips over " +
+   "the window inside a shield that dismisses them; UIPasteboard. No software " +
+   "keyboard and no VoiceOver bridge yet",
+   "class NativeWindowUIKit"],
   ["gui", "ComponentPeer (Android)",
    "gfx/window_android.h: NativeWindowAndroid, a layer of AndroidSurface -- the " +
    "activity's one ANativeWindow, which composites the editor and any menu or " +

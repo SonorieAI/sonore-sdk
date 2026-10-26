@@ -76,8 +76,13 @@
 #endif
 #include "wav.h"
 
+#if defined(__APPLE__)
+#include "apple_platform.h"
+#endif
 #if defined(_WIN32)
 #include "audio_wasapi.h"
+#elif defined(SONORE_IOS)
+#include "audio_ios.h"
 #elif defined(__APPLE__)
 #include "audio_coreaudio.h"
 #elif defined(__ANDROID__)
@@ -1095,6 +1100,9 @@ inline int verify(App& app) {
 /** The system output the standalone plays through: WASAPI on Windows, Core
  *  Audio on macOS, the Linux backend elsewhere. ASIO is chosen apart. */
 using PlatformAudio = WasapiOutput;
+#elif defined(SONORE_IOS)
+// RemoteIO under the app's AVAudioSession (audio_ios.h).
+using PlatformAudio = IosAudioOutput;
 #elif defined(__APPLE__)
 using PlatformAudio = CoreAudioOutput;
 #elif defined(__ANDROID__)
@@ -1359,7 +1367,7 @@ inline bool selectMidi(App& app, int index) {
  * nothing because there is nothing to say. A Mac that cannot provide one says
  * why, once, to a DSP that asked. Compiled for macOS, never run there.
  */
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(SONORE_IOS)
 inline void tellDeviceWorkgroup(App& app, CoreAudioOutput& output) {
   std::string why;
   const AudioWorkgroup workgroup = output.ioWorkgroup(&why);
@@ -2676,6 +2684,20 @@ done:
 } // namespace sonore
 
 // ── Linux ────────────────────────────────────────────────────────────────────
+#elif defined(SONORE_IOS)
+
+// iOS: runInteractive is UIApplicationMain, with the app's delegate and
+// editor (standalone_ios.h).
+#include "standalone_ios.h"
+
+namespace sonore {
+namespace standalone {
+
+inline int runInteractive(App& app, const Options& opt) { return iosapp::runApp(app, opt); }
+
+} // namespace standalone
+} // namespace sonore
+
 #elif defined(__ANDROID__)
 
 namespace sonore {

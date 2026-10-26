@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 277 headers, 759 public types.
+not have. 280 headers, 765 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -104,6 +104,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [audio_coreaudio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio.h): macOS audio output (the default-output AudioUnit)
 - [audio_coreaudio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_coreaudio_input.h): macOS audio capture (AUHAL, input scope)
 - [audio_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_input.h): live audio input for the standalone build
+- [audio_ios.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_ios.h): audio in and out on iOS and iPadOS, through RemoteIO
 - [audio_jack.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_jack.h): Linux audio output through JACK, dlopened
 - [audio_linux.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_linux.h): the Linux output the standalone actually uses
 - [audio_ring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_ring.h): the one lock-free ring both directions of audio use
@@ -219,6 +220,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [spring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/spring.h): a spring reverb
 - [standalone.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone.h): the standalone application
 - [standalone_android.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone_android.h): a plugin's standalone, as an Android app
+- [standalone_ios.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone_ios.h): a plugin's standalone, as an iPhone and iPad app
 - [state_bag.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/state_bag.h): state a plugin has beyond its parameters
 - [statistics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/statistics.h): running mean, variance, minimum, maximum and RMS of a stream
 - [stft.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/stft.h): a short-time Fourier transform you can process in the middle of
@@ -363,6 +365,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [widgets2.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/widgets2.h): A range slider, and a button with a picture on it
 - [window_android.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_android.h): The Android window, so the native UI runs on a phone and a tablet
 - [window_cocoa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_cocoa.h): The Cocoa window, so the native UI runs on the third platform
+- [window_uikit.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_uikit.h): The UIKit window, so the native UI runs on an iPhone and an iPad -- in a
 - [window_win32.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_win32.h): The Win32 window a native editor lives in: the platform peer for a
 - [window_x11.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_x11.h): The X11 window, so the native UI is not a Windows-only thing
 

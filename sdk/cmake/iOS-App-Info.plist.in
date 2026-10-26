@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  A plugin's standalone as an iPhone and iPad app (sonore_add_standalone), and
+  the app an AUv3 extension ships inside (sonore_add_auv3 CONTAINER).
+
+  UILaunchScreen, even empty, is what makes iOS run the app at the screen's
+  own size: an app without a launch screen is shown in a letterboxed
+  compatibility mode. NSMicrophoneUsageDescription is the sentence iOS shows
+  when an effect asks for the microphone; without it the app is ended the
+  moment it asks. The main thread is the delegate standalone_ios.h registers
+  at run time, so there is no storyboard and no nib.
+  (No double hyphen anywhere in this comment: XML forbids one there.)
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>@SONORE_IOS_DISPLAY_NAME@</string>
+  <key>CFBundleExecutable</key>
+  <string>@SONORE_IOS_EXECUTABLE@</string>
+  <key>CFBundleIdentifier</key>
+  <string>@SONORE_IOS_BUNDLE_ID@</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>@SONORE_IOS_DISPLAY_NAME@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SONORE_IOS_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SONORE_IOS_VERSION@</string>
+  <key>LSRequiresIPhoneOS</key>
+  <true/>
+  <key>MinimumOSVersion</key>
+  <string>@SONORE_IOS_MIN@</string>
+  <key>UIDeviceFamily</key>
+  <array>
+    <integer>1</integer>
+    <integer>2</integer>
+  </array>
+  <key>UILaunchScreen</key>
+  <dict/>
+  <key>UIRequiresFullScreen</key>
+  <true/>
+  <key>UIStatusBarHidden</key>
+  <true/>
+  <key>UISupportedInterfaceOrientations</key>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <key>UISupportedInterfaceOrientations~ipad</key>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationPortraitUpsideDown</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>@SONORE_IOS_MIC_USAGE@</string>
+</dict>
+</plist>

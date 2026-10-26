@@ -40,6 +40,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__APPLE__)
+#include "apple_platform.h" // iOS has no device volume to read: its audio session owns it
+#endif
 #if defined(_WIN32)
 // Before the first Windows header: mmdeviceapi.h includes windows.h itself.
 #ifndef NOMINMAX
@@ -52,7 +55,7 @@
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include "win_com.h"
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
 #include <CoreAudio/CoreAudio.h>
 #elif defined(__linux__)
 #include <dlfcn.h>
@@ -86,7 +89,7 @@ bool withEndpointVolume(Fn&& fn) {
   return fn(volume.get());
 }
 
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
 
 // The selectors as numbers, because their NAMES moved: the volume one is
 // kAudioHardwareServiceDeviceProperty_VirtualMainVolume from the macOS 12 SDK
@@ -240,7 +243,7 @@ public:
         }))
       return -1.0f;
     return level;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
     Float32 level = 0.0f;
     if (!sysvoldetail::readProperty(sysvoldetail::kVirtualMainVolume, &level,
                                     (UInt32) sizeof(level)))
@@ -270,7 +273,7 @@ public:
     return sysvoldetail::withEndpointVolume([&](IAudioEndpointVolume* v) {
       return SUCCEEDED(v->SetMasterVolumeLevelScalar(gain, nullptr));
     });
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
     const Float32 level = gain;
     return sysvoldetail::writeProperty(sysvoldetail::kVirtualMainVolume, &level,
                                        (UInt32) sizeof(level));
@@ -295,7 +298,7 @@ public:
             [&](IAudioEndpointVolume* v) { return SUCCEEDED(v->GetMute(&muted)); }))
       return false;
     return muted != FALSE;
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
     UInt32 muted = 0;
     if (!sysvoldetail::readProperty(sysvoldetail::kDeviceMute, &muted, (UInt32) sizeof(muted)))
       return false;
@@ -321,7 +324,7 @@ public:
     return sysvoldetail::withEndpointVolume([&](IAudioEndpointVolume* v) {
       return SUCCEEDED(v->SetMute(shouldMute ? TRUE : FALSE, nullptr));
     });
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && !defined(SONORE_IOS)
     const UInt32 muted = shouldMute ? 1u : 0u;
     return sysvoldetail::writeProperty(sysvoldetail::kDeviceMute, &muted, (UInt32) sizeof(muted));
 #elif defined(__linux__)

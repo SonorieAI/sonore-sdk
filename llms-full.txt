@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 277 headers, 759 public types.
+not have. 280 headers, 765 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -242,6 +242,14 @@ live audio input for the standalone build
 `sdk/include/sonore/audio_input.h`
 
 NullAudioInput
+
+### audio_ios.h
+
+audio in and out on iOS and iPadOS, through RemoteIO
+
+`sdk/include/sonore/audio_ios.h`
+
+RemoteIo, IosAudioOutput, IosAudioInput
 
 ### audio_jack.h
 
@@ -1387,6 +1395,14 @@ The Cocoa window, so the native UI runs on the third platform
 
 CoreGraphicsApi, NativeWindowCocoa
 
+### window_uikit.h
+
+The UIKit window, so the native UI runs on an iPhone and an iPad -- in a
+
+`sdk/include/sonore/gfx/window_uikit.h`
+
+CoreGraphicsApi, NativeWindowUIKit
+
 ### window_win32.h
 
 The Win32 window a native editor lives in: the platform peer for a
@@ -1978,6 +1994,14 @@ a plugin's standalone, as an Android app
 `sdk/include/sonore/standalone_android.h`
 
 AndroidApp
+
+### standalone_ios.h
+
+a plugin's standalone, as an iPhone and iPad app
+
+`sdk/include/sonore/standalone_ios.h`
+
+Runtime
 
 ### state_bag.h
 

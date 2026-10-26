@@ -100,6 +100,7 @@ const outputBackends = [
   ['LinuxOutput', 'audio_linux.h', 'Linux: chooses at runtime'],
   ['CoreAudioOutput', 'audio_coreaudio.h', 'macOS: NOBODY HERE CAN COMPILE THIS'],
   ['AAudioOutput', 'audio_aaudio.h', 'Android: AAudio'],
+  ['IosAudioOutput', 'audio_ios.h', 'iOS: RemoteIO'],
 ];
 
 const inputBackends = [
@@ -107,6 +108,7 @@ const inputBackends = [
   ['AlsaInput', 'audio_alsa_input.h', 'Linux'],
   ['CoreAudioInput', 'audio_coreaudio_input.h', 'macOS: NOBODY HERE CAN COMPILE THIS'],
   ['AAudioInput', 'audio_aaudio.h', 'Android: AAudio'],
+  ['IosAudioInput', 'audio_ios.h', 'iOS: RemoteIO'],
   ['NullAudioInput', 'audio_input.h', 'the honest fallback for everything else'],
 ];
 

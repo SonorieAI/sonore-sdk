@@ -409,3 +409,63 @@ jobs:
           name: sonore-android-apks
           path: sdk/build-android/*.apk
           if-no-files-found: warn
+
+  # iOS: the SDK built for the iOS simulator (arm64, iOS 15 and later), and run
+  # in a booted one -- every suite, the AUv3 wrapper's in-process self-test and
+  # both standalones' --verify, through simctl (tests/ios_run.cmake is ctest's
+  # emulator). Then the example apps -- each with its AUv3 extension inside --
+  # are installed, launched and photographed, so the run shows what a person
+  # would see.
+  ios:
+    name: iOS (simulator)
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          command -v ninja || brew install ninja
+          cmake -G Ninja -S sdk -B sdk/build-ios -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+      - name: Build
+        run: cmake --build sdk/build-ios
+      - name: Boot a simulator
+        run: |
+          set -x
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, ds in sorted(devices.items(), reverse=True) if "iOS" in runtime
+                     for d in ds if d["name"].startswith("iPhone")))')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Test (in the simulator)
+        run: ctest --test-dir sdk/build-ios --output-on-failure --timeout 900
+      - name: Launch the apps and photograph them
+        if: always()
+        run: |
+          set -x
+          mkdir -p ios-shots
+          for app in SonoreSynthApp SonoreSaturatorApp; do
+            path=$(find sdk/build-ios -maxdepth 3 -name "$app.app" -type d | head -1)
+            [ -n "$path" ] && xcrun simctl install "$UDID" "$path"
+          done
+          for id in com.sonorie.synth com.sonorie.saturator; do
+            xcrun simctl launch "$UDID" "$id" || true
+            sleep 8
+            xcrun simctl io "$UDID" screenshot "ios-shots/$id.png" || true
+            xcrun simctl terminate "$UDID" "$id" || true
+          done
+          # The extensions the apps carry, as the simulator registered them.
+          xcrun simctl spawn "$UDID" pluginkit -m -v -p com.apple.AudioUnit-UI || true
+      - name: Keep the apps and the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonore-ios
+          path: |
+            ios-shots/*.png
+            sdk/build-ios/*.app
+          if-no-files-found: warn
