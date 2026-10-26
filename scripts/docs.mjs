@@ -100,7 +100,7 @@ const AREAS = [
     guides: ["getting-started.md", "platforms-and-formats.md"],
     headers: [
       "formats.h", "clap_wrapper.h", "vst3_wrapper.h", "vst3_uid.h", "au_wrapper.h", "au_view.h",
-      "auv3_wrapper.h", "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "aax_wrapper.h", "standalone.h",
+      "auv3_wrapper.h", "android_app.h", "standalone_android.h", "lv2_wrapper.h", "lv2_ports.h", "lv2_atom.h", "lv2_ui.h", "aax_wrapper.h", "standalone.h",
       "wasm_abi.h",
     ],
   },
@@ -154,7 +154,7 @@ const AREAS = [
     guides: ["platforms-and-formats.md"],
     headers: [
       "audio_wasapi.h", "audio_wasapi_input.h", "audio_alsa.h", "audio_alsa_input.h",
-      "audio_coreaudio.h", "audio_coreaudio_input.h", "audio_jack.h", "audio_asio.h", "asio_format.h",
+      "audio_coreaudio.h", "audio_coreaudio_input.h", "audio_aaudio.h", "audio_jack.h", "audio_asio.h", "asio_format.h",
       "audio_input.h", "audio_linux.h", "audio_ring.h", "audio_workgroup.h", "audio_cd.h",
       "system_volume.h", "net.h", "process.h", "ipc.h", "thread_pool.h", "system_stats.h",
       "apple_block.h", "apple_platform.h", "win_com.h",

@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 273 headers, 752 public types.
+not have. 277 headers, 759 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -87,6 +87,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 
 - [aax_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/aax_wrapper.h): the AAX format wrapper (AAX Native), for Pro Tools
 - [analytics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/analytics.h): Analytics: events a plugin decides to record, and the destinations it
+- [android_app.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/android_app.h): an Android app's activity, in C++
 - [apple_block.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/apple_block.h): an Apple block, built by hand, for the APIs that take one
 - [apple_platform.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/apple_platform.h): which Apple platform this is -- the Mac, or one of the UIKit ones
 - [application.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/application.h): An application built on the SDK: the object that owns the process, and the
@@ -95,6 +96,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [au_view.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/au_view.h): the Audio Unit editor
 - [au_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/au_wrapper.h): the Audio Unit (AUv2) format wrapper, for macOS
 - [audio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio.h): core audio types. Our own, dependency-free equivalents of the
+- [audio_aaudio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_aaudio.h): audio in and out on Android, through AAudio
 - [audio_alsa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa.h): Linux audio output (ALSA, dlopened)
 - [audio_alsa_input.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_alsa_input.h): Linux audio capture (ALSA, dlopened)
 - [audio_asio.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audio_asio.h): ASIO output, without Steinberg's SDK
@@ -216,6 +218,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [special.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/special.h): the handful of functions the standard library does not carry
 - [spring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/spring.h): a spring reverb
 - [standalone.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone.h): the standalone application
+- [standalone_android.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone_android.h): a plugin's standalone, as an Android app
 - [state_bag.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/state_bag.h): state a plugin has beyond its parameters
 - [statistics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/statistics.h): running mean, variance, minimum, maximum and RMS of a stream
 - [stft.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/stft.h): a short-time Fourier transform you can process in the middle of
@@ -358,6 +361,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [viewport.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/viewport.h): A window onto something bigger than itself, and the bar that moves it
 - [widgets.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/widgets.h): Slider, Button, Label, ComboBox
 - [widgets2.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/widgets2.h): A range slider, and a button with a picture on it
+- [window_android.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_android.h): The Android window, so the native UI runs on a phone and a tablet
 - [window_cocoa.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_cocoa.h): The Cocoa window, so the native UI runs on the third platform
 - [window_win32.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_win32.h): The Win32 window a native editor lives in: the platform peer for a
 - [window_x11.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/window_x11.h): The X11 window, so the native UI is not a Windows-only thing

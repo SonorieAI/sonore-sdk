@@ -72,7 +72,7 @@
 #include "webview_win32.h"
 #elif defined(__APPLE__)
 #include "webview_cocoa.h"
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 #include "webview_gtk.h"
 #endif
 
@@ -103,10 +103,13 @@ using PlatformWebView = win32::WebViewHost;
 #elif defined(__APPLE__)
 using PlatformWebView = cocoa::WebViewHost;
 #define SONORE_HAS_WEBVIEW_BACKEND 1
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 using PlatformWebView = gtk::WebViewHost;
 #define SONORE_HAS_WEBVIEW_BACKEND 1
 #endif
+// Android: no webview backend yet -- WebKitGTK is not there, and Android's own
+// WebView is a Java object -- so an Android build opens the native editor
+// (gfx/window_android.h), whatever the descriptor prefers.
 
 // ── Fixed capacities ─────────────────────────────────────────────────────────
 // Bounded so every per-block pointer table stays on the stack: 8 channels
@@ -4583,7 +4586,9 @@ inline void guiOnMessage(Instance* inst, const BridgeMessage& msg) {
       // On this thread: verifying a signature and writing one small file is
       // main-thread work, and the audio thread only ever reads the resulting
       // atomic flag.
+#if defined(SONORE_HAS_WEBVIEW_BACKEND)
       inst->webview.eval(license::handleActivate(licenseGate(), msg.text));
+#endif
       inst->licenseUi = licenseGate().licensed() ? 1 : 0;
 #endif
       return;
@@ -4591,7 +4596,9 @@ inline void guiOnMessage(Instance* inst, const BridgeMessage& msg) {
     case BridgeMessage::Kind::CaptureKeys:
       // Straight onto the webview. Nothing crosses to audio: this decides who
       // receives a keystroke, which is a question only the UI thread has.
+#if defined(SONORE_HAS_WEBVIEW_BACKEND)
       inst->webview.captureKeys = msg.value >= 0.5;
+#endif
       return;
     case BridgeMessage::Kind::ChooseFile:
       // On this thread and blocking, which is what a modal dialog is. The

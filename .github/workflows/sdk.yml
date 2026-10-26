@@ -365,3 +365,47 @@ jobs:
       - uses: actions/checkout@v4
       - name: ASan+UBSan on every wrapper, the suites and the fuzzer; TSan on the handover
         run: npm run verify:sanitize
+
+  # Android: the SDK built with the runner's NDK for x86_64 at Android 9 (API
+  # 28, the floor), then run where it runs -- an emulator, under KVM. Every
+  # test program is pushed and run on it through adb (tests/android_run.cmake
+  # is ctest's emulator), the suites and the standalones' --verify alike, and
+  # the example apps are packaged as APKs and kept.
+  android:
+    name: Android (emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Configure
+        run: |
+          set -x
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          ls "$NDK/build/cmake/android.toolchain.cmake"
+          cmake -G Ninja -S sdk -B sdk/build-android -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-28
+      - name: Build
+        run: cmake --build sdk/build-android
+      - name: Test (in an emulator)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          disable-animations: true
+          script: ctest --test-dir sdk/build-android --output-on-failure --timeout 900
+      - name: Collect the APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonore-android-apks
+          path: sdk/build-android/*.apk
+          if-no-files-found: warn

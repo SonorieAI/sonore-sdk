@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 273 headers, 752 public types.
+not have. 277 headers, 759 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -107,6 +107,14 @@ Analytics: events a plugin decides to record, and the destinations it
 
 AnalyticsEvent, AnalyticsDestination, Analytics, ThreadedAnalyticsDestination
 
+### android_app.h
+
+an Android app's activity, in C++
+
+`sdk/include/sonore/android_app.h`
+
+ActivityHooks, ActivityState
+
 ### apple_block.h
 
 an Apple block, built by hand, for the APIs that take one
@@ -170,6 +178,14 @@ core audio types. Our own, dependency-free equivalents of the
 `sdk/include/sonore/audio.h`
 
 ProcessSpec, AudioBlock, MidiMessage, MidiBuffer, NoteExpressionBuffer, NoteIdBuffer, ParamModBuffer, RpnMessage, RpnDetector, HostInfo, TrackInfo, MpeZone, MpeDecoder, ProcessContextT
+
+### audio_aaudio.h
+
+audio in and out on Android, through AAudio
+
+`sdk/include/sonore/audio_aaudio.h`
+
+AAudioOutput, AAudioInput
 
 ### audio_alsa.h
 
@@ -1355,6 +1371,14 @@ A range slider, and a button with a picture on it
 
 RangeSlider, IconButton, ImageComponent, HyperlinkButton
 
+### window_android.h
+
+The Android window, so the native UI runs on a phone and a tablet
+
+`sdk/include/sonore/gfx/window_android.h`
+
+AndroidSurface, NativeWindowAndroid
+
 ### window_cocoa.h
 
 The Cocoa window, so the native UI runs on the third platform
@@ -1946,6 +1970,14 @@ the standalone application
 `sdk/include/sonore/standalone.h`
 
 StandaloneScratch, FileSource, TestSource, App, Options, DeviceHub
+
+### standalone_android.h
+
+a plugin's standalone, as an Android app
+
+`sdk/include/sonore/standalone_android.h`
+
+AndroidApp
 
 ### state_bag.h
 

@@ -17,6 +17,7 @@
 //   auv3_selftest --effect|--instrument --params N [--presets N] [--midi-out]
 //                 [--type aufx --subtype Sat3 --manufacturer Sonr]
 #include <AudioToolbox/AudioToolbox.h>
+#include <CoreFoundation/CFRunLoop.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <objc/message.h>
@@ -335,8 +336,13 @@ int main(int argc, char** argv) {
     const float target = lo + 0.75f * (hi - lo);
     if (schedule) callBlock<void>(schedule, kImmediate, (uint32_t) 0, (uint64_t) 0, target);
     h.render();
-    checkf(std::fabs(send<float>(p0, "value") - target) <= 1e-3f * (hi - lo) + 1e-6f,
-           "a scheduled change reaches the parameter (%g)", target);
+    // The render applies it; the unit publishes it into the parameter on the
+    // main thread's clock, which a host's main thread is running. Here it is
+    // run for a moment by hand.
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.3, false);
+    const float now = send<float>(p0, "value");
+    checkf(std::fabs(now - target) <= 1e-3f * (hi - lo) + 1e-6f,
+           "a scheduled change reaches the parameter (%g, read %g)", target, now);
   }
 
   // ── State ──
@@ -354,8 +360,9 @@ int main(int argc, char** argv) {
     const float saved = send<float>(p0, "value");
     send<void>(p0, "setValue:", send<float>(p0, "minValue"));
     send<void>(h.unit, "setFullState:", state);
-    checkf(std::fabs(send<float>(p0, "value") - saved) <= 1e-4f * std::fabs(saved) + 1e-5f,
-           "setFullState: brings the saved value back (%g)", saved);
+    const float back = send<float>(p0, "value");
+    checkf(std::fabs(back - saved) <= 1e-4f * std::fabs(saved) + 1e-5f,
+           "setFullState: brings the saved value back (%g, read %g)", saved, back);
   }
   if (state) send<void>(state, "release");
   {

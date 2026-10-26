@@ -99,12 +99,14 @@ const outputBackends = [
   // is exactly what this instrument is for.
   ['LinuxOutput', 'audio_linux.h', 'Linux: chooses at runtime'],
   ['CoreAudioOutput', 'audio_coreaudio.h', 'macOS: NOBODY HERE CAN COMPILE THIS'],
+  ['AAudioOutput', 'audio_aaudio.h', 'Android: AAudio'],
 ];
 
 const inputBackends = [
   ['WasapiInput', 'audio_wasapi_input.h', 'Windows'],
   ['AlsaInput', 'audio_alsa_input.h', 'Linux'],
   ['CoreAudioInput', 'audio_coreaudio_input.h', 'macOS: NOBODY HERE CAN COMPILE THIS'],
+  ['AAudioInput', 'audio_aaudio.h', 'Android: AAudio'],
   ['NullAudioInput', 'audio_input.h', 'the honest fallback for everything else'],
 ];
 

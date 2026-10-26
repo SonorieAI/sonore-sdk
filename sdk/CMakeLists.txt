@@ -114,6 +114,12 @@ elseif(SONORE_GUI)
   message(STATUS "Sonore GUI: no webview backend for this platform yet: "
                  "plugins build headless (hosts show generic controls)")
 endif()
+if(ANDROID)
+  # AAudio for the standalone's audio, the NDK's native window, input and
+  # activity for its window, and the log for what a phone has instead of a
+  # terminal. System libraries every device has from Android 9 on.
+  target_link_libraries(sonore_sdk INTERFACE aaudio android log)
+endif()
 if(APPLE)
   # The audio and MIDI headers call CoreAudio, AudioToolbox and CoreMIDI
   # directly (system_volume.h, system_audio_format.h, the device and MIDI

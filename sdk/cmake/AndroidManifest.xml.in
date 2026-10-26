@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The manifest of a plugin's standalone as an Android app (sonore_add_standalone).
+
+  android.app.NativeActivity is the framework's activity for an app written in
+  C++: it loads the library android.app.lib_name names and calls its
+  ANativeActivity_onCreate. hasCode is false because the APK carries no dex:
+  every Java call the app makes is to a framework class, through JNI.
+
+  configChanges: a rotation, a keyboard or a new density re-lays the editor out
+  in place (onConfigurationChanged) instead of recreating the activity, which
+  would stop the audio. RECORD_AUDIO is asked for at run time by an effect,
+  whose input is the microphone. low_latency is wanted, not required: a phone
+  without it still runs the app, with the latency it has.
+  (No double hyphen anywhere in this comment: XML forbids one there.)
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="@SONORE_ANDROID_PACKAGE@"
+          android:versionCode="@SONORE_ANDROID_VERSION_CODE@"
+          android:versionName="@SONORE_ANDROID_VERSION@">
+  <uses-sdk android:minSdkVersion="@SONORE_ANDROID_MIN_SDK@" android:targetSdkVersion="@SONORE_ANDROID_TARGET_SDK@" />
+@SONORE_ANDROID_PERMISSIONS@
+  <uses-feature android:name="android.hardware.audio.low_latency" android:required="false" />
+  <uses-feature android:name="android.hardware.audio.pro" android:required="false" />
+  <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+  <application android:label="@SONORE_ANDROID_LABEL@"
+               android:hasCode="false"
+               android:extractNativeLibs="false"
+               android:allowBackup="true"
+               android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+    <activity android:name="android.app.NativeActivity"
+              android:label="@SONORE_ANDROID_LABEL@"
+              android:exported="true"
+              android:launchMode="singleTask"
+              android:screenOrientation="unspecified"
+              android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode">
+      <meta-data android:name="android.app.lib_name" android:value="@SONORE_ANDROID_LIB@" />
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

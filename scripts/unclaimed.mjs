@@ -101,6 +101,9 @@ const NOT_A_CAPABILITY = new Set([
   // NSExtensionMain asks for them: what the "AUv3 app extension" row is made of.
   "EventHeader", "ParameterEvent", "MidiEvent", "UmpPacket", "UmpEventList", "MidiEventListEvent",
   "BlockHeader", "SuperRef", "ClassRegistrar",
+  // The activity's state and looper wiring: what the "Android app" row is
+  // made of.
+  "ActivityState",
   // The standalone's per-block buffers, owned by its App: the "standalone app"
   // row is what somebody looks for.
   "StandaloneScratch",

@@ -370,6 +370,13 @@ struct Unit {
   id outputBusArray = nil;
   id parameterTree = nil;
   id parameters[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1] = {};
+  /** The value each AUParameter was last given. An AUParameter CACHES its
+   *  value -- a host reads the cache, not the provider -- so every change the
+   *  plugin makes itself (a render event, a state, a preset, its own editor)
+   *  has to be pushed back with setValue:originator:, and this is what tells
+   *  publishParameters() which ones moved. Written by the observer too, on
+   *  whatever thread the host set a value from: atomic. */
+  std::atomic<float> published[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1] = {};
   id factoryPresets = nil;
   id currentPreset = nil;
 
@@ -457,12 +464,24 @@ inline uint32_t flagsFor(const ParamInfo& p) {
   return flags;
 }
 
+/** Set while this thread is pushing the plugin's own values into its
+ *  parameters: setValue: calls the observer back synchronously, and the value
+ *  it hands over may already be older than one the render thread has applied
+ *  since -- written back, it would undo that one. */
+inline bool& publishingHere() {
+  static thread_local bool publishing = false;
+  return publishing;
+}
+
 /** [any thread] The host, or its generic editor, set a value. */
 inline void observeValue(void* block, id parameter, Value value) {
   Unit* unit = ::sonore::detail::blockCapture<Unit*, ValueObserverInvoke>(block);
   const uint32_t i = parameterIndex(parameter);
-  if (!unit || !validIndex(i)) return;
-  unit->shared.params[i] = clampToRange(kDesc.params[i], value);
+  if (!unit || !validIndex(i) || publishingHere()) return;
+  const float v = clampToRange(kDesc.params[i], value);
+  unit->shared.params[i] = v;
+  // The parameter holds this value now: nothing to push back.
+  unit->published[i].store(v, std::memory_order_relaxed);
 }
 
 /** [any thread] The value the host reads. */
@@ -524,6 +543,7 @@ inline void buildParameterTree(Unit* unit) {
                         (Value) p.maxValue, u, unitName, flagsFor(p), valueStrings, (id) nil);
     if (!param) continue;
     send<void>(param, "setValue:", (Value) p.defaultValue);
+    unit->published[i].store(p.defaultValue, std::memory_order_relaxed);
     unit->parameters[i] = retain(param);
     const int g = groups.indexOf(p.group);
     if (g >= 0 && g < GroupTable::kMaxGroups) groupChildren[g].push_back(param);
@@ -561,14 +581,34 @@ inline void buildParameterTree(Unit* unit) {
  *  the AUParameter itself, which is what a host's automation records. */
 inline void tellHost(Unit* unit, int index, float value, uint32_t eventType) {
   if (!unit || index < 0 || !validIndex((uint32_t) index) || !unit->parameters[index]) return;
+  unit->published[index].store(value, std::memory_order_relaxed);
+  publishingHere() = true;
   send<void>(unit->parameters[index], "setValue:originator:atHostTime:eventType:", (Value) value,
              (void*) nullptr, (uint64_t) 0, eventType);
+  publishingHere() = false;
+}
+
+/** [main-thread] Every value the plugin moved itself, into its AUParameter,
+ *  which is what a host reads (see Unit::published). Without an originator,
+ *  so every observer hears it -- the host's controls and its automation. */
+inline void publishParameters(Unit* unit) {
+  publishingHere() = true;
+  for (int i = 0; i < kDesc.numParams && i < SONORE_NUM_PARAMS; ++i) {
+    if (!unit->parameters[i]) continue;
+    const float v = unit->shared.params[i];
+    if (unit->published[i].load(std::memory_order_relaxed) == v) continue;
+    unit->published[i].store(v, std::memory_order_relaxed);
+    send<void>(unit->parameters[i], "setValue:originator:", (Value) v, (void*) nullptr);
+  }
+  publishingHere() = false;
 }
 
 /** [main-thread] Every parameter moved at once -- a preset, a restored state
- *  -- and the host wrote none of them. AUv3's one notification for that. */
+ *  -- and the host wrote none of them: each pushed into its AUParameter, and
+ *  AUv3's one notification for the lot. */
 inline void announceAllParameters(Unit* unit) {
   unit->shared.uiEchoValid = false;
+  publishParameters(unit);
   announce(unit->self, "allParameterValues");
 }
 
@@ -716,6 +756,9 @@ inline void housekeepingTick(CFRunLoopTimerRef, void* info) {
     unit->reportedTail = tail;
     announce(self, "tailTime");
   }
+  // What render moved -- the host's own scheduled events, which land in the
+  // DSP's values and not in the parameters' caches -- and what the DSP moved.
+  publishParameters(unit);
   // AUv3 has no "my document changed" call. What a host does observe is
   // fullState, which it re-reads when the key-value notification fires.
   if (unit->stateDirtyPending.exchange(false, std::memory_order_acq_rel)) announce(self, "fullState");

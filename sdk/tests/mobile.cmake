@@ -72,3 +72,15 @@ foreach(_serial audio_sources gui_infra modules)
     set_tests_properties(${_serial} PROPERTIES RUN_SERIAL TRUE)
   endif()
 endforeach()
+
+# ── The examples as apps ─────────────────────────────────────────────────────
+# Each standalone is two things here: the program, which renders and checks
+# itself on the device (--verify, as on every desktop), and the app -- on
+# Android an APK (sonore_add_standalone), whose <target>Install target puts it
+# on the attached device and starts it.
+sonore_add_standalone(SonoreSaturatorApp SOURCES examples/saturator/plugin.cpp
+  NAME "Sonore Saturator" BUNDLE_ID com.sonorie.saturator VERSION 1.0.0)
+sonore_add_standalone(SonoreSynthApp SOURCES examples/synth/plugin.cpp
+  NAME "Sonore Synth" BUNDLE_ID com.sonorie.synth VERSION 1.0.0)
+add_test(NAME standalone_effect COMMAND SonoreSaturatorApp --verify)
+add_test(NAME standalone_instrument COMMAND SonoreSynthApp --verify)

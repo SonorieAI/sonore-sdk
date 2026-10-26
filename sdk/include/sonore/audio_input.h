@@ -67,6 +67,13 @@ inline std::string listedDevice(const std::vector<std::string>& list, int index)
 
 #if defined(_WIN32)
 #include "audio_wasapi_input.h"
+#elif defined(__ANDROID__)
+#include "audio_aaudio.h"
+namespace sonore {
+namespace standalone {
+using PlatformAudioInput = AAudioInput;
+} // namespace standalone
+} // namespace sonore
 #elif defined(__linux__)
 #include "audio_alsa_input.h"
 #elif defined(__APPLE__)

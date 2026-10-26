@@ -286,6 +286,13 @@ const MAP = [
    "audio because somebody opened a plugin", "class LinuxOutput"],
   ["devices", "AudioIODevice (CoreAudio)", "audio_coreaudio.h", "CoreAudioOutput"],
   ["devices", "AudioIODevice (ALSA)", "audio_alsa.h", "AlsaOutput"],
+  ["devices", "AudioIODevice (Android)",
+   "audio_aaudio.h: AAudioOutput and AAudioInput, AAudio's low-latency streams " +
+   "(exclusive where the device has an MMAP path), float stereo at the device's " +
+   "own rate, two bursts of buffer; a route pulled from under a stream is " +
+   "reported (takeDeviceLost) and reopened. Run in an Android 15 emulator; never " +
+   "on a phone by anyone in this loop",
+   "class AAudioOutput"],
   ["devices", "audio input capture", "audio_input.h", "class AudioRing"],
   ["devices", "MidiInput", "midi_input.h", "namespace midiin"],
   ["devices", "MidiInput::getAvailableDevices / MidiDeviceInfo",
@@ -834,6 +841,16 @@ const MAP = [
    "SONORE_APPLE_SYNTAX_CHECK"],
   ["client", "LV2 wrapper", "lv2_wrapper.h", "LV2_Descriptor"],
   ["client", "Standalone wrapper", "standalone.h", "inline int runInteractive"],
+  ["client", "Android app",
+   "android_app.h and standalone_android.h: a plugin's standalone as an APK " +
+   "sonore_add_standalone packages with the SDK's tools and no Gradle -- " +
+   "NativeActivity, no dex, every framework call through JNI. ActivityHooks " +
+   "over the activity's life; AndroidApp runs the shared App: the native editor " +
+   "full screen at the display's density, AAudio while visible, an effect's " +
+   "microphone once allowed and only while the sound goes to headphones. " +
+   "Android 9 (API 28) and later. Run in an Android 15 emulator, its suites " +
+   "too (tests/mobile.cmake); not yet on a phone",
+   "struct ActivityHooks"],
   ["client", "(the reference has no CLAP)", "clap_wrapper.h", "clap_plugin_entry"],
   // AUv3 was a guarded ABSENCE while there was no Mac to check one on. macOS
   // CI now builds the extension, registers it and runs auval on it, and the
@@ -1370,6 +1387,14 @@ const MAP = [
    "nothing about windows -- and cycles where nobody is listening",
    "std::function<void(ComboBox&)> onOpenMenu"],
   ["gui", "ComponentPeer (Windows)", "gfx/window_win32.h: window, blit, input", "class NativeWindow"],
+  ["gui", "ComponentPeer (Android)",
+   "gfx/window_android.h: NativeWindowAndroid, a layer of AndroidSurface -- the " +
+   "activity's one ANativeWindow, which composites the editor and any menu or " +
+   "tooltip over it (a phone has no windows to stack) and routes each finger, " +
+   "pen or mouse to the layer it lands on. RGBA rows copied straight into the " +
+   "window's buffer through its dirty-rectangle lock; inside the system bars. " +
+   "Driven in an emulator: slider drags, group headers, keys held",
+   "class NativeWindowAndroid"],
   ["gui", "ComponentPeer (Linux)",
    "gfx/window_x11.h: window, blit, input. libX11 is OPENED, never linked, so " +
    "a plugin still loads on a Wayland-only session and says why it has no " +

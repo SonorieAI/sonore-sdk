@@ -48,7 +48,10 @@
 #define SONORE_HAS_NATIVE_WINDOW_BACKEND 1
 #endif
 
-#if defined(__linux__)
+#if defined(__ANDROID__)
+#include "window_android.h"
+#define SONORE_HAS_NATIVE_WINDOW_BACKEND 1
+#elif defined(__linux__)
 #include "window_x11.h"
 #if defined(SONORE_X11_HEADERS)
 #define SONORE_HAS_NATIVE_WINDOW_BACKEND 1
@@ -73,6 +76,8 @@ namespace gfx {
 using PlatformWindow = NativeWindow;
 #elif defined(__APPLE__)
 using PlatformWindow = NativeWindowCocoa;
+#elif defined(__ANDROID__)
+using PlatformWindow = NativeWindowAndroid;
 #elif defined(__linux__) && defined(SONORE_X11_HEADERS)
 using PlatformWindow = NativeWindowX11;
 #endif
@@ -366,6 +371,8 @@ public:
   static const char* unavailableReason() {
 #if defined(__linux__) && defined(SONORE_X11_HEADERS)
     return x11::xlib().ok ? "" : "libX11.so.6 is not on this machine";
+#elif defined(__ANDROID__)
+    return "";
 #elif defined(__linux__)
     return "this plugin was built without the X11 headers, so it has no native window";
 #elif defined(__APPLE__)

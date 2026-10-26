@@ -410,12 +410,178 @@ function(sonore_add_au TARGET)
   _sonore_adhoc_sign(${TARGET})
 endfunction()
 
-# ── sonore_add_standalone(<target> SOURCES a.cpp [...]) ──────────────────────
+# ── _sonore_android_app(<target> SOURCES ... [NAME n] [BUNDLE_ID id] [VERSION v]) ──
+# A plugin's standalone as an Android app: lib<target>.so, the activity
+# (standalone_android.h, SONORE_ANDROID_ACTIVITY), packaged into <target>.apk
+# with the Android SDK's own tools and no Gradle:
+#
+#   aapt2      the manifest, compiled against the platform's android.jar
+#   (zip)      the library added under lib/<abi>/, every entry STORED, by the
+#              JDK's jar -- Android wants native code and resources.arsc
+#              uncompressed so it can map them where they lie
+#   zipalign   those entries aligned to 16 KB pages (Android 15's page size)
+#   apksigner  signed with the debug key: ~/.android/debug.keystore when
+#              Android Studio made one, else one made here
+#
+# What it needs is what an Android developer has: the SDK (found beside the
+# NDK, or ANDROID_HOME), its build-tools and a platform, and a JDK (JAVA_HOME,
+# or Android Studio's). Missing any, the library still builds and the APK
+# step says what it lacked. <target>Install puts the APK on the attached
+# device or emulator and starts it. Shipping needs your own signing key in
+# place of the debug one.
+function(_sonore_android_app TARGET)
+  cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION" "SOURCES" ${ARGN})
+  set(_lib ${TARGET}Activity)
+  add_library(${_lib} SHARED ${ARG_SOURCES})
+  target_link_libraries(${_lib} PRIVATE sonore_sdk)
+  target_compile_definitions(${_lib} PRIVATE SONORE_BUILD_STANDALONE=1 SONORE_STANDALONE_NO_MAIN=1
+                                             SONORE_ANDROID_ACTIVITY=1)
+  # lib<target>.so, the name the manifest's android.app.lib_name gives.
+  set_target_properties(${_lib} PROPERTIES OUTPUT_NAME "${TARGET}")
+
+  if(NOT ARG_NAME)
+    set(ARG_NAME "${TARGET}")
+  endif()
+  if(NOT ARG_VERSION)
+    set(ARG_VERSION "1.0.0")
+  endif()
+  if(NOT ARG_BUNDLE_ID)
+    string(TOLOWER "com.sonorie.${TARGET}" ARG_BUNDLE_ID)
+  endif()
+  string(REPLACE "." ";" _ver "${ARG_VERSION}")
+  list(LENGTH _ver _n)
+  set(_code 1)
+  if(_n EQUAL 3)
+    list(GET _ver 0 _vmaj)
+    list(GET _ver 1 _vmin)
+    list(GET _ver 2 _vpat)
+    math(EXPR _code "${_vmaj} * 10000 + ${_vmin} * 100 + ${_vpat}")
+    if(_code LESS 1)
+      set(_code 1)
+    endif()
+  endif()
+
+  # ── The Android SDK and a JDK ──
+  set(_sdk "")
+  foreach(_candidate "$ENV{ANDROID_HOME}" "$ENV{ANDROID_SDK_ROOT}" "${ANDROID_NDK}/../..")
+    if(_candidate AND EXISTS "${_candidate}/platforms")
+      get_filename_component(_sdk "${_candidate}" ABSOLUTE)
+      break()
+    endif()
+  endforeach()
+  set(_bt "")
+  if(_sdk)
+    file(GLOB _bts LIST_DIRECTORIES true "${_sdk}/build-tools/*")
+    list(SORT _bts COMPARE NATURAL ORDER DESCENDING)
+    foreach(_d ${_bts})
+      if(EXISTS "${_d}/zipalign" OR EXISTS "${_d}/zipalign.exe")
+        set(_bt "${_d}")
+        break()
+      endif()
+    endforeach()
+    file(GLOB _jars "${_sdk}/platforms/android-*/android.jar")
+    list(SORT _jars COMPARE NATURAL ORDER DESCENDING)
+    list(GET _jars 0 _androidJar)
+  endif()
+  set(_jdkHints "$ENV{JAVA_HOME}/bin" "C:/Program Files/Android/Android Studio/jbr/bin"
+                "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin")
+  find_program(SONORE_JAR jar HINTS ${_jdkHints})
+  find_program(SONORE_KEYTOOL keytool HINTS ${_jdkHints})
+  if(NOT _sdk OR NOT _bt OR NOT _androidJar OR NOT SONORE_JAR OR NOT SONORE_KEYTOOL)
+    message(STATUS "sonore_add_standalone(${TARGET}): the APK is not packaged -- it needs the Android SDK "
+                   "(build-tools and a platform; set ANDROID_HOME) and a JDK (set JAVA_HOME). "
+                   "lib${TARGET}.so is built.")
+    return()
+  endif()
+  get_filename_component(_javaBin "${SONORE_JAR}" DIRECTORY)
+  get_filename_component(_javaHome "${_javaBin}" DIRECTORY)
+  set(_exe "")
+  set(_bat "")
+  if(CMAKE_HOST_WIN32)
+    set(_exe ".exe")
+    set(_bat ".bat")
+  endif()
+  string(REGEX MATCH "android-([0-9]+)" _m "${_androidJar}")
+  set(_platformLevel "${CMAKE_MATCH_1}")
+
+  # ── The manifest ──
+  set(_dir "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-apk")
+  set(SONORE_ANDROID_PACKAGE "${ARG_BUNDLE_ID}")
+  set(SONORE_ANDROID_VERSION "${ARG_VERSION}")
+  set(SONORE_ANDROID_VERSION_CODE "${_code}")
+  set(SONORE_ANDROID_MIN_SDK 28)
+  if(ANDROID_PLATFORM_LEVEL AND ANDROID_PLATFORM_LEVEL GREATER 28)
+    set(SONORE_ANDROID_MIN_SDK ${ANDROID_PLATFORM_LEVEL})
+  endif()
+  set(SONORE_ANDROID_TARGET_SDK "${_platformLevel}")
+  _sonore_xml_escape(SONORE_ANDROID_LABEL "${ARG_NAME}")
+  set(SONORE_ANDROID_LIB "${TARGET}")
+  set(SONORE_ANDROID_PERMISSIONS
+      "  <uses-permission android:name=\"android.permission.RECORD_AUDIO\" />\n  <uses-permission android:name=\"android.permission.MODIFY_AUDIO_SETTINGS\" />")
+  configure_file("${SONORE_SDK_DIR}/cmake/AndroidManifest.xml.in" "${_dir}/AndroidManifest.xml" @ONLY)
+
+  # ── The key: Android Studio's debug key if there is one, else ours ──
+  set(_home "$ENV{HOME}")
+  if(CMAKE_HOST_WIN32 AND NOT _home)
+    set(_home "$ENV{USERPROFILE}")
+  endif()
+  if(EXISTS "${_home}/.android/debug.keystore")
+    set(_keystore "${_home}/.android/debug.keystore")
+  else()
+    set(_keystore "${CMAKE_BINARY_DIR}/sonore-debug.keystore")
+    if(NOT EXISTS "${_keystore}")
+      execute_process(COMMAND "${SONORE_KEYTOOL}" -genkeypair -keystore "${_keystore}" -storepass android
+                              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000
+                              -dname "CN=Android Debug,O=Android,C=US"
+                      OUTPUT_QUIET ERROR_QUIET)
+    endif()
+  endif()
+
+  set(_apk "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.apk")
+  add_custom_command(OUTPUT "${_apk}"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${_dir}/stage"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}/stage/lib/${ANDROID_ABI}"
+    COMMAND "${_bt}/aapt2${_exe}" link -o "${_dir}/base.apk" --manifest "${_dir}/AndroidManifest.xml"
+            -I "${_androidJar}" --min-sdk-version ${SONORE_ANDROID_MIN_SDK}
+            --target-sdk-version ${SONORE_ANDROID_TARGET_SDK}
+    COMMAND ${CMAKE_COMMAND} -E chdir "${_dir}/stage" ${CMAKE_COMMAND} -E tar xf "${_dir}/base.apk"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${_lib}>" "${_dir}/stage/lib/${ANDROID_ABI}/"
+    # Without the debug information: a device has no use for it, and it is
+    # most of the library's size. The built one keeps it, for a debugger.
+    COMMAND "${CMAKE_STRIP}" --strip-unneeded "${_dir}/stage/lib/${ANDROID_ABI}/$<TARGET_FILE_NAME:${_lib}>"
+    COMMAND ${CMAKE_COMMAND} -E remove -f "${_dir}/unaligned.apk" "${_dir}/aligned.apk"
+    COMMAND "${SONORE_JAR}" cf0M "${_dir}/unaligned.apk" -C "${_dir}/stage" .
+    COMMAND "${_bt}/zipalign${_exe}" -f -P 16 4 "${_dir}/unaligned.apk" "${_dir}/aligned.apk"
+    COMMAND ${CMAKE_COMMAND} -E env "JAVA_HOME=${_javaHome}"
+            "${_bt}/apksigner${_bat}" sign --ks "${_keystore}" --ks-pass pass:android --key-pass pass:android
+            --ks-key-alias androiddebugkey --out "${_apk}" "${_dir}/aligned.apk"
+    DEPENDS ${_lib} "${_dir}/AndroidManifest.xml"
+    COMMENT "Packaging ${TARGET}.apk"
+    VERBATIM)
+  add_custom_target(${TARGET}Apk ALL DEPENDS "${_apk}")
+
+  find_program(SONORE_ADB adb HINTS "${_sdk}/platform-tools")
+  if(SONORE_ADB)
+    add_custom_target(${TARGET}Install
+      COMMAND "${SONORE_ADB}" install -r "${_apk}"
+      COMMAND "${SONORE_ADB}" shell am start -n "${ARG_BUNDLE_ID}/android.app.NativeActivity"
+      DEPENDS ${TARGET}Apk
+      COMMENT "Installing and starting ${TARGET}.apk"
+      VERBATIM)
+  endif()
+endfunction()
+
+# ── sonore_add_standalone(<target> SOURCES a.cpp [...] [NAME n] [BUNDLE_ID id] [VERSION v]) ──
 # A runnable app from the same plugin source: window + webview faceplate + OS
 # audio. Also the CI-friendly offline modes (--verify / --render out.wav),
 # which need no audio device and no display.
+#
+# On Android, <target> is that program for an adb shell (it renders, verifies
+# and plays), and the app is <target>.apk beside it: see _sonore_android_app.
+# NAME, BUNDLE_ID and VERSION are the app's label, package and version there,
+# and are not used on the desktop.
 function(sonore_add_standalone TARGET)
-  cmake_parse_arguments(ARG "" "" "SOURCES" ${ARGN})
+  cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION" "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_standalone(${TARGET}): SOURCES is required")
   endif()
@@ -440,6 +606,15 @@ function(sonore_add_standalone TARGET)
     # ALSA and GTK are dlopened; only dl and threads are linked.
     find_package(Threads REQUIRED)
     target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  endif()
+  if(ANDROID)
+    set(_app_args)
+    foreach(_k NAME BUNDLE_ID VERSION)
+      if(ARG_${_k})
+        list(APPEND _app_args ${_k} "${ARG_${_k}}")
+      endif()
+    endforeach()
+    _sonore_android_app(${TARGET} SOURCES ${ARG_SOURCES} ${_app_args})
   endif()
 endfunction()
 

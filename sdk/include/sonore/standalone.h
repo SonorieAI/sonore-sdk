@@ -80,6 +80,8 @@
 #include "audio_wasapi.h"
 #elif defined(__APPLE__)
 #include "audio_coreaudio.h"
+#elif defined(__ANDROID__)
+#include "audio_aaudio.h"
 #elif defined(__linux__)
 #include "audio_alsa.h"
 #include "audio_linux.h"
@@ -1095,6 +1097,9 @@ inline int verify(App& app) {
 using PlatformAudio = WasapiOutput;
 #elif defined(__APPLE__)
 using PlatformAudio = CoreAudioOutput;
+#elif defined(__ANDROID__)
+// AAudio, the NDK's low-latency stream (audio_aaudio.h).
+using PlatformAudio = AAudioOutput;
 #elif defined(__linux__)
 // Both backends behind one type. Whether JACK is worth using is a fact about
 // the machine the plugin RUNS on, not the one it was built on, so the choice is
@@ -2183,6 +2188,7 @@ inline std::string standaloneBridge() {
  * devices. This was the same eleven lines in three places, and eleven lines in
  * three places is where the next platform-only bug lives.
  */
+#if defined(SONORE_HAS_WEBVIEW_BACKEND)
 inline void attachPicker(Instance* inst, DeviceHub& hub, uint64_t& uiTick, uint64_t& nextPoll) {
   installDeviceBridge(inst, hub);
   inst->webview.onTick = [inst, &hub, &uiTick, &nextPoll]() {
@@ -2208,6 +2214,7 @@ inline void attachPicker(Instance* inst, DeviceHub& hub, uint64_t& uiTick, uint6
     pollDevices(inst, hub, nextPoll, ++uiTick, 30);
   };
 }
+#endif // SONORE_HAS_WEBVIEW_BACKEND
 
 /** Wait for the audio thread to finish the block it may be in. Clearing
  *  inputOpen stops the NEXT block reading the capture ring, not one already
@@ -2669,6 +2676,34 @@ done:
 } // namespace sonore
 
 // ── Linux ────────────────────────────────────────────────────────────────────
+#elif defined(__ANDROID__)
+
+namespace sonore {
+namespace standalone {
+
+/** On Android the window is the APK's (standalone_android.h, an activity).
+ *  From an adb shell this program still renders and verifies offline, and
+ *  plays through AAudio for --play: what a test on a device can drive. */
+inline int runInteractive(App& app, const Options& opt) {
+  PlatformAudio audio;
+  const bool audioOk = startLiveAudio(app, audio, opt.deviceIndex);
+  if (opt.playOnly) {
+    if (!audioOk) return 1;
+    usleep((useconds_t) (opt.seconds * 1e6));
+    audio.stop();
+    reportPlayed(app, opt.seconds);
+    return 0;
+  }
+  audio.stop();
+  std::fprintf(stderr,
+               "[sonore] on Android the app is the APK sonore_add_standalone builds; from a shell this program "
+               "renders (--render), verifies (--verify) and plays (--play)\n");
+  return 1;
+}
+
+} // namespace standalone
+} // namespace sonore
+
 #elif defined(__linux__)
 
 namespace sonore {
@@ -3088,3 +3123,9 @@ int main(int argc, char** argv) {
   return runInteractive(app, opt);
 }
 #endif // !SONORE_STANDALONE_NO_MAIN
+
+// Android's app: the activity over the same App, and its entry point when
+// sonore_add_standalone builds the APK's library (SONORE_ANDROID_ACTIVITY).
+#if defined(__ANDROID__)
+#include "standalone_android.h"
+#endif
