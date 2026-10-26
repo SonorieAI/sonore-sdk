@@ -709,6 +709,143 @@ private:
   int count_ = 0;
 };
 
+/**
+ * Notes a host has named, one entry each: the key, the channel, the host's
+ * id for the note and a frame. ProcessContext carries two of them, one each
+ * way.
+ *
+ * In, as `noteIds`: the id of each note-on in `midi`, where the format names
+ * its notes (CLAP's note_id, VST3's noteId). MIDI has no field for one, so
+ * the ids travel beside the events rather than in them, and renderVoices()
+ * pairs each note-on with its own: take() hands out the first entry not yet
+ * taken for that key and channel, so a key struck twice in one block gets
+ * each strike's id, in order.
+ *
+ * Out, as `endedNotes`: each note that finished sounding during the block,
+ * release tail included, for the wrapper to tell the host (CLAP's NOTE_END).
+ * A host that modulates per note keeps a note's modulation running until it
+ * hears that, and frees it then.
+ */
+class NoteIdBuffer {
+public:
+  /** The most notes one block holds; add() drops the newest past it. */
+  static constexpr int kMaxEntries = 128;
+
+  /** One note: which key on which channel, the host's id, and the frame. */
+  struct Entry {
+    int32_t noteId = -1;    ///< the host's id for the note, or -1
+    int samplePosition = 0; ///< the frame, 0-based from the start of the block
+    int16_t key = -1;       ///< MIDI note number, 0..127
+    int16_t channel = -1;   ///< MIDI channel 0..15 (0-based)
+  };
+
+  /** Empty the buffer. No allocation; a wrapper clears the ones it hands a
+   *  DSP between blocks. */
+  void clear() { count_ = 0; }
+  /** How many notes the block holds, 0 to kMaxEntries. */
+  int getNumEntries() const { return count_; }
+  /** No notes this block. */
+  bool isEmpty() const { return count_ == 0; }
+
+  /** Add a note in frame order, after any others at the same frame. Past
+   *  kMaxEntries it is dropped. No allocation. */
+  void add(int samplePosition, int key, int channel, int32_t noteId) {
+    if (count_ >= kMaxEntries) return;
+    int i = count_;
+    while (i > 0 && entries_[i - 1].samplePosition > samplePosition) {
+      entries_[i] = entries_[i - 1];
+      taken_[i] = taken_[i - 1];
+      --i;
+    }
+    entries_[i].noteId = noteId;
+    entries_[i].samplePosition = samplePosition;
+    entries_[i].key = (int16_t) key;
+    entries_[i].channel = (int16_t) channel;
+    taken_[i] = false;
+    ++count_;
+  }
+
+  /** The host's id for the next note-on of `key` on `channel` (0-based), or
+   *  -1 when the host gave none: the first entry for them not yet taken,
+   *  which this marks taken. Called once per note-on, in frame order. */
+  int32_t take(int key, int channel) {
+    for (int i = 0; i < count_; ++i) {
+      if (taken_[i] || entries_[i].key != key || entries_[i].channel != channel) continue;
+      taken_[i] = true;
+      return entries_[i].noteId;
+    }
+    return -1;
+  }
+
+  /** The first note, for a range-for over the block in frame order. */
+  const Entry* begin() const { return entries_; }
+  /** One past the last note. */
+  const Entry* end() const { return entries_ + count_; }
+
+private:
+  Entry entries_[kMaxEntries];
+  bool taken_[kMaxEntries] = {};
+  int count_ = 0;
+};
+
+/**
+ * A host's modulation of parameters for single notes (CLAP's polyphonic
+ * modulation): which note, which parameter, and the offset to add to that
+ * parameter's value for that note alone, in the parameter's own units.
+ *
+ * Each entry REPLACES the note's earlier offset for that parameter; 0 ends
+ * it. An offset for the whole plugin never arrives here: the wrapper adds
+ * that to the values the DSP is handed (ParamInfo::modulatable). Only
+ * parameters declared ParamInfo::modulatablePerNote are modulated this way.
+ */
+class ParamModBuffer {
+public:
+  /** The most modulation events one block holds; addEvent() drops the
+   *  newest past it. */
+  static constexpr int kMaxEvents = 128;
+
+  /** One parameter's offset for one note, at a frame within the block. A
+   *  note is named as a NoteExpressionBuffer's are: the host's id where it
+   *  gave one, and key and channel, -1 meaning every key or every channel. */
+  struct Entry {
+    int32_t noteId = -1;    ///< host's note id, or -1
+    int16_t key = -1;       ///< MIDI note number, -1 = every note
+    int16_t channel = -1;   ///< MIDI channel 0..15 (0-based), -1 = every channel
+    int32_t param = 0;      ///< the parameter's index in the descriptor's table
+    float amount = 0.0f;    ///< the offset, in the parameter's own units
+    int samplePosition = 0; ///< the frame, 0-based from the start of the block
+  };
+
+  /** Empty the buffer. No allocation. */
+  void clear() { count_ = 0; }
+  /** How many events the block holds, 0 to kMaxEvents. */
+  int getNumEvents() const { return count_; }
+  /** No events this block. */
+  bool isEmpty() const { return count_ == 0; }
+
+  /** Insert `e` keeping frame order, after any others at the same frame.
+   *  Past kMaxEvents it is dropped. No allocation. */
+  void addEvent(const Entry& e) {
+    if (count_ >= kMaxEvents) return;
+    int i = count_;
+    while (i > 0 && events_[i - 1].samplePosition > e.samplePosition) {
+      events_[i] = events_[i - 1];
+      --i;
+    }
+    events_[i] = e;
+    ++count_;
+  }
+
+  /** The first event, for a range-for over the block in frame order. */
+  const Entry* begin() const { return events_; }
+  /** One past the last event. */
+  const Entry* end() const { return events_ + count_; }
+
+private:
+  Entry events_[kMaxEvents];
+  int count_ = 0;
+};
+
 /** One Registered or Non-Registered Parameter, once it has been assembled. */
 struct RpnMessage {
   int channel = 1;         ///< 1-based, MIDI convention
@@ -1547,6 +1684,18 @@ struct ProcessContextT {
   /** Offline render, same meaning as ProcessSpec::offline. Repeated here so a
    *  DSP can react per block rather than only at prepare(). */
   bool offline = false;
+  /** The host's id for each note-on in `midi`, where the format names its
+   *  notes (CLAP, VST3); null where it cannot. renderVoices() hands each one
+   *  to the voice manager with its note. See NoteIdBuffer. */
+  NoteIdBuffer* noteIds = nullptr;
+  /** Where a DSP reports the notes that finished sounding this block, for a
+   *  host that wants to hear it (CLAP's NOTE_END); null where none does.
+   *  renderVoices() fills it from the voice manager. */
+  NoteIdBuffer* endedNotes = nullptr;
+  /** The host's modulation of parameters for single notes this block
+   *  (CLAP); null where the format has none. renderVoices() hands each entry
+   *  to its voice's setParamMod(). See ParamModBuffer. */
+  const ParamModBuffer* paramMods = nullptr;
 
   /** Is aux bus `index` being consumed? True when the host never said
    *  otherwise, which is the common case and the safe one. */

@@ -12,6 +12,8 @@
 //   Portamento          the glide a mono line makes between notes
 //   pitchBendRange()    the wheel's range for a keyboard that is not MPE
 //   setMpe(true)        bend and pressure per finger, from an MPE controller
+//   setParamMod()       a CLAP host's modulation of the filter, per note
+//   voiceCount()        the Voices control, as a CLAP host reads it
 #define SONORE_NUM_PARAMS 10
 // Tall enough for the generic editor to show all four groups of controls and
 // the keyboard under them without scrolling: a keyboard below the fold is one
@@ -54,7 +56,16 @@ struct Voice {
     // Leant open by the note's pressure, as setPressure() leaves it. Set
     // plain, a cutoff knob nudged by a hertz -- or automated, every block --
     // closed the filter under a finger still pressing, until it moved again.
-    filter.set(cutoff * (1.0f + 3.0f * pressure), resonance);
+    applyFilter();
+  }
+  /** A CLAP host's modulation of this note alone (the table marks Cutoff and
+   *  Resonance modulatablePerNote): an offset in the control's own units,
+   *  added to the knob for this voice and kept until the host moves it. */
+  void setParamMod(int param, float amount) {
+    if (param == kCutoff) cutoffMod = amount;
+    else if (param == kResonance) resonanceMod = amount;
+    else return;
+    applyFilter();
   }
   void setEnvelope(float attack, float release) {
     sonore::ADSR::Parameters p;
@@ -87,8 +98,10 @@ struct Voice {
     // the ladder where the voice's last note had leant it -- four times the
     // cutoff after a full press -- and the next note's own "no pressure" was
     // no change by that number, so it played the whole note that bright.
+    // A new note's modulation is its own, which the host sends after this.
     pressure = 0.0f;
-    filter.set(cutoff, resonance);
+    cutoffMod = resonanceMod = 0.0f;
+    applyFilter();
     retune(glide.current());
     osc.reset();
     filter.reset();
@@ -118,7 +131,7 @@ struct Voice {
     // Pressure opens this voice's filter -- what a player feels as leaning
     // in. Coefficients are rebuilt only when it MOVES: recomputing a ladder
     // every sample is both wasteful and audible as a change in tone.
-    filter.set(cutoff * (1.0f + 3.0f * pressure), resonance);
+    applyFilter();
   }
   /** The mod wheel: vibrato, up to half a semitone either way at 5.5 Hz. */
   void setModWheel(float value) { vibratoDepth = 0.5f * value; }
@@ -142,6 +155,16 @@ private:
     lastNote = note;
     osc.setFreq(440.0f * std::exp2((note - 69.0f) / 12.0f));
   }
+  /** The knob, this note's modulation and its pressure, in that order: the
+   *  modulated value held to the control's range before pressure leans it. */
+  void applyFilter() {
+    float c = cutoff + cutoffMod;
+    c = c < 80.0f ? 80.0f : (c > 16000.0f ? 16000.0f : c);
+    float r = resonance + resonanceMod;
+    r = r < 0.0f ? 0.0f : (r > 0.95f ? 0.95f : r);
+    filter.set(c * (1.0f + 3.0f * pressure), r);
+  }
+  float cutoffMod = 0.0f, resonanceMod = 0.0f;
   float gainL = 0.70710678f, gainR = 0.70710678f;
   float vibratoPhase = 0.0f, vibratoDepth = 0.0f;
   float lastNote = -1000.0f;
@@ -166,6 +189,9 @@ struct SonoreDsp {
    *  guess, and a guess that is too high sounds like voices stolen for no
    *  reason the player can see. */
   int voiceCapacity() const { return voices.kNumVoices; }
+  /** The voices the patch may use: the Voices control, which a CLAP host
+   *  hears about when it moves. */
+  int voiceCount() const { return voices.polyphony(); }
   int activeVoices() const { return voices.activeVoices(); }
   /** The wheel's range for a keyboard that is not MPE, from the Bend Range
    *  control: the wrapper's decoder reads it before every block. */
@@ -281,9 +307,14 @@ static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     //
     // Spelled as "where the centre should be" rather than as an exponent,
     // because 0.3 is not a number anybody can check and 1000 Hz is.
+    //
+    // The two a host may modulate, per note as well: the last two fields,
+    // modulatable and modulatablePerNote. A CLAP host's LFO or envelope then
+    // moves the filter of each voice on its own (Voice::setParamMod).
     {"cutoff", "Cutoff", "Hz", 80.0f, 16000.0f, 4000.0f, 0, "Filter", nullptr, 0, true, false,
-     false, sonore::skewForCentre(80.0f, 16000.0f, 1000.0f)},
-    {"resonance", "Resonance", "", 0.0f, 0.95f, 0.2f, 0, "Filter"},
+     false, sonore::skewForCentre(80.0f, 16000.0f, 1000.0f), true, true},
+    {"resonance", "Resonance", "", 0.0f, 0.95f, 0.2f, 0, "Filter", nullptr, 0, true, false, false,
+     1.0f, true, true},
     {"attack", "Attack", "s", 0.001f, 2.0f, 0.01f, 0, "Envelope"},
     {"release", "Release", "s", 0.01f, 4.0f, 0.3f, 0, "Envelope"},
     {"level", "Level", "dB", -40.0f, 6.0f, -12.0f, 0, "Output"},

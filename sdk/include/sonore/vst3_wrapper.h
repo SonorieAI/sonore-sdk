@@ -1375,6 +1375,9 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
         plugin->shared.midi.addEvent(
             MidiMessage::noteOn(on.channel < 0 ? 0 : on.channel, on.pitch, vel), offset);
         plugin->noteIds.add(on.noteId, on.pitch, on.channel);
+        // And beside the note-on for the DSP, which pairs them up
+        // (ProcessContext::noteIds): a voice found by the host's id.
+        plugin->shared.noteIdsIn.add(offset, on.pitch, on.channel < 0 ? 0 : on.channel, on.noteId);
         // The note's own TUNING, in cents: how a microtonal host, or Cubase's
         // per-note expression, says "this C, a quarter tone sharp" in one
         // event. It was dropped, and every such note played at its twelve-
@@ -1608,7 +1611,10 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
                                     &plugin->shared.expression,
                                     nullptr, // VST3 has no per-port activation
                                     true,
-                                    plugin->shared.offline};
+                                    plugin->shared.offline,
+                                    &plugin->shared.noteIdsIn,
+                                    nullptr, // no event for a note's end
+                                    nullptr}; // nor for modulating one
       clapwrap::bypassCapture(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
       trackNotes(plugin->shared.notes, ctx64.midi);
       clapwrap::snapshotParams(&plugin->shared);
@@ -1719,7 +1725,10 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
                      &plugin->shared.expression,
                      nullptr, // VST3 has no per-port activation; every bus is live
                      true,
-                     plugin->shared.offline};
+                     plugin->shared.offline,
+                     &plugin->shared.noteIdsIn,
+                     nullptr, // no event for a note's end
+                     nullptr}; // nor for modulating one
   trackNotes(plugin->shared.notes, ctx.midi);
   clapwrap::snapshotParams(&plugin->shared);
   clapwrap::runDspCtx(plugin->shared.dsp, ctx, plugin->shared.paramsBlock);

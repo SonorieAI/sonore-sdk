@@ -1703,6 +1703,11 @@ template <typename V, typename = void>
 struct VoiceHasKill : std::false_type {};
 template <typename V>
 struct VoiceHasKill<V, std::void_t<decltype(std::declval<V&>().kill())>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasParamMod : std::false_type {};
+template <typename V>
+struct VoiceHasParamMod<V, std::void_t<decltype(std::declval<V&>().setParamMod(0, 0.0f))>>
+    : std::true_type {};
 } // namespace detail
 
 /**
@@ -1730,6 +1735,10 @@ struct VoiceHasKill<V, std::void_t<decltype(std::declval<V&>().kill())>> : std::
  *   void setBrightness(float 0..1)           this note's timbre (MPE CC 74).
  *   void setModWheel(float 0..1)             CC 1.
  *   void kill()                              silent now: All Sound Off.
+ *   void setParamMod(int param, float amount)
+ *                                            a host's offset to parameter
+ *                                            `param` for this note alone
+ *                                            (CLAP polyphonic modulation).
  *
  * Four things here are the difference between a voice manager and a synth a
  * player will tolerate:
@@ -2160,6 +2169,9 @@ public:
     for (int i = 0; i < endedCount_; ++i) f(ended_[i]);
     endedCount_ = 0;
   }
+  /** Notes have ended since drainEndedNotes() last ran: a check cheap enough
+   *  for every sample. */
+  bool hasEndedNotes() const { return endedCount_ > 0; }
 
 private:
   void start(int slot, int note, float velocity, int channel, int32_t noteId) {
@@ -2461,11 +2473,11 @@ inline bool applyPedals(VoiceManagerType& voices, const MidiMessage& m) {
  * wrapper has already turned them into each note's own expression.
  */
 template <typename VoiceManagerType>
-inline bool applyMidi(VoiceManagerType& voices, const MidiMessage& m) {
+inline bool applyMidi(VoiceManagerType& voices, const MidiMessage& m, int32_t noteId = -1) {
   if (applyPedals(voices, m)) return true;
   const int channel = m.getChannel() - 1;
   if (m.isNoteOn()) { // velocity 0 is a note-off, and isNoteOn() says so
-    voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), channel);
+    voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), channel, noteId);
     return true;
   }
   if (m.isNoteOff()) {
@@ -2533,6 +2545,51 @@ inline void applyExpression(VoiceManagerType& voices, const NoteExpressionBuffer
 }
 
 /**
+ * A note's offset to one parameter (ParamModBuffer), to the voice playing it,
+ * through the voice's `setParamMod(int param, float amount)` where it has one.
+ * Found as an expression is: by the host's note id, then by key and channel;
+ * with no key, every note on the channel, or on every channel.
+ *
+ * The voice keeps the amount and adds it to the parameter's value for itself
+ * alone. A new note starts with none: clear the offsets in noteOn(), and the
+ * host sends the new note its own.
+ */
+template <typename VoiceManagerType>
+inline void applyParamMod(VoiceManagerType& voices, const ParamModBuffer::Entry& e) {
+  using VoiceType = std::remove_reference_t<decltype(voices.voice(0))>;
+  if constexpr (detail::VoiceHasParamMod<VoiceType>::value) {
+    int v = voices.voiceForNoteId(e.noteId);
+    if (v < 0 && e.key >= 0)
+      v = voices.voiceForNote(e.key, e.channel < 0 ? VoiceManagerType::kAnyChannel : e.channel);
+    if (v >= 0) {
+      voices.voice(v).setParamMod((int) e.param, e.amount);
+      return;
+    }
+    if (e.key >= 0 || e.noteId >= 0) return;
+    for (int i = 0; i < VoiceManagerType::kNumVoices; ++i)
+      if (voices.voice(i).isActive() && (e.channel < 0 || voices.channelOf(i) == e.channel))
+        voices.voice(i).setParamMod((int) e.param, e.amount);
+  } else {
+    (void) voices;
+    (void) e;
+  }
+}
+
+/**
+ * The notes the voice manager has seen end, into `out` at frame
+ * `samplePosition`: what a wrapper tells a host that wants to know (CLAP's
+ * NOTE_END). renderVoices() does this itself; a DSP that renders its voices
+ * by hand calls it once per block with `*ctx.endedNotes`, when that is not
+ * null.
+ */
+template <typename VoiceManagerType>
+inline void reportEndedNotes(VoiceManagerType& voices, NoteIdBuffer& out, int samplePosition) {
+  voices.drainEndedNotes([&](const typename VoiceManagerType::EndedNote& e) {
+    out.add(samplePosition, e.note, e.channel, e.noteId);
+  });
+}
+
+/**
  * A whole instrument block: the block's MIDI and note expression applied at
  * their exact frames, and the voices rendered between them into the main bus
  * (stereo voices in stereo, mono voices in the middle; a mono bus gets the
@@ -2554,17 +2611,29 @@ inline void renderVoices(VoiceManagerType& voices, ProcessContext& ctx) {
   const auto eventEnd = ctx.midi.end();
   const NoteExpressionBuffer::Entry* expr = ctx.expression ? ctx.expression->begin() : nullptr;
   const NoteExpressionBuffer::Entry* exprEnd = ctx.expression ? ctx.expression->end() : nullptr;
+  const ParamModBuffer::Entry* mod = ctx.paramMods ? ctx.paramMods->begin() : nullptr;
+  const ParamModBuffer::Entry* modEnd = ctx.paramMods ? ctx.paramMods->end() : nullptr;
   for (size_t i = 0; i < n; ++i) {
     while (event != eventEnd && (size_t) event->samplePosition <= i) {
-      applyMidi(voices, event->getMessage());
+      const MidiMessage& m = event->getMessage();
+      // The host's name for the note goes with it, so its expression, its
+      // modulation and its end can all be addressed by that name.
+      const int32_t id =
+          ctx.noteIds && m.isNoteOn() ? ctx.noteIds->take(m.getNoteNumber(), m.getChannel() - 1) : -1;
+      applyMidi(voices, m, id);
       ++event;
     }
     while (expr != exprEnd && (size_t) expr->samplePosition <= i) {
       applyExpression(voices, *expr);
       ++expr;
     }
+    while (mod != modEnd && (size_t) mod->samplePosition <= i) {
+      applyParamMod(voices, *mod);
+      ++mod;
+    }
     float l = 0.0f, r = 0.0f;
     voices.render(l, r);
+    if (ctx.endedNotes && voices.hasEndedNotes()) reportEndedNotes(voices, *ctx.endedNotes, (int) i);
     if (R) {
       L[i] = l;
       R[i] = r;

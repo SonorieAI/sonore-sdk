@@ -38,6 +38,7 @@
 #include <clap/ext/timer-support.h>
 #include <clap/factory/preset-discovery.h>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include <chrono>
@@ -531,6 +532,16 @@ template <typename T>
 struct HasVoiceCapacity<T, std::void_t<decltype(std::declval<const T&>().voiceCapacity())>>
     : std::true_type {};
 
+/** …how many of them the patch may use now: a Voices control's setting, at
+ *  most the capacity. This is CLAP's voice_count; without it, the capacity
+ *  is the count. */
+template <typename T, typename = void>
+struct HasVoiceCount : std::false_type {};
+/** The match for HasVoiceCount: T declares `voiceCount() const`. */
+template <typename T>
+struct HasVoiceCount<T, std::void_t<decltype(std::declval<const T&>().voiceCount())>>
+    : std::true_type {};
+
 /** …and how many are sounding right now. Detected, and NOT what CLAP's
  *  voice_count asks for -- that is the voices the patch can use, never the
  *  ones in use (see fillVoiceInfo) -- so no format reports it. */
@@ -926,6 +937,23 @@ struct Instance {
   };
   NoteIdSlot noteIds[64];
   int noteIdNext = 0;
+  /** The id of each of the block's note-ons, in order, for the DSP
+   *  (ProcessContext::noteIds); and the notes it reports ended, for the
+   *  host (NOTE_END). */
+  NoteIdBuffer noteIdsIn;
+  NoteIdBuffer endedNotes;
+  /** The host's modulation: per note, for the DSP (ProcessContext::
+   *  paramMods); for the whole plugin, an offset per parameter the wrapper
+   *  adds to what the DSP is handed. Audio thread only. */
+  ParamModBuffer paramMods;
+  float paramMod[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
+  /** paramsBlock with paramMod added, when any offset is set. */
+  float paramsModulated[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
+  /** The DSP's voiceCount() as the last block left it, published for the
+   *  main thread's voice-info answer (0: no block yet), and whether the host
+   *  is still to be told it moved. */
+  SharedParam voiceCountNow;
+  SharedFlag voiceInfoDirty;
   /** What the DSP emitted this block, drained to the host after process. */
   MidiBuffer midiOut;
   /** Per-note expression for this block, and the decoder that fills it from
@@ -1249,6 +1277,14 @@ inline bool paramsGetInfo(const clap_plugin_t* plugin, uint32_t index, clap_para
   if (p.readOnly) info->flags |= CLAP_PARAM_IS_READONLY;
   else if (p.automatable) info->flags |= CLAP_PARAM_IS_AUTOMATABLE;
   if (p.hidden) info->flags |= CLAP_PARAM_IS_HIDDEN;
+  // Modulation is an offset to a value the host can set, so never for a
+  // read-only one. Per note, a note named any of the three ways CLAP names
+  // one: by id, by key, by channel.
+  if (!p.readOnly && (p.modulatable || p.modulatablePerNote))
+    info->flags |= CLAP_PARAM_IS_MODULATABLE;
+  if (!p.readOnly && p.modulatablePerNote)
+    info->flags |= CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID | CLAP_PARAM_IS_MODULATABLE_PER_KEY |
+                   CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL;
   // CLAP's stepped flag promises the CONSECUTIVE integers min..max -- a host
   // steps such a control by one. A control stepping 2, 4, 6, 8 (or 0, 0.5,
   // 1) cannot keep that promise, so it is declared continuous here and the
@@ -1354,12 +1390,48 @@ inline void applyEvent(Instance* inst, const clap_event_header_t* hdr, uint32_t 
         inst->params[e->param_id] = clampToRange(kDesc.params[e->param_id], (float) e->value);
       break;
     }
+    case CLAP_EVENT_PARAM_MOD: {
+      // Modulation: an offset to the value, never written into it -- not
+      // saved, not shown on the knob, gone when the host sends 0.
+      const auto* e = eventAs<clap_event_param_mod_t>(hdr);
+      if (!e || e->param_id >= (uint32_t) SONORE_NUM_PARAMS) break;
+      const ParamInfo& p = kDesc.params[e->param_id];
+      if (p.readOnly || !(p.modulatable || p.modulatablePerNote)) break;
+      const float amount = std::isfinite(e->amount) ? (float) e->amount : 0.0f;
+      if (e->note_id < 0 && e->key < 0 && e->channel < 0) {
+        inst->paramMod[e->param_id] = amount;
+        break;
+      }
+      if (!p.modulatablePerNote) break;
+      ParamModBuffer::Entry entry;
+      entry.noteId = e->note_id;
+      entry.key = e->key;
+      entry.channel = e->channel;
+      // Named by its id alone, as an expression can be: key and channel
+      // from the note-on that carried the id, or nothing for an id nobody
+      // played.
+      if (e->note_id >= 0 && (e->key < 0 || e->channel < 0)) {
+        const Instance::NoteIdSlot* slot = nullptr;
+        for (const Instance::NoteIdSlot& sl : inst->noteIds)
+          if (sl.id == e->note_id) slot = &sl;
+        if (!slot) break;
+        if (entry.key < 0) entry.key = slot->key;
+        if (entry.channel < 0) entry.channel = slot->channel;
+      }
+      entry.param = (int32_t) e->param_id;
+      entry.amount = amount;
+      entry.samplePosition = time;
+      inst->paramMods.addEvent(entry);
+      break;
+    }
     case CLAP_EVENT_NOTE_ON: {
       const auto* e = eventAs<clap_event_note_t>(hdr);
       if (!e || e->key < 0) break;
       const int ch = e->channel < 0 ? 0 : e->channel;
       const int vel = (int) (e->velocity * 127.0 + 0.5);
       inst->midi.addEvent(MidiMessage::noteOn(ch, e->key, vel < 1 ? 1 : vel), time);
+      // Every note-on, named or not, so the DSP pairs each with its own.
+      inst->noteIdsIn.add(time, e->key, ch, e->note_id);
       if (e->note_id >= 0) {
         Instance::NoteIdSlot& slot = inst->noteIds[inst->noteIdNext];
         inst->noteIdNext = (inst->noteIdNext + 1) % 64;
@@ -1484,6 +1556,24 @@ inline void applyEvent(Instance* inst, const clap_event_header_t* hdr, uint32_t 
 inline void discardEvents(Instance* inst) {
   inst->midi.clear();
   inst->expression.clear();
+  inst->noteIdsIn.clear();
+  inst->paramMods.clear();
+}
+
+/** [audio-thread] The values the DSP is handed this block: the block's
+ *  snapshot, with the host's modulation for the whole plugin added and
+ *  clamped to each range. The snapshot itself when nothing is modulated, so
+ *  a plugin no host modulates pays one pass over its parameters. */
+inline const float* dspParams(Instance* inst) {
+  bool any = false;
+  for (int i = 0; i < SONORE_NUM_PARAMS; ++i)
+    if (inst->paramMod[i] != 0.0f) any = true;
+  if (!any) return inst->paramsBlock;
+  for (int i = 0; i < SONORE_NUM_PARAMS; ++i)
+    inst->paramsModulated[i] = inst->paramMod[i] != 0.0f
+                                   ? clampToRange(kDesc.params[i], inst->paramsBlock[i] + inst->paramMod[i])
+                                   : inst->paramsBlock[i];
+  return inst->paramsModulated;
 }
 
 /** Drain the UI queue: apply each edit locally AND tell the host, so a knob
@@ -1846,27 +1936,60 @@ inline const clap_plugin_render_t kRenderExt = {renderHasHardRealtimeRequirement
  *  is an error even when the condition is false. Making the DSP type a
  *  template parameter is what actually discards it. */
 template <typename T>
-inline bool fillVoiceInfo(const T& dsp, clap_voice_info_t* info) {
+inline bool fillVoiceInfo(const T& dsp, clap_voice_info_t* info, int count = 0) {
   if constexpr (HasVoiceCapacity<T>::value) {
     const int capacity = dsp.voiceCapacity();
     if (capacity <= 0) return false;
     info->voice_capacity = (uint32_t) capacity;
-    // Every voice the DSP has is one the patch can use: the SDK has no
-    // polyphony setting below the capacity. See above for why this is not
+    // The voices the patch can use: a DSP with a Voices control says how many
+    // through voiceCount(), as the last block left it (`count`); one without
+    // can use every voice it has. See above for why this is not
     // activeVoices().
-    info->voice_count = (uint32_t) capacity;
+    if (count < 1 || count > capacity) count = capacity;
+    info->voice_count = (uint32_t) count;
     info->flags = 0;
     return true;
   } else {
     (void) dsp;
     (void) info;
+    (void) count;
     return false;
   }
 }
 
 inline bool voiceInfoGet(const clap_plugin_t* plugin, clap_voice_info_t* info) {
   if (!info || !kDesc.isInstrument) return false;
-  return fillVoiceInfo(self(plugin)->dsp, info);
+  Instance* inst = self(plugin);
+  return fillVoiceInfo(inst->dsp, info, (int) (float) inst->voiceCountNow);
+}
+
+/** [audio-thread] Publish the DSP's voiceCount() and, when it moved, ask for
+ *  the main thread to tell the host: clap_host_voice_info::changed is
+ *  [main-thread]. */
+template <typename T>
+inline void publishVoiceCount(Instance* inst, const T& dsp) {
+  if constexpr (HasVoiceCount<T>::value) {
+    const float now = (float) dsp.voiceCount();
+    if (now == (float) inst->voiceCountNow) return;
+    // The first block's count is news too: a host that asked before it was
+    // answered with the capacity, and a session may have restored fewer.
+    inst->voiceCountNow = now;
+    inst->voiceInfoDirty = true;
+    if (inst->host) inst->host->request_callback(inst->host);
+  } else {
+    (void) inst;
+    (void) dsp;
+  }
+}
+
+/** [main-thread] Tell the host the voice count moved, once it has. */
+inline void announceVoiceInfoIfChanged(Instance* inst) {
+  if (!inst->voiceInfoDirty) return;
+  inst->voiceInfoDirty = false;
+  if (!inst->host) return;
+  if (const auto* ext = static_cast<const clap_host_voice_info_t*>(
+          inst->host->get_extension(inst->host, CLAP_EXT_VOICE_INFO)))
+    if (ext->changed) ext->changed(inst->host);
 }
 
 inline const clap_plugin_voice_info_t kVoiceInfoExt = {voiceInfoGet};
@@ -3168,17 +3291,38 @@ inline void finishProcess(Instance* inst, const clap_process_t* process, uint32_
   // In TIME ORDER, short messages and SysEx merged, which is what CLAP
   // requires of an output list. The SysEx used to go out after every short
   // message, so a SysEx early in the block followed a note-off late in it.
-  if (kDesc.producesMidi && process->out_events) {
+  //
+  // The notes the DSP reports ended go out in the same list, as NOTE_END on
+  // the note port they came in on: how a host that modulates per note learns
+  // that a voice is gone, release tail and all, and stops modulating it.
+  const bool sendsNoteEnds = kDesc.isInstrument && !inst->endedNotes.isEmpty();
+  if ((kDesc.producesMidi || sendsNoteEnds) && process->out_events) {
     auto clampTime = [frames](int position) {
       uint32_t t = (uint32_t) (position < 0 ? 0 : position);
       return t >= frames ? frames - 1 : t;
     };
-    const MidiBuffer::Entry* e = inst->midiOut.begin();
-    const MidiBuffer::Entry* const eEnd = inst->midiOut.end();
-    const MidiBuffer::SysexEntry* x = inst->midiOut.sysexBegin();
-    const MidiBuffer::SysexEntry* const xEnd = inst->midiOut.sysexEnd();
-    while (e != eEnd || x != xEnd) {
-      if (x == xEnd || (e != eEnd && e->samplePosition <= x->samplePosition)) {
+    const MidiBuffer::Entry* e = kDesc.producesMidi ? inst->midiOut.begin() : nullptr;
+    const MidiBuffer::Entry* const eEnd = kDesc.producesMidi ? inst->midiOut.end() : nullptr;
+    const MidiBuffer::SysexEntry* x = kDesc.producesMidi ? inst->midiOut.sysexBegin() : nullptr;
+    const MidiBuffer::SysexEntry* const xEnd = kDesc.producesMidi ? inst->midiOut.sysexEnd() : nullptr;
+    const NoteIdBuffer::Entry* n = sendsNoteEnds ? inst->endedNotes.begin() : nullptr;
+    const NoteIdBuffer::Entry* const nEnd = sendsNoteEnds ? inst->endedNotes.end() : nullptr;
+    while (e != eEnd || x != xEnd || n != nEnd) {
+      if (n != nEnd && (e == eEnd || n->samplePosition < e->samplePosition) &&
+          (x == xEnd || n->samplePosition < x->samplePosition)) {
+        clap_event_note_t ev{};
+        ev.header.size = sizeof(ev);
+        ev.header.type = CLAP_EVENT_NOTE_END;
+        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        ev.header.time = clampTime(n->samplePosition);
+        ev.note_id = n->noteId;
+        ev.port_index = 0;
+        ev.channel = n->channel;
+        ev.key = n->key;
+        ev.velocity = 0.0;
+        process->out_events->try_push(process->out_events, &ev.header);
+        ++n;
+      } else if (x == xEnd || (e != eEnd && e->samplePosition <= x->samplePosition)) {
         clap_event_midi_t ev{};
         ev.header.size = sizeof(ev);
         ev.header.type = CLAP_EVENT_MIDI;
@@ -3212,6 +3356,10 @@ inline void finishProcess(Instance* inst, const clap_process_t* process, uint32_
   // here -- it asks to be restarted, which is thread-safe and therefore legal
   // from the audio thread.
   requestRestartIfLatencyChanged(inst);
+
+  // So may the voices the patch can use (a Voices control), which a host
+  // reads through voice-info and is told about on the main thread.
+  if (kDesc.isInstrument) publishVoiceCount(inst, inst->dsp);
 
   // The tail, by contrast, is announced from HERE. clap_host_tail::changed is
   // [audio-thread] -- the only notification in this wrapper that is.
@@ -3364,16 +3512,20 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
           inst->mainRoles(roles64, kMaxAudioChannels);
       AudioBlock<double> block64(chans64, nch64, frames);
       inst->midiOut.clear();
+      inst->endedNotes.clear();
       ProcessContextT<double> ctx64{block64,   auxBlocks64, nAux64,
                                     scBlock64, inst->midi,  inst->midiOut,
                                     numRoles64 ? roles64 : nullptr, &inst->expression,
                                     &inst->outputPortActive.flags[1],
                                     inst->inputPortActive[1],
-                                    inst->offline};
+                                    inst->offline,
+                                    &inst->noteIdsIn,
+                                    &inst->endedNotes,
+                                    &inst->paramMods};
       bypassCapture(inst->bypass, chans64, nch64, frames);
       trackNotes(inst->notes, ctx64.midi);
       snapshotParams(inst);
-      runDspCtx64(inst->dsp, ctx64, inst->paramsBlock);
+      runDspCtx64(inst->dsp, ctx64, dspParams(inst));
       bypassApply(inst->bypass, chans64, nch64, frames);
       guardOutputs(inst, chans64, nch64, auxBlocks64, nAux64, frames);
 
@@ -3469,6 +3621,7 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
   }
 
   inst->midiOut.clear();
+  inst->endedNotes.clear();
   uint8_t roles[kMaxAudioChannels];
   const uint32_t numRoles = inst->mainRoles(roles, kMaxAudioChannels);
   // Aux flags start at index 1 of the output array: index 0 is the MAIN output,
@@ -3478,7 +3631,10 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
                      numRoles ? roles : nullptr, &inst->expression,
                      &inst->outputPortActive.flags[1],
                      inst->inputPortActive[1],
-                     inst->offline};
+                     inst->offline,
+                     &inst->noteIdsIn,
+                     &inst->endedNotes,
+                     &inst->paramMods};
   // Stash the dry input, run the DSP, then crossfade back to the dry if the
   // host has engaged the bypass.
   //
@@ -3491,7 +3647,7 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
   bypassCapture(inst->bypass, chans, nch, frames);
   trackNotes(inst->notes, ctx.midi);
   snapshotParams(inst);
-  runDspCtx(inst->dsp, ctx, inst->paramsBlock);
+  runDspCtx(inst->dsp, ctx, dspParams(inst));
   bypassApply(inst->bypass, chans, nch, frames);
   guardOutputs(inst, chans, nch, auxBlocks, nAux, frames);
 
@@ -4893,6 +5049,7 @@ inline void pluginOnMainThread(const clap_plugin_t* plugin) {
   // is a log, so the output guard's report comes the same way.
   markDirtyIfNeeded(self(plugin));
   reportOutputGuard(self(plugin));
+  announceVoiceInfoIfChanged(self(plugin));
 }
 
 // ── Descriptor + factory ─────────────────────────────────────────────────────

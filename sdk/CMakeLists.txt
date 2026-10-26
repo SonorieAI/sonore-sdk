@@ -595,7 +595,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_test(NAME clap_effect COMMAND clap_host_test $<TARGET_FILE:SonoreSaturator>
            --expect-web-editor)
   add_test(NAME clap_instrument COMMAND clap_host_test $<TARGET_FILE:SonoreSynth>
-           --expect-native-editor)
+           --expect-native-editor --expect-poly-mod)
   add_test(NAME clap_sidechain COMMAND clap_host_test $<TARGET_FILE:SonoreDucker>
                                        --expect-sidechain)
   add_test(NAME clap_channels COMMAND clap_host_test $<TARGET_FILE:SonoreTrim>

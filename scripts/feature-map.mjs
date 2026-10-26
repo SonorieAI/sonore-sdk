@@ -964,6 +964,22 @@ const MAP = [
    "addresses a VOICE and a MIDI message addresses a channel -- and flattening " +
    "the first into the second is what makes MPE sound like ordinary MIDI",
    "class NoteExpressionBuffer"],
+  ["dsp", "notes a host names, and when they end",
+   "audio.h: NoteIdBuffer. The host's id for each note-on (CLAP's note_id, " +
+   "VST3's noteId) travels beside the MIDI, and renderVoices() hands it to the " +
+   "voice manager with its note, so the note's expression, its modulation and " +
+   "its end are all addressed by that name -- two strikes of one key in a block " +
+   "included. The notes a DSP reports ended go back to a CLAP host as NOTE_END, " +
+   "which is when a host stops modulating a voice",
+   "class NoteIdBuffer"],
+  ["dsp", "parameter modulation from the host, for the plugin and per note",
+   "plugin.h: ParamInfo::modulatable and modulatablePerNote; audio.h: " +
+   "ParamModBuffer. CLAP's modulation is an offset a host's own LFO or envelope " +
+   "adds to a parameter without writing it into the value a session saves. For " +
+   "the whole plugin the wrapper adds it, clamped to the range, before every " +
+   "block, so any DSP has it; for one note renderVoices() hands it to that " +
+   "note's voice through setParamMod()",
+   "class ParamModBuffer"],
   ["basics", "channel routing matrix",
    "channel_matrix.h: ChannelMatrix. What a plugin uses when its input layout " +
    "and its output layout are not the same one -- a mono-to-stereo, a " +

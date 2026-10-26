@@ -183,6 +183,14 @@ Numerics
 
 ### New
 
+- CLAP parameter modulation, for the whole plugin and per note, and note ends:
+  - `ParamInfo::modulatable` lets a CLAP host modulate a parameter: the wrapper adds the host's offset, clamped to the range, to what `process()` is handed before every block, and never to the value a session saves, so any DSP has it;
+  - `ParamInfo::modulatablePerNote` lets it modulate one note at a time: the offsets arrive in `ctx.paramMods` (`ParamModBuffer`), and `renderVoices()` hands each to its note's voice through `setParamMod(int param, float amount)`;
+  - the host's id for each note-on (CLAP's note_id, VST3's noteId) reaches the voice manager with its note (`NoteIdBuffer`, `ctx.noteIds`), two strikes of one key in a block included;
+  - the notes a DSP reports ended (`ctx.endedNotes`, filled by `renderVoices()`, or by `reportEndedNotes()` for voices rendered by hand) go back to a CLAP host as NOTE_END, which is when a host stops modulating a voice;
+  - a DSP's `int voiceCount() const` is CLAP's voice_count, and the host is told when it moves.
+
+  The example synth's Cutoff and Resonance are modulatable per note, and its Voices control is its voice count.
 - Synthesisers on `VoiceManager` (dsp.h):
   - a stolen voice fades out over 2 ms under the new note, rendered ahead so the steal does not click (`setSampleRate()` times it);
   - stereo voices, through `render(float& left, float& right)`;

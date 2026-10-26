@@ -131,6 +131,11 @@ static int g_tailChanged = 0;
 static void hostTailChanged(const clap_host_t*) { ++g_tailChanged; }
 static const clap_host_tail_t kHostTail = {hostTailChanged};
 
+/** How many times the plugin said the voices it can use changed. */
+static int g_voiceInfoChanged = 0;
+static void hostVoiceInfoChanged(const clap_host_t*) { ++g_voiceInfoChanged; }
+static const clap_host_voice_info_t kHostVoiceInfo = {hostVoiceInfoChanged};
+
 /** The track this host pretends to have. A real host gathers this from the
  *  session; the point here is that the plugin ASKS and reads what comes back
  *  -- including the parts it must decode rather than copy, like the flags and
@@ -187,6 +192,7 @@ static const void* hostGetExtension(const clap_host_t*, const char* id) {
   if (std::strcmp(id, CLAP_EXT_CONTEXT_MENU) == 0) return &kHostContextMenu;
   if (std::strcmp(id, CLAP_EXT_TRACK_INFO) == 0) return &kHostTrackInfo;
   if (std::strcmp(id, CLAP_EXT_TAIL) == 0) return &kHostTail;
+  if (std::strcmp(id, CLAP_EXT_VOICE_INFO) == 0) return &kHostVoiceInfo;
   if (std::strcmp(id, CLAP_EXT_PARAMS) == 0) return &kHostParams;
   if (std::strcmp(id, CLAP_EXT_LATENCY) == 0) return &kHostLatency;
   if (std::strcmp(id, CLAP_EXT_STATE) == 0) return &kHostState;
@@ -229,17 +235,35 @@ struct EventList {
   }
 
   void addNote(uint16_t type, int16_t key, double velocity, uint32_t time,
-               int16_t channel = 0) {
+               int16_t channel = 0, int32_t noteId = -1) {
     clap_event_note_t e{};
     e.header.size = sizeof(e);
     e.header.time = time;
     e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
     e.header.type = type;
-    e.note_id = -1;
+    e.note_id = noteId;
     e.port_index = 0;
     e.channel = channel;
     e.key = key;
     e.velocity = velocity;
+    push(&e, sizeof(e));
+  }
+
+  /** A modulation: an offset to a parameter, for one note (by id, key or
+   *  channel) or, all three -1, for the whole plugin. */
+  void addParamMod(uint32_t paramId, double amount, uint32_t time, int32_t noteId = -1,
+                   int16_t key = -1, int16_t channel = -1) {
+    clap_event_param_mod_t e{};
+    e.header.size = sizeof(e);
+    e.header.time = time;
+    e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    e.header.type = CLAP_EVENT_PARAM_MOD;
+    e.param_id = paramId;
+    e.note_id = noteId;
+    e.port_index = -1;
+    e.channel = channel;
+    e.key = key;
+    e.amount = amount;
     push(&e, sizeof(e));
   }
 
@@ -296,6 +320,8 @@ struct EmittedMidi {
   }
 };
 static EmittedMidi g_emitted;
+/** The NOTE_END events the plugin sent, in order. */
+static std::vector<clap_event_note_t> g_noteEnds;
 
 /** SysEx the plugin emitted, COPIED here. The event carries a pointer that is
  *  only promised to be valid until process() returns, so a test that kept the
@@ -313,7 +339,9 @@ static bool paramTryPush(const clap_output_events_t*, const clap_event_header_t*
 }
 
 static bool outTryPush(const clap_output_events_t*, const clap_event_header_t* h) {
-  if (h && h->type == CLAP_EVENT_MIDI && h->space_id == CLAP_CORE_EVENT_SPACE_ID) {
+  if (h && h->type == CLAP_EVENT_NOTE_END && h->space_id == CLAP_CORE_EVENT_SPACE_ID) {
+    g_noteEnds.push_back(*reinterpret_cast<const clap_event_note_t*>(h));
+  } else if (h && h->type == CLAP_EVENT_MIDI && h->space_id == CLAP_CORE_EVENT_SPACE_ID) {
     const auto* m = reinterpret_cast<const clap_event_midi_t*>(h);
     g_emitted.events.push_back({h->time, {m->data[0], m->data[1], m->data[2]}});
   } else if (h && h->type == CLAP_EVENT_MIDI_SYSEX &&
@@ -465,6 +493,9 @@ int main(int argc, char** argv) {
   /** The 64-bit fixture (tests/double_fixture.cpp): its double-precision
    *  block must have every consequence a float block has. */
   bool expect64Parity = false;
+  /** The plugin lets a host modulate a parameter per note, and says when
+   *  each note ends: CLAP's polyphonic modulation, measured on the sound. */
+  bool expectPolyMod = false;
   // Which editor this plugin should open. A plugin that defines SONORE_UI_HTML
   // asked for a page; one that does not gets the SDK's own controls. The test
   // is told which to expect so it can measure rather than accept whatever
@@ -478,6 +509,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[i], "--expect-sidechain") == 0) expectSidechain = true;
     if (std::strcmp(argv[i], "--expect-midi-out") == 0) expectMidiOut = true;
     if (std::strcmp(argv[i], "--expect-64bit-parity") == 0) expect64Parity = true;
+    if (std::strcmp(argv[i], "--expect-poly-mod") == 0) expectPolyMod = true;
     if (std::strcmp(argv[i], "--expect-linked-stereo") == 0) expectLinkedStereo = true;
     if (std::strcmp(argv[i], "--expect-aux-outs") == 0 && i + 1 < argc) {
       expectAuxOuts = std::atoi(argv[i + 1]);
@@ -1605,6 +1637,132 @@ int main(int argc, char** argv) {
     } else {
       check(voiceInfo == nullptr,
             "a plugin with no voices does not pretend to have any");
+    }
+  }
+
+  // ── Notes a host names: modulated one at a time, and reported ended ──────
+  //
+  // CLAP's polyphonic modulation is a host's LFO or envelope on ONE voice's
+  // cutoff, addressed by the note_id the host gave that note-on. It asks two
+  // things of a plugin: the offset reaches that voice and no other, and the
+  // plugin says when the voice is gone (NOTE_END), which is when the host
+  // stops modulating it. Measured on the sound: a filter pulled down to the
+  // bottom of its range for one note takes that note's harmonics with it.
+  if (expectPolyMod && isInstrument) {
+    uint32_t modId = UINT32_MAX;
+    double modMin = 0.0, modValue = 0.0;
+    for (uint32_t i = 0; i < nParams; ++i) {
+      clap_param_info_t info{};
+      if (!params->get_info(plugin, i, &info)) continue;
+      if ((info.flags & CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID) == 0) continue;
+      check((info.flags & CLAP_PARAM_IS_MODULATABLE) != 0,
+            "a parameter modulatable per note is modulatable");
+      modId = info.id;
+      modMin = info.min_value;
+      params->get_value(plugin, info.id, &modValue);
+      break;
+    }
+    check(modId != UINT32_MAX, "the plugin declares a parameter a host may modulate per note");
+    if (modId != UINT32_MAX) {
+      // How much of the output is in its sample-to-sample motion: a bright
+      // saw has a lot, the same saw through a closed filter almost none.
+      auto brightness = [&](int blocks) {
+        double motion = 0.0, energy = 0.0;
+        float prev = 0.0f;
+        for (int b = 0; b < blocks; ++b) {
+          plugin->process(plugin, &process);
+          events.storage.clear();
+          for (uint32_t i = 0; i < blockSize; ++i) {
+            const double d = (double) outL[i] - prev;
+            motion += d * d;
+            energy += (double) outL[i] * outL[i];
+            prev = outL[i];
+          }
+        }
+        return energy > 1e-12 ? motion / energy : 0.0;
+      };
+      events.storage.clear();
+      brightness(oneSecond); // whatever an earlier check left sounding, gone
+      g_noteEnds.clear();
+
+      events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0, 0, 7); // A2, named 7
+      brightness(oneSecond / 8);
+      const double open = brightness(oneSecond / 4);
+      // Named by its id alone, as a host may: key and channel left open.
+      events.addParamMod(modId, modMin - modValue, 0, 7);
+      brightness(4);
+      const double shut = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0, 7);
+      brightness(4);
+      const double reopened = brightness(oneSecond / 4);
+      events.addParamMod(modId, modMin - modValue, 0); // the whole plugin
+      brightness(4);
+      const double global = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0);
+      brightness(4);
+      std::printf("  ---- brightness: open %.4f, the note modulated %.4f, released %.4f, "
+                  "the plugin modulated %.4f ----\n",
+                  open, shut, reopened, global);
+      check(open > 0.0 && shut < open * 0.5,
+            "a modulation addressed to a note's id moves that note: its filter closes");
+      check(reopened > shut * 1.5, "…and an amount of 0 ends it");
+      check(global < open * 0.5, "a modulation for the whole plugin moves every note");
+      double after = 0.0;
+      params->get_value(plugin, modId, &after);
+      check(after == modValue, "modulation never moves the value a host saves and shows");
+
+      // A note named 9 that nobody played: its modulation is no one's.
+      events.addParamMod(modId, modMin - modValue, 0, 9);
+      brightness(4);
+      const double stray = brightness(oneSecond / 4);
+      check(stray > shut * 1.5, "a modulation for a note nobody played changes nothing");
+
+      events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0, 0, 7);
+      int ends = 0;
+      for (int b = 0; b < 4 * oneSecond && ends == 0; ++b) {
+        brightness(1);
+        for (const clap_event_note_t& e : g_noteEnds)
+          if (e.note_id == 7 && e.key == 45 && e.channel == 0) ++ends;
+      }
+      check(ends == 1, "when a released note's tail runs out, the plugin says so by its id (NOTE_END)");
+      brightness(oneSecond / 4);
+      ends = 0;
+      for (const clap_event_note_t& e : g_noteEnds)
+        if (e.note_id == 7) ++ends;
+      check(ends == 1, "…once");
+    }
+
+    // The voices the patch can use follow its Voices control, and the host
+    // is told when they move: Bitwig sizes its MPE channels and voice stack
+    // by this number.
+    const auto* voiceInfo = static_cast<const clap_plugin_voice_info_t*>(
+        plugin->get_extension(plugin, CLAP_EXT_VOICE_INFO));
+    uint32_t voicesId = UINT32_MAX;
+    double voicesWas = 0.0;
+    for (uint32_t i = 0; i < nParams; ++i) {
+      clap_param_info_t info{};
+      if (params->get_info(plugin, i, &info) && std::strcmp(info.name, "Voices") == 0) {
+        voicesId = info.id;
+        params->get_value(plugin, info.id, &voicesWas);
+      }
+    }
+    if (voiceInfo && voicesId != UINT32_MAX) {
+      plugin->on_main_thread(plugin); // anything already pending, told
+      const int toldBefore = g_voiceInfoChanged;
+      events.storage.clear();
+      events.addParam(voicesId, 4.0, 0);
+      plugin->process(plugin, &process);
+      events.storage.clear();
+      plugin->on_main_thread(plugin);
+      clap_voice_info_t info{};
+      voiceInfo->get(plugin, &info);
+      check(info.voice_count == 4 && info.voice_capacity >= 4,
+            "voice_count follows the Voices control: 4 of the capacity");
+      check(g_voiceInfoChanged == toldBefore + 1, "…and the host is told it changed, once");
+      events.addParam(voicesId, voicesWas, 0);
+      plugin->process(plugin, &process);
+      events.storage.clear();
+      plugin->on_main_thread(plugin);
     }
   }
 

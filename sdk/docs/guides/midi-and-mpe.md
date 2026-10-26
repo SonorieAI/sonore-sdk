@@ -57,6 +57,7 @@ manager finds them at compile time:
 | `void setPressure(float)`, `void setBrightness(float)` | this note's pressure and timbre, 0 to 1 |
 | `void setModWheel(float)` | CC 1, 0 to 1 |
 | `void kill()` | silence now: All Sound Off (CC 120) stops the voice outright |
+| `void setParamMod(int param, float amount)` | a host's offset to a parameter for this note alone (below) |
 
 `sonore::renderVoices(voices, ctx)` is a whole instrument block. It applies every
 MIDI event and every note expression at its frame and renders the voices
@@ -70,7 +71,7 @@ between them into `ctx.main`, stereo voices in stereo. The MIDI goes through
 
 `drainEndedNotes()` reports each note that has finished sounding, release tail
 included: its key, its channel and, where `noteOn()` was given one, the host's
-id for it.
+id for it. `renderVoices()` passes those on to the host itself (below).
 
 ## Mono, legato and glide
 
@@ -87,6 +88,38 @@ with no new attack. Either way the manager remembers the keys held:
 The glide itself is the voice's: `sonore::Portamento` moves a pitch in
 semitones, over a fixed time or at a rate per octave. `jumpTo()` the note in
 `noteOn()`, `glideTo()` it in `legatoTo()`, and read `next()` every sample.
+
+## Notes the host names, and modulation
+
+A CLAP or VST3 host gives each note it starts an id. `renderVoices()` hands
+it to the voice manager with the note (from `ctx.noteIds`), so the note's
+expression, its modulation and its end can all be addressed by that id, even
+when one key is struck twice in a block.
+
+A CLAP host can also modulate a parameter: its own LFO or envelope adds an
+offset to the value, without moving the knob and without being saved. Two
+fields of `sonore::ParamInfo` allow it:
+
+- `modulatable`: the host may modulate the parameter for the whole plugin.
+  The wrapper adds the offset to the values `process()` is handed, clamped to
+  the range, so the DSP needs no code for it.
+- `modulatablePerNote`: the host may also modulate it one note at a time.
+  `renderVoices()` hands each offset to that note's voice through
+  `void setParamMod(int param, float amount)`. The voice adds the amount, in
+  the parameter's own units, to the knob's value for itself alone, and clears
+  its offsets in `noteOn()`: a new note starts unmodulated, and the host sends
+  it its own.
+
+A host keeps modulating a note until the plugin says the note has ended,
+release tail included. `renderVoices()` reports that in `ctx.endedNotes`, and
+the CLAP wrapper sends it to the host as NOTE_END. A DSP that renders its
+voices by hand calls `sonore::reportEndedNotes(voices, *ctx.endedNotes, frame)`
+once per block, when `ctx.endedNotes` is not null.
+
+A DSP with a Voices control also declares `int voiceCount() const` beside
+`voiceCapacity()`, and a CLAP host is told when it moves. The example synth
+(`sdk/examples/synth/plugin.cpp`) does all of this: its Cutoff and Resonance
+are modulatable per note.
 
 ## MPE
 

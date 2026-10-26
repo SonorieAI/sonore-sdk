@@ -1900,6 +1900,166 @@ static void testVoiceManagerForSynths() {
   }
 }
 
+static void testHostNamedNotes() {
+  std::printf("voice manager: notes the host names, their ends, their modulation\n");
+
+  // ── The ids pair with their note-ons, in order ────────────────────
+  {
+    sonore::NoteIdBuffer ids;
+    ids.add(10, 60, 0, 102);
+    ids.add(0, 60, 0, 101); // earlier frame, added later: sorted in front
+    ids.add(0, 64, 1, 7);
+    check(ids.getNumEntries() == 3 && ids.begin()->noteId == 101,
+          "a note id buffer keeps its notes in frame order");
+    check(ids.take(60, 0) == 101 && ids.take(60, 0) == 102,
+          "a key struck twice in a block gets each strike's own id, in order");
+    check(ids.take(60, 0) == -1, "…and a third strike the host never named gets none");
+    check(ids.take(64, 0) == -1 && ids.take(64, 1) == 7, "the channel is part of the match");
+    ids.clear();
+    check(ids.isEmpty(), "clear() empties it");
+  }
+
+  // A voice that keeps what it was given: its modulation by parameter, and
+  // a release that lasts a fixed number of samples, so its end is countable.
+  struct ModVoice {
+    bool active = false;
+    int releaseLeft = -1;
+    float mod[4] = {};
+    int mods = 0;
+    void noteOn(int, float) {
+      active = true;
+      releaseLeft = -1;
+      for (float& m : mod) m = 0.0f; // a new note starts unmodulated
+    }
+    void noteOff() { releaseLeft = 10; }
+    bool isActive() const { return active; }
+    float render() {
+      if (releaseLeft > 0 && --releaseLeft == 0) active = false;
+      return active ? 0.5f : 0.0f;
+    }
+    void setParamMod(int param, float amount) {
+      if (param >= 0 && param < 4) mod[param] = amount;
+      ++mods;
+    }
+  };
+
+  // One block of the voices against a hand-made context.
+  struct Rig {
+    std::vector<float> l = std::vector<float>(64, 0.0f), r = std::vector<float>(64, 0.0f);
+    float* ch[2] = {nullptr, nullptr};
+    sonore::MidiBuffer midi, midiOut;
+    sonore::NoteExpressionBuffer expr;
+    sonore::NoteIdBuffer ids, ended;
+    sonore::ParamModBuffer mods;
+  };
+  // A local class cannot have a member template, so the block is a lambda.
+  auto runBlock = [](Rig& rig, auto& voices) {
+    rig.ch[0] = rig.l.data();
+    rig.ch[1] = rig.r.data();
+    sonore::AudioBlock<float> block(rig.ch, 2, 64);
+    sonore::AudioBlock<float> aux[1] = {};
+    float* scp[2] = {nullptr, nullptr};
+    sonore::AudioBlock<float> sc(scp, 2, 0);
+    rig.ended.clear();
+    sonore::ProcessContext ctx{block, aux, 0, sc, rig.midi, rig.midiOut, nullptr, &rig.expr,
+                               nullptr, true, false, &rig.ids, &rig.ended, &rig.mods};
+    sonore::renderVoices(voices, ctx);
+    rig.midi.clear();
+    rig.ids.clear();
+    rig.mods.clear();
+  };
+
+  // ── Through renderVoices: ids, modulation, ends ───────────────────
+  {
+    sonore::VoiceManager<ModVoice, 4> voices;
+    Rig rig;
+    rig.midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    rig.ids.add(0, 60, 0, 101);
+    rig.midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 10); // the same key again
+    rig.ids.add(10, 60, 0, 102);
+    rig.midi.addEvent(sonore::MidiMessage::noteOn(0, 67, 100), 10);
+    rig.ids.add(10, 67, 0, 103);
+    sonore::ParamModBuffer::Entry m;
+    m.noteId = 102;
+    m.param = 1;
+    m.amount = 0.5f;
+    m.samplePosition = 20;
+    rig.mods.addEvent(m);
+    sonore::ParamModBuffer::Entry byKey;
+    byKey.key = 67;
+    byKey.channel = 0;
+    byKey.param = 2;
+    byKey.amount = -3.0f;
+    byKey.samplePosition = 20;
+    rig.mods.addEvent(byKey);
+    runBlock(rig, voices);
+    const int first = voices.voiceForNoteId(101), second = voices.voiceForNoteId(102),
+              third = voices.voiceForNoteId(103);
+    check(first >= 0 && second >= 0 && third >= 0 && first != second,
+          "renderVoices gives each note-on the host's id for it: two strikes of one key are two notes");
+    check(voices.voice(second).mod[1] == 0.5f && voices.voice(first).mod[1] == 0.0f,
+          "a modulation addressed by id reaches that note's voice and no other");
+    check(voices.voice(third).mod[2] == -3.0f, "…and one addressed by key and channel reaches the key's voice");
+
+    sonore::ParamModBuffer::Entry all;
+    all.param = 3;
+    all.amount = 1.0f;
+    rig.mods.addEvent(all);
+    runBlock(rig, voices);
+    check(voices.voice(first).mod[3] == 1.0f && voices.voice(second).mod[3] == 1.0f &&
+              voices.voice(third).mod[3] == 1.0f,
+          "a modulation naming no note reaches every note sounding");
+
+    // Release one at frame 5: ten samples of release, 5 to 14, so it is
+    // over from frame 15 of the block.
+    rig.midi.addEvent(sonore::MidiMessage::noteOff(0, 67), 5);
+    runBlock(rig, voices);
+    int ends = 0, endFrame = -1;
+    int32_t endId = -1;
+    for (const auto& e : rig.ended) {
+      ++ends;
+      endId = e.noteId;
+      endFrame = e.samplePosition;
+    }
+    check(ends == 1 && endId == 103 && endFrame == 15,
+          "a note whose release runs out is reported ended, by its id, at the first frame it is over");
+  }
+
+  // ── A stolen note ends where it is stolen ─────────────────────────
+  {
+    sonore::VoiceManager<ModVoice, 1> voices;
+    voices.setSampleRate(48000.0);
+    Rig rig;
+    rig.midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    rig.ids.add(0, 60, 0, 1);
+    rig.midi.addEvent(sonore::MidiMessage::noteOn(0, 62, 100), 30);
+    rig.ids.add(30, 62, 0, 2);
+    runBlock(rig, voices);
+    int ends = 0;
+    for (const auto& e : rig.ended)
+      if (e.noteId == 1 && e.samplePosition == 30) ++ends;
+    check(ends == 1, "a note a steal cuts short is reported ended, by its id, at the steal's frame");
+    check(voices.voiceForNoteId(2) == 0, "…and the voice now carries the new note's id");
+  }
+
+  // ── Without a context's buffers nothing changes ───────────────────
+  {
+    sonore::VoiceManager<ModVoice, 2> voices;
+    std::vector<float> l(64, 0.0f), r(64, 0.0f);
+    float* ch[2] = {l.data(), r.data()};
+    sonore::MidiBuffer midi, midiOut;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    sonore::AudioBlock<float> block(ch, 2, 64);
+    sonore::AudioBlock<float> aux[1] = {};
+    float* scp[2] = {nullptr, nullptr};
+    sonore::AudioBlock<float> sc(scp, 2, 0);
+    sonore::ProcessContext ctx{block, aux, 0, sc, midi, midiOut, nullptr, nullptr};
+    sonore::renderVoices(voices, ctx);
+    check(voices.voiceForNote(60) >= 0 && voices.noteIdOf(voices.voiceForNote(60)) == -1,
+          "a format that names no notes plays them unnamed, through the same call");
+  }
+}
+
 /**
  * Which keys a UI should draw as held. Read off the MIDI buffer every format
  * fills, so it is one tally rather than five decoders each keeping their own.
@@ -39049,6 +39209,7 @@ int main() {
   testVoiceManager();
   testVoiceStealingAndPedals();
   testVoiceManagerForSynths();
+  testHostNamedNotes();
   testNoteState();
   testUserSettings();
   testUnicodePaths();

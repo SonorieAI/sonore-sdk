@@ -17,6 +17,7 @@ at. Its fields, in the order an aggregate initialiser fills them:
 | `valueNames`, `numValueNames` | what each step is called, so automation reads "Highpass" rather than "2" |
 | `automatable`, `hidden`, `readOnly` | whether a host may record it, show it, or write it |
 | `skew` | how the range spreads over a knob's travel; `sonore::skewForCentre(min, max, centre)` computes it |
+| `modulatable`, `modulatablePerNote` | whether a CLAP host may modulate it, for the whole plugin or note by note ([MIDI and MPE](midi-and-mpe.md)) |
 
 **The table is positional.** A parameter's index is its identity to every host
 and in every saved session. A shipped plugin only ever appends rows: reordering
