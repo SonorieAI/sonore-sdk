@@ -132,8 +132,13 @@ if(APPLE)
   # backends), so anything that includes them links these, GUI or not: the
   # first macOS CI run failed to link audio_io_test without them. The plugin
   # helpers name them as well; the linker takes each once.
-  target_link_libraries(sonore_sdk INTERFACE "-framework AudioToolbox" "-framework AudioUnit"
+  target_link_libraries(sonore_sdk INTERFACE "-framework AudioToolbox"
     "-framework CoreAudio" "-framework CoreMIDI" "-framework CoreFoundation" objc)
+  # The AudioUnit framework is the Mac's alone: on iOS its API is in
+  # AudioToolbox, and asking for it fails the link.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_link_libraries(sonore_sdk INTERFACE "-framework AudioUnit")
+  endif()
 endif()
 
 # ── The sonore_add_* helpers ─────────────────────────────────────────────────

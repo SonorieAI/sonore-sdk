@@ -104,6 +104,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFNotificationCenter.h>
 #include <CoreFoundation/CFRunLoop.h>
+#include "apple_platform.h"
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -126,6 +127,19 @@ class MessageListener;
 
 namespace detail {
 namespace msgloop {
+
+#if defined(__APPLE__)
+/** The centre a broadcast to other processes goes through: the Mac's
+ *  distributed one. iOS has none -- apps do not message each other -- so a
+ *  broadcast there reaches nobody, and says so. */
+inline CFNotificationCenterRef distributedCentre() {
+#if defined(SONORE_IOS)
+  return nullptr;
+#else
+  return CFNotificationCenterGetDistributedCenter();
+#endif
+}
+#endif
 
 /** How many messages one wake-up runs before it re-arms and lets the OS loop
  *  have a turn, and for how long. See the header. */
@@ -971,7 +985,7 @@ private:
 
   void platformInitialise() {
     source_ = createSourceOnThisThread(&runLoop_);
-    if (CFNotificationCenterRef centre = CFNotificationCenterGetDistributedCenter()) {
+    if (CFNotificationCenterRef centre = detail::msgloop::distributedCentre()) {
       CFStringRef name =
           CFStringCreateWithCString(kCFAllocatorDefault, detail::msgloop::kBroadcastName,
                                     kCFStringEncodingUTF8);
@@ -987,7 +1001,7 @@ private:
 
   void platformShutdown() {
     if (observing_)
-      if (CFNotificationCenterRef centre = CFNotificationCenterGetDistributedCenter())
+      if (CFNotificationCenterRef centre = detail::msgloop::distributedCentre())
         CFNotificationCenterRemoveEveryObserver(centre, this);
     observing_ = false;
     CFRunLoopSourceRef source = nullptr;
@@ -1706,7 +1720,7 @@ inline bool MessageManager::broadcastMessage(const std::string& message) {
   }
   return delivered > 0;
 #elif defined(__APPLE__)
-  CFNotificationCenterRef centre = CFNotificationCenterGetDistributedCenter();
+  CFNotificationCenterRef centre = detail::msgloop::distributedCentre();
   if (!centre) return false;
   CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, detail::msgloop::kBroadcastName,
                                                kCFStringEncodingUTF8);

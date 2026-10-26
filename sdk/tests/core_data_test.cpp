@@ -18,9 +18,9 @@
 //   core_data_test            the whole suite
 //   core_data_test --leak-child   (internal: the process that leaks on purpose)
 #if defined(_WIN32)
-#include <sonore/apple_platform.h> // SONORE_IOS: what an iPhone may not do
 #include <windows.h>
 #endif
+#include <sonore/apple_platform.h> // SONORE_IOS: what an iPhone may not do
 
 // On in every build of this test, so the detector is exercised in release too.
 #define SONORE_CHECK_MEMORY_LEAKS 1
