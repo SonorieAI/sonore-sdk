@@ -3,7 +3,9 @@
 From nothing to your own plugin in a DAW (a digital audio workstation, such as
 REAPER, Ableton Live or Logic Pro). You write one C++ file, and the SDK builds
 it as a CLAP and a VST3 plugin, an Audio Unit on macOS, an LV2 plugin and a
-standalone app. Step 5 sets up a coding agent to write the next one with you.
+standalone app, and as an AAX for Pro Tools when you give the build Avid's AAX
+SDK ([Platforms and formats](platforms-and-formats.md) says how). Step 5 sets
+up a coding agent to write the next one with you.
 
 ## What you need
 
@@ -31,7 +33,7 @@ writes into a folder that already has anything in it.
 | --- | --- |
 | `-DTYPE=instrument` | starts an eight-voice synth instead of a filter |
 | `-DID=com.mycompany.myplugin` | sets the plugin's id (see below) |
-| `-DAU_SUBTYPE=`, `-DAU_MANUFACTURER=` | set the Audio Unit's four-character codes |
+| `-DAU_SUBTYPE=`, `-DAU_MANUFACTURER=` | set the Audio Unit's four-character codes, which the AAX uses too |
 
 **Choose the id now.** The generator prints the plugin's id, here
 `com.mycompany.myfilter`. It is how every host and every saved session
@@ -154,7 +156,7 @@ A few rules hold for every plugin:
   the plugin ships, add new parameters at the end only.
 - `process()` runs on the audio thread: no allocation, no locks, no files.
 - The same file becomes every format. `formats.h` always includes the CLAP
-  wrapper, and the VST3, AU, LV2 or standalone wrapper when the CMake target
+  wrapper, and the VST3, AU, LV2, AAX or standalone wrapper when the CMake target
   asks for it (`sonore_add_plugin` and `sonore_add_standalone` in the generated
   `CMakeLists.txt`).
 
@@ -170,6 +172,7 @@ hosts look for it:
 | `vst3/MyFilterVST3.vst3`, a folder (on macOS, `MyFilterVST3.vst3` itself) | Windows `C:\Program Files\Common Files\VST3` (or `C:\Users\<you>\AppData\Local\Programs\Common\VST3`); macOS `~/Library/Audio/Plug-Ins/VST3`; Linux `~/.vst3` |
 | `MyFilterAU.component` (macOS) | `~/Library/Audio/Plug-Ins/Components` |
 | `MyFilterLV2.lv2` (a folder) | Windows `C:\Users\<you>\AppData\Roaming\LV2`; macOS `~/Library/Audio/Plug-Ins/LV2`; Linux `~/.lv2` |
+| `aax/MyFilterAAX.aaxplugin`, a folder (on macOS, `MyFilterAAX.aaxplugin`), only when the build was given Avid's AAX SDK | Windows `C:\Program Files\Common Files\Avid\Audio\Plug-Ins`; macOS `/Library/Application Support/Avid/Audio/Plug-Ins`. A developer build of Pro Tools loads it as built, a retail one only once it is signed |
 
 Then rescan plugins in the DAW. A plugin with no editor of its own opens the
 native editor: one control per parameter, drawn by the SDK. To run the plugin
