@@ -1696,6 +1696,13 @@ int main(int argc, char** argv) {
       events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0, 0, 7); // A2, named 7
       brightness(oneSecond / 8);
       const double open = brightness(oneSecond / 4);
+      // The whole plugin first, while the note has no amount of its own: once
+      // it has one, that is all it hears (CLAP), and the host resends it.
+      events.addParamMod(modId, modMin - modValue, 0);
+      brightness(4);
+      const double global = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0);
+      brightness(4);
       // Named by its id alone, as a host may: key and channel left open.
       events.addParamMod(modId, modMin - modValue, 0, 7);
       brightness(4);
@@ -1703,11 +1710,6 @@ int main(int argc, char** argv) {
       events.addParamMod(modId, 0.0, 0, 7);
       brightness(4);
       const double reopened = brightness(oneSecond / 4);
-      events.addParamMod(modId, modMin - modValue, 0); // the whole plugin
-      brightness(4);
-      const double global = brightness(oneSecond / 4);
-      events.addParamMod(modId, 0.0, 0);
-      brightness(4);
       std::printf("  ---- brightness: open %.4f, the note modulated %.4f, released %.4f, "
                   "the plugin modulated %.4f ----\n",
                   open, shut, reopened, global);
@@ -1725,6 +1727,24 @@ int main(int argc, char** argv) {
       const double stray = brightness(oneSecond / 4);
       check(stray > shut * 1.5, "a modulation for a note nobody played changes nothing");
 
+      // A note's own amount includes the plugin-wide one (CLAP): with both
+      // set, the note hears its own, not the two added -- and still its own
+      // when the plugin-wide one moves after it.
+      const double half = (modMin - modValue) * 0.5;
+      events.addParamMod(modId, half, 0, 7);
+      brightness(4);
+      const double noteHalf = brightness(oneSecond / 4);
+      events.addParamMod(modId, half, 0); // the plugin-wide half, after the note's
+      brightness(4);
+      const double both = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0);
+      events.addParamMod(modId, 0.0, 0, 7);
+      brightness(4);
+      std::printf("  ---- brightness: the note's half %.4f, with the plugin's half too %.4f ----\n", noteHalf,
+                  both);
+      check(std::fabs(both - noteHalf) < noteHalf * 0.1 && noteHalf > shut * 1.5,
+            "a note's own modulation is its whole amount: the plugin-wide one is not added to it");
+
       events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0, 0, 7);
       int ends = 0;
       for (int b = 0; b < 4 * oneSecond && ends == 0; ++b) {
@@ -1738,6 +1758,66 @@ int main(int argc, char** argv) {
       for (const clap_event_note_t& e : g_noteEnds)
         if (e.note_id == 7) ++ends;
       check(ends == 1, "…once");
+
+      // A note released by its name alone is still that note until it ends:
+      // modulation the host sends to the name during the release reaches it.
+      auto releaseBrightness = [&](bool modulate) {
+        events.storage.clear();
+        brightness(oneSecond / 2);
+        events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0, 0, 21);
+        brightness(oneSecond / 8);
+        events.addNote(CLAP_EVENT_NOTE_OFF, -1, 0.0, 0, -1, 21); // by name alone
+        if (modulate) events.addParamMod(modId, modMin - modValue, 0, 21);
+        brightness(2);
+        const double b = brightness(8); // well inside its release
+        events.addParamMod(modId, 0.0, 0, 21);
+        brightness(oneSecond);
+        return b;
+      };
+      const double releasing = releaseBrightness(false);
+      const double releasingShut = releaseBrightness(true);
+      check(releasing > 0.0 && releasingShut < releasing * 0.5,
+            "a note released by its name alone is still that note: modulation sent to the name in its release reaches it");
+
+      // The host's modulation of the whole plugin is the host's, still set: a
+      // reset silences the notes and keeps it.
+      events.addParamMod(modId, modMin - modValue, 0);
+      plugin->process(plugin, &process);
+      events.storage.clear();
+      plugin->reset(plugin);
+      events.addNote(CLAP_EVENT_NOTE_ON, 45, 1.0, 0, 0, 22);
+      brightness(oneSecond / 8);
+      const double afterReset = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0);
+      events.addNote(CLAP_EVENT_NOTE_OFF, 45, 0.0, 0, 0, 22);
+      brightness(oneSecond);
+      check(afterReset < open * 0.5, "a reset keeps the host's modulation of the whole plugin: it will not be sent again");
+
+      // A pad held under a long run of other notes keeps its name: a
+      // modulation that names only it still finds it, seventy notes later.
+      events.storage.clear();
+      brightness(oneSecond);
+      events.addNote(CLAP_EVENT_NOTE_ON, 33, 1.0, 0, 0, 3); // A1, named 3
+      brightness(4);
+      for (int k = 0; k < 70; ++k) {
+        const int16_t key = (int16_t) (60 + k % 12);
+        events.addNote(CLAP_EVENT_NOTE_ON, key, 0.5, 0, 0, 100 + k);
+        brightness(1);
+        events.addNote(CLAP_EVENT_NOTE_OFF, key, 0.0, 0, 0, 100 + k);
+        brightness(1);
+      }
+      brightness(oneSecond); // the run's tails gone: the pad alone
+      const double padOpen = brightness(oneSecond / 4);
+      events.addParamMod(modId, modMin - modValue, 0, 3);
+      brightness(4);
+      const double padShut = brightness(oneSecond / 4);
+      events.addParamMod(modId, 0.0, 0, 3);
+      events.addNote(CLAP_EVENT_NOTE_OFF, 33, 0.0, 0, 0, 3);
+      brightness(oneSecond);
+      std::printf("  ---- the pad after seventy notes: %.4f open, %.4f modulated by its name ----\n", padOpen,
+                  padShut);
+      check(padOpen > 0.0 && padShut < padOpen * 0.5,
+            "a held note keeps its name under seventy notes played over it: its modulation still reaches it");
     }
 
     // The voices the patch can use follow its Voices control, and the host

@@ -216,7 +216,12 @@ inline void runDspStandalone(T& dsp, AudioBlock<float>& block, const float* para
     // in and find out whether the instrument they just generated responds to
     // it. It did not, and nothing said why: the synth reads pitch only from
     // expression, so a bend on a member channel simply went nowhere.
-    if (mpe) mpe->process(midi, expression);
+    if (mpe) {
+      // The DSP's bend range first, from this block's values, as every format
+      // decodes (clapwrap::decodeMpe).
+      clapwrap::syncBendRange(dsp, *mpe, params);
+      mpe->process(midi, expression);
+    }
     ProcessContext ctx{block,    auxBlocks, nAux,
                        scBlock,  midi,      midiOut,
                        numRoles ? roles : nullptr, &expression,

@@ -214,9 +214,10 @@ const MAP = [
   ["basics", "A keyboard's pitch wheel in an MPE plugin",
    "audio.h: MpeDecoder bends a channel in no MPE zone -- an ordinary keyboard -- " +
    "at two semitones, or at the range the plugin declares (pitchBendRange(), " +
-   "which every wrapper passes on) or the keyboard announces (RPN 0); a zone's " +
-   "members keep MPE's 48. It used 48 for every channel, so a plain wheel threw " +
-   "a note four octaves in any plugin that declared MPE",
+   "which every wrapper passes on each block) or the keyboard announces for that " +
+   "channel (RPN 0), whichever was set last; a zone's members keep MPE's 48. It " +
+   "used 48 for every channel, so a plain wheel threw a note four octaves in any " +
+   "plugin that declared MPE",
    "setLegacyBendRange"],
   ["basics", "AudioPlayHead::PositionInfo", "TransportInfo", "struct TransportInfo"],
 
@@ -990,8 +991,10 @@ const MAP = [
    "ParamModBuffer. CLAP's modulation is an offset a host's own LFO or envelope " +
    "adds to a parameter without writing it into the value a session saves. For " +
    "the whole plugin the wrapper adds it, clamped to the range, before every " +
-   "block, so any DSP has it; for one note renderVoices() hands it to that " +
-   "note's voice through setParamMod()",
+   "block, so any DSP has it; a parameter modulated per note takes all of it " +
+   "through the voices (renderVoices(), setParamMod(), setParamModWide()), " +
+   "where synth.h's NoteModulation lets a note's own amount replace the " +
+   "plugin-wide one, as CLAP has it, rather than add to it",
    "class ParamModBuffer"],
   ["basics", "channel routing matrix",
    "channel_matrix.h: ChannelMatrix. What a plugin uses when its input layout " +

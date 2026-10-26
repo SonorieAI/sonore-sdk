@@ -553,25 +553,43 @@ struct HasActiveVoices<T, std::void_t<decltype(std::declval<const T&>().activeVo
     : std::true_type {};
 
 /** Does the DSP have a pitch-bend range of its own -- a "bend range" control
- *  -- for MIDI that is not MPE? Optional: `float pitchBendRange() const`, in
- *  semitones. The wrapper's MPE decoder turns a plain keyboard's wheel into
- *  each note's tuning at this range (two semitones when the DSP has none). */
+ *  -- for MIDI that is not MPE? Optional:
+ *  `float pitchBendRange(const float* params) const`, in semitones, given the
+ *  values this block's process() will be handed, so a control answers it for
+ *  the block it moved in. The wrapper's MPE decoder turns a plain keyboard's
+ *  wheel into each note's tuning at this range (two semitones when the DSP
+ *  has none). */
 template <typename T, typename = void>
 struct HasPitchBendRange : std::false_type {};
-/** The match for HasPitchBendRange: T declares `pitchBendRange() const`. */
+/** The match for HasPitchBendRange: T declares
+ *  `pitchBendRange(const float* params) const`. */
 template <typename T>
-struct HasPitchBendRange<T, std::void_t<decltype(std::declval<const T&>().pitchBendRange())>>
+struct HasPitchBendRange<
+    T, std::void_t<decltype(std::declval<const T&>().pitchBendRange((const float*) nullptr))>>
     : std::true_type {};
 
 /** [audio-thread] The DSP's bend range, to the decoder, before it reads the
- *  block's MIDI: every format calls this just before mpe.process(), so the
- *  control a player sets takes effect from the next block in all of them. */
+ *  block's MIDI, from the block's own parameter values. The formats reach it
+ *  through decodeMpe(); the standalone, which runs a DSP outside an
+ *  Instance's process path, calls it itself. */
+/** A DSP still declaring the hook's first form, `pitchBendRange() const`. */
+template <typename T, typename = void>
+struct HasOldPitchBendRange : std::false_type {};
+/** The match for HasOldPitchBendRange. */
 template <typename T>
-inline void syncBendRange(const T& dsp, MpeDecoder& mpe) {
-  if constexpr (HasPitchBendRange<T>::value) mpe.setLegacyBendRange((float) dsp.pitchBendRange());
+struct HasOldPitchBendRange<T, std::void_t<decltype(std::declval<const T&>().pitchBendRange())>>
+    : std::true_type {};
+
+template <typename T>
+inline void syncBendRange(const T& dsp, MpeDecoder& mpe, const float* params) {
+  static_assert(!HasOldPitchBendRange<T>::value || HasPitchBendRange<T>::value,
+                "pitchBendRange() takes the block's parameter values now: declare "
+                "float pitchBendRange(const float* params) const");
+  if constexpr (HasPitchBendRange<T>::value) mpe.setLegacyBendRange((float) dsp.pitchBendRange(params));
   else {
     (void) dsp;
     (void) mpe;
+    (void) params;
   }
 }
 
@@ -928,12 +946,23 @@ struct Instance {
   std::atomic<uint32_t> paramsSeq{0};
   bool paramsSnapped = false; // paramsBlock has been filled at least once
   MidiBuffer midi;
-  /** Which key and channel each recent note_id was played on, so a note-off
-   *  or choke that names only the id reaches that one note. A ring: an id
-   *  older than the last 64 notes on is simply not found, and ignored. */
+  /** Which key and channel each recent note_id was played on, so a note-off,
+   *  a choke, an expression or a modulation that names only the id reaches
+   *  that one note. A note takes its id's old slot, a free one, or past 64
+   *  the oldest, and keeps it until the host has let it go and the DSP has
+   *  reported it ended (NOTE_END): a pad held under a long run of shorter
+   *  notes keeps its name, and so does a note in its release. An id no slot
+   *  holds is ignored. */
   struct NoteIdSlot {
     int32_t id = -1;
     int16_t key = -1, channel = -1;
+    /** The host has let the note go (NOTE_OFF or a choke). */
+    bool released = false;
+    /** The DSP reported the note ended (NOTE_END). A slot is freed once both
+     *  have happened, in either order: a voice can fall silent under a key
+     *  still down, and the host's note-off that follows may name the note by
+     *  its id alone. */
+    bool ended = false;
   };
   NoteIdSlot noteIds[64];
   int noteIdNext = 0;
@@ -946,6 +975,7 @@ struct Instance {
    *  paramMods); for the whole plugin, an offset per parameter the wrapper
    *  adds to what the DSP is handed. Audio thread only. */
   ParamModBuffer paramMods;
+  /** The plugin-wide offset on each parameter, as the host last sent it. */
   float paramMod[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
   /** paramsBlock with paramMod added, when any offset is set. */
   float paramsModulated[SONORE_NUM_PARAMS > 0 ? SONORE_NUM_PARAMS : 1]{};
@@ -1398,11 +1428,18 @@ inline void applyEvent(Instance* inst, const clap_event_header_t* hdr, uint32_t 
       const ParamInfo& p = kDesc.params[e->param_id];
       if (p.readOnly || !(p.modulatable || p.modulatablePerNote)) break;
       const float amount = std::isfinite(e->amount) ? (float) e->amount : 0.0f;
-      if (e->note_id < 0 && e->key < 0 && e->channel < 0) {
-        inst->paramMod[e->param_id] = amount;
-        break;
-      }
+      const bool wide = e->note_id < 0 && e->key < 0 && e->channel < 0;
+      // The plugin-wide offset is kept either way: added to what process() is
+      // handed, or for a parameter modulated per note, handed to its voices
+      // again whenever queued events are thrown away (requeueWideMods).
+      if (wide) inst->paramMod[e->param_id] = amount;
       if (!p.modulatablePerNote) break;
+      // A parameter modulated per note has its plugin-wide offset handed to
+      // the voices as well, as an entry naming no note: a note's own amount
+      // replaces the plugin-wide one for that note (CLAP: it already includes
+      // it), and only the voices know which notes have one. Added to what
+      // process() is handed instead, it would be counted twice on every such
+      // note.
       ParamModBuffer::Entry entry;
       entry.noteId = e->note_id;
       entry.key = e->key;
@@ -1433,11 +1470,24 @@ inline void applyEvent(Instance* inst, const clap_event_header_t* hdr, uint32_t 
       // Every note-on, named or not, so the DSP pairs each with its own.
       inst->noteIdsIn.add(time, e->key, ch, e->note_id);
       if (e->note_id >= 0) {
-        Instance::NoteIdSlot& slot = inst->noteIds[inst->noteIdNext];
-        inst->noteIdNext = (inst->noteIdNext + 1) % 64;
+        // The id's own slot if it has one -- a host may use an id again once
+        // the note is released, and two slots under one id would steer an
+        // event for the new note by the old note's key -- else a free one,
+        // else the oldest.
+        int pick = -1;
+        for (int k = 0; k < 64 && pick < 0; ++k)
+          if (inst->noteIds[k].id == e->note_id) pick = k;
+        for (int k = 0; k < 64 && pick < 0; ++k) {
+          const int at = (inst->noteIdNext + k) % 64;
+          if (inst->noteIds[at].id < 0) pick = at;
+        }
+        if (pick < 0) pick = inst->noteIdNext;
+        inst->noteIdNext = (pick + 1) % 64;
+        Instance::NoteIdSlot& slot = inst->noteIds[pick];
         slot.id = e->note_id;
         slot.key = (int16_t) e->key;
         slot.channel = (int16_t) ch;
+        slot.released = slot.ended = false;
       }
       break;
     }
@@ -1456,11 +1506,21 @@ inline void applyEvent(Instance* inst, const clap_event_header_t* hdr, uint32_t 
           if (slot.id != e->note_id) continue;
           if (key < 0) key = slot.key;
           if (channel < 0) channel = slot.channel;
-          slot.id = -1;
           found = true;
           break;
         }
         if (!found) break;
+      }
+      // The names this lets go of: kept through the release, which is still
+      // the note, and freed when the DSP reports the end -- or now, if it
+      // already has.
+      for (Instance::NoteIdSlot& slot : inst->noteIds) {
+        if (slot.id < 0) continue;
+        if (e->note_id >= 0 ? slot.id != e->note_id
+                            : ((key >= 0 && slot.key != key) || (channel >= 0 && slot.channel != channel)))
+          continue;
+        slot.released = true;
+        if (slot.ended) slot.id = -1;
       }
       // A wildcard CHANNEL is every channel. Read as channel 0, it released
       // nothing on an MPE instrument, whose notes sit on 1-15.
@@ -1560,20 +1620,58 @@ inline void discardEvents(Instance* inst) {
   inst->paramMods.clear();
 }
 
+/** [audio-thread] What a reset or an activation leaves behind of the host's
+ *  notes: every note is silenced, so the names they were played under go.
+ *  The plugin-wide offsets stay: they are the host's modulators, still set,
+ *  and a host does not resend a modulation that has not moved. */
+inline void forgetHostNotes(Instance* inst) {
+  for (Instance::NoteIdSlot& slot : inst->noteIds) slot.id = -1;
+}
+
 /** [audio-thread] The values the DSP is handed this block: the block's
  *  snapshot, with the host's modulation for the whole plugin added and
  *  clamped to each range. The snapshot itself when nothing is modulated, so
  *  a plugin no host modulates pays one pass over its parameters. */
 inline const float* dspParams(Instance* inst) {
+  // A parameter modulated per note takes all its modulation through the
+  // voices (ParamModBuffer), never here: here it would be counted twice on
+  // every note with an amount of its own.
+  auto folded = [](int i) { return !kDesc.params[i].modulatablePerNote; };
   bool any = false;
   for (int i = 0; i < SONORE_NUM_PARAMS; ++i)
-    if (inst->paramMod[i] != 0.0f) any = true;
+    if (inst->paramMod[i] != 0.0f && folded(i)) any = true;
   if (!any) return inst->paramsBlock;
   for (int i = 0; i < SONORE_NUM_PARAMS; ++i)
-    inst->paramsModulated[i] = inst->paramMod[i] != 0.0f
+    inst->paramsModulated[i] = inst->paramMod[i] != 0.0f && folded(i)
                                    ? clampToRange(kDesc.params[i], inst->paramsBlock[i] + inst->paramMod[i])
                                    : inst->paramsBlock[i];
   return inst->paramsModulated;
+}
+
+/** [audio-thread] The plugin-wide offsets of the parameters modulated per
+ *  note, queued for the voices again: what was queued has just been thrown
+ *  away (an activation, a reset, a block with no output), and a host does
+ *  not resend a modulation that has not moved. */
+inline void requeueWideMods(Instance* inst) {
+  for (int i = 0; i < SONORE_NUM_PARAMS; ++i) {
+    if (!kDesc.params[i].modulatablePerNote || inst->paramMod[i] == 0.0f) continue;
+    ParamModBuffer::Entry wide;
+    wide.param = i;
+    wide.amount = inst->paramMod[i];
+    inst->paramMods.addEvent(wide);
+  }
+}
+
+/** [audio-thread] MPE's channel-per-note MIDI into per-note expression, for a
+ *  DSP whose descriptor says supportsMpe: the plain channels' bend range
+ *  from the DSP's pitchBendRange(), against `params` -- the values the DSP
+ *  is about to be handed, so a Bend Range control moved for this block bends
+ *  this block -- and then `midi`. Every format calls this, and only this, to
+ *  decode, after the block's one snapshotParams(). */
+inline void decodeMpe(Instance* inst, const MidiBuffer& midi, const float* params) {
+  if (!kDesc.supportsMpe) return;
+  syncBendRange(inst->dsp, inst->mpe, params);
+  inst->mpe.process(midi, inst->expression);
 }
 
 /** Drain the UI queue: apply each edit locally AND tell the host, so a knob
@@ -3226,8 +3324,10 @@ inline bool pluginActivate(const clap_plugin_t* plugin, double sampleRate,
   // directly skipped all three, so after activating at 96 kHz the editor's
   // CPU meter judged every block against a 48 kHz deadline.
   // Whatever was queued for a block before this activation is not for one
-  // after it.
+  // after it, and the notes it was for are gone.
   discardEvents(inst);
+  forgetHostNotes(inst);
+  requeueWideMods(inst);
   prepareDsp(inst); // the one place allocation is allowed
   inst->bypass.prepare(sampleRate, maxFrames, dspLatency(inst->dsp), inst->mainChannels);
   if (TakesSidechain<SonoreDsp>::value) inst->scSilence.assign(maxFrames > 0 ? maxFrames : 1, 0.0f);
@@ -3250,6 +3350,8 @@ inline void pluginStopProcessing(const clap_plugin_t*) {}
 inline void pluginReset(const clap_plugin_t* plugin) {
   Instance* inst = self(plugin);
   discardEvents(inst);
+  forgetHostNotes(inst);
+  requeueWideMods(inst);
   // A reset means the plugin is not in the middle of ANYTHING, and a bypass
   // crossfade in flight is something. Snapping it to its target rather than
   // letting it keep ramping is what makes a reset deterministic: the host
@@ -3352,6 +3454,18 @@ inline void finishProcess(Instance* inst, const clap_process_t* process, uint32_
     }
   }
 
+  // A note that ended gives up its name once the host has let it go too --
+  // the slot that is still its own: a host may have given the id to a new
+  // note on another key since.
+  for (const NoteIdBuffer::Entry& ended : inst->endedNotes) {
+    if (ended.noteId < 0) continue;
+    for (Instance::NoteIdSlot& slot : inst->noteIds) {
+      if (slot.id != ended.noteId || slot.key != ended.key || slot.channel != ended.channel) continue;
+      slot.ended = true;
+      if (slot.released) slot.id = -1;
+    }
+  }
+
   // The latency may have moved this block. A plugin cannot announce that from
   // here -- it asks to be restarted, which is thread-safe and therefore legal
   // from the audio thread.
@@ -3424,20 +3538,25 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
   // No block to play them in: they wait, at time 0, for the next one.
   if (frames == 0) return CLAP_PROCESS_CONTINUE;
 
-  // Raw-MIDI hosts express per note through MPE's channel layout instead of
-  // through typed events, so the same block is read both ways.
-  if (kDesc.supportsMpe) {
-    syncBendRange(inst->dsp, inst->mpe);
-    inst->mpe.process(inst->midi, inst->expression);
-  }
-
-  // Then whatever the user did to the INTERFACE since the last block. These go
-  // back out to the host as live events too, which is what makes turning a knob
-  // on our webview recordable as automation exactly like a host-side control.
+  // Whatever the user did to the INTERFACE since the last block. These go back
+  // out to the host as live events too, which is what makes turning a knob on
+  // our webview recordable as automation exactly like a host-side control.
   drainUiEvents(inst, process->out_events);
+
+  // The block's parameters, once, the plugin-wide modulation added: what the
+  // decoder reads the bend range from and what the DSP is handed below.
+  snapshotParams(inst);
+  const float* const blockParams = dspParams(inst);
+
+  // Raw-MIDI hosts express per note through MPE's channel layout instead of
+  // through typed events, so the same block is read both ways. After the
+  // interface's events, so a key played on the editor's keyboard is a note
+  // the decoder knows: a bend on its channel reaches it.
+  decodeMpe(inst, inst->midi, blockParams);
 
   if (process->audio_outputs_count < 1) {
     discardEvents(inst);
+    requeueWideMods(inst);
     return CLAP_PROCESS_CONTINUE;
   }
 
@@ -3524,8 +3643,7 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
                                     &inst->paramMods};
       bypassCapture(inst->bypass, chans64, nch64, frames);
       trackNotes(inst->notes, ctx64.midi);
-      snapshotParams(inst);
-      runDspCtx64(inst->dsp, ctx64, dspParams(inst));
+      runDspCtx64(inst->dsp, ctx64, blockParams);
       bypassApply(inst->bypass, chans64, nch64, frames);
       guardOutputs(inst, chans64, nch64, auxBlocks64, nAux64, frames);
 
@@ -3546,6 +3664,7 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
 
   if (!out->data32 || out->channel_count < 1) {
     discardEvents(inst);
+    requeueWideMods(inst);
     return CLAP_PROCESS_CONTINUE;
   }
 
@@ -3646,8 +3765,7 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
   // visible -- the check that measures the contract failed on the first run.
   bypassCapture(inst->bypass, chans, nch, frames);
   trackNotes(inst->notes, ctx.midi);
-  snapshotParams(inst);
-  runDspCtx(inst->dsp, ctx, dspParams(inst));
+  runDspCtx(inst->dsp, ctx, blockParams);
   bypassApply(inst->bypass, chans, nch, frames);
   guardOutputs(inst, chans, nch, auxBlocks, nAux, frames);
 
@@ -3772,15 +3890,19 @@ inline void advanceTransport(clap_event_transport_t& t, uint32_t frames, double 
 }
 
 /** Whether a CLAP event moves a parameter for the whole plugin: a value, or a
- *  modulation that names no note. What sample-accurate automation splits a
- *  block at (PluginDescriptor::automationGranularity); a note's own
- *  modulation already lands at its frame (ParamModBuffer). */
+ *  modulation that names no note of a parameter not modulated per note.
+ *  What sample-accurate automation splits a block at (PluginDescriptor::
+ *  automationGranularity); the rest land at their frames already
+ *  (ParamModBuffer). */
 inline bool movesParameter(const clap_event_header_t* hdr) {
   if (!hdr || hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
   if (hdr->type == CLAP_EVENT_PARAM_VALUE) return true;
   if (hdr->type != CLAP_EVENT_PARAM_MOD) return false;
   const auto* e = eventAs<clap_event_param_mod_t>(hdr);
-  return e && e->note_id < 0 && e->key < 0 && e->channel < 0;
+  // A parameter modulated per note takes every modulation through the voices,
+  // at its frame already: only the others move what process() is handed.
+  return e && e->note_id < 0 && e->key < 0 && e->channel < 0 && e->param_id < (uint32_t) SONORE_NUM_PARAMS &&
+         !kDesc.params[e->param_id].modulatablePerNote;
 }
 
 /** Where the piece of a block that starts at `start` ends: at `end` (the

@@ -58,7 +58,7 @@ manager finds them at compile time:
 | `void setPressure(float)`, `void setBrightness(float)` | this note's pressure and timbre, 0 to 1 |
 | `void setModWheel(float)` | CC 1, 0 to 1 |
 | `void kill()` | silence now: All Sound Off (CC 120) stops the voice outright |
-| `void setParamMod(int param, float amount)` | a host's offset to a parameter for this note alone (below) |
+| `void setParamMod(int param, float amount)`, `void setParamModWide(int param, float amount)` | a host's offset to a parameter for this note alone, and for every note (below) |
 
 `sonore::renderVoices(voices, ctx)` is a whole instrument block. It applies every
 MIDI event and every note expression at its frame and renders the voices
@@ -165,11 +165,20 @@ fields of `sonore::ParamInfo` allow it:
   The wrapper adds the offset to the values `process()` is handed, clamped to
   the range, so the DSP needs no code for it.
 - `modulatablePerNote`: the host may also modulate it one note at a time.
-  `renderVoices()` hands each offset to that note's voice through
-  `void setParamMod(int param, float amount)`. The voice adds the amount, in
-  the parameter's own units, to the knob's value for itself alone, and clears
-  its offsets in `noteOn()`: a new note starts unmodulated, and the host sends
-  it its own.
+  Every modulation of the parameter then goes to the voices, and none is
+  added to what `process()` is handed. `renderVoices()` hands a note's own
+  amount to its voices through `void setParamMod(int param, float amount)`,
+  and the plugin-wide offset to every voice, sounding or not, through
+  `void setParamModWide(int param, float amount)`.
+
+A note's own amount replaces the plugin-wide one for that note, as CLAP
+specifies, so the two are never counted twice. `sonore::NoteModulation` keeps
+that for a voice: it holds both, `offset()` is what to add to the parameter's
+value, in its own units, and `noteStarted()` -- called from `noteOn()` and
+`legatoTo()` -- hands a new note back to the plugin-wide offsets. An offset
+addressed by key or channel reaches the notes sounding when it arrives. In
+Mono and Legato a key still held keeps its note's offsets, and the line brings
+them back when it returns to that key.
 
 A host keeps modulating a note until the plugin says the note has ended,
 release tail included. `renderVoices()` reports that in `ctx.endedNotes`, and
@@ -202,8 +211,10 @@ Call `voices.setMpe(true)`: the wrapper has already folded the pitch wheel and
 channel pressure into each note's expression, and the voice manager then
 leaves the raw messages alone rather than bend every note twice. A keyboard
 that is not MPE still has a wheel, and it bends at two semitones, or at what the
-DSP's `float pitchBendRange() const` returns (a "Bend Range" control); the
-wrapper passes that on before every block.
+DSP's `float pitchBendRange(const float* params) const` returns (a "Bend Range"
+control). The wrapper asks before every block, with the values that block will
+be handed. A range the keyboard announces itself (RPN 0) takes over for its
+channel until the DSP's answer changes.
 
 ```cpp
 // test-run
@@ -267,8 +278,9 @@ struct SonoreDsp {
     levelSm.snap(0.25f);
   }
 
-  // How far a keyboard that is not MPE bends: read before every block.
-  float pitchBendRange() const { return 2.0f; }
+  // How far a keyboard that is not MPE bends: asked before every block, with
+  // that block's parameter values. A fixed two semitones here.
+  float pitchBendRange(const float*) const { return 2.0f; }
 
   void process(sonore::ProcessContext& ctx, const float* p) {
     voices.setMode(p[1] >= 0.5f ? Voices::Mode::Legato : Voices::Mode::Poly);

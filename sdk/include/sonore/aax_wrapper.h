@@ -803,10 +803,10 @@ private:
     const uint32_t numRoles = shared.mainRoles(roles, clapwrap::kMaxAudioChannels);
     shared.expression.clear();
     midi.clampPositions((int) frames);
-    if (kDesc.supportsMpe) {
-      clapwrap::syncBendRange(shared.dsp, shared.mpe);
-      shared.mpe.process(midi, shared.expression);
-    }
+    // The slice's parameters, once: what the MPE decode reads the bend range
+    // from and what the DSP is handed.
+    clapwrap::snapshotParams(&shared);
+    clapwrap::decodeMpe(&shared, midi, shared.paramsBlock);
     ProcessContext pc{block,
                       auxBlocks,
                       nAux,
@@ -821,7 +821,6 @@ private:
     trackNotes(shared.notes, pc.midi);
     if (clapwrap::WantsTransport<SonoreDsp>::value)
       clapwrap::sendTransport(shared.dsp, readTransport());
-    clapwrap::snapshotParams(&shared);
     clapwrap::runDspCtx(shared.dsp, pc, shared.paramsBlock);
 
     // MIDI the DSP emitted, to Pro Tools' output node at its offsets.

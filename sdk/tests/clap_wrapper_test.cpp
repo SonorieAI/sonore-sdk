@@ -203,11 +203,14 @@ int main() {
   // is one smoother, so this is the wrapper's own Instance. Its two
   // MidiBuffers were 37 KB of the 66 while a MidiMessage was three ints; a
   // bound with room to spare, so it fails on a regrowth and not on a field.
+  // 60 KB since the host's notes joined it -- their names in and out
+  // (NoteIdBuffer), their modulation (ParamModBuffer) and its totals, about
+  // 5 KB in all -- with the same room left for the next field.
   {
     char sized[160];
-    std::snprintf(sized, sizeof(sized), "the wrapper's Instance is %zu bytes (MidiBuffer %zu), under 56 KB",
+    std::snprintf(sized, sizeof(sized), "the wrapper's Instance is %zu bytes (MidiBuffer %zu), under 60 KB",
                   sizeof(sonore::clapwrap::Instance), sizeof(sonore::MidiBuffer));
-    check(sizeof(sonore::clapwrap::Instance) < 56 * 1024 && sizeof(sonore::MidiBuffer::Entry) == 8,
+    check(sizeof(sonore::clapwrap::Instance) < 60 * 1024 && sizeof(sonore::MidiBuffer::Entry) == 8,
           sized);
   }
   clap_entry.deinit();

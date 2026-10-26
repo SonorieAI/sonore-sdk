@@ -728,7 +728,8 @@ private:
  */
 class NoteIdBuffer {
 public:
-  /** The most notes one block holds; add() drops the newest past it. */
+  /** The most notes one block holds; add() drops the newest past it: a
+   *  4096-frame block of a fast run, or All Sound Off over a big manager. */
   static constexpr int kMaxEntries = 128;
 
   /** One note: which key on which channel, the host's id, and the frame. */
@@ -793,10 +794,15 @@ private:
  * modulation): which note, which parameter, and the offset to add to that
  * parameter's value for that note alone, in the parameter's own units.
  *
- * Each entry REPLACES the note's earlier offset for that parameter; 0 ends
- * it. An offset for the whole plugin never arrives here: the wrapper adds
- * that to the values the DSP is handed (ParamInfo::modulatable). Only
- * parameters declared ParamInfo::modulatablePerNote are modulated this way.
+ * Each entry REPLACES the note's earlier offset for that parameter, 0
+ * included: a note's amount of 0 is a total of 0, its plugin-wide part
+ * included. Only parameters declared ParamInfo::modulatablePerNote come here, and
+ * for them the plugin-wide offset comes here too, as an entry that names no
+ * note at all (noteId, key and channel all -1): it is for every note without
+ * an amount of its own, and every note started while it is set. A note's own
+ * amount replaces it for that note, as CLAP has it; VoiceManager::paramMod()
+ * keeps that straight. Such a parameter's plugin-wide offset is NOT added to
+ * what process() is handed, or a note with its own amount would hear both.
  */
 class ParamModBuffer {
 public:
@@ -823,10 +829,22 @@ public:
   /** No events this block. */
   bool isEmpty() const { return count_ == 0; }
 
-  /** Insert `e` keeping frame order, after any others at the same frame.
-   *  Past kMaxEvents it is dropped. No allocation. */
+  /** Insert `e` keeping frame order, after any others at the same frame. A
+   *  full buffer keeps the LATEST amount: `e` replaces the last entry for the
+   *  same parameter and note address, a little early, and is dropped only
+   *  when there is none -- a host that modulates densely ends the block on
+   *  the value it last sent. No allocation. */
   void addEvent(const Entry& e) {
-    if (count_ >= kMaxEvents) return;
+    if (count_ >= kMaxEvents) {
+      for (int i = count_ - 1; i >= 0; --i) {
+        Entry& was = events_[i];
+        if (was.param == e.param && was.noteId == e.noteId && was.key == e.key && was.channel == e.channel) {
+          was.amount = e.amount;
+          return;
+        }
+      }
+      return;
+    }
     int i = count_;
     while (i > 0 && events_[i - 1].samplePosition > e.samplePosition) {
       events_[i] = events_[i - 1];
@@ -1243,15 +1261,26 @@ public:
   /** The bend range for MIDI that is NOT MPE: a channel in no zone -- every
    *  channel, until a controller announces one -- which is what an ordinary
    *  keyboard's pitch wheel is. Two semitones unless set, as MIDI has it and
-   *  as nearly every keyboard ships; a range announced through RPN 0 on such
-   *  a channel takes over. A plugin that offers its own "bend range" control
-   *  passes it here (the wrappers do, for a DSP that declares
-   *  pitchBendRange()).
+   *  as nearly every keyboard ships. A plugin that offers its own "bend
+   *  range" control passes it here (the wrappers do, every block, for a DSP
+   *  that declares pitchBendRange()).
+   *
+   *  A range a keyboard announces through RPN 0 on such a channel takes over
+   *  for that channel; this, set to a different value afterwards, takes it
+   *  back. The last one set wins, whichever side set it: a keyboard that
+   *  announces two semitones at power-on does not disable the plugin's knob
+   *  for good, and a knob left alone does not override what a keyboard says.
    *
    *  It used to be the per-note 48 -- MPE's default, applied to a keyboard that
    *  never said it was MPE -- so a plain pitch wheel threw a note four octaves
    *  in any plugin that declared MPE support. */
-  void setLegacyBendRange(float semitones) { legacyBendRange_ = semitones >= 0.0f ? semitones : 0.0f; }
+  void setLegacyBendRange(float semitones) {
+    const float range = semitones >= 0.0f ? semitones : 0.0f;
+    if (range == legacyBendRange_) return;
+    legacyBendRange_ = range;
+    for (float& announced : plainRange_) announced = -1.0f;
+  }
+  /** The range setLegacyBendRange() last set: 2 until then. */
   float legacyBendRange() const { return legacyBendRange_; }
 
   /** The zone, if a controller has announced one. Inactive until then, and
@@ -1272,8 +1301,9 @@ public:
 
   /** Forget what is sounding and what the controller said: held notes, each
    *  channel's last bend, pressure and CC 74, half-sent RPNs, and both zones,
-   *  which go back to inactive. The two bend ranges are kept. No
-   *  allocation. */
+   *  which go back to inactive. The bend ranges are kept, the ones plain
+   *  channels announced included: a keyboard says its range once, at power-on,
+   *  and a reset is not a new keyboard. No allocation. */
   void reset() {
     for (int i = 0; i < 16; ++i) {
       for (bool& key : held_[i]) key = false;
@@ -1319,15 +1349,24 @@ public:
                 rpn.is14Bit ? (float) (rpn.value >> 7) + (float) (rpn.value & 0x7f) / 100.0f
                             : (float) rpn.value;
             if (semis >= 0.0f && semis <= 96.0f) {
-              // Which range this sets depends on WHERE it arrived. On a master
-              // channel it is the zone's global bend; anywhere else it is the
-              // per-note one.
+              // Which range this sets depends on WHERE it arrived: on a master
+              // channel the zone's global bend, on a member channel the
+              // per-note one, and on a channel in no zone that channel's own,
+              // for its wheel alone. A member's 48 announced while a zone is
+              // up does not follow its channel out of the zone when the zone
+              // is turned off, and one plain channel's range is not another's.
               const int ch = rpn.channel - 1;
               if (lower_.isMaster(ch) || upper_.isMaster(ch)) {
                 masterBendRange_ = semis;
-              } else {
+              } else if (lower_.hasMember(ch) || upper_.hasMember(ch)) {
                 bendRange_ = semis;
-                rangeAnnounced_ = true; // a plain channel said what it wants, too
+              } else if (ch >= 0 && ch < 16) {
+                plainRange_[ch] = semis;
+                // With no zone configured at all it is also what the per-note
+                // range reports: a controller that plays a note per channel
+                // without MPE's configuration message announces it this way.
+                // A zone configured later starts from 48 again.
+                if (!lower_.active && !upper_.active) bendRange_ = semis;
               }
             }
           } else if (rpn.parameterNumber == kRpnMpeConfiguration) {
@@ -1468,7 +1507,8 @@ private:
         lower_.hasMember(channel) ? &lower_ : (upper_.hasMember(channel) ? &upper_ : nullptr);
     // A member channel bends at the per-note range; any other channel is a
     // plain one, at the legacy range unless it announced its own.
-    const float range = (zone || rangeAnnounced_) ? bendRange_ : legacyBendRange_;
+    const float range =
+        zone ? bendRange_ : (plainRange_[channel] >= 0.0f ? plainRange_[channel] : legacyBendRange_);
     float semitones = ((float) bend_[channel] - 8192.0f) / 8192.0f * range;
     if (zone)
       semitones += ((float) bend_[zone->masterChannel] - 8192.0f) / 8192.0f * masterBendRange_;
@@ -1522,7 +1562,6 @@ private:
     // the specification says it should.
     bendRange_ = 48.0f;
     masterBendRange_ = 2.0f;
-    rangeAnnounced_ = false;
   }
 
   MpeZone lower_, upper_;
@@ -1531,10 +1570,11 @@ private:
   /** MPE's default, and only the default. A controller that announces its own
    *  through RPN 0 replaces this the moment it does. */
   float bendRange_ = 48.0f;
-  /** A plain channel's range (see setLegacyBendRange), and whether a range
-   *  announced through RPN 0 outside any zone has replaced it. */
+  /** A plain channel's range (see setLegacyBendRange), and the range each
+   *  channel in no zone announced through RPN 0, -1 where it has not. */
   float legacyBendRange_ = 2.0f;
-  bool rangeAnnounced_ = false;
+  float plainRange_[16] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+                           -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
 };
 
 /** What a channel MEANS. Width alone is not enough: a limiter that ducks the

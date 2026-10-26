@@ -1924,12 +1924,13 @@ static void testHostNamedNotes() {
   struct ModVoice {
     bool active = false;
     int releaseLeft = -1;
-    float mod[4] = {};
+    float mod[4] = {};  // this note's own
+    float wide[4] = {}; // the plugin-wide offsets
     int mods = 0;
     void noteOn(int, float) {
       active = true;
       releaseLeft = -1;
-      for (float& m : mod) m = 0.0f; // a new note starts unmodulated
+      for (float& m : mod) m = 0.0f; // a new note has none of its own
     }
     void noteOff() { releaseLeft = 10; }
     bool isActive() const { return active; }
@@ -1940,6 +1941,9 @@ static void testHostNamedNotes() {
     void setParamMod(int param, float amount) {
       if (param >= 0 && param < 4) mod[param] = amount;
       ++mods;
+    }
+    void setParamModWide(int param, float amount) {
+      if (param >= 0 && param < 4) wide[param] = amount;
     }
   };
 
@@ -2006,9 +2010,10 @@ static void testHostNamedNotes() {
     all.amount = 1.0f;
     rig.mods.addEvent(all);
     runBlock(rig, voices);
-    check(voices.voice(first).mod[3] == 1.0f && voices.voice(second).mod[3] == 1.0f &&
-              voices.voice(third).mod[3] == 1.0f,
-          "a modulation naming no note reaches every note sounding");
+    bool everyVoice = true;
+    for (int i = 0; i < 4; ++i) everyVoice = everyVoice && voices.voice(i).wide[3] == 1.0f;
+    check(everyVoice && voices.voice(first).mod[3] == 0.0f,
+          "a modulation naming no note is the plugin-wide offset: every voice, sounding or not, takes it as that");
 
     // Release one at frame 5: ten samples of release, 5 to 14. The voices
     // render frames 5 to 63 as one stretch (no event inside it), so the note
@@ -2272,6 +2277,322 @@ static void testModMatrix() {
   small.process(wide);
   check(small.offset(kPitch) == 0.0f && small.offset(kCutoff) == 0.0f,
         "routes past a matrix's sources or destinations are skipped");
+}
+
+static void testNoteModulation() {
+  std::printf("note modulation: a note's own amount and the plugin-wide one\n");
+  sonore::NoteModulation<3> m;
+  check(m.setWide(0, 0.5f) && m.offset(0) == 0.5f, "a plugin-wide offset is every note's");
+  check(m.setOwn(0, 0.2f) && m.offset(0) == 0.2f && m.hasOwn(0), "a note's own amount replaces it, not added to it");
+  check(!m.setWide(0, 0.9f) && m.offset(0) == 0.2f, "…and the plugin-wide one moving does not move that note");
+  check(m.noteStarted() && m.offset(0) == 0.9f && !m.hasOwn(0),
+        "a new note has none of its own: back to the plugin-wide offset, as it stands now");
+  check(!m.noteStarted(), "…and says nothing moved when nothing had");
+  check(!m.setOwn(7, 1.0f) && m.offset(7) == 0.0f, "a parameter out of range is ignored");
+
+  // A full modulation buffer keeps the latest amount for an address.
+  sonore::ParamModBuffer buffer;
+  sonore::ParamModBuffer::Entry wide;
+  wide.param = 2;
+  for (int i = 0; i < sonore::ParamModBuffer::kMaxEvents; ++i) {
+    sonore::ParamModBuffer::Entry e;
+    e.noteId = i;
+    e.param = 1;
+    e.samplePosition = i;
+    buffer.addEvent(i == 3 ? wide : e);
+  }
+  wide.amount = 0.75f;
+  wide.samplePosition = 500;
+  buffer.addEvent(wide); // full: replaces the earlier plugin-wide entry for parameter 2
+  float last = 0.0f;
+  int count = 0;
+  for (const auto& e : buffer) {
+    ++count;
+    if (e.param == 2) last = e.amount;
+  }
+  check(count == sonore::ParamModBuffer::kMaxEvents && last == 0.75f,
+        "a full modulation buffer keeps the last amount sent to an address rather than dropping it");
+}
+
+static void testVoiceAddressing() {
+  std::printf("voice manager: addresses, mono note names, kept modulation\n");
+
+  struct Voice {
+    bool active = false;
+    sonore::NoteModulation<4> hostMods;
+    float tuning = 0.0f;
+    int legatos = 0;
+    void noteOn(int, float) {
+      active = true;
+      hostMods.noteStarted();
+      tuning = 0.0f;
+    }
+    void legatoTo(int, float) {
+      ++legatos;
+      hostMods.noteStarted();
+    }
+    void noteOff() { active = false; }
+    bool isActive() const { return active; }
+    float render() { return active ? 1.0f : 0.0f; }
+    void setParamMod(int param, float amount) { hostMods.setOwn(param, amount); }
+    void setParamModWide(int param, float amount) { hostMods.setWide(param, amount); }
+    void setTuning(float semitones) { tuning = semitones; }
+    float mod(int param) const { return hostMods.offset(param); }
+  };
+  auto touched = [](auto& voices, int32_t id, int key, int channel) {
+    int mask = 0;
+    voices.forEachVoiceOf(id, key, channel, [&](int i) { mask |= 1 << i; });
+    return mask;
+  };
+
+  // ── Named voices answer to their names ────────────────────────────
+  {
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.noteOn(60, 1.0f, 0, 5);
+    voices.noteOff(60, 0); // still sounding: a Voice here ends at once, so hold it
+    voices.voice(0).active = true;
+    voices.noteOn(60, 1.0f, 0, 9); // the same key again, a new name
+    const int a = voices.voiceForNoteId(5), b = voices.voiceForNoteId(9);
+    check(a >= 0 && b >= 0 && a != b, "two strikes of one key are two named voices");
+    check(touched(voices, 5, 60, 0) == (1 << a),
+          "an address naming a note reaches that note, not a newer one on its key and channel");
+    check(touched(voices, 7, 60, 0) == 0, "…and a name no voice has reaches nothing, key or not");
+    check(touched(voices, 7, -1, -1) == 0, "…nor does a bare name");
+  }
+  // ── A key reaches the newest note on it, on each channel ──────────
+  {
+    sonore::VoiceManager<Voice, 8> voices;
+    voices.noteOn(60, 1.0f, 2); // two fingers on one key: MPE, two channels
+    voices.noteOn(60, 1.0f, 3);
+    voices.noteOn(62, 1.0f, 2);
+    const int c2 = voices.voiceForNote(60, 2), c3 = voices.voiceForNote(60, 3);
+    check(touched(voices, -1, 60, -1) == ((1 << c2) | (1 << c3)),
+          "a key with any channel reaches the note on it on every channel");
+    check(touched(voices, -1, -1, 2) == ((1 << c2) | (1 << voices.voiceForNote(62, 2))),
+          "a channel with any key reaches every note on that channel");
+    // A release tail, and the same key struck over it on the same channel.
+    voices.noteOn(64, 1.0f, 0);
+    voices.voice(voices.voiceForNote(64, 0)).active = true;
+    const int tail = voices.voiceForNote(64, 0);
+    voices.noteOff(64, 0);
+    voices.voice(tail).active = true; // the release still sounding
+    voices.noteOn(64, 1.0f, 0);
+    const int fresh = voices.voiceForNote(64, 0);
+    check(fresh != tail && touched(voices, -1, 64, 0) == (1 << fresh),
+          "a key reaches the note last struck on it, not the tail it was struck over");
+    check(touched(voices, 3, 64, 0) == (1 << fresh),
+          "a voice with no name answers to a named address by its key");
+  }
+
+  // ── Mono and Legato: held keys are notes until they cannot sound ──
+  auto ends = [](sonore::VoiceManager<Voice, 4>& voices) {
+    std::vector<int32_t> ids;
+    voices.drainEndedNotes([&](const auto& e) { ids.push_back(e.noteId); });
+    return ids;
+  };
+  {
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.setMode(sonore::VoiceManager<Voice, 4>::Mode::Legato);
+    ends(voices);
+    voices.noteOn(60, 1.0f, 0, 1); // A
+    voices.paramMod(1, -1, -1, 0, 0.25f);
+    voices.noteOn(64, 1.0f, 0, 2); // B over it
+    check(ends(voices).empty(), "legato: a key still down is not ended when a new key takes the line");
+    check(voices.noteIdOf(0) == 2 && voices.voice(0).mod(0) == 0.0f,
+          "…the voice plays the new note under its name, without the old note's modulation");
+    voices.paramMod(2, -1, -1, 0, 0.75f);
+    voices.noteOff(64, 0); // lift B: back to A
+    const std::vector<int32_t> afterB = ends(voices);
+    check(afterB.size() == 1 && afterB[0] == 2, "lifting the playing key ends its note, once, by its name");
+    check(voices.noteIdOf(0) == 1 && voices.voice(0).mod(0) == 0.25f,
+          "…and the line returns to the key still down, under that note's name, its modulation brought back");
+    voices.noteOff(60, 0); // lift A: the voice releases
+    check(ends(voices).empty(), "the last key up releases the voice; its note is not over yet");
+    voices.render();
+    const std::vector<int32_t> afterA = ends(voices);
+    check(afterA.size() == 1 && afterA[0] == 1, "…and ends when the voice falls silent");
+  }
+  {
+    sonore::VoiceManager<Voice, 4> voices;
+    using VM = sonore::VoiceManager<Voice, 4>;
+    voices.setMode(VM::Mode::Mono);
+    voices.setNotePriority(VM::NotePriority::High);
+    voices.noteOn(72, 1.0f, 0, 10); // the lead
+    voices.noteOn(60, 1.0f, 0, 11); // under it: remembered, never played
+    check(voices.noteIdOf(0) == 10 && ends(voices).empty(), "high priority: a lower key under the lead is not played");
+    voices.noteOff(60, 0);
+    const std::vector<int32_t> under = ends(voices);
+    check(under.size() == 1 && under[0] == 11,
+          "…and when it comes up it ends, though it never sounded: the host is not left holding it");
+    voices.noteOn(65, 1.0f, 0, 12);
+    voices.allNotesOff();
+    const std::vector<int32_t> panic = ends(voices);
+    check(panic.size() == 1 && panic[0] == 12,
+          "All Notes Off ends the keys held that were not playing; the one playing ends with its release");
+  }
+  {
+    // A voice that falls silent under its key (a one-shot, an envelope run out).
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.setMode(sonore::VoiceManager<Voice, 4>::Mode::Mono);
+    voices.noteOn(60, 1.0f, 0, 20);
+    voices.voice(0).active = false; // silent, the key still down
+    voices.render();
+    const std::vector<int32_t> silent = ends(voices);
+    voices.noteOff(60, 0);
+    const std::vector<int32_t> lifted = ends(voices);
+    check(silent.size() == 1 && silent[0] == 20 && lifted.empty(),
+          "a note whose voice falls silent under its key is ended once, not again when the key comes up");
+  }
+  {
+    // The sustain pedal holds a note whose key is up; the key struck again.
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.setMode(sonore::VoiceManager<Voice, 4>::Mode::Mono);
+    voices.sustainPedal(true);
+    voices.noteOn(60, 1.0f, 0, 30);
+    voices.noteOff(60, 0); // held by the pedal
+    voices.paramMod(30, -1, -1, 1, 0.5f);
+    voices.noteOn(60, 1.0f, 0, 31); // struck again, the pedal still down
+    const std::vector<int32_t> restruck = ends(voices);
+    check(restruck.size() == 1 && restruck[0] == 30 && voices.noteIdOf(0) == 31 &&
+              voices.voice(0).mod(1) == 0.0f,
+          "a note held only by the pedal, struck again, is a new note: the old one ends, its modulation goes");
+    voices.sustainPedal(false);
+    check(voices.voice(0).isActive() && voices.voiceForNoteId(31) == 0,
+          "…and lifting the pedal does not silence the key now down");
+  }
+  {
+    // A note's own amount and the plugin-wide one (CLAP: the note's includes it).
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.paramMod(-1, -1, -1, 2, 0.3f); // plugin-wide, before any note
+    voices.noteOn(60, 1.0f, 0, 1);
+    const int a = voices.voiceForNoteId(1);
+    check(voices.voice(a).mod(2) == 0.3f, "a note started under a plugin-wide offset starts with it");
+    voices.noteOn(64, 1.0f, 0, 2);
+    const int b = voices.voiceForNoteId(2);
+    voices.paramMod(2, -1, -1, 2, 0.8f); // note 2's own
+    voices.paramMod(-1, -1, -1, 2, 0.5f); // the plugin-wide one moves
+    check(voices.voice(a).mod(2) == 0.5f && voices.voice(b).mod(2) == 0.8f,
+          "the plugin-wide offset moves every note without its own; a note's own replaces it, not added");
+  }
+  {
+    // All Sound Off with a key down: the voice is killed before the keys are
+    // let go, and the note must still be reported once.
+    struct KillVoice : Voice {
+      void kill() { active = false; }
+    };
+    sonore::VoiceManager<KillVoice, 4> voices;
+    voices.setMode(sonore::VoiceManager<KillVoice, 4>::Mode::Mono);
+    voices.noteOn(60, 1.0f, 0, 40);
+    voices.allSoundOff();
+    voices.render();
+    int reports = 0;
+    voices.drainEndedNotes([&](const auto& e) { reports += e.noteId == 40 ? 1 : 0; });
+    check(reports == 1, "All Sound Off in Mono reports the note playing once, not once for its key and once for its voice");
+  }
+  {
+    // A key whose voice fell silent under it, gone back to by the line.
+    sonore::VoiceManager<Voice, 4> voices;
+    voices.setMode(sonore::VoiceManager<Voice, 4>::Mode::Mono);
+    voices.noteOn(60, 1.0f, 0, 50);
+    voices.voice(0).active = false; // a one-shot, run out under the key
+    voices.render();
+    voices.noteOn(64, 1.0f, 0, 51);
+    voices.noteOff(64, 0); // back to 60, still down
+    voices.noteOff(60, 0);
+    voices.render();
+    std::vector<int32_t> told = ends(voices);
+    std::sort(told.begin(), told.end());
+    check(told == std::vector<int32_t>{50, 51},
+          "a key the line returns to after its note ended plays again, but its end is not reported twice");
+  }
+}
+
+static void testMpeBendRangeAnnouncements() {
+  std::printf("MPE decoder: which bend range an announcement sets\n");
+  auto bentBy = [](sonore::MpeDecoder& mpe, int channel) {
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    midi.addEvent(sonore::MidiMessage::noteOn(channel, 60, 100), 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(channel, 0), 1); // full throw down
+    mpe.process(midi, out);
+    float tuning = 0.0f;
+    for (const auto* e = out.begin(); e != out.end(); ++e)
+      if (e->expression == sonore::kExprTuning && e->channel == channel) tuning = e->value;
+    sonore::MidiBuffer off;
+    off.addEvent(sonore::MidiMessage::noteOff(channel, 60), 0);
+    off.addEvent(sonore::MidiMessage::pitchBend(channel, 8192), 1);
+    mpe.process(off, out);
+    return -tuning;
+  };
+  auto rpn0 = [](sonore::MpeDecoder& mpe, int channel, int semis) {
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    midi.addEvent(sonore::MidiMessage::controlChange(channel, 101, 0), 0);
+    midi.addEvent(sonore::MidiMessage::controlChange(channel, 100, 0), 1);
+    midi.addEvent(sonore::MidiMessage::controlChange(channel, 6, semis), 2);
+    mpe.process(midi, out);
+  };
+  auto zone = [](sonore::MpeDecoder& mpe, int members) {
+    sonore::MidiBuffer midi;
+    sonore::NoteExpressionBuffer out;
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 101, 0), 0); // MCM on the lower master
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 100, 6), 1);
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 6, members), 2);
+    mpe.process(midi, out);
+  };
+
+  {
+    sonore::MpeDecoder mpe;
+    zone(mpe, 5);
+    rpn0(mpe, 1, 48); // a member channel's per-note range, as MPE controllers send
+    zone(mpe, 0);     // the zone turned off: an ordinary keyboard again
+    checkNear(bentBy(mpe, 1), 2.0f, 0.01f,
+              "a member's 48 does not follow its channel out of a zone that is turned off");
+  }
+  {
+    sonore::MpeDecoder mpe;
+    rpn0(mpe, 2, 12);
+    checkNear(bentBy(mpe, 2), 12.0f, 0.01f, "a plain channel bends at the range it announced");
+    checkNear(bentBy(mpe, 0), 2.0f, 0.01f, "…and another channel is not told by it");
+  }
+  {
+    sonore::MpeDecoder mpe;
+    mpe.setLegacyBendRange(7.0f); // the plugin's knob
+    rpn0(mpe, 0, 2);              // a keyboard announcing two at power-on
+    mpe.setLegacyBendRange(7.0f); // the knob, unmoved, every block
+    checkNear(bentBy(mpe, 0), 2.0f, 0.01f, "the keyboard's announcement holds while the plugin's knob stays where it was");
+    mpe.setLegacyBendRange(12.0f); // the player turns it
+    checkNear(bentBy(mpe, 0), 12.0f, 0.01f, "…and the knob turned takes the range back: the last one set wins");
+  }
+  {
+    sonore::MpeDecoder mpe;
+    rpn0(mpe, 0, 12); // said once, at power-on
+    mpe.reset();
+    checkNear(bentBy(mpe, 0), 12.0f, 0.01f, "a reset keeps the range a keyboard announced: it will not say it again");
+  }
+}
+
+static void testVoiceManagerFootprint() {
+  std::printf("voice manager: the steal fade's room only where it can be used\n");
+  struct ChannelVoice { // mixed by its DSP, as the sampler's is: no render()
+    bool active = false;
+    void noteOn(int, float) { active = true; }
+    void noteOff() { active = false; }
+    bool isActive() const { return active; }
+  };
+  struct MonoVoice {
+    bool active = false;
+    void noteOn(int, float) { active = true; }
+    void noteOff() { active = false; }
+    bool isActive() const { return active; }
+    float render() { return 0.0f; }
+  };
+  const size_t mixedByDsp = sizeof(sonore::VoiceManager<ChannelVoice, 8>);
+  const size_t rendered = sizeof(sonore::VoiceManager<MonoVoice, 8>);
+  std::printf("  ---- 8 voices: %zu bytes mixed by the DSP, %zu rendered by the manager ----\n",
+              mixedByDsp, rendered);
+  check(mixedByDsp < 4096, "a voice manager that cannot render its voices carries no fade buffers");
+  check(rendered > 8 * 2 * 384 * sizeof(float), "…one that can has room for each voice's 2 ms tail at 192 kHz");
 }
 
 /**
@@ -39426,6 +39747,10 @@ int main() {
   testHostNamedNotes();
   testVoiceBlockRendering();
   testModMatrix();
+  testNoteModulation();
+  testVoiceAddressing();
+  testMpeBendRangeAnnouncements();
+  testVoiceManagerFootprint();
   testNoteState();
   testUserSettings();
   testUnicodePaths();

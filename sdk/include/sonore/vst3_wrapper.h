@@ -1506,11 +1506,6 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
   // No block to play them in: they wait, at offset 0, for the next one.
   if (frames <= 0) return Steinberg_kResultOk;
 
-  if (kDesc.supportsMpe) {
-    clapwrap::syncBendRange(plugin->shared.dsp, plugin->shared.mpe);
-    plugin->shared.mpe.process(plugin->shared.midi, plugin->shared.expression);
-  }
-
   if (data->numOutputs < 1 || !data->outputs) {
     clapwrap::discardEvents(&plugin->shared);
     return Steinberg_kResultOk;
@@ -1520,6 +1515,11 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
   // drained into, and its values lose nothing by waiting -- the main thread
   // already wrote them.
   drainUiEvents(plugin);
+
+  // The block's parameters, once, and then the MPE decode against them --
+  // after the editor's keys, so the decoder knows a note played there.
+  clapwrap::snapshotParams(&plugin->shared);
+  clapwrap::decodeMpe(&plugin->shared, plugin->shared.midi, plugin->shared.paramsBlock);
 
   auto& out = data->outputs[0];
 
@@ -1617,7 +1617,6 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
                                     nullptr}; // nor for modulating one
       clapwrap::bypassCapture(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
       trackNotes(plugin->shared.notes, ctx64.midi);
-      clapwrap::snapshotParams(&plugin->shared);
       clapwrap::runDspCtx64(plugin->shared.dsp, ctx64, plugin->shared.paramsBlock);
       emitVst3MidiOut(plugin, data, frames);
       clapwrap::bypassApply(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
@@ -1730,7 +1729,6 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
                      nullptr, // no event for a note's end
                      nullptr}; // nor for modulating one
   trackNotes(plugin->shared.notes, ctx.midi);
-  clapwrap::snapshotParams(&plugin->shared);
   clapwrap::runDspCtx(plugin->shared.dsp, ctx, plugin->shared.paramsBlock);
 
   emitVst3MidiOut(plugin, data, frames);

@@ -10,7 +10,7 @@
 //   renderVoices()      the block's MIDI and expression applied at their exact
 //                       frames, the voices rendered between them
 //   Portamento          the glide a mono line makes between notes
-//   pitchBendRange()    the wheel's range for a keyboard that is not MPE
+//   pitchBendRange(p)   the wheel's range for a keyboard that is not MPE
 //   setMpe(true)        bend and pressure per finger, from an MPE controller
 //   setParamMod()       a CLAP host's modulation of the filter, per note
 //   voiceCount()        the Voices control, as a CLAP host reads it
@@ -18,9 +18,10 @@
 //                       pressure or the mod wheel to cutoff, pitch, pan or
 //                       level, per voice
 #define SONORE_NUM_PARAMS 22
-// Tall enough for the generic editor to show all four groups of controls and
-// the keyboard under them without scrolling: a keyboard below the fold is one
-// a player does not know is there.
+// The generic editor's first groups in view and the rest a scroll away; the
+// keyboard is docked along the window's foot, so it is never below the fold
+// however far the controls scroll -- a keyboard out of sight is one a player
+// does not know is there.
 #define SONORE_UI_WIDTH 700
 #define SONORE_UI_HEIGHT 640
 
@@ -99,14 +100,16 @@ struct Voice {
     // closed the filter under a finger still pressing, until it moved again.
     applyFilter();
   }
-  /** A CLAP host's modulation of this note alone (the table marks Cutoff and
-   *  Resonance modulatablePerNote): an offset in the control's own units,
-   *  added to the knob for this voice and kept until the host moves it. */
+  /** A CLAP host's modulation (the table marks Cutoff and Resonance
+   *  modulatablePerNote): this note's own amount, and the plugin-wide one
+   *  every note without its own hears. Offsets in the control's own units,
+   *  kept by NoteModulation, which lets a note's own replace the plugin-wide
+   *  one as CLAP has it; the filter is rebuilt only when one moved. */
   void setParamMod(int param, float amount) {
-    if (param == kCutoff) cutoffMod = amount;
-    else if (param == kResonance) resonanceMod = amount;
-    else return;
-    applyFilter();
+    if (hostMods.setOwn(param, amount) && (param == kCutoff || param == kResonance)) applyFilter();
+  }
+  void setParamModWide(int param, float amount) {
+    if (hostMods.setWide(param, amount) && (param == kCutoff || param == kResonance)) applyFilter();
   }
   void setEnvelope(float attack, float release) {
     sonore::ADSR::Parameters p;
@@ -140,7 +143,7 @@ struct Voice {
     // no change by that number, so it played the whole note that bright.
     // A new note's modulation is its own, which the host sends after this.
     pressure = 0.0f;
-    cutoffMod = resonanceMod = 0.0f;
+    hostMods.noteStarted();
     // The note's own modulation sources, and its LFO and envelope started
     // with it: every voice's LFO from the top of its cycle, as a key-synced
     // LFO is.
@@ -160,11 +163,14 @@ struct Voice {
     filter.reset();
     env.noteOn();
   }
-  /** Legato: the next note without a new attack, gliding if glide is on. */
+  /** Legato: the next note without a new attack, gliding if glide is on.
+   *  A new note to the host, so its own modulation, as at a note-on: the
+   *  voice manager brings back what the host gave a key returned to. */
   void legatoTo(int note, float vel) {
     velocity = vel;
     if (glides) glide.glideTo((float) note);
     else glide.jumpTo((float) note);
+    if (hostMods.noteStarted()) applyFilter();
   }
   void noteOff() {
     env.noteOff();
@@ -228,11 +234,11 @@ private:
    *  note's pressure, in that order: the host's held to the control's range,
    *  the matrix's in octaves on top. */
   void applyFilter() {
-    float c = cutoff + cutoffMod;
+    float c = cutoff + hostMods.offset(kCutoff);
     c = c < 80.0f ? 80.0f : (c > 16000.0f ? 16000.0f : c);
     if (modCutoff != 0.0f) c *= std::exp2(modCutoff);
     c = c > 20000.0f ? 20000.0f : c;
-    float r = resonance + resonanceMod;
+    float r = resonance + hostMods.offset(kResonance);
     r = r < 0.0f ? 0.0f : (r > 0.95f ? 0.95f : r);
     filter.set(c * (1.0f + 3.0f * pressure), r);
   }
@@ -289,7 +295,7 @@ private:
     modGainTarget = g < 0.0f ? 0.0f : (g > 2.0f ? 2.0f : g);
     modGainStep = (modGainTarget - modGain) / (float) kControlRate;
   }
-  float cutoffMod = 0.0f, resonanceMod = 0.0f;
+  sonore::NoteModulation<SONORE_NUM_PARAMS> hostMods;
   float basePan = 0.0f, targetL = 0.70710678f, targetR = 0.70710678f;
   float gainL = 0.70710678f, gainR = 0.70710678f, gainLStep = 0.0f, gainRStep = 0.0f;
   float modCutoff = 0.0f, modPitch = 0.0f, modPan = 0.0f;
@@ -316,7 +322,6 @@ struct SonoreDsp {
   float lastCutoff = -1.0f, lastRes = -1.0f, lastAttack = -1.0f, lastRelease = -1.0f;
   float lastGlide = -1.0f, lastSpread = -1.0f;
   int lastVoices = -1, lastMode = -1;
-  float bendRange = 2.0f;
 
   /** What a host needs to draw a voice meter and to decide how many MPE
    *  member channels are worth allocating. Answering nothing makes a host
@@ -328,8 +333,9 @@ struct SonoreDsp {
   int voiceCount() const { return voices.polyphony(); }
   int activeVoices() const { return voices.activeVoices(); }
   /** The wheel's range for a keyboard that is not MPE, from the Bend Range
-   *  control: the wrapper's decoder reads it before every block. */
-  float pitchBendRange() const { return bendRange; }
+   *  control: the wrapper's decoder asks before every block, with the values
+   *  that block will be handed, so a moved knob bends from that block. */
+  float pitchBendRange(const float* p) const { return p[kBendRange]; }
 
   void prepare(const sonore::ProcessSpec& spec) {
     const float sr = (float) spec.sampleRate;
@@ -399,7 +405,6 @@ struct SonoreDsp {
       }
       lastSpread = p[kSpread];
     }
-    bendRange = p[kBendRange];
 
     // The modulation: the LFO and the envelope when their controls moved,
     // and the three routes, which ModRouting::set() leaves alone when a
@@ -520,7 +525,8 @@ static const sonore::PluginDescriptor kDesc = {
     "Sonore Synth",
     "Sonorie",
     "1.0.0",
-    "Eight-voice saw synth with a ladder filter: poly, mono and legato with glide, stereo spread, MPE.",
+    "Eight-voice saw synth with a ladder filter: poly, mono and legato with glide, a modulation matrix, "
+    "stereo spread, MPE.",
     "https://sonorie.com",
     true, // instrument
     kParamTable,

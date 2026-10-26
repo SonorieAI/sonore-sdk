@@ -913,10 +913,10 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
     const uint32_t numRoles =
         rolesFromMask(defaultChannelMask(width), roles, clapwrap::kMaxAudioChannels);
     self->shared.expression.clear();
-    if (kDesc.supportsMpe) {
-      clapwrap::syncBendRange(self->shared.dsp, self->shared.mpe);
-      self->shared.mpe.process(self->shared.midi, self->shared.expression);
-    }
+    // The block's parameters, once: what the MPE decode reads the bend range
+    // from and what the DSP is handed.
+    clapwrap::snapshotParams(&self->shared);
+    clapwrap::decodeMpe(&self->shared, self->shared.midi, self->shared.paramsBlock);
     // ctx.offline too: it was left false, so a DSP reading it -- as the
     // other formats let it -- never heard that the host was freewheeling.
     ProcessContext ctx{block,
@@ -931,7 +931,6 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
                        true,
                        self->shared.offline};
     trackNotes(self->shared.notes, ctx.midi);
-    clapwrap::snapshotParams(&self->shared);
     clapwrap::runDspCtx(self->shared.dsp, ctx, self->shared.paramsBlock);
     writeMidiOut(self, done, n);
     clapwrap::bypassApply(self->shared.bypass, slice, width, n);

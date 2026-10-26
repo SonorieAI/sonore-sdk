@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 271 headers, 740 public types.
+not have. 271 headers, 742 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -345,7 +345,7 @@ the CLAP format wrapper
 
 `sdk/include/sonore/clap_wrapper.h`
 
-TakesMidi, TakesSidechain, TakesContext, TakesDouble, TakesDoubleCtx, WantsTransport, WantsHostInfo, WantsTrackInfo, WantsFile, StateHeader, HasVoiceCapacity, HasVoiceCount, HasActiveVoices, HasPitchBendRange, HasStateBag, SharedParam, SharedFlag, BypassState, Instance, HasLatency, HasGainReduction, HasStateDirty, HasTail, SliceEventsIn, SliceEventsOut, PresetProvider
+TakesMidi, TakesSidechain, TakesContext, TakesDouble, TakesDoubleCtx, WantsTransport, WantsHostInfo, WantsTrackInfo, WantsFile, StateHeader, HasVoiceCapacity, HasVoiceCount, HasActiveVoices, HasPitchBendRange, HasOldPitchBendRange, HasStateBag, SharedParam, SharedFlag, BypassState, Instance, HasLatency, HasGainReduction, HasStateDirty, HasTail, SliceEventsIn, SliceEventsOut, PresetProvider
 
 ### clipper.h
 
@@ -1969,7 +1969,7 @@ the synthesiser side, past one oscillator and one envelope
 
 `sdk/include/sonore/synth.h`
 
-Wavetable, WavetableOscillator, UnisonOscillator, HardSyncOscillator, FmOperator, Dahdsr, Portamento, KarplusStrong, ModalResonator, ModRoute, ModRouting, ModMatrix
+Wavetable, WavetableOscillator, UnisonOscillator, HardSyncOscillator, FmOperator, Dahdsr, Portamento, KarplusStrong, ModalResonator, ModRoute, ModRouting, ModMatrix, NoteModulation
 
 ### sysex.h
 

@@ -229,8 +229,9 @@ struct ParamInfo {
    * handed, so a host's LFO on the cutoff wobbles the sound without dragging
    * the knob and without being saved in its place. CLAP is the format that
    * says so (CLAP_PARAM_IS_MODULATABLE); the wrapper adds the offset, clamped
-   * to the range, before every block, so a DSP needs nothing to support it.
-   * Other formats have no such event and ignore the flag.
+   * to the range, before every block, so a DSP needs nothing to support it
+   * (a parameter also modulatablePerNote takes it through its voices
+   * instead; see there). Other formats have no such event and ignore the flag.
    *
    * Off by default: a control whose change is a reconfiguration (an
    * oversampling switch, a voice count) moved by an LFO is a rebuild a block.
@@ -239,10 +240,14 @@ struct ParamInfo {
   /**
    * Whether a host may modulate it for ONE note at a time (CLAP's polyphonic
    * modulation): each voice's own envelope on its own cutoff. Implies
-   * modulatable. The offsets reach a DSP as ctx.paramMods, and through
+   * modulatable. Every modulation of such a parameter -- a note's own and
+   * the plugin-wide one alike -- reaches a DSP as ctx.paramMods, and through
    * renderVoices() a voice's `setParamMod(int param, float amount)`, which
    * adds the amount, in the parameter's own units, to the value for that
-   * voice alone. A DSP that does not read them should not claim this.
+   * voice alone; the value process() is handed carries no modulation. That
+   * is what lets a note's own amount replace the plugin-wide one, as CLAP
+   * has it, rather than be added to it. A DSP that does not read them should
+   * not claim this.
    */
   bool modulatablePerNote = false;
 };

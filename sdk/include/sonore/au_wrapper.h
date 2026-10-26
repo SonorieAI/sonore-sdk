@@ -1835,10 +1835,10 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   // The offsets came with the MIDI, before this call said how long the block
   // is: one at or past its end was never reached, and the note hung.
   unit->shared.midi.clampPositions((int) frames);
-  if (kDesc.supportsMpe) {
-    clapwrap::syncBendRange(unit->shared.dsp, unit->shared.mpe);
-    unit->shared.mpe.process(unit->shared.midi, unit->shared.expression);
-  }
+  // The block's parameters, once: what the MPE decode reads the bend range
+  // from and what the DSP is handed.
+  clapwrap::snapshotParams(&unit->shared);
+  clapwrap::decodeMpe(&unit->shared, unit->shared.midi, unit->shared.paramsBlock);
   ProcessContext ctx{block,
                      auxBlocks,
                      nAux,
@@ -1853,7 +1853,6 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   trackNotes(unit->shared.notes, ctx.midi);
   if (clapwrap::WantsTransport<SonoreDsp>::value)
     clapwrap::sendTransport(unit->shared.dsp, readHostTransport(unit));
-  clapwrap::snapshotParams(&unit->shared);
   clapwrap::runDspCtx(unit->shared.dsp, ctx, unit->shared.paramsBlock);
 
   // AU delivers emitted MIDI through a host callback taking a CoreMIDI packet

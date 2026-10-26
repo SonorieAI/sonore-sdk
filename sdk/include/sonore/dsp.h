@@ -1713,6 +1713,11 @@ struct VoiceHasParamMod : std::false_type {};
 template <typename V>
 struct VoiceHasParamMod<V, std::void_t<decltype(std::declval<V&>().setParamMod(0, 0.0f))>>
     : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasParamModWide : std::false_type {};
+template <typename V>
+struct VoiceHasParamModWide<V, std::void_t<decltype(std::declval<V&>().setParamModWide(0, 0.0f))>>
+    : std::true_type {};
 } // namespace detail
 
 /**
@@ -1749,7 +1754,14 @@ struct VoiceHasParamMod<V, std::void_t<decltype(std::declval<V&>().setParamMod(0
  *   void setParamMod(int param, float amount)
  *                                            a host's offset to parameter
  *                                            `param` for this note alone
- *                                            (CLAP polyphonic modulation).
+ *                                            (CLAP polyphonic modulation),
+ *                                            replacing the plugin-wide one;
+ *   void setParamModWide(int param, float amount)
+ *                                            and the plugin-wide offset, for
+ *                                            every note without its own. The
+ *                                            two together, or neither:
+ *                                            NoteModulation (synth.h) keeps
+ *                                            them for a voice.
  *
  * Four things here are the difference between a voice manager and a synth a
  * player will tolerate:
@@ -1821,6 +1833,8 @@ public:
     High, ///< the highest key held: a lead over sustained lower notes
   };
 
+  /** Every voice idle, Poly, all of them usable, the steal fade timed for
+   *  48 kHz until setSampleRate() says otherwise. */
   VoiceManager() { setSampleRate(48000.0); }
 
   /** Voice `i`, 0 .. kNumVoices - 1, unchecked: to set every voice's
@@ -1838,8 +1852,9 @@ public:
     fadeLength_ = n;
     // A raised cosine from 1 to 0: no corner where it starts, none where it
     // ends, which a linear ramp has at both.
-    for (int k = 0; k < n; ++k)
-      fade_[k] = 0.5f * (1.0f + std::cos(3.14159265358979f * (float) (k + 1) / (float) n));
+    if constexpr (kCanRenderBlock)
+      for (int k = 0; k < n; ++k)
+        fade_[k] = 0.5f * (1.0f + std::cos(3.14159265358979f * (float) (k + 1) / (float) n));
   }
   /** The steal fade's length, in samples. */
   int stealFadeSamples() const { return fadeLength_; }
@@ -1870,10 +1885,12 @@ public:
     allNotesOff();
     mode_ = mode;
   }
+  /** The mode setMode() last set; Poly until then. */
   Mode mode() const { return mode_; }
 
   /** Which held key a Mono or Legato line plays. */
   void setNotePriority(NotePriority priority) { priority_ = priority; }
+  /** The priority setNotePriority() last set; Last until then. */
   NotePriority notePriority() const { return priority_; }
 
   /** Whether bend and pressure arrive as per-note expression (MPE, decoded
@@ -1882,6 +1899,7 @@ public:
    *  pressure to the expression path, which has already folded them into
    *  each note: applying them again would bend every note twice. */
   void setMpe(bool on) { mpe_ = on; }
+  /** Whether setMpe() turned MPE on. */
   bool isMpe() const { return mpe_; }
 
   /** Start a note.
@@ -1960,11 +1978,101 @@ public:
     return -1;
   }
 
-  /** What voice `i` is playing: its key, its channel and the host's id for
-   *  the note (-1 where there was none). */
+  /** The key voice `i` is playing (or last played). */
   int noteOf(int i) const { return notes_[i]; }
+  /** The 0-based channel voice `i`'s note came on. */
   int channelOf(int i) const { return channels_[i]; }
+  /** The host's id for voice `i`'s note; -1 where there was none. */
   int32_t noteIdOf(int i) const { return noteIds_[i]; }
+
+  /**
+   * Call `f(i)` for every sounding voice an address reaches: a note named the
+   * way CLAP names one, by the host's id, its key and its channel, -1 for
+   * any. How expression (applyExpression()) and per-note modulation
+   * (paramMod()) find their voices.
+   *
+   *  - A voice the host named answers to its id alone: an address for a note
+   *    that has ended does not land on a newer note that happens to share its
+   *    key and channel.
+   *  - A voice with no name (a format with no note ids, or notes a DSP
+   *    started itself) answers to a key and channel, and only to an address
+   *    that gives a key.
+   *  - A key reaches the note most recently started on it, on each channel:
+   *    not a release tail the key was struck again over. Two fingers on one
+   *    key are on two channels (MPE), and both are reached.
+   *  - No key and no id: every note, on the channel or on all of them.
+   */
+  template <typename F>
+  void forEachVoiceOf(int32_t noteId, int key, int channel, F&& f) {
+    if (key < 0) {
+      // No key: every note on the channel, or every note -- but a named
+      // voice still answers only to its own name.
+      for (int i = 0; i < MaxVoices; ++i) {
+        if (!voices_[i].isActive() || (channel >= 0 && channels_[i] != channel)) continue;
+        if (noteId >= 0 && noteIds_[i] != noteId) continue;
+        f(i);
+      }
+      return;
+    }
+    // A key: first the newest voice on it on each channel, in one pass.
+    int newest[16];
+    for (int& n : newest) n = -1;
+    for (int i = 0; i < MaxVoices; ++i) {
+      if (!voices_[i].isActive() || notes_[i] != key || (channel >= 0 && channels_[i] != channel)) continue;
+      const int c = channels_[i] & 15;
+      if (newest[c] < 0 || age_[i] > age_[newest[c]]) newest[c] = i;
+    }
+    for (int i = 0; i < MaxVoices; ++i) {
+      if (!voices_[i].isActive() || notes_[i] != key || (channel >= 0 && channels_[i] != channel)) continue;
+      if (noteId >= 0 && noteIds_[i] >= 0) { // named: the id decides
+        if (noteIds_[i] == noteId) f(i);
+        continue;
+      }
+      // A key restarted after the host was told its note ended answers to no
+      // name: an address naming the old note does not land on it.
+      if (noteId >= 0 && noteIds_[i] == kNameReported) continue;
+      if (newest[channels_[i] & 15] == i) f(i); // not a tail the key was struck over
+    }
+  }
+
+  /**
+   * A host's offset to parameter `param`, to each voice's `setParamMod()`
+   * where it has one: CLAP's per-note modulation.
+   *
+   * An address that names a note (see forEachVoiceOf()) gives the notes it
+   * reaches an amount of their own, through setParamMod(). One that names
+   * no note at all -- every field -1 -- is the plugin-wide offset, which
+   * goes to EVERY voice, sounding or not, through setParamModWide(): the
+   * voice keeps it for the notes it plays, and a note's own amount replaces
+   * it for that note, as CLAP has it (the host's per-note amount includes
+   * the plugin-wide signal). NoteModulation (synth.h) keeps that for a
+   * voice.
+   *
+   * In Mono and Legato a note's own offset is also kept with its key while
+   * the key is down -- the last eight parameters' -- so a line that goes
+   * back to the key brings it back. A voice without setParamMod() is left
+   * alone.
+   */
+  void paramMod(int32_t noteId, int key, int channel, int param, float amount) {
+    if constexpr (detail::VoiceHasParamMod<VoiceType>::value) {
+      static_assert(detail::VoiceHasParamModWide<VoiceType>::value,
+                    "a voice that takes a note's own modulation takes the plugin-wide one too: "
+                    "void setParamModWide(int param, float amount) -- see NoteModulation");
+      if (noteId < 0 && key < 0 && channel < 0) {
+        for (int i = 0; i < MaxVoices; ++i) voices_[i].setParamModWide(param, amount);
+        return;
+      }
+      forEachVoiceOf(noteId, key, channel, [&](int i) { voices_[i].setParamMod(param, amount); });
+      for (int h = 0; h < stackSize_; ++h)
+        if (heldAddressed(stack_[h], noteId, key, channel)) keepMod(stack_[h], param, amount);
+    } else {
+      (void) noteId;
+      (void) key;
+      (void) channel;
+      (void) param;
+      (void) amount;
+    }
+  }
 
   /** Voices sounding now, release tails included: what a voice meter shows
    *  and what CLAP's voice-info and a DSP's activeVoices() report. */
@@ -2042,6 +2150,10 @@ public:
    *  button mean: a voice still sounding afterwards because a pedal was down
    *  is the exact failure the user pressed the button to stop. */
   void allNotesOff() {
+    // A held key the line was not playing will never sound now. The one it
+    // was playing ends with its release, as any note does.
+    for (int r = 0; r < stackSize_; ++r)
+      if (!voiceReports(stack_[r])) heldEnded(stack_[r]);
     stackSize_ = 0;
     for (int i = 0; i < MaxVoices; ++i) {
       held_[i] = false;
@@ -2082,6 +2194,7 @@ public:
   /** How far a full wheel throw bends, in semitones, for applyMidi(): 2 by
    *  default, as the MIDI spec has it and as most keyboards are set. */
   void setPitchBendRange(float semitones) { bendRange_ = semitones; }
+  /** The range setPitchBendRange() last set: 2 until then. */
   float pitchBendRange() const { return bendRange_; }
 
   /** Channel aftertouch, 0 .. 1, to the voices on that channel that have
@@ -2104,6 +2217,7 @@ public:
     if constexpr (detail::VoiceHasModWheel<VoiceType>::value)
       for (int i = 0; i < MaxVoices; ++i) voices_[i].setModWheel(value);
   }
+  /** The mod wheel as modWheel() last set it, 0 .. 1. */
   float modWheelValue() const { return modWheel_; }
 
   /** Sum every active voice for one sample: the mono mix. A stereo-only voice
@@ -2230,9 +2344,9 @@ public:
 
   /** A note that has stopped sounding: its key, channel and the host's id. */
   struct EndedNote {
-    int note = 0;
-    int channel = 0;
-    int32_t noteId = -1;
+    int note = 0;        ///< the key
+    int channel = 0;     ///< the 0-based channel it came on
+    int32_t noteId = -1; ///< the host's id for it, or -1
   };
   /** Hand every note that has finished since the last call to `f(EndedNote)`
    *  and forget them: voices whose release ran out, and notes a steal or All
@@ -2264,6 +2378,18 @@ private:
     if constexpr (detail::VoiceHasPitchBend<VoiceType>::value)
       voices_[slot].setPitchBend(channel >= 0 && channel < 16 ? bend_[channel] : 0.0f);
     if constexpr (detail::VoiceHasModWheel<VoiceType>::value) voices_[slot].setModWheel(modWheel_);
+  }
+
+  struct Held; // a key held in Mono or Legato; below
+  /** A held key's own offsets back on the voice, which noteOn() or
+   *  legatoTo() has just cleared. */
+  void replayHeldMods(int slot, const Held& h) {
+    if constexpr (detail::VoiceHasParamMod<VoiceType>::value) {
+      for (int k = 0; k < h.numMods; ++k) voices_[slot].setParamMod(h.modParam[k], h.modAmount[k]);
+    } else {
+      (void) slot;
+      (void) h;
+    }
   }
 
   void releaseSlot(int i) {
@@ -2335,6 +2461,14 @@ private:
   }
 
   void noteEnded(int i) {
+    // In Mono and Legato a voice can fall silent under a key still down (a
+    // one-shot, an envelope run out). Its note is reported now, and the key
+    // remembers that, so its coming up does not report it again.
+    if (mode_ != Mode::Poly && i == 0)
+      for (int r = 0; r < stackSize_; ++r)
+        if (stack_[r].note == notes_[0] && stack_[r].channel == channels_[0] && stack_[r].noteId == noteIds_[0])
+          stack_[r].ended = true;
+    if (noteIds_[i] == kNameReported) return; // the host was told already
     if (endedCount_ >= kMaxEnded) return; // full: nobody drained; the oldest stay
     ended_[endedCount_].note = notes_[i];
     ended_[endedCount_].channel = channels_[i];
@@ -2380,22 +2514,97 @@ private:
   // what makes a trill work: lift the top note of two and the line goes back
   // to the one still held, which a synth that only remembers one key cannot.
 
-  /** One key held in Mono or Legato, as it was struck. */
+  // A key held is a note the host still has, sounding or not: it may sound
+  // again when the keys above it come up. So it ends -- reported, for a host
+  // that frees a note's modulation when it does -- only once it can no
+  // longer sound: its key up while another plays, or the line leaving it
+  // after its key came up, or the voice falling silent. Its per-note
+  // modulation is kept with it, for when the line comes back.
+
+  /** How many per-note offsets a held key keeps: none for a voice that takes
+   *  no modulation. */
+  static constexpr int kHeldMods = detail::VoiceHasParamMod<VoiceType>::value ? 8 : 1;
+
+  /** One key held in Mono or Legato, as it was struck, and the host's latest
+   *  offsets for it. */
   struct Held {
-    int note;
-    float velocity;
-    int channel;
-    int32_t noteId;
+    int note;                   ///< the key
+    float velocity;             ///< as it was struck, 0 .. 1
+    int channel;                ///< 0-based
+    int32_t noteId;             ///< the host's name for the note, or -1
+    bool ended;                 ///< its note already ended, the key still down
+    int numMods;                ///< how many offsets are kept below
+    int modParam[kHeldMods];    ///< each kept offset's parameter
+    float modAmount[kHeldMods]; ///< and its amount
   };
 
+  /** Whether `h` is the note the voice is playing now. */
+  bool monoPlays(const Held& h) const {
+    return voices_[0].isActive() && !released_[0] && notes_[0] == h.note && channels_[0] == h.channel &&
+           noteIds_[0] == h.noteId;
+  }
+  /** Whether `h` is the voice's note, whose end the voice itself will report
+   *  -- still sounding, or silenced (All Sound Off) and not yet noticed. */
+  bool voiceReports(const Held& h) const {
+    return sounding_[0] && notes_[0] == h.note && channels_[0] == h.channel && noteIds_[0] == h.noteId;
+  }
+  /** A held key's note is over without having sounded to the end -- once:
+   *  one whose voice already fell silent under the key was reported then. */
+  void heldEnded(const Held& h) {
+    if (h.ended || endedCount_ >= kMaxEnded) return;
+    ended_[endedCount_].note = h.note;
+    ended_[endedCount_].channel = h.channel;
+    ended_[endedCount_].noteId = h.noteId;
+    ++endedCount_;
+  }
+  /** Whether an address reaches a held key, by the rules forEachVoiceOf()
+   *  keeps for voices. */
+  static bool heldAddressed(const Held& h, int32_t noteId, int key, int channel) {
+    if (key >= 0 && h.note != key) return false;
+    if (channel >= 0 && h.channel != channel) return false;
+    if (noteId >= 0 && h.noteId >= 0) return h.noteId == noteId;
+    if (noteId >= 0 && h.noteId == kNameReported) return false;
+    return !(noteId >= 0 && key < 0);
+  }
+  /** The latest offset for one parameter, kept with a held key: replacing
+   *  the one before, and past kHeldMods the oldest makes room. */
+  static void keepMod(Held& h, int param, float amount) {
+    for (int k = 0; k < h.numMods; ++k)
+      if (h.modParam[k] == param) {
+        h.modAmount[k] = amount;
+        return;
+      }
+    if (h.numMods == kHeldMods) {
+      for (int k = 1; k < kHeldMods; ++k) {
+        h.modParam[k - 1] = h.modParam[k];
+        h.modAmount[k - 1] = h.modAmount[k];
+      }
+      --h.numMods;
+    }
+    h.modParam[h.numMods] = param;
+    h.modAmount[h.numMods] = amount;
+    ++h.numMods;
+  }
+
+  /** Take the keys `note` (on `channel`) off the stack. One that is not the
+   *  note playing will never sound now, and ends here. */
   void forgetHeld(int note, int channel) {
     int w = 0;
-    for (int r = 0; r < stackSize_; ++r)
-      if (!(held(r).note == note && (channel == kAnyChannel || held(r).channel == channel)))
+    for (int r = 0; r < stackSize_; ++r) {
+      if (stack_[r].note == note && (channel == kAnyChannel || stack_[r].channel == channel)) {
+        if (!voiceReports(stack_[r])) heldEnded(stack_[r]);
+      } else {
         stack_[w++] = stack_[r];
+      }
+    }
     stackSize_ = w;
   }
-  const Held& held(int i) const { return stack_[i]; }
+  /** Whether the note the voice is playing is still a key held. */
+  bool playingIsHeld() const {
+    for (int r = 0; r < stackSize_; ++r)
+      if (monoPlays(stack_[r])) return true;
+    return false;
+  }
 
   /** The key the line should play: an index into the stack, or -1. */
   int chosenHeld() const {
@@ -2420,16 +2629,25 @@ private:
     // Overlapping: another key was still down when this one came. That, and
     // not the timing, is what legato means.
     const bool overlapping = stackSize_ > 0;
-    forgetHeld(note, channel);
+    forgetHeld(note, channel); // the same key's earlier strike, if still down
     if (stackSize_ == kMaxHeldNotes) { // more keys than fingers: forget the oldest
+      if (!voiceReports(stack_[0])) heldEnded(stack_[0]);
       for (int i = 1; i < stackSize_; ++i) stack_[i - 1] = stack_[i];
       --stackSize_;
     }
-    stack_[stackSize_++] = Held{note, velocity, channel, noteId};
-    const Held& target = stack_[chosenHeld()];
+    stack_[stackSize_] = Held{};
+    stack_[stackSize_].note = note;
+    stack_[stackSize_].velocity = velocity;
+    stack_[stackSize_].channel = channel;
+    stack_[stackSize_].noteId = noteId;
+    ++stackSize_;
+    Held& target = stack_[chosenHeld()];
     // A key that does not win the priority changes nothing audible: a low
-    // note added under a High-priority lead is remembered, not played.
-    if (monoSounds(target.note, target.channel)) return;
+    // note added under a High-priority lead is remembered, not played. Only
+    // when the line already plays that very strike, with its key down: a
+    // note only a pedal holds, or a key struck again, is a new note -- as in
+    // Poly -- and the pedal coming up does not silence the key now down.
+    if (monoPlays(target) && held_[0]) return;
     moveTo(target, overlapping);
   }
 
@@ -2447,27 +2665,45 @@ private:
   }
 
   /** The one voice to `target`: in Legato, while it is sounding and the
-   *  voice can, without a restart; otherwise a fresh start, faded across. */
-  void moveTo(const Held& target, bool overlapping) {
+   *  voice can, without a restart; otherwise a fresh start, faded across.
+   *  The note it leaves ends here unless its key is still down, and the
+   *  target's kept modulation comes with it. */
+  void moveTo(Held& target, bool overlapping) {
+    const bool leavingHeld = playingIsHeld();
+    // A key whose note the host was told had ended sounds again, but not
+    // under that name -- the host let it go -- and is never reported again.
+    if (target.ended) target.noteId = kNameReported;
+    const int32_t name = target.noteId;
+    bool slid = false;
     if constexpr (detail::VoiceHasLegato<VoiceType>::value) {
       if (mode_ == Mode::Legato && overlapping && voices_[0].isActive() && !released_[0]) {
-        sounding_[0] = false;
-        noteEnded(0); // the host's note ended, though the sound carries on
+        if (!leavingHeld) noteEnded(0); // the host's note is over, though the sound carries on
         notes_[0] = target.note;
         channels_[0] = target.channel;
-        noteIds_[0] = target.noteId;
+        noteIds_[0] = name;
         held_[0] = true;
         pedalHeld_[0] = false;
         sounding_[0] = true;
         voices_[0].legatoTo(target.note, target.velocity);
-        return;
+        slid = true;
       }
     }
-    steal(0);
-    start(0, target.note, target.velocity, target.channel, target.noteId);
+    if (!slid) {
+      if (!leavingHeld) {
+        steal(0);
+      } else {
+        fadeOut(0); // the key is still down: faded across, but not over
+        sounding_[0] = false;
+      }
+      start(0, target.note, target.velocity, target.channel, name);
+    }
+    if (!target.ended) replayHeldMods(0, target);
   }
 
   static constexpr int kMaxEnded = 64;
+  /** The name a voice plays under when its note was reported ended while its
+   *  key stayed down: not the host's any more, and never reported again. */
+  static constexpr int32_t kNameReported = -2;
 
   VoiceType voices_[MaxVoices];
   int channels_[MaxVoices] = {};
@@ -2501,17 +2737,22 @@ private:
   float bendRange_ = 2.0f;
   float modWheel_ = 0.0f;
 
-  // The steal fades: each slot's last notes, faded, playing out.
-  float fade_[kMaxStealFade] = {};
+  // The steal fades: each slot's last notes, faded, playing out. Room for
+  // them only where the manager can render a voice: one it cannot (the
+  // sampler mixes its own) never fades, and would carry 3 KB a voice of
+  // nothing.
+  static constexpr int kTailCapacity = kCanRenderBlock ? kMaxStealFade : 1;
+  float fade_[kTailCapacity] = {};
   int fadeLength_ = 96;
-  float tailL_[MaxVoices][kMaxStealFade] = {};
-  float tailR_[MaxVoices][kMaxStealFade] = {};
+  float tailL_[MaxVoices][kTailCapacity] = {};
+  float tailR_[MaxVoices][kTailCapacity] = {};
   int tailPos_[MaxVoices] = {};
   int tailLen_[MaxVoices] = {};
   bool tailStereo_ = false;
 
   EndedNote ended_[kMaxEnded];
   int endedCount_ = 0;
+
 };
 
 /**
@@ -2614,50 +2855,28 @@ inline void applyExpressionTo(VoiceType& voice, const NoteExpressionBuffer::Entr
   (void) e;
 }
 
+/** One note expression to the voices it addresses (VoiceManager::
+ *  forEachVoiceOf()): by the host's note id, by key and channel, or with no
+ *  key every note on the channel. */
 template <typename VoiceManagerType>
 inline void applyExpression(VoiceManagerType& voices, const NoteExpressionBuffer::Entry& e) {
-  int v = voices.voiceForNoteId(e.noteId);
-  if (v < 0 && e.key >= 0) v = voices.voiceForNote(e.key, e.channel < 0 ? VoiceManagerType::kAnyChannel : e.channel);
-  if (v >= 0) {
-    applyExpressionTo(voices.voice(v), e);
-    return;
-  }
-  // No key: the expression is for every note (on its channel, if it names one).
-  if (e.key >= 0 || e.noteId >= 0) return;
-  for (int i = 0; i < VoiceManagerType::kNumVoices; ++i)
-    if (voices.voice(i).isActive() && (e.channel < 0 || voices.channelOf(i) == e.channel))
-      applyExpressionTo(voices.voice(i), e);
+  voices.forEachVoiceOf(e.noteId, e.key, e.channel, [&](int i) { applyExpressionTo(voices.voice(i), e); });
 }
 
 /**
- * A note's offset to one parameter (ParamModBuffer), to the voice playing it,
- * through the voice's `setParamMod(int param, float amount)` where it has one.
- * Found as an expression is: by the host's note id, then by key and channel;
- * with no key, every note on the channel, or on every channel.
+ * A note's offset to one parameter (ParamModBuffer), to the voices it
+ * addresses (VoiceManager::paramMod()), through each one's
+ * `setParamMod(int param, float amount)` where it has one.
  *
- * The voice keeps the amount and adds it to the parameter's value for itself
- * alone. A new note starts with none: clear the offsets in noteOn(), and the
- * host sends the new note its own.
+ * The voice keeps the amount and adds it to the parameter's value, as
+ * process() is handed it, for itself alone. A new note starts with none:
+ * clear the offsets in noteOn() and legatoTo(), and the host sends the new
+ * note its own. One addressed by key or channel reaches the notes sounding
+ * when it arrives; a note started later starts with its own.
  */
 template <typename VoiceManagerType>
 inline void applyParamMod(VoiceManagerType& voices, const ParamModBuffer::Entry& e) {
-  using VoiceType = std::remove_reference_t<decltype(voices.voice(0))>;
-  if constexpr (detail::VoiceHasParamMod<VoiceType>::value) {
-    int v = voices.voiceForNoteId(e.noteId);
-    if (v < 0 && e.key >= 0)
-      v = voices.voiceForNote(e.key, e.channel < 0 ? VoiceManagerType::kAnyChannel : e.channel);
-    if (v >= 0) {
-      voices.voice(v).setParamMod((int) e.param, e.amount);
-      return;
-    }
-    if (e.key >= 0 || e.noteId >= 0) return;
-    for (int i = 0; i < VoiceManagerType::kNumVoices; ++i)
-      if (voices.voice(i).isActive() && (e.channel < 0 || voices.channelOf(i) == e.channel))
-        voices.voice(i).setParamMod((int) e.param, e.amount);
-  } else {
-    (void) voices;
-    (void) e;
-  }
+  voices.paramMod(e.noteId, e.key, e.channel, (int) e.param, e.amount);
 }
 
 /**

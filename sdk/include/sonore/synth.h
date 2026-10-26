@@ -17,6 +17,8 @@
 //   ModalResonator                    a struck body: a bank of ringing modes
 //   ModRouting + ModMatrix            a modulation matrix: a patch's routes,
 //                                     each voice's sources and offsets
+//   NoteModulation                    a voice's modulation from a CLAP host:
+//                                     plugin-wide, and its note's own
 //
 // Everything is per voice and allocation-free; the Wavetable is the one big
 // object and is designed to be held ONCE and read by every voice.
@@ -588,12 +590,20 @@ private:
  */
 class Portamento {
 public:
-  enum class Timing { ConstantTime, ConstantRate };
+  /** What setTime() measures. */
+  enum class Timing {
+    ConstantTime, ///< every glide takes the time, however far it goes
+    ConstantRate  ///< the time is per octave: a fifth takes 7/12 of it
+  };
 
+  /** The rate next() is called at, in Hz; 0 or less means 48 kHz. Glides
+   *  started after it are timed against it. */
   void setSampleRate(float sampleRate) { sr_ = sampleRate > 0.0f ? sampleRate : 48000.0f; }
   /** The glide's time: its whole length, or its length per octave (see
    *  Timing). 0 is no glide: every move lands at once. */
   void setTime(float seconds) { time_ = seconds > 0.0f ? seconds : 0.0f; }
+  /** Whether setTime() is each glide's length or its length per octave:
+   *  ConstantTime until set. */
   void setTiming(Timing timing) { timing_ = timing; }
 
   /** Be at `note` now, with no glide. */
@@ -629,6 +639,7 @@ public:
   float current() const { return current_; }
   /** Where it is going. */
   float target() const { return to_; }
+  /** Still on the way: next() will move again. */
   bool isGliding() const { return remaining_ > 0; }
 
 private:
@@ -991,6 +1002,73 @@ public:
 private:
   float sources_[NumSources] = {};
   float offsets_[NumDestinations] = {};
+};
+
+// ── A note's modulation from the host ────────────────────────────────────────
+
+/**
+ * One voice's modulation from a CLAP host, parameter by parameter: the
+ * plugin-wide offset every note hears, and the amount this note was given of
+ * its own, which REPLACES the plugin-wide one for this note -- CLAP's rule,
+ * since a host's per-note amount already includes the plugin-wide signal.
+ *
+ * A voice that takes per-note modulation keeps one of these, sized by the
+ * plugin's parameter count, and hands the voice manager's two calls to it:
+ *
+ *   void setParamMod(int param, float amount)      { if (mods.setOwn(param, amount)) ...; }
+ *   void setParamModWide(int param, float amount)  { if (mods.setWide(param, amount)) ...; }
+ *
+ * noteOn() and legatoTo() call noteStarted(): a new note has no amounts of
+ * its own and hears the plugin-wide offsets, which the voice keeps from note
+ * to note. offset() is what to add to a parameter's value, in its own units.
+ * Each setter says whether offset() moved, so a voice rebuilds a filter only
+ * when it must. Allocation-free.
+ */
+template <int NumParams>
+class NoteModulation {
+public:
+  static_assert(NumParams >= 1, "a modulation needs a parameter");
+
+  /** This note's own amount for `param`, until noteStarted(). Returns
+   *  whether offset(param) moved. Out of range is ignored. */
+  bool setOwn(int param, float amount) {
+    if (param < 0 || param >= NumParams) return false;
+    const float was = offset(param);
+    own_[param] = amount;
+    hasOwn_[param] = true;
+    return offset(param) != was;
+  }
+  /** The plugin-wide offset for `param`: every note's without an amount of
+   *  its own, this one and those to come. Returns whether offset(param)
+   *  moved. */
+  bool setWide(int param, float amount) {
+    if (param < 0 || param >= NumParams) return false;
+    const float was = offset(param);
+    wide_[param] = amount;
+    return offset(param) != was;
+  }
+  /** A new note: no amounts of its own. Returns whether any offset moved. */
+  bool noteStarted() {
+    bool moved = false;
+    for (int p = 0; p < NumParams; ++p) {
+      if (hasOwn_[p] && own_[p] != wide_[p]) moved = true;
+      hasOwn_[p] = false;
+    }
+    return moved;
+  }
+  /** What `param` is offset by for this note: its own amount if it has one,
+   *  the plugin-wide offset if not; 0 out of range. */
+  float offset(int param) const {
+    if (param < 0 || param >= NumParams) return 0.0f;
+    return hasOwn_[param] ? own_[param] : wide_[param];
+  }
+  /** Whether this note has an amount of its own for `param`. */
+  bool hasOwn(int param) const { return param >= 0 && param < NumParams && hasOwn_[param]; }
+
+private:
+  float own_[NumParams] = {};
+  float wide_[NumParams] = {};
+  bool hasOwn_[NumParams] = {};
 };
 
 } // namespace sonore
