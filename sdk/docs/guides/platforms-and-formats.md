@@ -10,9 +10,10 @@ not available.
 | CLAP | `sonore_add_clap`, or `CLAP` in `sonore_add_plugin` | Windows, Linux, macOS |
 | VST3 | `sonore_add_vst3`, or `VST3` | Windows, Linux, macOS |
 | Audio Unit (v2) | `sonore_add_au`, or `AU` (skipped off macOS) | macOS |
+| Audio Unit (v3) | `sonore_add_auv3`, or `AUV3` -- an app extension, see below | macOS, iOS and iPadOS |
 | LV2 | `sonore_add_lv2`, or `LV2` | Windows, Linux, macOS |
 | AAX (Native) | `sonore_add_aax`, or `AAX` -- with Avid's SDK, see below | Windows, macOS |
-| Standalone application | `sonore_add_standalone` | Windows, Linux, macOS |
+| Standalone application | `sonore_add_standalone` | Windows, Linux, macOS, iOS and iPadOS (an app), Android (an APK) |
 | Browser (WebAssembly) | emscripten over `wasm_abi.h` | a browser, driven from an AudioWorklet (the worklet host is Sonorie's studio, not this repository) |
 
 The CLAP wrapper owns the shared machinery: the DSP instance, parameters,
@@ -45,6 +46,20 @@ line and the functions the worklet calls.
   example Audio Units installed so the hosting tests load them. The Audio Unit
   wrapper passes Apple's `auval` on six of the nine example AUs (not yet run on
   the sampler, the reverb and the showcase).
+
+- **Android**: built with the NDK for Android 9 (API 28) and later, and run
+  in an emulator: every suite, both example standalones' `--verify`, and the
+  example apps by hand -- the native editor and a plugin's page in a WebView,
+  touch, AAudio, the microphone permission. CI builds it and runs the same
+  tests in an emulator, and keeps the APKs. Not yet on a phone.
+- **iOS**: built for the simulator by CI, which runs the suites, the AUv3
+  self-test and the apps' `--verify` in a booted iPhone simulator, then
+  launches both example apps and keeps screenshots. Not yet on an iPhone, and
+  not yet inside GarageBand or AUM.
+- **AUv3 on the Mac**: CI builds the example extensions inside their apps,
+  registers them with pluginkit and validates them with `auval`, and drives
+  the unit in process (`sdk/tests/auv3_selftest.cpp`). Not yet opened in a
+  host's window.
 
 What has not yet run on a Mac with a person at it: the CI job runs
 `sdk/tests/mac_host_selftest.cpp` (Audio Unit hosting, audio workgroups), which
@@ -89,16 +104,83 @@ build, which is how to test one. A retail Pro Tools loads only a plugin Avid
 has approved and PACE has signed: ask audiosdk@avid.com for the signing tools,
 then sign every build with PACE's `wraptool` and your iLok before it ships.
 
+## AUv3, for iPhone, iPad and the Mac App Store
+
+An Audio Unit v3 is an app extension: the plugin ships inside an app, and
+installing the app installs the plugin. It is the only kind of plugin iOS and
+iPadOS load (GarageBand, AUM, Cubasis, Logic Pro for iPad), and the only kind
+the Mac App Store accepts; Mac hosts load it beside an AUv2.
+
+```
+sonore_add_auv3(MyPluginAUv3 SOURCES plugin.cpp
+  SUBTYPE "Myp3" MANUFACTURER "Manu" TYPE aufx VENDOR "My Company"
+  NAME "My Plugin" BUNDLE_ID com.mycompany.myplugin VERSION 1.2.0)
+```
+
+or `AUV3 MyPluginAUv3` (with `AUV3_SUBTYPE`) in `sonore_add_plugin`. A product
+shipping both formats gives the AUv3 its own subtype, or a Mac host sees one
+component twice. On the Mac the extension goes into a small app built beside
+it, `MyPluginAUv3.app` -- open it once, or put it in Applications, and every
+host lists the plugin. On iOS it goes into the plugin's own app: name it with
+`CONTAINER`, a `sonore_add_standalone` target.
+
+Both are signed ad hoc, which a Mac and a simulator run. Shipping needs your
+Developer ID (Mac) or a provisioning profile (iOS), and the App Store's review.
+
+What it does: the parameters as the host's tree, with begin and end gestures
+for every edit an editor makes; automation as timed events, sample-accurate
+where the descriptor asks (`automationGranularity`); MIDI 1.0 and MIDI 2.0 in,
+MIDI out; the host's tempo and transport; the same saved state as every other
+format, in the AUv2 dictionary layout; factory presets; the bypass; the track's
+name; and either editor, the page or the native one.
+
+## iPhone and iPad apps
+
+On iOS `sonore_add_standalone` builds `MyPluginApp.app`: the editor full screen
+inside the safe area, sound through RemoteIO while the app is in front, and a
+MIDI keyboard through CoreMIDI. An effect asks for the microphone once and hears
+it only while the sound goes to headphones or an interface -- through the
+speaker the microphone would hear the effect and howl. Configure for the
+simulator or a device with CMake's iOS support:
+
+```
+cmake -G Ninja -S . -B build-ios -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+```
+
+iOS 15 and later. Not yet: the software keyboard for a text field in the native
+editor, and VoiceOver.
+
+## Android apps
+
+Android has no plugin format a host loads, so a plugin there is an app, as it
+is with other frameworks. With the NDK's toolchain, `sonore_add_standalone`
+builds `MyPluginApp.apk` beside the command-line program:
+
+```
+cmake -G Ninja -S . -B build-android \
+  -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28
+cmake --build build-android --target MyPluginAppInstall
+```
+
+`MyPluginAppInstall` puts the APK on the attached phone or emulator and starts
+it. Packaging uses the Android SDK's own tools and a JDK -- no Gradle -- so set
+`ANDROID_HOME` and `JAVA_HOME` if they are not found; the APK is signed with
+the debug key, and a store needs yours. Android 9 (API 28) and later; MIDI from
+Android 10. The app shows the plugin's page in a WebView, or the native
+editor; plays through AAudio while it is in front; takes every MIDI keyboard
+plugged in; and, for an effect, the microphone, by the same rule as on iOS.
+
 ## Not available, and why
 
 - **VST2.** Steinberg ended VST2 licensing in October 2018 and no longer
   distributes the SDK, so a plugin licensed after that date cannot legally ship
   as VST2. `sonore_add_vst2()` is a configure error that says so. Every host that
   still loads VST2 also loads VST3 or CLAP.
-- **AUv3.** An app extension shipped inside a containing application, which iOS
-  and App Store distribution require. It needs an Xcode extension target and a
-  host application, not CMake alone, and can only be checked on a Mac.
-  `sonore_add_auv3()` skips loudly. AUv2 is what every macOS desktop host loads.
+- **Plugins on Android.** There is no plugin format Android hosts share, so
+  an Android build is an app (above).
 - **ARA** is a hook too (`sonore_add_ara()`): its SDK is Apache-2.0, but an ARA
   plugin can only be proven inside an ARA host, and none is in the loop.
 

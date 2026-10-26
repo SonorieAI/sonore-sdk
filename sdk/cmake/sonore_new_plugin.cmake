@@ -158,6 +158,15 @@ foreach(code AU_SUBTYPE AU_MANUFACTURER)
     _fail("-D${code}=\"${${code}}\" must be exactly four plain ASCII characters")
   endif()
 endforeach()
+# The AUv3's own subtype, beside the AUv2's: one component per code is what a
+# Mac host expects. The AUv2's with its last character turned into a digit
+# that is not already there.
+string(SUBSTRING "${AU_SUBTYPE}" 0 3 _stem)
+string(SUBSTRING "${AU_SUBTYPE}" 3 1 _last)
+set(AUV3_SUBTYPE "${_stem}3")
+if(_last STREQUAL "3")
+  set(AUV3_SUBTYPE "${_stem}4")
+endif()
 if(NOT AU_MANUFACTURER MATCHES "[A-Z]")
   _fail("-DAU_MANUFACTURER=\"${AU_MANUFACTURER}\" needs an upper-case letter "
         "(all-lower-case codes are reserved by Apple)")
@@ -235,7 +244,7 @@ configure_file("${_t}/gitignore.in" "${DIR}/.gitignore" @ONLY)
 
 message(STATUS "Created the ${KIND} \"${NAME}\" in ${DIR}")
 message(STATUS "  id ${ID}, targets ${TARGET} (CLAP) ${TARGET}VST3 ${TARGET}AU ${TARGET}LV2 ${TARGET}App")
-message(STATUS "  Audio Unit ${AU_TYPE} ${AU_SUBTYPE} ${AU_MANUFACTURER}")
+message(STATUS "  Audio Unit ${AU_TYPE} ${AU_SUBTYPE} ${AU_MANUFACTURER}, AUv3 ${AUV3_SUBTYPE}")
 if(_idDerived)
   message(STATUS "  The id was made from the vendor and name. It is the plugin's identity "
                  "in every saved session: change it now if it is not the one to keep.")

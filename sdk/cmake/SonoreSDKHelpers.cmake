@@ -312,7 +312,8 @@ function(_sonore_xml_escape OUT TEXT)
 endfunction()
 
 function(sonore_add_au TARGET)
-  if(NOT APPLE)
+  # An AUv2 is a Mac bundle a host dlopens; iOS loads only AUv3.
+  if(NOT APPLE OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     return()
   endif()
   cmake_parse_arguments(ARG "" "SUBTYPE;MANUFACTURER;TYPE;VERSION;OBJECTS;NAME;VENDOR;BUNDLE_ID" "SOURCES" ${ARGN})
@@ -761,6 +762,7 @@ endfunction()
 #   sonore_add_plugin(MyPlugin SOURCES plugin.cpp
 #     CLAP MyPlugin  VST3 MyPluginVST3  AU MyPluginAU  AUV3 MyPluginAUv3  LV2 MyPluginLV2  AAX MyPluginAAX
 #     AU_SUBTYPE "Mypl" AU_MANUFACTURER "Manu" AU_TYPE aufx  AUV3_SUBTYPE "Myp3"  VERSION 1.2.0
+#     [AUV3_CONTAINER MyPluginApp])
 #     AU_VENDOR "My Company" AU_NAME "My Plugin" AU_BUNDLE_ID com.mycompany.myplugin
 #     AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl")
 #
@@ -781,13 +783,26 @@ endfunction()
 # AUV3_SUBTYPE for its own code (a product shipping AUv2 and AUv3 needs two,
 # or a Mac host sees one component twice); Apple platforms only.
 function(sonore_add_plugin NAME)
-  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;AUV3;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AUV3_SUBTYPE;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
+  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;AUV3;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AUV3_SUBTYPE;AUV3_CONTAINER;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
                         "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): SOURCES is required")
   endif()
   if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_AUV3 OR ARG_LV2 OR ARG_AAX))
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/AUV3/LV2/AAX)")
+  endif()
+  # A phone builds what a phone runs. iOS loads AUv3 alone, in its app;
+  # Android loads no plugin format at all (the app is sonore_add_standalone's).
+  if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
+    foreach(_k CLAP VST3 AU LV2 AAX)
+      set(ARG_${_k} "")
+    endforeach()
+    if(ANDROID)
+      set(ARG_AUV3 "")
+    endif()
+    if(NOT ARG_AUV3)
+      return()
+    endif()
   endif()
   if(ARG_AUV3 AND APPLE)
     set(_auv3_args)
@@ -803,6 +818,11 @@ function(sonore_add_plugin NAME)
     endif()
     if(ARG_VERSION)
       list(APPEND _auv3_args VERSION "${ARG_VERSION}")
+    endif()
+    # The app it ships in, on iOS, where it is the plugin's own app. On the
+    # Mac the standalone is a plain program, and a small app is made instead.
+    if(ARG_AUV3_CONTAINER AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+      list(APPEND _auv3_args CONTAINER ${ARG_AUV3_CONTAINER})
     endif()
     sonore_add_auv3(${ARG_AUV3} SOURCES ${ARG_SOURCES} ${_auv3_args})
   endif()
