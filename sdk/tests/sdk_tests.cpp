@@ -2010,8 +2010,9 @@ static void testHostNamedNotes() {
               voices.voice(third).mod[3] == 1.0f,
           "a modulation naming no note reaches every note sounding");
 
-    // Release one at frame 5: ten samples of release, 5 to 14, so it is
-    // over from frame 15 of the block.
+    // Release one at frame 5: ten samples of release, 5 to 14. The voices
+    // render frames 5 to 63 as one stretch (no event inside it), so the note
+    // is found over at the stretch's end: the block's last frame.
     rig.midi.addEvent(sonore::MidiMessage::noteOff(0, 67), 5);
     runBlock(rig, voices);
     int ends = 0, endFrame = -1;
@@ -2021,8 +2022,8 @@ static void testHostNamedNotes() {
       endId = e.noteId;
       endFrame = e.samplePosition;
     }
-    check(ends == 1 && endId == 103 && endFrame == 15,
-          "a note whose release runs out is reported ended, by its id, at the first frame it is over");
+    check(ends == 1 && endId == 103 && endFrame == 63,
+          "a note whose release runs out is reported ended, by its id, by the end of the stretch it ran out in");
   }
 
   // ── A stolen note ends where it is stolen ─────────────────────────
@@ -2058,6 +2059,219 @@ static void testHostNamedNotes() {
     check(voices.voiceForNote(60) >= 0 && voices.noteIdOf(voices.voiceForNote(60)) == -1,
           "a format that names no notes plays them unnamed, through the same call");
   }
+}
+
+static void testVoiceBlockRendering() {
+  std::printf("voice manager: rendered a stretch at a time, to the bit\n");
+
+  // A stereo saw with a release, panned off centre so left and right differ.
+  struct SawVoice {
+    float phase = 0.0f, inc = 0.0f, gain = 0.0f;
+    bool active = false, releasing = false;
+    void noteOn(int note, float vel) {
+      inc = 440.0f * std::exp2((float) (note - 69) / 12.0f) / 48000.0f;
+      phase = 0.0f;
+      gain = vel;
+      active = true;
+      releasing = false;
+    }
+    void noteOff() { releasing = true; }
+    bool isActive() const { return active; }
+    void render(float& l, float& r) {
+      phase += inc;
+      if (phase >= 1.0f) phase -= 1.0f;
+      const float s = (2.0f * phase - 1.0f) * gain;
+      if (releasing) {
+        gain *= 0.99f;
+        if (gain < 1e-4f) active = false;
+      }
+      l = s * 0.7f;
+      r = s * 1.3f;
+    }
+  };
+  // The same voice with its own stretch loop, silent once it has finished.
+  struct BlockSawVoice : SawVoice {
+    int blocks = 0;
+    void renderBlock(float* left, float* right, int numSamples) {
+      ++blocks;
+      for (int k = 0; k < numSamples && active; ++k) {
+        float l = 0.0f, r = 0.0f;
+        render(l, r);
+        left[k] += l;
+        right[k] += r;
+      }
+    }
+  };
+
+  // Four blocks of 300 frames (each longer than a stretch), three voices for
+  // five notes so two are stolen, a release, and All Sound Off in the last.
+  auto fill = [](sonore::MidiBuffer& midi, int block) {
+    midi.clear();
+    if (block == 0) {
+      midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+      midi.addEvent(sonore::MidiMessage::noteOn(0, 64, 90), 17);
+      midi.addEvent(sonore::MidiMessage::noteOn(0, 67, 80), 140);
+      midi.addEvent(sonore::MidiMessage::noteOn(0, 71, 70), 141);
+    } else if (block == 1) {
+      midi.addEvent(sonore::MidiMessage::noteOff(0, 64), 3);
+      midi.addEvent(sonore::MidiMessage::noteOn(0, 74, 127), 250);
+    } else if (block == 3) {
+      midi.addEvent(sonore::MidiMessage::controlChange(0, 120, 0), 200);
+    }
+  };
+  constexpr int kFrames = 300;
+  auto perSample = [&](auto& voices, std::vector<float>& outL, std::vector<float>& outR) {
+    sonore::MidiBuffer midi;
+    for (int b = 0; b < 4; ++b) {
+      fill(midi, b);
+      auto ev = midi.begin();
+      for (int i = 0; i < kFrames; ++i) {
+        for (; ev != midi.end() && ev->samplePosition <= i; ++ev) sonore::applyMidi(voices, ev->getMessage());
+        float l = 0.0f, r = 0.0f;
+        voices.render(l, r);
+        outL.push_back(l);
+        outR.push_back(r);
+      }
+    }
+  };
+  auto byStretch = [&](auto& voices, std::vector<float>& outL, std::vector<float>& outR, int width) {
+    sonore::MidiBuffer midi, midiOut;
+    for (int b = 0; b < 4; ++b) {
+      fill(midi, b);
+      std::vector<float> l(kFrames, 9.0f), r(kFrames, 9.0f);
+      float* ch[2] = {l.data(), r.data()};
+      sonore::AudioBlock<float> block(ch, (size_t) width, kFrames);
+      sonore::AudioBlock<float> aux[1] = {};
+      float* scp[2] = {nullptr, nullptr};
+      sonore::AudioBlock<float> sc(scp, 2, 0);
+      sonore::ProcessContext ctx{block, aux, 0, sc, midi, midiOut, nullptr, nullptr};
+      sonore::renderVoices(voices, ctx);
+      outL.insert(outL.end(), l.begin(), l.end());
+      outR.insert(outR.end(), r.begin(), r.end());
+    }
+  };
+  auto sameBits = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+  };
+
+  {
+    sonore::VoiceManager<SawVoice, 3> a, b;
+    a.setSampleRate(48000.0);
+    b.setSampleRate(48000.0);
+    std::vector<float> al, ar, bl, br;
+    perSample(a, al, ar);
+    byStretch(b, bl, br, 2);
+    check(sameBits(al, bl) && sameBits(ar, br),
+          "renderVoices, a stretch at a time, gives what a sample at a time gave: to the bit, steals and all");
+    double energy = 0.0;
+    for (float v : bl) energy += (double) v * v;
+    check(energy > 1.0, "…and it is not silence that matches");
+  }
+  {
+    sonore::VoiceManager<BlockSawVoice, 3> a, b;
+    a.setSampleRate(48000.0);
+    b.setSampleRate(48000.0);
+    std::vector<float> al, ar, bl, br;
+    perSample(a, al, ar);
+    byStretch(b, bl, br, 2);
+    check(sameBits(al, bl) && sameBits(ar, br),
+          "a voice's own renderBlock() gives what its render() gave, to the bit");
+    int blocks = 0;
+    for (int i = 0; i < 3; ++i) blocks += b.voice(i).blocks;
+    check(blocks > 0, "…and it is the voice's own loop that ran");
+  }
+  {
+    sonore::VoiceManager<SawVoice, 3> a, b;
+    a.setSampleRate(48000.0);
+    b.setSampleRate(48000.0);
+    std::vector<float> al, ar, bl, br;
+    perSample(a, al, ar);
+    byStretch(b, bl, br, 1);
+    bool folded = bl.size() == al.size();
+    for (size_t i = 0; folded && i < al.size(); ++i) folded = bl[i] == 0.5f * (al[i] + ar[i]);
+    check(folded, "a mono bus gets the stereo voices folded to the middle");
+  }
+
+  // A voice with nothing but a stretch loop: no per-sample render() at all.
+  {
+    struct OnlyBlockVoice {
+      float value = 0.0f;
+      bool active = false;
+      void noteOn(int, float vel) {
+        value = vel;
+        active = true;
+      }
+      void noteOff() { active = false; }
+      bool isActive() const { return active; }
+      void renderBlock(float* left, float* right, int numSamples) {
+        for (int k = 0; k < numSamples; ++k) {
+          left[k] += value;
+          right[k] += value;
+        }
+      }
+    };
+    sonore::VoiceManager<OnlyBlockVoice, 1> voices;
+    voices.setSampleRate(48000.0);
+    std::vector<float> l, r;
+    byStretch(voices, l, r, 2);
+    const float first = 100.0f / 127.0f, second = 90.0f / 127.0f;
+    check(l[0] == first, "a voice with only renderBlock() plays through renderVoices");
+    // One voice, so the note at frame 17 steals it: the first note fades out
+    // under the second for 2 ms, and is gone after.
+    check(l[17] > second + 0.5f * first && std::fabs(l[17 + 120] - second) < 1e-6f,
+          "…and a steal fades its old note out under the new one, as a per-sample voice's does");
+  }
+}
+
+static void testModMatrix() {
+  std::printf("modulation matrix: routes, sources, offsets\n");
+  enum { kLfo, kEnv, kWheel, kSources };
+  enum { kCutoff, kPitch, kDests };
+
+  sonore::ModRouting<4> routing;
+  check(routing.activeCount() == 0, "a new routing has no routes on");
+  routing.set(0, kLfo, kPitch, 0.5f);
+  routing.set(1, kEnv, kCutoff, 2.0f);
+  routing.set(2, kLfo, kCutoff, -1.0f, kWheel);
+  routing.set(3, kEnv, kPitch, 0.0f); // an amount of 0 is off
+  routing.set(9, kEnv, kPitch, 1.0f); // no slot 9: ignored
+  check(routing.activeCount() == 3, "routes with a source, a destination and an amount are on; the rest are not");
+  check(routing.route(2).via == kWheel, "…and a route keeps the source that scales it");
+
+  sonore::ModMatrix<kSources, kDests> m;
+  m.setSource(kLfo, 0.5f);
+  m.setSource(kEnv, 1.0f);
+  m.setSource(kWheel, 0.25f);
+  m.setSource(7, 1.0f); // no source 7: ignored
+  m.process(routing);
+  check(m.offset(kPitch) == 0.25f, "a destination's offset is its source times the amount");
+  // 1.0 * 2.0 from the envelope, and 0.5 * -1.0 * 0.25 from the LFO through the wheel.
+  check(m.offset(kCutoff) == 2.0f - 0.125f, "two routes into one destination add, the second scaled by its via");
+  check(m.offset(5) == 0.0f && m.source(7) == 0.0f, "out of range reads 0");
+
+  routing.clear(1);
+  m.process(routing);
+  check(m.offset(kCutoff) == -0.125f && routing.activeCount() == 2, "a cleared route stops moving its destination");
+  routing.set(0, -1, kPitch, 0.5f);
+  m.process(routing);
+  check(m.offset(kPitch) == 0.0f, "a route set to no source is off, and its destination reads 0");
+  routing.clearAll();
+  m.process(routing);
+  check(routing.activeCount() == 0 && m.offset(kCutoff) == 0.0f, "clearAll() turns every route off");
+
+  m.reset();
+  check(m.source(kEnv) == 0.0f && m.offset(kCutoff) == 0.0f, "reset() zeroes every source and offset, for a note-on");
+
+  // A route to a destination the matrix does not have is skipped, not a
+  // write past the end: a routing can be shared by matrices of two sizes.
+  sonore::ModRouting<2> wide;
+  wide.set(0, kLfo, 3, 1.0f);
+  wide.set(1, 5, kPitch, 1.0f);
+  sonore::ModMatrix<kSources, kDests> small;
+  small.setSource(kLfo, 1.0f);
+  small.process(wide);
+  check(small.offset(kPitch) == 0.0f && small.offset(kCutoff) == 0.0f,
+        "routes past a matrix's sources or destinations are skipped");
 }
 
 /**
@@ -39210,6 +39424,8 @@ int main() {
   testVoiceStealingAndPedals();
   testVoiceManagerForSynths();
   testHostNamedNotes();
+  testVoiceBlockRendering();
+  testModMatrix();
   testNoteState();
   testUserSettings();
   testUnicodePaths();

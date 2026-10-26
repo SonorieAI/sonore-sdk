@@ -14,7 +14,10 @@
 //   setMpe(true)        bend and pressure per finger, from an MPE controller
 //   setParamMod()       a CLAP host's modulation of the filter, per note
 //   voiceCount()        the Voices control, as a CLAP host reads it
-#define SONORE_NUM_PARAMS 10
+//   ModRouting/Matrix   three routes from an LFO, an envelope, velocity, key,
+//                       pressure or the mod wheel to cutoff, pitch, pan or
+//                       level, per voice
+#define SONORE_NUM_PARAMS 22
 // Tall enough for the generic editor to show all four groups of controls and
 // the keyboard under them without scrolling: a keyboard below the fold is one
 // a player does not know is there.
@@ -27,13 +30,37 @@ namespace {
 
 // The table's rows by name, in the order the table has them -- which is their
 // identity in every saved session, so a new control is only ever appended.
-enum Param { kCutoff, kResonance, kAttack, kRelease, kLevel, kVoices, kMode, kGlide, kBendRange, kSpread };
+enum Param {
+  kCutoff, kResonance, kAttack, kRelease, kLevel, kVoices, kMode, kGlide, kBendRange, kSpread,
+  kLfoRate, kLfoShape, kModDecay,
+  kMod1Source, kMod1Dest, kMod1Amount, kMod2Source, kMod2Dest, kMod2Amount,
+  kMod3Source, kMod3Dest, kMod3Amount
+};
+
+// What the modulation matrix can read, and what it can move. Numbered here,
+// by the plugin: the matrix knows nothing of what they mean.
+enum ModSource { kSrcLfo, kSrcModEnv, kSrcVelocity, kSrcKey, kSrcPressure, kSrcModWheel, kNumSources };
+enum ModDest { kDstCutoff, kDstPitch, kDstPan, kDstLevel, kNumDests };
+/** What a route's amount means at 100%, per destination: four octaves of
+ *  cutoff, an octave of pitch, the whole stereo field, the level doubled or
+ *  gone. The matrix carries offsets in these units. */
+constexpr float kDestReach[kNumDests] = {4.0f, 12.0f, 1.0f, 1.0f};
+constexpr int kRoutes = 3;
+/** The modulation's control rate: offsets worked out every this many
+ *  samples, 0.33 ms at 48 kHz, which a filter's coefficients can afford. */
+constexpr int kControlRate = 16;
 
 struct Voice {
   sonore::Oscillator osc;
   sonore::ADSR env;
   sonore::LadderFilter filter;
   sonore::Portamento glide;
+  // The modulation: this voice's LFO and envelope, run at the control rate,
+  // and its side of the matrix. The routes are the patch's, held by the DSP.
+  sonore::Lfo lfo;
+  sonore::ADSR modEnv;
+  sonore::ModMatrix<kNumSources, kNumDests> mod;
+  const sonore::ModRouting<kRoutes>* routing = nullptr;
   float velocity = 1.0f;
   float cutoff = 4000.0f;
   float resonance = 0.2f;
@@ -49,6 +76,20 @@ struct Voice {
     filter.setSampleRate(sr);
     filter.reset();
     glide.setSampleRate(sr);
+    // Advanced once per control period, so clocked at the control rate.
+    lfo.setSampleRate(sr / (float) kControlRate);
+    modEnv.setSampleRate(sr / (float) kControlRate);
+    modEnv.reset();
+  }
+  /** The modulation envelope: a pluck, up at once and down over `decay`
+   *  seconds, held or not. */
+  void setModDecay(float decay) {
+    sonore::ADSR::Parameters p;
+    p.attack = 0.002f;
+    p.decay = decay;
+    p.sustain = 0.0f;
+    p.release = decay;
+    modEnv.setParameters(p);
   }
   void setTone(float cutoffHz, float res) {
     cutoff = cutoffHz;
@@ -82,9 +123,8 @@ struct Voice {
   /** Where in the stereo field this voice sits, -1 left to 1 right: equal
    *  power, so a note panned to one side is as loud as one in the middle. */
   void setPan(float pan) {
-    const float a = (pan + 1.0f) * 0.25f * 3.14159265f;
-    gainL = std::cos(a);
-    gainR = std::sin(a);
+    basePan = pan;
+    placeInField();
   }
 
   void noteOn(int note, float vel) {
@@ -101,7 +141,20 @@ struct Voice {
     // A new note's modulation is its own, which the host sends after this.
     pressure = 0.0f;
     cutoffMod = resonanceMod = 0.0f;
+    // The note's own modulation sources, and its LFO and envelope started
+    // with it: every voice's LFO from the top of its cycle, as a key-synced
+    // LFO is.
+    mod.reset();
+    mod.setSource(kSrcVelocity, vel);
+    mod.setSource(kSrcKey, (float) (note - 60) / 48.0f); // +-1 four octaves from middle C
+    mod.setSource(kSrcModWheel, wheel);
+    lfo.retrigger();
+    modEnv.noteOn();
+    modCutoff = modPitch = modPan = 0.0f;
+    modGain = modGainTarget = 1.0f;
+    controlLeft = 0; // worked out on the note's first sample
     applyFilter();
+    placeInField();
     retune(glide.current());
     osc.reset();
     filter.reset();
@@ -113,10 +166,14 @@ struct Voice {
     if (glides) glide.glideTo((float) note);
     else glide.jumpTo((float) note);
   }
-  void noteOff() { env.noteOff(); }
+  void noteOff() {
+    env.noteOff();
+    modEnv.noteOff();
+  }
   /** Silent now, with no release: what a reset and All Sound Off mean. */
   void kill() {
     env.reset();
+    modEnv.reset();
     filter.reset();
   }
   bool isActive() const { return env.isActive(); }
@@ -128,16 +185,23 @@ struct Voice {
     const float clamped = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
     if (clamped == pressure) return;
     pressure = clamped;
+    mod.setSource(kSrcPressure, pressure);
     // Pressure opens this voice's filter -- what a player feels as leaning
     // in. Coefficients are rebuilt only when it MOVES: recomputing a ladder
     // every sample is both wasteful and audible as a change in tone.
     applyFilter();
   }
-  /** The mod wheel: vibrato, up to half a semitone either way at 5.5 Hz. */
-  void setModWheel(float value) { vibratoDepth = 0.5f * value; }
+  /** The mod wheel: vibrato, up to half a semitone either way at 5.5 Hz,
+   *  and a source for the matrix. */
+  void setModWheel(float value) {
+    vibratoDepth = 0.5f * value;
+    wheel = value;
+    mod.setSource(kSrcModWheel, value);
+  }
 
   void render(float& left, float& right) {
-    float note = glide.next() + bendSemis;
+    if (--controlLeft <= 0) modulate();
+    float note = glide.next() + bendSemis + modPitch;
     if (vibratoDepth > 0.0f) {
       vibratoPhase += 5.5f / sampleRate;
       if (vibratoPhase >= 1.0f) vibratoPhase -= 1.0f;
@@ -145,7 +209,12 @@ struct Voice {
     }
     // The frequency only when the pitch moved: a steady note costs nothing.
     if (note != lastNote) retune(note);
-    const float s = filter.process(osc.saw()) * env.getNextSample() * velocity;
+    // Level and pan glide across the control period, so a fast LFO on either
+    // is a curve rather than a staircase.
+    modGain += modGainStep;
+    gainL += gainLStep;
+    gainR += gainRStep;
+    const float s = filter.process(osc.saw()) * env.getNextSample() * velocity * modGain;
     left = s * gainL;
     right = s * gainR;
   }
@@ -155,17 +224,78 @@ private:
     lastNote = note;
     osc.setFreq(440.0f * std::exp2((note - 69.0f) / 12.0f));
   }
-  /** The knob, this note's modulation and its pressure, in that order: the
-   *  modulated value held to the control's range before pressure leans it. */
+  /** The knob, the host's modulation of this note, the matrix's, and the
+   *  note's pressure, in that order: the host's held to the control's range,
+   *  the matrix's in octaves on top. */
   void applyFilter() {
     float c = cutoff + cutoffMod;
     c = c < 80.0f ? 80.0f : (c > 16000.0f ? 16000.0f : c);
+    if (modCutoff != 0.0f) c *= std::exp2(modCutoff);
+    c = c > 20000.0f ? 20000.0f : c;
     float r = resonance + resonanceMod;
     r = r < 0.0f ? 0.0f : (r > 0.95f ? 0.95f : r);
     filter.set(c * (1.0f + 3.0f * pressure), r);
   }
+  /** Where the voice sits, Spread's place for it moved by the matrix: the
+   *  equal-power gains it glides to over the next control period. */
+  void placeInField() {
+    float pan = basePan + modPan;
+    pan = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
+    const float a = (pan + 1.0f) * 0.25f * 3.14159265f;
+    targetL = std::cos(a);
+    targetR = std::sin(a);
+    if (controlLeft <= 0) { // at a note-on: there already
+      gainL = targetL;
+      gainR = targetR;
+      gainLStep = gainRStep = 0.0f;
+    } else {
+      gainLStep = (targetL - gainL) / (float) controlLeft;
+      gainRStep = (targetR - gainR) / (float) controlLeft;
+    }
+  }
+  /** The control-rate tick: the LFO and envelope step on, the matrix sums
+   *  every route, and what moved is applied. No routes, and nothing moves. */
+  void modulate() {
+    controlLeft = kControlRate;
+    // Every glide of the last period ends here, on its target, rather than
+    // carrying on by its step.
+    gainL = targetL;
+    gainR = targetR;
+    modGain = modGainTarget;
+    gainLStep = gainRStep = modGainStep = 0.0f;
+    if (!routing || routing->activeCount() == 0) {
+      if (modCutoff != 0.0f || modPitch != 0.0f || modPan != 0.0f || modGainTarget != 1.0f) {
+        modCutoff = modPitch = modPan = 0.0f;
+        modGainTarget = 1.0f;
+        applyFilter();
+        placeInField();
+        modGainStep = (modGainTarget - modGain) / (float) kControlRate;
+      }
+      return;
+    }
+    mod.setSource(kSrcLfo, lfo.next());
+    mod.setSource(kSrcModEnv, modEnv.getNextSample());
+    mod.process(*routing);
+    modPitch = mod.offset(kDstPitch);
+    const float cutoffOct = mod.offset(kDstCutoff);
+    if (cutoffOct != modCutoff) {
+      modCutoff = cutoffOct;
+      applyFilter();
+    }
+    const float pan = mod.offset(kDstPan);
+    if (pan != modPan) modPan = pan;
+    placeInField();
+    float g = 1.0f + mod.offset(kDstLevel);
+    modGainTarget = g < 0.0f ? 0.0f : (g > 2.0f ? 2.0f : g);
+    modGainStep = (modGainTarget - modGain) / (float) kControlRate;
+  }
   float cutoffMod = 0.0f, resonanceMod = 0.0f;
-  float gainL = 0.70710678f, gainR = 0.70710678f;
+  float basePan = 0.0f, targetL = 0.70710678f, targetR = 0.70710678f;
+  float gainL = 0.70710678f, gainR = 0.70710678f, gainLStep = 0.0f, gainRStep = 0.0f;
+  float modCutoff = 0.0f, modPitch = 0.0f, modPan = 0.0f;
+  float modGain = 1.0f, modGainTarget = 1.0f, modGainStep = 0.0f;
+  float wheel = 0.0f;
+  int controlLeft = 0;
   float vibratoPhase = 0.0f, vibratoDepth = 0.0f;
   float lastNote = -1000.0f;
 
@@ -177,7 +307,11 @@ public:
 
 struct SonoreDsp {
   sonore::VoiceManager<Voice, 8> voices;
+  /** The patch's three routes, read by every voice's matrix. */
+  sonore::ModRouting<kRoutes> routing;
   sonore::Smooth levelSm;
+  float lastLfoRate = -1.0f, lastModDecay = -1.0f;
+  int lastLfoShape = -1;
   bool levelArrived = false; // the smoother has been put on the control
   float lastCutoff = -1.0f, lastRes = -1.0f, lastAttack = -1.0f, lastRelease = -1.0f;
   float lastGlide = -1.0f, lastSpread = -1.0f;
@@ -209,7 +343,10 @@ struct SonoreDsp {
     for (int i = 0; i < voices.kNumVoices; ++i) {
       voices.voice(i).kill();
       voices.voice(i).setSampleRate(sr);
+      voices.voice(i).routing = &routing;
     }
+    lastLfoRate = lastModDecay = -1.0f;
+    lastLfoShape = -1;
     voices.allNotesOff();
     voices.setSampleRate(spec.sampleRate); // the steal fade's 2 ms
     // Bend and pressure arrive per note, decoded by the wrapper (the
@@ -264,6 +401,30 @@ struct SonoreDsp {
     }
     bendRange = p[kBendRange];
 
+    // The modulation: the LFO and the envelope when their controls moved,
+    // and the three routes, which ModRouting::set() leaves alone when a
+    // route is as it was.
+    if (p[kLfoRate] != lastLfoRate) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).lfo.setRate(p[kLfoRate]);
+      lastLfoRate = p[kLfoRate];
+    }
+    const int shape = (int) (p[kLfoShape] + 0.5f);
+    if (shape != lastLfoShape) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).lfo.setShape((sonore::Lfo::Shape) shape);
+      lastLfoShape = shape;
+    }
+    if (p[kModDecay] != lastModDecay) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setModDecay(p[kModDecay]);
+      lastModDecay = p[kModDecay];
+    }
+    for (int r = 0; r < kRoutes; ++r) {
+      // Each choice's step 0 is Off; the rest are the enums above, in order.
+      const int source = (int) (p[kMod1Source + 3 * r] + 0.5f) - 1;
+      const int dest = (int) (p[kMod1Dest + 3 * r] + 0.5f) - 1;
+      const float amount = dest >= 0 ? p[kMod1Amount + 3 * r] / 100.0f * kDestReach[dest] : 0.0f;
+      routing.set(r, source, dest, amount);
+    }
+
     // Notes, pedals, wheels and per-note expression, each at its own frame.
     sonore::renderVoices(voices, ctx);
 
@@ -295,6 +456,10 @@ struct SonoreDsp {
 #include <sonore/plugin.h>
 
 static const char* const kModeNames[] = {"Poly", "Mono", "Legato"};
+static const char* const kShapeNames[] = {"Sine", "Triangle", "Saw", "Square", "S&H", "Drift"};
+static const char* const kSourceNames[] = {"Off",      "LFO",      "Mod Env",  "Velocity",
+                                           "Key",      "Pressure", "Mod Wheel"};
+static const char* const kDestNames[] = {"Off", "Cutoff", "Pitch", "Pan", "Level"};
 
 static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     // The trailing name is the display GROUP: a host's generic editor folds
@@ -327,6 +492,27 @@ static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
      sonore::skewForCentre(0.0f, 1.0f, 0.15f)},
     {"bendrange", "Bend Range", "st", 1.0f, 24.0f, 2.0f, 24, "Voices"},
     {"spread", "Spread", "%", 0.0f, 100.0f, 30.0f, 0, "Output"},
+    // The modulation matrix: an LFO and an envelope per voice, and three
+    // routes, each a source, a destination and an amount. Every route starts
+    // Off, so a session saved before these existed sounds as it did. The
+    // amounts are modulatable: a host's own LFO can deepen the vibrato.
+    {"lforate", "LFO Rate", "Hz", 0.05f, 20.0f, 5.0f, 0, "Modulation", nullptr, 0, true, false, false,
+     sonore::skewForCentre(0.05f, 20.0f, 2.0f)},
+    {"lfoshape", "LFO Shape", "", 0.0f, 5.0f, 0.0f, 6, "Modulation", kShapeNames, 6},
+    {"moddecay", "Mod Decay", "s", 0.01f, 4.0f, 0.5f, 0, "Modulation", nullptr, 0, true, false, false,
+     sonore::skewForCentre(0.01f, 4.0f, 0.4f)},
+    {"mod1src", "Mod 1 Source", "", 0.0f, 6.0f, 0.0f, 7, "Modulation", kSourceNames, 7},
+    {"mod1dst", "Mod 1 Target", "", 0.0f, 4.0f, 0.0f, 5, "Modulation", kDestNames, 5},
+    {"mod1amt", "Mod 1 Amount", "%", -100.0f, 100.0f, 0.0f, 0, "Modulation", nullptr, 0, true, false,
+     false, 1.0f, true},
+    {"mod2src", "Mod 2 Source", "", 0.0f, 6.0f, 0.0f, 7, "Modulation", kSourceNames, 7},
+    {"mod2dst", "Mod 2 Target", "", 0.0f, 4.0f, 0.0f, 5, "Modulation", kDestNames, 5},
+    {"mod2amt", "Mod 2 Amount", "%", -100.0f, 100.0f, 0.0f, 0, "Modulation", nullptr, 0, true, false,
+     false, 1.0f, true},
+    {"mod3src", "Mod 3 Source", "", 0.0f, 6.0f, 0.0f, 7, "Modulation", kSourceNames, 7},
+    {"mod3dst", "Mod 3 Target", "", 0.0f, 4.0f, 0.0f, 5, "Modulation", kDestNames, 5},
+    {"mod3amt", "Mod 3 Amount", "%", -100.0f, 100.0f, 0.0f, 0, "Modulation", nullptr, 0, true, false,
+     false, 1.0f, true},
 };
 
 static const sonore::PluginDescriptor kDesc = {
@@ -349,6 +535,13 @@ static const sonore::PluginDescriptor kDesc = {
     0,
     false,    // emits no MIDI
     true,     // …but it DOES play expressively: per-note bend and pressure
+    sonore::EditorKind::Auto,
+    {},       // the editor's default size limits
+    true,     // the output guard
+    // Sample-accurate automation: a host's point inside a block lands within
+    // 16 frames of where it was drawn (a third of a millisecond at 48 kHz),
+    // whatever the buffer size, rather than at the top of the block.
+    16,
 };
 
 #include <sonore/formats.h> // CLAP, and every format this target is built as

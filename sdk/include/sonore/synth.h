@@ -15,6 +15,8 @@
 //   Portamento                        a glide between notes, in pitch
 //   KarplusStrong                     a plucked string
 //   ModalResonator                    a struck body: a bank of ringing modes
+//   ModRouting + ModMatrix            a modulation matrix: a patch's routes,
+//                                     each voice's sources and offsets
 //
 // Everything is per voice and allocation-free; the Wavetable is the one big
 // object and is designed to be held ONCE and read by every voice.
@@ -851,6 +853,144 @@ private:
   float y1_[MaxModes]{}, y2_[MaxModes]{};
   float sr_ = 48000.0f;
   int modes_ = 0;
+};
+
+// ── Modulation matrix ────────────────────────────────────────────────────────
+
+/** One route of a modulation matrix: a source, a destination, how far.
+ *  ModRouting::set() fills these. */
+struct ModRoute {
+  int source = -1;      ///< the source's index, -1 off
+  int destination = -1; ///< the destination's index, -1 off
+  /** How far a source at 1 moves the destination, in the destination's own
+   *  units: semitones for a pitch, octaves for a cutoff, whatever the voice
+   *  reads the offset as. Negative inverts. */
+  float amount = 0.0f;
+  /** A second source that scales the route, -1 for none: the mod wheel
+   *  opening an LFO's vibrato, velocity deepening an envelope's sweep. */
+  int via = -1;
+};
+
+/**
+ * The routes of a modulation matrix, as a patch sets them: which source
+ * moves which destination, and how far. One per plugin, shared by every
+ * voice's ModMatrix.
+ *
+ * Sources and destinations are numbered by the plugin -- an enum of its LFOs
+ * and envelopes, an enum of what they can move -- so the matrix knows
+ * nothing about what they mean and a plugin is not limited to a list
+ * somebody else chose. A route is usually three parameters (source,
+ * destination, amount: two choices and a knob), set here once per block from
+ * the values the DSP is handed. Allocation-free, for the audio thread.
+ */
+template <int MaxRoutes = 8>
+class ModRouting {
+public:
+  static_assert(MaxRoutes >= 1, "a routing needs at least one slot");
+  /** How many routes a patch can have. */
+  static constexpr int kMaxRoutes = MaxRoutes;
+
+  /** Route slot `slot`: `source` to `destination` by `amount`, scaled by
+   *  `via` where it is not -1. A negative source or destination, or an amount
+   *  of 0, turns the slot off. A slot out of range is ignored. */
+  void set(int slot, int source, int destination, float amount, int via = -1) {
+    if (slot < 0 || slot >= MaxRoutes) return;
+    ModRoute& r = routes_[slot];
+    if (r.source == source && r.destination == destination && r.amount == amount && r.via == via) return;
+    r.source = source;
+    r.destination = destination;
+    r.amount = amount;
+    r.via = via;
+    pack();
+  }
+  /** Slot `slot` off. */
+  void clear(int slot) { set(slot, -1, -1, 0.0f); }
+  /** Every slot off. */
+  void clearAll() {
+    for (ModRoute& r : routes_) r = ModRoute{};
+    count_ = 0;
+  }
+  /** Slot `slot` as it was set. */
+  const ModRoute& route(int slot) const { return routes_[slot]; }
+  /** The routes that are on, packed, for evaluation: `activeCount()` of
+   *  them, in slot order. */
+  const ModRoute* active() const { return active_; }
+  /** How many routes are on. */
+  int activeCount() const { return count_; }
+
+private:
+  void pack() {
+    count_ = 0;
+    for (const ModRoute& r : routes_)
+      if (r.source >= 0 && r.destination >= 0 && r.amount != 0.0f) active_[count_++] = r;
+  }
+  ModRoute routes_[MaxRoutes];
+  ModRoute active_[MaxRoutes];
+  int count_ = 0;
+};
+
+/**
+ * One voice's side of a modulation matrix: its sources' values in, the
+ * offset each destination gets out.
+ *
+ * Each voice has one, because a voice's sources are its own -- its envelope,
+ * its LFO started at its note-on, its velocity and key, its pressure -- while
+ * the routes are the patch's (ModRouting). Set the sources that moved, call
+ * process() with the routing, and read each destination's offset: the sum,
+ * over every route into it, of source x amount (x via). A destination no
+ * route reaches reads 0.
+ *
+ * Cheap enough per sample -- a multiply-add per route -- though what a
+ * voice does with the offsets usually is not (a filter's coefficients), and
+ * that part can run at a control rate: every 16 or 32 samples, as the
+ * example synth does.
+ */
+template <int NumSources, int NumDestinations>
+class ModMatrix {
+public:
+  static_assert(NumSources >= 1 && NumDestinations >= 1, "a matrix needs a source and a destination");
+  /** How many sources the plugin numbered. */
+  static constexpr int kNumSources = NumSources;
+  /** How many destinations the plugin numbered. */
+  static constexpr int kNumDestinations = NumDestinations;
+
+  /** Source `source`'s value now: bipolar (-1..1) for an LFO, 0..1 for an
+   *  envelope or a velocity, as the source is. Out of range is ignored. */
+  void setSource(int source, float value) {
+    if (source >= 0 && source < NumSources) sources_[source] = value;
+  }
+  /** Source `source`'s value, as last set; 0 out of range. */
+  float source(int source) const { return source >= 0 && source < NumSources ? sources_[source] : 0.0f; }
+
+  /** Every destination's offset, from the sources as they are now. */
+  template <int MaxRoutes>
+  void process(const ModRouting<MaxRoutes>& routing) {
+    for (float& o : offsets_) o = 0.0f;
+    const ModRoute* r = routing.active();
+    for (int i = 0, n = routing.activeCount(); i < n; ++i) {
+      const ModRoute& route = r[i];
+      if (route.source >= NumSources || route.destination >= NumDestinations) continue;
+      float v = sources_[route.source] * route.amount;
+      if (route.via >= 0 && route.via < NumSources) v *= sources_[route.via];
+      offsets_[route.destination] += v;
+    }
+  }
+  /** Destination `destination`'s offset as process() left it; 0 out of
+   *  range. */
+  float offset(int destination) const {
+    return destination >= 0 && destination < NumDestinations ? offsets_[destination] : 0.0f;
+  }
+
+  /** Every source and offset to 0: a voice's note-on, before it sets what
+   *  its note brings (velocity, key). */
+  void reset() {
+    for (float& s : sources_) s = 0.0f;
+    for (float& o : offsets_) o = 0.0f;
+  }
+
+private:
+  float sources_[NumSources] = {};
+  float offsets_[NumDestinations] = {};
 };
 
 } // namespace sonore

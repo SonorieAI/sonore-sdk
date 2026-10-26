@@ -140,6 +140,7 @@ struct ValueQueue {
   Steinberg_Vst_IParamValueQueueVtbl* lpVtbl = nullptr;
   Steinberg_Vst_ParamID id = 0;
   double value = 0.0;
+  Steinberg_int32 offset = 0; ///< the frame the one point falls on
 };
 
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE vqQuery(void*, const Steinberg_TUID, void** o) {
@@ -156,7 +157,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE vqGetPoint(void* self, Steinberg
                                                            Steinberg_int32* offset,
                                                            Steinberg_Vst_ParamValue* value) {
   if (index != 0) return Steinberg_kInvalidArgument;
-  if (offset) *offset = 0;
+  if (offset) *offset = ((ValueQueue*) self)->offset;
   if (value) *value = ((ValueQueue*) self)->value;
   return Steinberg_kResultOk;
 }
@@ -569,6 +570,9 @@ int main(int argc, char** argv) {
    *  which answer is the correct one -- inferring it from the query would make
    *  the check agree with whatever the plugin happened to do. */
   bool expectMpe = false;
+  /** The descriptor asks for sample-accurate automation: a parameter moved
+   *  inside a block changes the sound from that frame, not the block's. */
+  bool expectSampleAccurate = false;
   /** Drag the first row of a native GENERIC editor (one with no parameter
    *  groups, so its first slider sits at a fixed place) and expect the host to
    *  hear about it. */
@@ -585,6 +589,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[i], "--expect-sidechain") == 0) expectSidechain = true;
     if (std::strcmp(argv[i], "--expect-midi-out") == 0) expectMidiOut = true;
     if (std::strcmp(argv[i], "--expect-mpe") == 0) expectMpe = true;
+    if (std::strcmp(argv[i], "--expect-sample-accurate") == 0) expectSampleAccurate = true;
     if (std::strcmp(argv[i], "--expect-aux-outs") == 0 && i + 1 < argc) {
       expectAuxOuts = std::atoi(argv[i + 1]);
       ++i;
@@ -1068,6 +1073,89 @@ int main(int argc, char** argv) {
   };
 
   const int oneSecond = 48000 / blockSize;
+
+  // ── Sample-accurate automation ────────────────────────────────────────────
+  //
+  // A queue's point at frame 96 of a block is meant at frame 96. The same
+  // note rendered twice from a fresh activation, once with the Level pulled
+  // down there: the two must match sample for sample up to that frame.
+  // Applied per block, the move would have reached the very first frame.
+  if (expectSampleAccurate && isInstrument) {
+    Steinberg_Vst_ParamID levelId = 0;
+    bool found = false;
+    const Steinberg_int32 count = controller->lpVtbl->getParameterCount(controller);
+    for (Steinberg_int32 i = 0; i < count; ++i) {
+      Steinberg_Vst_ParameterInfo info{};
+      if (controller->lpVtbl->getParameterInfo(controller, i, &info) != Steinberg_kResultOk) continue;
+      std::string title;
+      for (int k = 0; k < 128 && info.title[k]; ++k) title.push_back((char) info.title[k]);
+      if (title == "Level") {
+        levelId = info.id;
+        found = true;
+      }
+    }
+    check(found, "the plugin has a Level control to automate");
+    if (found) {
+      const double levelWas = controller->lpVtbl->getParamNormalized(controller, levelId);
+      constexpr Steinberg_int32 kAt = 96;
+      data.numSamples = blockSize;
+      auto oneBlock = [&](bool move) {
+        processor->lpVtbl->setProcessing(processor, 0);
+        component->lpVtbl->setActive(component, 0);
+        component->lpVtbl->setActive(component, 1);
+        processor->lpVtbl->setProcessing(processor, 1);
+        Steinberg_Vst_Event on{};
+        on.type = Steinberg_Vst_Event_EventTypes_kNoteOnEvent;
+        on.Steinberg_Vst_Event_noteOn.pitch = 57;
+        on.Steinberg_Vst_Event_noteOn.velocity = 1.0f;
+        on.Steinberg_Vst_Event_noteOn.noteId = -1;
+        events.push_back(on);
+        if (move) {
+          ValueQueue q;
+          q.lpVtbl = &g_vqVtbl;
+          q.id = levelId;
+          q.value = 0.0; // the bottom of the range
+          q.offset = kAt;
+          queues.push_back(q);
+        }
+        processor->lpVtbl->process(processor, &data);
+        queues.clear();
+        events.clear();
+        std::vector<float> out(outL.begin(), outL.begin() + blockSize);
+        Steinberg_Vst_Event off{};
+        off.type = Steinberg_Vst_Event_EventTypes_kNoteOffEvent;
+        off.Steinberg_Vst_Event_noteOff.pitch = 57;
+        off.Steinberg_Vst_Event_noteOff.noteId = -1;
+        events.push_back(off);
+        ValueQueue back;
+        back.lpVtbl = &g_vqVtbl;
+        back.id = levelId;
+        back.value = levelWas;
+        queues.push_back(back);
+        processor->lpVtbl->process(processor, &data);
+        queues.clear();
+        events.clear();
+        return out;
+      };
+      const std::vector<float> steady = oneBlock(false);
+      const std::vector<float> moved = oneBlock(true);
+      int firstDiff = -1;
+      for (Steinberg_int32 i = 0; i < blockSize; ++i)
+        if (steady[(size_t) i] != moved[(size_t) i]) {
+          firstDiff = (int) i;
+          break;
+        }
+      std::printf("  ---- Level moved at frame %d: the output first differs at frame %d ----\n",
+                  (int) kAt, firstDiff);
+      check(firstDiff > 0 && firstDiff <= kAt && firstDiff >= kAt - 16,
+            "a parameter moved inside a block changes the sound from that frame, not the block's first");
+      // The note's release, cut short: what follows starts from silence.
+      processor->lpVtbl->setProcessing(processor, 0);
+      component->lpVtbl->setActive(component, 0);
+      component->lpVtbl->setActive(component, 1);
+      processor->lpVtbl->setProcessing(processor, 1);
+    }
+  }
 
   // ── An input bus with no channels ─────────────────────────────────────────
   //

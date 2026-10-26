@@ -28,6 +28,25 @@ value again through `sonore::parseParamValue`. The wrappers and the native
 editor both use them, and a web page's `sonore.format` follows the same rule,
 so the host's readout, the knob and the page never disagree.
 
+## Automation inside a block
+
+By default a host's parameter changes take effect once per block, each at the
+last value the block gave it, and the toolkit's smoothers (`sonore::Smooth`)
+make the step inaudible. A plugin whose controls must land on their frame, such
+as a filter sweep or a gate drawn against the grid, sets the descriptor's
+`automationGranularity` to a number of frames, 16 to 64:
+
+- where a host's automation moves a parameter inside a block, the CLAP and
+  VST3 wrappers split the block there and run `process()` once per piece;
+- each piece runs with the values set in its first N frames, so a change lands
+  up to N frames early and never late, at any buffer size;
+- splits are at least N frames apart, so automation written every sample costs
+  at most one call per N frames.
+
+The DSP needs nothing for it: it is handed shorter blocks, which a host may do
+at any time anyway. AU, LV2 and AAX deliver parameters per block and ignore
+the setting. The example synth sets 16.
+
 ## State beyond the parameters
 
 The state every format saves holds the parameter values, the bypass, a few

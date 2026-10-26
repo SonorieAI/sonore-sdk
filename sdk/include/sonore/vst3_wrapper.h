@@ -1939,13 +1939,54 @@ static void advanceContext(Steinberg_Vst_ProcessContext& ctx, Steinberg_int32 fr
   }
 }
 
+/** Where the piece of a block that starts at `start` ends: at `end`, or at
+ *  the first point of a parameter's automation at least `granularity` frames
+ *  in (PluginDescriptor::automationGranularity), so each piece runs with the
+ *  values set in its first frames. A point in the last `granularity` frames
+ *  before `end` splits there instead, a little early, rather than leave a
+ *  sliver of a piece. A MIDI controller a host sends as a parameter does not
+ *  split: its points are messages, and each already lands at its frame. */
+static Steinberg_int32 automationPieceEnd(Steinberg_Vst_IParameterChanges* changes,
+                                          Steinberg_int32 start, Steinberg_int32 end,
+                                          Steinberg_int32 granularity) {
+  if (!changes || granularity <= 0) return end;
+  Steinberg_int32 cut = end;
+  const Steinberg_int32 count = changes->lpVtbl->getParameterCount(changes);
+  for (Steinberg_int32 i = 0; i < count; ++i) {
+    auto* queue = changes->lpVtbl->getParameterData(changes, i);
+    if (!queue) continue;
+    int channel = 0, cc = 0;
+    if (midiParamSlot(queue->lpVtbl->getParameterId(queue), &channel, &cc)) continue;
+    const Steinberg_int32 points = queue->lpVtbl->getPointCount(queue);
+    for (Steinberg_int32 p = 0; p < points; ++p) {
+      Steinberg_int32 at = 0;
+      Steinberg_Vst_ParamValue value = 0.0;
+      if (queue->lpVtbl->getPoint(queue, p, &at, &value) != Steinberg_kResultOk) break;
+      if (at >= cut) break; // in offset order: nothing later in this queue is earlier
+      if (at >= start + granularity) {
+        cut = at;
+        break;
+      }
+    }
+  }
+  if (cut >= end) return end;
+  if (cut + granularity > end) cut = end - granularity;
+  return cut >= start + granularity ? cut : end;
+}
+
 static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
     void* self, Steinberg_Vst_ProcessData* data) {
   Plugin* plugin = ownerOfProcessor(self);
   if (!data) return Steinberg_kInvalidArgument;
   const Steinberg_int32 frames = data->numSamples;
   const auto most = (Steinberg_int32) plugin->shared.maxFrames;
-  if (most <= 0 || frames <= most) return processVst3Block(plugin, data);
+  // Sample-accurate automation, where the descriptor asks for it: the block
+  // is cut where a parameter moves, by the same slicing that keeps a piece
+  // within the frames the DSP was prepared for.
+  const Steinberg_int32 granularity = kDesc.automationGranularity > 0 ? kDesc.automationGranularity : 0;
+  if ((most <= 0 || frames <= most) &&
+      automationPieceEnd(data->inputParameterChanges, 0, frames, granularity) >= frames)
+    return processVst3Block(plugin, data);
 
   const bool doubles = data->symbolicSampleSize == Steinberg_Vst_SymbolicSampleSizes_kSample64;
   constexpr Steinberg_int32 kOuts = 1 + (Steinberg_int32) clapwrap::kMaxAuxOutputs;
@@ -1984,9 +2025,11 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
   const Steinberg_int32 total =
       data->inputEvents ? data->inputEvents->lpVtbl->getEventCount(data->inputEvents) : 0;
   Steinberg_int32 next = 0;
-  for (Steinberg_int32 start = 0; start < frames; start += most) {
-    const Steinberg_int32 len = frames - start < most ? frames - start : most;
-    const bool last = start + len >= frames;
+  for (Steinberg_int32 start = 0; start < frames;) {
+    Steinberg_int32 end = most > 0 && frames - start > most ? start + most : frames;
+    end = automationPieceEnd(data->inputParameterChanges, start, end, granularity);
+    const Steinberg_int32 len = end - start;
+    const bool last = end >= frames;
     // The events before this piece's end -- in a host's offset-ordered list,
     // the next run of them. The last piece takes whatever is left.
     inEvents.first = next;
@@ -2016,6 +2059,7 @@ static Steinberg_tresult SMTG_STDMETHODCALLTYPE processorProcess(
       piece.processContext = &context;
     }
     processVst3Block(plugin, &piece);
+    start = end;
   }
   for (Steinberg_int32 b = 0; b < nOuts; ++b) data->outputs[b].silenceFlags = 0;
   return Steinberg_kResultOk;

@@ -51,6 +51,7 @@ manager finds them at compile time:
 | Method | What it gets |
 | --- | --- |
 | `void render(float& left, float& right)` | a stereo voice: panned, spread; it may replace `render()` |
+| `void renderBlock(float* left, float* right, int numSamples)` | a stretch between two events, in the voice's own loop: added to both buffers (below) |
 | `void legatoTo(int note, float velocity)` | in Legato, the next note without a new attack: where a glide starts |
 | `void setPitchBend(float semitones)` | the pitch wheel of the voice's channel |
 | `void setTuning(float semitones)` | this note's own bend (MPE) |
@@ -61,8 +62,19 @@ manager finds them at compile time:
 
 `sonore::renderVoices(voices, ctx)` is a whole instrument block. It applies every
 MIDI event and every note expression at its frame and renders the voices
-between them into `ctx.main`, stereo voices in stereo. The MIDI goes through
-`sonore::applyMidi()`, which also works on its own:
+between them into `ctx.main`, stereo voices in stereo.
+
+The stretch between two events goes through `VoiceManager::renderBlock()`. A
+voice with only `render()` is run sample by sample, all the voices in turn at
+each sample. That is the faster order for most voices: a filter or an envelope
+is a chain of steps that each wait for the last, and eight voices' chains
+interleaved keep the processor busy where one voice run to the end of the
+block leaves it waiting. On the example synth's voice, one voice after another
+took 1.7 times as long. A voice whose work does run better over a block, such
+as a sample player or a SIMD wavetable read, takes the stretch itself through
+`renderBlock()`.
+
+The MIDI goes through `sonore::applyMidi()`, which also works on its own:
 
 - notes, with their channel;
 - the pedals, and All Notes Off and All Sound Off;
@@ -88,6 +100,55 @@ with no new attack. Either way the manager remembers the keys held:
 The glide itself is the voice's: `sonore::Portamento` moves a pitch in
 semitones, over a fixed time or at a rate per octave. `jumpTo()` the note in
 `noteOn()`, `glideTo()` it in `legatoTo()`, and read `next()` every sample.
+
+## A modulation matrix
+
+`sonore::ModRouting` holds a patch's routes: which source moves which
+destination, and how far. `sonore::ModMatrix` is one voice's side of it: the
+voice sets its sources, its LFO and envelope, its velocity, and reads back
+each destination's offset, the sum of every route into it. The plugin numbers
+the sources and destinations itself, so the matrix knows nothing of what they
+mean:
+
+```cpp
+// test-compile
+#include <sonore/dsp.h>
+
+// What the matrix can read, and what it can move: the plugin's own numbering.
+enum Source { kLfo, kVelocity, kNumSources };
+enum Destination { kCutoff, kPitch, kNumDestinations };
+
+struct Voice {
+  sonore::Lfo lfo;
+  sonore::ModMatrix<kNumSources, kNumDestinations> mod;
+  const sonore::ModRouting<4>* routing = nullptr; // the patch's, shared by every voice
+  float cutoffOctaves = 0.0f, pitchSemitones = 0.0f;
+
+  void noteOn(int, float velocity) {
+    mod.reset();
+    mod.setSource(kVelocity, velocity);
+    lfo.retrigger(); // each note's LFO from the top of its cycle
+  }
+  // Every few samples: the control rate a filter's coefficients can afford.
+  void modulate() {
+    mod.setSource(kLfo, lfo.next());
+    mod.process(*routing);
+    cutoffOctaves = mod.offset(kCutoff); // in the units the amounts were set in
+    pitchSemitones = mod.offset(kPitch);
+  }
+};
+
+// Once per block, from the controls. set() leaves an unchanged route alone.
+inline void route(sonore::ModRouting<4>& routing, float vibrato) {
+  routing.set(0, kLfo, kPitch, 0.5f * vibrato);  // half a semitone at full depth
+  routing.set(1, kVelocity, kCutoff, 2.0f);       // two octaves brighter at full velocity
+}
+```
+
+A route can also take a second source that scales it (`via`), such as the mod
+wheel opening an LFO's vibrato. The example synth has three routes, from an
+LFO, an envelope, velocity, key, pressure or the mod wheel to cutoff, pitch,
+pan or level, worked out every 16 samples.
 
 ## Notes the host names, and modulation
 

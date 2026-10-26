@@ -972,6 +972,19 @@ const MAP = [
    "included. The notes a DSP reports ended go back to a CLAP host as NOTE_END, " +
    "which is when a host stops modulating a voice",
    "class NoteIdBuffer"],
+  ["dsp", "sample-accurate automation",
+   "plugin.h: PluginDescriptor::automationGranularity. Where a host's automation " +
+   "moves a parameter inside a block, the CLAP and VST3 wrappers split the block " +
+   "there, so a change lands within N frames of where the host drew it, at any " +
+   "buffer size, with splits at least N frames apart; the DSP is only handed " +
+   "shorter blocks. Off by default",
+   "automationGranularity"],
+  ["dsp", "modulation matrix",
+   "synth.h: ModRouting holds a patch's routes (ModRoute: source, destination, " +
+   "amount, an optional scaling source), shared by the voices; ModMatrix is a " +
+   "voice's sources in and each destination's summed offset out. The plugin " +
+   "numbers its own sources and destinations",
+   "class ModMatrix"],
   ["dsp", "parameter modulation from the host, for the plugin and per note",
    "plugin.h: ParamInfo::modulatable and modulatablePerNote; audio.h: " +
    "ParamModBuffer. CLAP's modulation is an offset a host's own LFO or envelope " +

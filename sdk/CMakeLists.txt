@@ -595,7 +595,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_test(NAME clap_effect COMMAND clap_host_test $<TARGET_FILE:SonoreSaturator>
            --expect-web-editor)
   add_test(NAME clap_instrument COMMAND clap_host_test $<TARGET_FILE:SonoreSynth>
-           --expect-native-editor --expect-poly-mod)
+           --expect-native-editor --expect-poly-mod --expect-sample-accurate
+           --expect-mod-matrix)
   add_test(NAME clap_sidechain COMMAND clap_host_test $<TARGET_FILE:SonoreDucker>
                                        --expect-sidechain)
   add_test(NAME clap_channels COMMAND clap_host_test $<TARGET_FILE:SonoreTrim>
@@ -850,7 +851,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_test(NAME vst3_effect COMMAND vst3_host_test $<TARGET_FILE:SonoreSaturatorVST3>)
   add_test(NAME vst3_instrument COMMAND vst3_host_test $<TARGET_FILE:SonoreSynthVST3>
                                         --expect-mpe --expect-pressure
-           --expect-native-editor)
+           --expect-native-editor --expect-sample-accurate)
   add_test(NAME vst3_sidechain COMMAND vst3_host_test $<TARGET_FILE:SonoreDuckerVST3>
                                        --expect-sidechain)
   # Trim also carries the native-editor drag: its generic editor has no

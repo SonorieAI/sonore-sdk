@@ -625,6 +625,27 @@ struct PluginDescriptor {
    *  the host. Last in the struct, so a descriptor written positionally
    *  before it existed still compiles and gets the guard. */
   bool guardOutput = true;
+  /** Sample-accurate automation.
+   *
+   *  0, the default: a host's parameter changes take effect once per block,
+   *  each parameter at the last value the block gave it, and the toolkit's
+   *  smoothers make the step inaudible. For a gain or a mix that is enough.
+   *
+   *  N > 0: where a host's automation moves a parameter inside a block, the
+   *  CLAP and VST3 wrappers split the block there and run the DSP once per
+   *  piece, each with the values set in its first N frames. A change lands
+   *  up to N frames early and never late, and splits are at least N frames
+   *  apart, so a host that writes a point every sample costs one process()
+   *  call per N frames at most. What it is for: a filter sweep or a gate
+   *  drawn against the grid that has to hit the beat it was drawn on, at any
+   *  buffer size, and an offline bounce that sounds the same at 64 frames as
+   *  at 4096. 16 to 64 is the usual choice.
+   *
+   *  The DSP needs nothing for it: it is handed shorter blocks, as a host may
+   *  hand it at any time. AU, LV2 and AAX deliver parameters per block and
+   *  ignore it. After guardOutput, so a positional descriptor written before
+   *  it existed still compiles, with it off. */
+  int automationGranularity = 0;
 };
 
 /** Whether an INTERFACE may write parameter `index` or open a gesture on it:

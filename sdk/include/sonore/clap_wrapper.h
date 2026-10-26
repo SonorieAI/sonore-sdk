@@ -3771,12 +3771,55 @@ inline void advanceTransport(clap_event_transport_t& t, uint32_t frames, double 
   }
 }
 
+/** Whether a CLAP event moves a parameter for the whole plugin: a value, or a
+ *  modulation that names no note. What sample-accurate automation splits a
+ *  block at (PluginDescriptor::automationGranularity); a note's own
+ *  modulation already lands at its frame (ParamModBuffer). */
+inline bool movesParameter(const clap_event_header_t* hdr) {
+  if (!hdr || hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
+  if (hdr->type == CLAP_EVENT_PARAM_VALUE) return true;
+  if (hdr->type != CLAP_EVENT_PARAM_MOD) return false;
+  const auto* e = eventAs<clap_event_param_mod_t>(hdr);
+  return e && e->note_id < 0 && e->key < 0 && e->channel < 0;
+}
+
+/** Where the piece of a block that starts at `start` ends: at `end` (the
+ *  block's end, or the most frames a piece may have), or at the first
+ *  parameter change at least `granularity` frames in, so each piece runs
+ *  with the values set in its first frames. A change in the last
+ *  `granularity` frames before `end` splits there instead, a little early,
+ *  rather than leave a sliver of a piece. `from` is the first event not yet
+ *  given to a piece; a host's list is in time order, so the search stops at
+ *  `end`. */
+inline uint32_t pieceEnd(const clap_input_events_t* events, uint32_t from, uint32_t total,
+                         uint32_t start, uint32_t end, uint32_t granularity) {
+  if (!events || granularity == 0) return end;
+  for (uint32_t i = from; i < total; ++i) {
+    const clap_event_header_t* hdr = events->get(events, i);
+    if (!hdr) continue;
+    if (hdr->time >= end) break;
+    if (hdr->time < start + granularity || !movesParameter(hdr)) continue;
+    uint32_t cut = hdr->time;
+    if (cut + granularity > end) cut = end - granularity;
+    return cut >= start + granularity ? cut : end;
+  }
+  return end;
+}
+
 inline clap_process_status pluginProcess(const clap_plugin_t* plugin,
                                          const clap_process_t* process) {
   Instance* inst = self(plugin);
   const uint32_t frames = process->frames_count;
   const uint32_t most = inst->maxFrames;
-  if (most == 0 || frames <= most) return processBlock(inst, process);
+  // Sample-accurate automation, where the descriptor asks for it: the block
+  // is cut where a parameter moves, by the same slicing that keeps a piece
+  // within the frames the DSP was prepared for.
+  const uint32_t granularity =
+      kDesc.automationGranularity > 0 ? (uint32_t) kDesc.automationGranularity : 0u;
+  const uint32_t total = process->in_events ? process->in_events->size(process->in_events) : 0;
+  if ((most == 0 || frames <= most) &&
+      pieceEnd(process->in_events, 0, total, 0, frames, granularity) >= frames)
+    return processBlock(inst, process);
 
   SliceEventsIn in;
   in.list.ctx = &in;
@@ -3807,11 +3850,12 @@ inline clap_process_status pluginProcess(const clap_plugin_t* plugin,
   piece.audio_outputs_count = nOuts;
   clap_event_transport_t transport{};
 
-  const uint32_t total = process->in_events ? process->in_events->size(process->in_events) : 0;
   uint32_t next = 0;
-  for (uint32_t start = 0; start < frames; start += most) {
-    const uint32_t len = frames - start < most ? frames - start : most;
-    const bool last = start + len >= frames;
+  for (uint32_t start = 0; start < frames;) {
+    uint32_t end = most > 0 && frames - start > most ? start + most : frames;
+    end = pieceEnd(process->in_events, next, total, start, end, granularity);
+    const uint32_t len = end - start;
+    const bool last = end >= frames;
     // The events before this piece's end -- in a host's time-ordered list,
     // the next run of them. The last piece takes whatever is left.
     in.first = next;
@@ -3835,6 +3879,7 @@ inline clap_process_status pluginProcess(const clap_plugin_t* plugin,
       piece.transport = &transport;
     }
     processBlock(inst, &piece);
+    start = end;
   }
   for (uint32_t b = 0; b < nOuts; ++b) process->audio_outputs[b].constant_mask = 0;
   return CLAP_PROCESS_CONTINUE;

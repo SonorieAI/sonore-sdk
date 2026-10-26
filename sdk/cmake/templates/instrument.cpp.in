@@ -37,6 +37,10 @@ struct Voice {
   void noteOff() { env.noteOff(); }
   bool isActive() const { return env.isActive(); }
   float render() { return osc.saw() * env.getNextSample() * velocity; }
+  // And this one because it exists: All Sound Off (CC 120) silences the
+  // voice at once instead of releasing it. A voice may have more -- stereo,
+  // legato, per-note bend and pressure; see the SDK's MIDI guide.
+  void kill() { env.reset(); }
 };
 
 } // namespace
@@ -51,58 +55,46 @@ struct SonoreDsp {
   // It may also run on the audio thread (see the SDK README, "What runs
   // where"), so it allocates nothing.
   void prepare(const sonore::ProcessSpec& spec) {
-    voices.allNotesOff();
-    for (int i = 0; i < voices.kNumVoices; ++i)
+    for (int i = 0; i < voices.kNumVoices; ++i) {
+      voices.voice(i).kill(); // a host that re-prepares sends no note-offs
       voices.voice(i).setSampleRate((float) spec.sampleRate);
+    }
+    voices.allNotesOff();
+    voices.setSampleRate(spec.sampleRate); // a stolen voice fades out over 2 ms
     levelSm.setup((float) spec.sampleRate, 20.0f);
     lastAttack = lastRelease = -1.0f;
     fresh = true;
   }
 
-  // Taking a MidiBuffer is what makes this an instrument in every format.
-  // The audio thread: no allocation, no locks, no files.
-  void process(sonore::AudioBlock<float>& io, const float* p, sonore::MidiBuffer& midi) {
+  // The audio thread: no allocation, no locks, no files. The ProcessContext
+  // form carries the MIDI and everything that comes with a note: the host's
+  // id for it, its expression, its end.
+  void process(sonore::ProcessContext& ctx, const float* p) {
     if (p[0] != lastAttack || p[1] != lastRelease) { // only when a control moved
       for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setEnvelope(p[0], p[1]);
       lastAttack = p[0];
       lastRelease = p[1];
     }
+    // Every note, pedal and wheel at its own frame, not the block's first --
+    // that is what keeps an instrument in time -- and the voices rendered
+    // between them, into a bus this overwrites.
+    sonore::renderVoices(voices, ctx);
+
     const float level = sonore::dbToGain(p[2]);
     if (fresh) {
       levelSm.snap(level);
       fresh = false;
     }
-    float* left = io.getChannelPointer(0);
-    float* right = io.getNumChannels() > 1 ? io.getChannelPointer(1) : nullptr;
-    auto event = midi.begin();
-    const auto end = midi.end();
+    sonore::AudioBlock<float>& io = ctx.main;
     for (size_t i = 0; i < io.getNumSamples(); ++i) {
-      // Each event at its own frame, not the block's first: that is what
-      // keeps an instrument in time.
-      while (event != end && (size_t) event->samplePosition <= i) {
-        const sonore::MidiMessage& m = event->getMessage();
-        if (!sonore::applyPedals(voices, m)) { // sustain, sostenuto, all-notes-off
-          if (m.isNoteOn())
-            voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), m.getChannel() - 1);
-          else if (m.isNoteOff())
-            voices.noteOff(m.getNoteNumber(), m.getChannel() - 1);
-        }
-        ++event;
-      }
-      const float s = voices.render() * levelSm.next(level);
-      left[i] = s;
-      if (right) right[i] = s;
+      const float g = levelSm.next(level);
+      for (size_t c = 0; c < io.getNumChannels(); ++c) io.getChannelPointer(c)[i] *= g;
     }
   }
 
   // A host's voice meter.
   int voiceCapacity() const { return voices.kNumVoices; }
-  int activeVoices() const {
-    int n = 0;
-    for (int i = 0; i < voices.kNumVoices; ++i)
-      if (voices.voice(i).isActive()) ++n;
-    return n;
-  }
+  int activeVoices() const { return voices.activeVoices(); }
 };
 
 #include <sonore/plugin.h>

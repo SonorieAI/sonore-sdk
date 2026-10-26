@@ -496,6 +496,12 @@ int main(int argc, char** argv) {
   /** The plugin lets a host modulate a parameter per note, and says when
    *  each note ends: CLAP's polyphonic modulation, measured on the sound. */
   bool expectPolyMod = false;
+  /** The descriptor asks for sample-accurate automation: a parameter moved
+   *  inside a block changes the sound from that frame, not the block's. */
+  bool expectSampleAccurate = false;
+  /** The example synth's modulation matrix: an LFO routed to its level is
+   *  heard as a tremolo, and the same route off is not. */
+  bool expectModMatrix = false;
   // Which editor this plugin should open. A plugin that defines SONORE_UI_HTML
   // asked for a page; one that does not gets the SDK's own controls. The test
   // is told which to expect so it can measure rather than accept whatever
@@ -510,6 +516,8 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[i], "--expect-midi-out") == 0) expectMidiOut = true;
     if (std::strcmp(argv[i], "--expect-64bit-parity") == 0) expect64Parity = true;
     if (std::strcmp(argv[i], "--expect-poly-mod") == 0) expectPolyMod = true;
+    if (std::strcmp(argv[i], "--expect-sample-accurate") == 0) expectSampleAccurate = true;
+    if (std::strcmp(argv[i], "--expect-mod-matrix") == 0) expectModMatrix = true;
     if (std::strcmp(argv[i], "--expect-linked-stereo") == 0) expectLinkedStereo = true;
     if (std::strcmp(argv[i], "--expect-aux-outs") == 0 && i + 1 < argc) {
       expectAuxOuts = std::atoi(argv[i + 1]);
@@ -1763,6 +1771,127 @@ int main(int argc, char** argv) {
       plugin->process(plugin, &process);
       events.storage.clear();
       plugin->on_main_thread(plugin);
+    }
+  }
+
+  // ── Sample-accurate automation ────────────────────────────────────────────
+  //
+  // A host draws automation against the timeline, and a point inside a block
+  // is meant at its frame. Rendered twice from a reset, the same note: once
+  // as it is, once with the Level pulled down at frame 96 of the block. The
+  // two must be the same sample for sample up to that frame. Applied per
+  // block, the move would have reached the very first frame.
+  if (expectSampleAccurate && isInstrument) {
+    uint32_t levelId = UINT32_MAX;
+    double levelWas = 0.0, levelMin = 0.0;
+    for (uint32_t i = 0; i < nParams; ++i) {
+      clap_param_info_t info{};
+      if (params->get_info(plugin, i, &info) && std::strcmp(info.name, "Level") == 0) {
+        levelId = info.id;
+        levelMin = info.min_value;
+        params->get_value(plugin, info.id, &levelWas);
+      }
+    }
+    check(levelId != UINT32_MAX, "the plugin has a Level control to automate");
+    if (levelId != UINT32_MAX) {
+      constexpr uint32_t kAt = 96;
+      auto oneBlock = [&](bool move) {
+        plugin->reset(plugin);
+        events.storage.clear();
+        events.addNote(CLAP_EVENT_NOTE_ON, 57, 1.0, 0);
+        if (move) events.addParam(levelId, levelMin, kAt);
+        plugin->process(plugin, &process);
+        events.storage.clear();
+        std::vector<float> out(outL.begin(), outL.begin() + blockSize);
+        events.addNote(CLAP_EVENT_NOTE_OFF, 57, 0.0, 0);
+        events.addParam(levelId, levelWas, 0);
+        plugin->process(plugin, &process);
+        events.storage.clear();
+        return out;
+      };
+      const std::vector<float> steady = oneBlock(false);
+      const std::vector<float> moved = oneBlock(true);
+      int firstDiff = -1;
+      for (uint32_t i = 0; i < blockSize; ++i)
+        if (steady[i] != moved[i]) {
+          firstDiff = (int) i;
+          break;
+        }
+      std::printf("  ---- Level moved at frame %u: the output first differs at frame %d ----\n",
+                  (unsigned) kAt, firstDiff);
+      check(firstDiff > 0 && firstDiff <= (int) kAt && firstDiff >= (int) kAt - 16,
+            "a parameter moved inside a block changes the sound from that frame, not the block's first");
+    }
+  }
+
+  // ── A modulation matrix, heard ─────────────────────────────────────────────
+  //
+  // A square LFO at 10 Hz routed to the level at -100% swings each voice
+  // between silence and twice its level every 50 ms. Measured as the spread
+  // of the output's loudness over 10 ms windows: steady with the route off,
+  // a tremolo with it on.
+  if (expectModMatrix && isInstrument) {
+    auto findParam = [&](const char* name, double* value) -> uint32_t {
+      for (uint32_t i = 0; i < nParams; ++i) {
+        clap_param_info_t info{};
+        if (params->get_info(plugin, i, &info) && std::strcmp(info.name, name) == 0) {
+          if (value) params->get_value(plugin, info.id, value);
+          return info.id;
+        }
+      }
+      return UINT32_MAX;
+    };
+    double was[5] = {};
+    const uint32_t ids[5] = {findParam("Mod 1 Source", &was[0]), findParam("Mod 1 Target", &was[1]),
+                             findParam("Mod 1 Amount", &was[2]), findParam("LFO Rate", &was[3]),
+                             findParam("LFO Shape", &was[4])};
+    bool all = true;
+    for (uint32_t id : ids) all = all && id != UINT32_MAX;
+    check(all, "the plugin has a modulation route's controls and an LFO's");
+    if (all) {
+      auto swing = [&]() {
+        plugin->reset(plugin);
+        events.storage.clear();
+        events.addNote(CLAP_EVENT_NOTE_ON, 57, 1.0, 0);
+        std::vector<float> out;
+        for (int b = 0; b < oneSecond / 4; ++b) {
+          plugin->process(plugin, &process);
+          events.storage.clear();
+          out.insert(out.end(), outL.begin(), outL.begin() + blockSize);
+        }
+        events.addNote(CLAP_EVENT_NOTE_OFF, 57, 0.0, 0);
+        plugin->process(plugin, &process);
+        events.storage.clear();
+        // 10 ms windows over the last 200 ms, past the attack.
+        const size_t window = 480;
+        double quietest = 1e30, loudest = 0.0;
+        for (size_t at = out.size() - 20 * window; at + window <= out.size(); at += window) {
+          double e = 0.0;
+          for (size_t i = at; i < at + window; ++i) e += (double) out[i] * out[i];
+          quietest = std::min(quietest, e);
+          loudest = std::max(loudest, e);
+        }
+        // In decibels, capped: a window of true silence is infinitely quieter.
+        const double db = 10.0 * std::log10((loudest + 1e-30) / (quietest + 1e-30));
+        return db < 120.0 ? db : 120.0;
+      };
+      const double steady = swing();
+      events.addParam(ids[0], 1.0, 0);    // LFO
+      events.addParam(ids[1], 4.0, 0);    // Level
+      events.addParam(ids[2], -100.0, 0); // all the way
+      events.addParam(ids[3], 10.0, 0);
+      events.addParam(ids[4], 3.0, 0); // Square
+      plugin->process(plugin, &process);
+      events.storage.clear();
+      const double tremolo = swing();
+      for (int k = 0; k < 5; ++k) events.addParam(ids[k], was[k], 0);
+      plugin->process(plugin, &process);
+      events.storage.clear();
+      plugin->reset(plugin);
+      std::printf("  ---- loudness spread over 10 ms windows: %.1f dB with no route, %.1f dB with LFO -> Level ----\n",
+                  steady, tremolo);
+      check(steady < 2.0, "with every route off the level holds steady");
+      check(tremolo > 13.0, "an LFO routed to the level is heard: a tremolo from silence to twice the level");
     }
   }
 

@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 271 headers, 737 public types.
+not have. 271 headers, 740 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -1969,7 +1969,7 @@ the synthesiser side, past one oscillator and one envelope
 
 `sdk/include/sonore/synth.h`
 
-Wavetable, WavetableOscillator, UnisonOscillator, HardSyncOscillator, FmOperator, Dahdsr, Portamento, KarplusStrong, ModalResonator
+Wavetable, WavetableOscillator, UnisonOscillator, HardSyncOscillator, FmOperator, Dahdsr, Portamento, KarplusStrong, ModalResonator, ModRoute, ModRouting, ModMatrix
 
 ### sysex.h
 
