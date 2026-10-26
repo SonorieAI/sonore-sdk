@@ -31,14 +31,18 @@ endif()
 # Every format from one compile of the source. The AU is built on macOS only.
 # Its codes are how macOS registers it: SUBTYPE and MANUFACTURER must be
 # unique to you, and MANUFACTURER needs an upper-case letter (all lower case
-# is Apple's).
+# is Apple's). The AAX uses the same two codes, and builds only with Avid's
+# AAX SDK, which Avid gives to registered developers: configure with
+# -DSONORE_AAX_SDK_ROOT=<the unpacked SDK> to get it.
 sonore_add_plugin(@TARGET@ SOURCES src/plugin.cpp
   CLAP @TARGET@
   VST3 @TARGET@VST3
   AU   @TARGET@AU
   LV2  @TARGET@LV2
+  AAX  @TARGET@AAX
   AU_TYPE @AU_TYPE@  AU_SUBTYPE "@AU_SUBTYPE@"  AU_MANUFACTURER "@AU_MANUFACTURER@"
   AU_VENDOR "@VENDOR@"  AU_NAME "@NAME@"  AU_BUNDLE_ID @ID@
+  AAX_MANUFACTURER "@AU_MANUFACTURER@"  AAX_PRODUCT "@AU_SUBTYPE@"
   VERSION ${PROJECT_VERSION})
 
 # The same source as an app with its own window and audio, and an offline

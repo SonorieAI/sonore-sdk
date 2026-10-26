@@ -498,12 +498,13 @@ function(sonore_add_lv2 TARGET)
   add_dependencies(${TARGET} ${TARGET}_ttlgen)
 endfunction()
 
-# ── sonore_add_plugin(<name> SOURCES a.cpp [CLAP <t>] [VST3 <t>] [AU <t>] [LV2 <t>]) ──
+# ── sonore_add_plugin(<name> SOURCES a.cpp [CLAP <t>] [VST3 <t>] [AU <t>] [LV2 <t>] [AAX <t>]) ──
 #
 #   sonore_add_plugin(MyPlugin SOURCES plugin.cpp
-#     CLAP MyPlugin  VST3 MyPluginVST3  AU MyPluginAU  LV2 MyPluginLV2
+#     CLAP MyPlugin  VST3 MyPluginVST3  AU MyPluginAU  LV2 MyPluginLV2  AAX MyPluginAAX
 #     AU_SUBTYPE "Mypl" AU_MANUFACTURER "Manu" AU_TYPE aufx  VERSION 1.2.0
-#     AU_VENDOR "My Company" AU_NAME "My Plugin" AU_BUNDLE_ID com.mycompany.myplugin)
+#     AU_VENDOR "My Company" AU_NAME "My Plugin" AU_BUNDLE_ID com.mycompany.myplugin
+#     AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl")
 #
 # One compile of the source, then one bundle per format named, each the same
 # artifact the single-format helper would have produced under that name. AU
@@ -511,14 +512,34 @@ endfunction()
 # named, so a Linux-only LV2 is the caller's if(). The standalone is not here
 # on purpose: it is an executable with a main loop of its own, and its object
 # cannot be a module's.
+#
+# AAX is the exception to the one compile: it is compiled on its own by
+# sonore_add_aax(), against the developer's copy of Avid's SDK. In the shared
+# object, the AAX code would make every other bundle need Avid's library to
+# link. Without SONORE_AAX_SDK_ROOT it is skipped, as sonore_add_aax() says.
 function(sonore_add_plugin NAME)
-  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;LV2;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;VERSION"
+  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
                         "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): SOURCES is required")
   endif()
-  if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2))
-    message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/LV2)")
+  if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2 OR ARG_AAX))
+    message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/LV2/AAX)")
+  endif()
+  if(ARG_AAX)
+    set(_aax_args)
+    foreach(_k MANUFACTURER PRODUCT)
+      if(ARG_AAX_${_k})
+        list(APPEND _aax_args ${_k} "${ARG_AAX_${_k}}")
+      endif()
+    endforeach()
+    if(ARG_VERSION)
+      list(APPEND _aax_args VERSION "${ARG_VERSION}")
+    endif()
+    sonore_add_aax(${ARG_AAX} SOURCES ${ARG_SOURCES} ${_aax_args})
+    if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2))
+      return()
+    endif()
   endif()
   if(ARG_AU AND NOT APPLE)
     set(ARG_AU "")
@@ -572,23 +593,132 @@ function(sonore_add_plugin NAME)
   endif()
 endfunction()
 
-# ── sonore_add_aax(<target> ...): a hook, not an implementation ──────────────
-# AAX cannot be built here and pretending otherwise would be worse than absent:
-# Avid's SDK is distributed only under their developer agreement (there is no
-# public header, unlike VST3's C ABI), and shipping binaries must be signed
-# with PACE tools. When the SDK exists locally, set SONORE_AAX_SDK_ROOT and
-# implement the wrapper against it; until then this function says exactly why
-# it is skipping, so nobody mistakes silence for support.
-function(sonore_add_aax TARGET)
-  if(NOT DEFINED SONORE_AAX_SDK_ROOT OR NOT EXISTS "${SONORE_AAX_SDK_ROOT}")
-    message(STATUS "sonore_add_aax(${TARGET}): SKIPPED: the AAX SDK requires an "
-                   "Avid developer agreement (developer.avid.com) and is not present. "
-                   "Set SONORE_AAX_SDK_ROOT once obtained.")
+# ── sonore_add_aax(<target> SOURCES a.cpp [...] MANUFACTURER Manu [PRODUCT Prod]) ──
+# An AAX Native plugin for Pro Tools: a module named <target>.aaxplugin, in the
+# bundle Pro Tools scans. Same sources again, with SONORE_BUILD_AAX defined.
+#
+# Built against the developer's OWN copy of Avid's AAX SDK, which this
+# repository does not carry: Avid distributes it to registered AAX developers,
+# under their licence or the GPLv3. Set SONORE_AAX_SDK_ROOT to the unpacked SDK
+# (the folder holding Interfaces/ and Libs/). Without it the target is skipped,
+# loudly, and nothing else in the build changes.
+#
+# MANUFACTURER is the developer's four-character code and PRODUCT this plugin's;
+# PRODUCT may be left out, and is then derived from the descriptor's id. Pro
+# Tools files the plugin, and every session saves it, under these codes, so
+# they are chosen once. Shipping an AAX also needs Avid's approval and a PACE
+# signature on every build (wraptool); a developer build of Pro Tools loads
+# unsigned plugins, which is how a build is tested before that.
+#
+# The AAX library is compiled here from the SDK's sources rather than through
+# the SDK's own CMake project, which, added to someone else's build, takes over
+# its install prefix and adds install rules for Avid's targets.
+function(_sonore_aax_library)
+  if(TARGET sonore_aax_library)
     return()
   endif()
-  message(FATAL_ERROR "sonore_add_aax(${TARGET}): SONORE_AAX_SDK_ROOT is set but the "
-                      "AAX wrapper is not implemented yet. Implement it against the "
-                      "SDK now that it is available.")
+  set(_sdk "${SONORE_AAX_SDK_ROOT}")
+  file(GLOB _sources "${_sdk}/Libs/AAXLibrary/source/*.cpp")
+  if(APPLE)
+    list(APPEND _sources "${_sdk}/Libs/AAXLibrary/source/AAX_CAutoreleasePool.OSX.mm")
+  endif()
+  list(APPEND _sources "${_sdk}/Interfaces/ACF/CACFClassFactory.cpp")
+  add_library(sonore_aax_library STATIC ${_sources})
+  target_include_directories(sonore_aax_library PUBLIC
+    "${_sdk}/Interfaces" "${_sdk}/Interfaces/ACF" "${_sdk}/Libs/AAXLibrary/include")
+  target_compile_features(sonore_aax_library PUBLIC cxx_std_17)
+  set_target_properties(sonore_aax_library PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(MSVC)
+    # Avid's sources, Avid's warnings: not ours to fix or to fail on.
+    target_compile_options(sonore_aax_library PRIVATE /W0)
+  else()
+    target_compile_options(sonore_aax_library PRIVATE -w)
+    target_compile_options(sonore_aax_library PUBLIC -Wno-multichar)
+  endif()
+  if(APPLE)
+    target_link_libraries(sonore_aax_library PUBLIC "-framework Cocoa")
+  endif()
+endfunction()
+
+function(sonore_add_aax TARGET)
+  if(NOT (WIN32 OR APPLE))
+    message(STATUS "sonore_add_aax(${TARGET}): SKIPPED: AAX is for Pro Tools, which runs on "
+                   "Windows and macOS")
+    return()
+  endif()
+  if(NOT DEFINED SONORE_AAX_SDK_ROOT OR NOT EXISTS "${SONORE_AAX_SDK_ROOT}/Interfaces/AAX.h")
+    message(STATUS "sonore_add_aax(${TARGET}): SKIPPED: no AAX SDK. Avid gives it to registered "
+                   "AAX developers (developer.avid.com/aax); set SONORE_AAX_SDK_ROOT to the "
+                   "unpacked folder, the one holding Interfaces/ and Libs/")
+    return()
+  endif()
+  cmake_parse_arguments(ARG "" "MANUFACTURER;PRODUCT;VERSION;BUNDLE_ID" "SOURCES" ${ARGN})
+  if(NOT ARG_SOURCES)
+    message(FATAL_ERROR "sonore_add_aax(${TARGET}): SOURCES is required")
+  endif()
+  if(NOT ARG_MANUFACTURER)
+    message(WARNING "sonore_add_aax(${TARGET}): no MANUFACTURER given, so this AAX registers "
+                    "under Sonorie's code (Sonr), which every AAX built without one shares. "
+                    "Pass your own four-character MANUFACTURER code.")
+    set(ARG_MANUFACTURER "Sonr")
+  endif()
+  foreach(_k MANUFACTURER PRODUCT)
+    if(ARG_${_k} AND NOT ARG_${_k} MATCHES "^[A-Za-z0-9 ]...$")
+      message(FATAL_ERROR "sonore_add_aax(${TARGET}): ${_k} is four letters or digits, "
+                          "got '${ARG_${_k}}'")
+    endif()
+  endforeach()
+  if(NOT ARG_VERSION)
+    set(ARG_VERSION "1.0.0")
+  endif()
+  if(NOT ARG_BUNDLE_ID)
+    set(ARG_BUNDLE_ID "com.sonorie.${TARGET}")
+  endif()
+
+  _sonore_aax_library()
+  add_library(${TARGET} MODULE ${ARG_SOURCES} "${SONORE_AAX_SDK_ROOT}/Interfaces/AAX_Exports.cpp")
+  target_link_libraries(${TARGET} PRIVATE sonore_sdk sonore_aax_library)
+  target_compile_definitions(${TARGET} PRIVATE
+    SONORE_BUILD_AAX=1
+    "SONORE_AAX_MANUFACTURER=\"${ARG_MANUFACTURER}\""
+    "SONORE_AAX_PRODUCT=\"${ARG_PRODUCT}\"")
+  set_target_properties(${TARGET} PROPERTIES
+    PREFIX ""
+    SUFFIX ".aaxplugin"
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+
+  if(APPLE)
+    set(MACOSX_BUNDLE_INFO_STRING "${ARG_VERSION}")
+    set_target_properties(${TARGET} PROPERTIES
+      BUNDLE TRUE
+      BUNDLE_EXTENSION "aaxplugin"
+      MACOSX_BUNDLE_BUNDLE_NAME "${TARGET}"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "${ARG_BUNDLE_ID}"
+      MACOSX_BUNDLE_BUNDLE_VERSION "${ARG_VERSION}"
+      MACOSX_BUNDLE_SHORT_VERSION_STRING "${ARG_VERSION}"
+      MACOSX_BUNDLE_INFO_STRING "${ARG_VERSION}"
+      # Avid's template: package type TDMw, signature PTul -- what Pro Tools
+      # looks for in a plug-in bundle.
+      MACOSX_BUNDLE_INFO_PLIST "${SONORE_AAX_SDK_ROOT}/cmake/Info.plist.in")
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E echo_append "TDMwPTul" > "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/PkgInfo"
+      COMMENT "Writing the ${TARGET} AAX PkgInfo")
+    _sonore_plugin_exports(${TARGET} clap_entry ACFRegisterPlugin ACFRegisterComponent
+      ACFGetClassFactory ACFCanUnloadNow ACFStartup ACFShutdown ACFGetSDKVersion)
+    _sonore_adhoc_sign(${TARGET})
+  else()
+    # The bundle Pro Tools scans: aax/<target>.aaxplugin/Contents/x64/<binary>,
+    # in a folder of its own beside the module (which already has that name),
+    # ready to copy into C:\Program Files\Common Files\Avid\Audio\Plug-Ins.
+    set(_bundle "$<TARGET_FILE_DIR:${TARGET}>/aax/${TARGET}.aaxplugin")
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${_bundle}/Contents/x64"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${_bundle}/Contents/Resources"
+      COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${TARGET}>"
+              "${_bundle}/Contents/x64/${TARGET}.aaxplugin"
+      COMMENT "Assembling the ${TARGET} AAX bundle")
+  endif()
 endfunction()
 
 # ── VST2 ─────────────────────────────────────────────────────────────────────

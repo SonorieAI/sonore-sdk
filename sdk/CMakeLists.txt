@@ -134,12 +134,18 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # exercises -- are built the way the farm builds a plugin: ONE compile, one
   # bundle per format (sonore_add_plugin). The rest stay one target per
   # format, so both ways of using the helpers are proven on every run.
+  # AAX builds only where SONORE_AAX_SDK_ROOT points at Avid's SDK, which
+  # this repository does not carry; elsewhere sonore_add_aax() says it skipped.
   sonore_add_plugin(SonoreSaturator SOURCES examples/saturator/plugin.cpp
     CLAP SonoreSaturator VST3 SonoreSaturatorVST3 AU SonoreSaturatorAU LV2 SonoreSaturatorLV2
-    AU_SUBTYPE "Sat1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie")
+    AAX SonoreSaturatorAAX
+    AU_SUBTYPE "Sat1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie"
+    AAX_MANUFACTURER "Sonr" AAX_PRODUCT "Sat1")
   sonore_add_plugin(SonoreSynth SOURCES examples/synth/plugin.cpp
     CLAP SonoreSynth VST3 SonoreSynthVST3 AU SonoreSynthAU LV2 SonoreSynthLV2
-    AU_SUBTYPE "Syn1" AU_TYPE "aumu" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie")
+    AAX SonoreSynthAAX
+    AU_SUBTYPE "Syn1" AU_TYPE "aumu" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie"
+    AAX_MANUFACTURER "Sonr" AAX_PRODUCT "Syn1")
   sonore_add_clap(SonoreDucker SOURCES examples/ducker/plugin.cpp)
   sonore_add_clap(SonoreTrim SOURCES examples/trim/plugin.cpp)
   sonore_add_clap(SonoreSplitter SOURCES examples/splitter/plugin.cpp)
@@ -153,7 +159,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # DocumentWindow, the AudioSource chain and the OS's audio device.
   sonore_add_plugin(SonoreShowcase SOURCES examples/showcase/plugin.cpp
     CLAP SonoreShowcase VST3 SonoreShowcaseVST3 AU SonoreShowcaseAU LV2 SonoreShowcaseLV2
-    AU_SUBTYPE "Shw1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie")
+    AAX SonoreShowcaseAAX
+    AU_SUBTYPE "Shw1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie"
+    AAX_MANUFACTURER "Sonr" AAX_PRODUCT "Shw1")
+  # The AAX paths the three above do not reach: the key input, MIDI out, and
+  # aux output stems. Only with the SDK, so a build without it says "skipped"
+  # three times rather than six.
+  if(SONORE_AAX_SDK_ROOT)
+    sonore_add_aax(SonoreDuckerAAX SOURCES examples/ducker/plugin.cpp
+      MANUFACTURER "Sonr" PRODUCT "Dck1")
+    sonore_add_aax(SonoreArpAAX SOURCES examples/arp/plugin.cpp
+      MANUFACTURER "Sonr" PRODUCT "Arp1")
+    sonore_add_aax(SonoreSplitterAAX SOURCES examples/splitter/plugin.cpp
+      MANUFACTURER "Sonr" PRODUCT "Spl1")
+  endif()
   add_executable(SonorePlayer examples/player/main.cpp)
   target_link_libraries(SonorePlayer PRIVATE sonore_sdk)
   if(WIN32)

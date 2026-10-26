@@ -91,6 +91,10 @@ const NOT_A_CAPABILITY = new Set([
   // them. The format rows -- "VST3 wrapper", "LV2 wrapper", "AudioUnit (AUv2)
   // wrapper" -- are what somebody looks for; these are what those are made of.
   "Instance", "Plugin", "Unit", "Factory", "View", "ViewFactoryRegistrar",
+  // AAX's data model and editor, the algorithm's context struct and the
+  // pointer it carries back to the data model, and the taper a parameter's
+  // curve is handed to Pro Tools through: what the "AAX wrapper" row is made of.
+  "Effect", "Gui", "Taper", "RenderContext", "PrivateData",
   // The standalone's per-block buffers, owned by its App: the "standalone app"
   // row is what somebody looks for.
   "StandaloneScratch",

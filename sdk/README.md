@@ -616,19 +616,33 @@ built this way exports every format's -- the `.clap` also answers
 | VST3 | Steinberg **C ABI** header, BSD-3 | proven on Windows + Linux |
 | AU | Apple frameworks | proven on macOS CI: `auval` passes six of the eight example AUs (not yet run on the sampler and reverb), zero warnings |
 | LV2 | ISC headers | proven on Windows + Linux |
-| AAX | Avid SDK, **not public** | hook only, see below |
+| AAX | Avid's AAX SDK, the developer's own copy, **not vendored** | AAX Native, mono and stereo: every example builds on Windows against SDK 2.9.0, see below |
 
 VST3 is built against Steinberg's one-file C ABI rather than their C++ SDK: the
-header is BSD-3 (not the SDK's dual GPLv3/proprietary), so the wrapper is our
-code and the plugin links no framework. Distributing VST3 commercially still
-means registering with Steinberg: that is their licence, not the header's.
+header is BSD-3, so the wrapper is our code and the plugin links no framework.
+Since VST 3.8 (October 2025) Steinberg asks for no agreement to distribute a
+VST3; the VST name and logo are optional and follow their usage guidelines.
 
-**AAX is deliberately a hook, not an implementation.** Avid's SDK is distributed
-only under their developer agreement (developer.avid.com). There is no public
-header, unlike VST3's C ABI, and shipping AAX binaries requires PACE signing.
-`sonore_add_aax()` exists and says exactly why it is skipping; writing a wrapper
-without the SDK would be fabrication, which is worse than absence. Once the SDK
-is obtained, set `SONORE_AAX_SDK_ROOT` and implement against it.
+**AAX is built against the developer's own copy of Avid's SDK.** Avid gives the
+AAX SDK to registered developers (developer.avid.com/aax), under their licence
+or the GPLv3, and this repository does not carry it. `aax_wrapper.h` is our
+code, written against SDK 2.9.0; `sonore_add_aax()` compiles it, with the AAX
+library built from the SDK's sources, when `SONORE_AAX_SDK_ROOT` points at the
+unpacked SDK, and skips loudly when it does not:
+
+```cmake
+sonore_add_aax(MyPluginAAX SOURCES plugin.cpp MANUFACTURER "Manu" PRODUCT "Mypl")
+# or, with the other formats: AAX MyPluginAAX AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl"
+```
+
+It is AAX Native: mono and stereo, effects and instruments, MIDI in and out,
+the key input, aux output stems, latency, Pro Tools' master bypass, the SNRS
+state as the plugin's one chunk (so a session restores the same sound as in
+the other formats), and both editors inside Pro Tools' window. Not AAX DSP
+(HDX), AudioSuite, host page tables, or main buses wider than stereo. A
+developer build of Pro Tools loads an unsigned build; a retail one loads only
+what Avid has approved and PACE has signed (`wraptool`), which no framework
+can do for you.
 
 ## Verifying
 
@@ -899,6 +913,6 @@ hosts through our own wrappers rather than through another framework: keeping
 our code as the plugin core is precisely what stops a framework licence from
 governing what anyone may generate with this. What those FORMATS require of
 you is separate from any software licence and is listed in the third-party
-notices: VST3 needs registration with Steinberg for commercial distribution,
-AAX needs Avid's agreement plus PACE signing, and VST2 is deliberately
+notices: AAX needs Avid's approval plus a PACE signature on every build, the
+VST name and logo follow Steinberg's guidelines, and VST2 is deliberately
 impossible.

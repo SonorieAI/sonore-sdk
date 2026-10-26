@@ -90,9 +90,12 @@ will silently fail.
 - **Steinberg ASIO SDK**: required by `sonore_enable_asio()`. Not
   redistributable; obtain it from Steinberg under their licence.
   `sdk/third_party/asio/` is git-ignored for this reason.
-- **Avid AAX SDK**: requires Avid's developer agreement, and shipping AAX
-  binaries requires PACE signing. `sonore_add_aax()` is a hook that explains
-  this and stops.
+- **Avid AAX SDK**: Avid's, under the AAX SDK licence or the GPLv3, given to
+  registered developers at developer.avid.com/aax. Never vendored here:
+  `sonore_add_aax()` builds against the copy `SONORE_AAX_SDK_ROOT` names and
+  skips, saying why, without one. `aax_wrapper.h` is our own code. A plugin
+  built with it links Avid's AAX library, so its builder is bound by the
+  licence they accepted when they downloaded the SDK.
 - **Apple SDKs**: used only by the optional cross-compilation images. Never
   push an image containing them to a public registry.
 
@@ -100,13 +103,17 @@ will silently fail.
 
 Apache-2.0 governs *this code*. It cannot grant rights the format owners hold:
 
-- **VST3**: the C API header is BSD-3-Clause, but Steinberg requires
-  registration for commercial distribution of VST3 products, under their VST3
-  licensing terms. Read them before selling a VST3 built with this SDK.
+- **VST3**: the C API header is BSD-3-Clause. Since VST 3.8 (October 2025)
+  Steinberg asks for no licence agreement to distribute a VST3, commercially
+  or not; the VST name and logo are optional, and using them means following
+  Steinberg's usage guidelines.
 - **VST2**: impossible on purpose. Steinberg ended VST2 licensing in October
   2018 and no longer distributes the SDK; `sonore_add_vst2()` exists solely to
   fail with that explanation so nobody mistakes its absence for an oversight.
-- **AAX**: Avid agreement plus PACE signing, as above.
+- **AAX**: a retail Pro Tools loads only a plugin Avid has approved and PACE
+  has signed. Ask audiosdk@avid.com for the signing tools, and sign every
+  build with `wraptool` before shipping it; a developer build of Pro Tools
+  loads unsigned plugins for testing.
 - **Audio Units**: building and distributing AUs is governed by Apple's
   developer terms for the platform you ship on.
 

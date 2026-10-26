@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 270 headers, 726 public types.
+not have. 271 headers, 732 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -90,6 +90,14 @@ a class that sounds like it should exist is the most common way generated code
 fails to compile against this library. Functions, aliases and methods are not
 listed here (dbToGain is a function, ProcessContext an alias): look for those in
 the header itself, or ask the MCP server's `sonore_search`, which covers them.
+
+### aax_wrapper.h
+
+the AAX format wrapper (AAX Native), for Pro Tools
+
+`sdk/include/sonore/aax_wrapper.h`
+
+Taper, Display, PrivateData, RenderContext, Effect, Gui
 
 ### analytics.h
 

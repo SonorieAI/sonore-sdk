@@ -52,7 +52,7 @@ method you have not seen in this SDK:
   a complete working plugin of a given kind, and `sonore-sdk:sonore_rules`
   the rules below.
 - **Without it**, read `llms-full.txt` at the SDK root for the classes and
-  structs: every one in every header (270 headers, 726
+  structs: every one in every header (271 headers, 732
   types), so a class that is not in it does not exist. Functions, aliases and
   methods are not listed there; search the headers for those before deciding
   one is missing.
@@ -168,7 +168,11 @@ Compiling is not finished. Before calling a plugin done:
   changing it later makes every saved session lose the plugin.
 - The parameter table is positional. Once a version is out, only append.
 - The Audio Unit's codes (`AU_SUBTYPE` / `AU_MANUFACTURER` in
-  CMakeLists.txt) must be unique to you.
+  CMakeLists.txt) must be unique to you. The AAX is filed under the same two.
+- A retail Pro Tools loads only an AAX that Avid has approved and PACE has
+  signed: write to audiosdk@avid.com for the signing tools, then sign every
+  build with `wraptool`. A developer build of Pro Tools loads it unsigned,
+  which is how to test it first.
 - Keep the version in `src/plugin.cpp` and in `CMakeLists.txt` the same.
 - Run the format owners' validators on the build: clap-validator
   (github.com/free-audio/clap-validator), pluginval

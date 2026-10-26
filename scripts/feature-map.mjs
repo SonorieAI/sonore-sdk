@@ -819,14 +819,19 @@ const MAP = [
    // in prose, which the first attempt at this regex did -- "AUv3" matches a
    // comment in host.h that merely says the format exists.
    null, "AudioUnitViewController|NSExtensionPrincipalClass"],
+  // AAX was a guarded ABSENCE until Avid's SDK was in hand: the rule was not
+  // to write a wrapper against a guessed ABI, and the row failed the build if
+  // one appeared. It was then written against the real SDK (2.9.0), which the
+  // repository still does not carry -- each developer brings their own copy.
   ["client", "AAX wrapper",
-   "blocked: Avid's SDK needs a developer agreement, and PACE signing needs " +
-   "hardware. Fabricating it against a guessed ABI would be worse than absent",
-   // A guard rather than a note. The instruction not to fabricate an AAX
-   // wrapper has been carried in prose and in somebody's memory; this makes
-   // the build fail if one ever appears, which is the only form of the rule
-   // that survives whoever remembers it.
-   null, "AAX_|AaxWrapper|AAXEffectParameters|AAX_CEffectParameters"],
+   "aax_wrapper.h: AAX Native for Pro Tools, mono and stereo, effects and " +
+   "instruments, with MIDI in and out, the key input and aux output stems, the " +
+   "SNRS state as the one chunk, latency, master bypass, and both editors in " +
+   "Pro Tools' window. Built by sonore_add_aax() against the developer's own " +
+   "copy of Avid's SDK (SONORE_AAX_SDK_ROOT), never vendored. Not AAX DSP, " +
+   "AudioSuite or page tables. Every example builds on Windows against SDK " +
+   "2.9.0; shipping still needs Avid's approval and a PACE signature",
+   "AAX_CEffectParameters"],
   ["client", "VST2 wrapper",
    "deliberately never: Steinberg ended VST2 licensing in 2018, and shipping one " +
    "without a licence is the kind of risk this project rejected the reference to avoid",

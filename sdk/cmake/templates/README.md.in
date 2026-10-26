@@ -3,7 +3,9 @@
 @DESCRIPTION@
 
 An @KIND@ built on the Sonore SDK: `src/plugin.cpp` becomes a CLAP, a VST3,
-an LV2, an Audio Unit (on macOS) and a standalone app.
+an LV2, an Audio Unit (on macOS), a standalone app, and an AAX for Pro Tools
+when the build is given Avid's AAX SDK (`-DSONORE_AAX_SDK_ROOT=<the unpacked
+SDK>`; Avid gives it to registered developers at developer.avid.com/aax).
 
 ## Build
 
@@ -28,6 +30,7 @@ which fails on any allocation on the audio thread.
 | `vst3/@TARGET@VST3.vst3` | Windows `%COMMONPROGRAMFILES%\VST3`, macOS `~/Library/Audio/Plug-Ins/VST3`, Linux `~/.vst3` |
 | `@TARGET@AU.component` | macOS `~/Library/Audio/Plug-Ins/Components` |
 | `@TARGET@LV2.lv2/` | Windows `%APPDATA%\LV2`, macOS `~/Library/Audio/Plug-Ins/LV2`, Linux `~/.lv2` |
+| `aax/@TARGET@AAX.aaxplugin` (Windows), `@TARGET@AAX.aaxplugin` (macOS) | Windows `C:\Program Files\Common Files\Avid\Audio\Plug-Ins`, macOS `/Library/Application Support/Avid/Audio/Plug-Ins` |
 | `@TARGET@App` | runs as it is; `--help` lists its options |
 
 ## Before you ship
@@ -36,7 +39,11 @@ which fails on any allocation on the audio thread.
   changing it later makes every saved session lose the plugin.
 - The parameter table is positional. Once a version is out, only append.
 - The Audio Unit's codes (`@AU_SUBTYPE@` / `@AU_MANUFACTURER@` in
-  CMakeLists.txt) must be unique to you.
+  CMakeLists.txt) must be unique to you. The AAX is filed under the same two.
+- A retail Pro Tools loads only an AAX that Avid has approved and PACE has
+  signed: write to audiosdk@avid.com for the signing tools, then sign every
+  build with `wraptool`. A developer build of Pro Tools loads it unsigned,
+  which is how to test it first.
 - Keep the version in `src/plugin.cpp` and in `CMakeLists.txt` the same.
 - Run the format owners' validators on the build: clap-validator
   (github.com/free-audio/clap-validator), pluginval

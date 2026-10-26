@@ -2,7 +2,8 @@
 
 A header-only C++17 audio plugin framework. One plugin source file builds a
 `.clap`, a `.vst3`, an AUv2 `.component`, an `.lv2` bundle and a standalone
-application, with a software-rasterised native UI. No framework runtime, no
+application, with a software-rasterised native UI, and an `.aaxplugin` for Pro
+Tools when the build is given Avid's AAX SDK. No framework runtime, no
 framework licence.
 
 **The framework itself lives in [`sdk/`](sdk/), and so does
@@ -171,9 +172,9 @@ Two files are worth reading before you ship something built with this:
 
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md): the vendored headers
   (CLAP, LV2, VST3 C API, minimp3, stb_vorbis) and their licences, plus the
-  format obligations no software licence can grant you: VST3 requires
-  registration with Steinberg for commercial distribution, AAX requires Avid's
-  agreement and PACE signing, and VST2 is deliberately impossible.
+  format obligations no software licence can grant you: AAX requires Avid's
+  approval and a PACE signature on every build, Steinberg's terms govern the
+  VST name and logo, and VST2 is deliberately impossible.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): the two rules this repository is
   strict about (every claim is measured; every public type is in the feature
   map), and the DCO sign-off contributions use.

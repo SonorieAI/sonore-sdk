@@ -11,6 +11,7 @@ not available.
 | VST3 | `sonore_add_vst3`, or `VST3` | Windows, Linux, macOS |
 | Audio Unit (v2) | `sonore_add_au`, or `AU` (skipped off macOS) | macOS |
 | LV2 | `sonore_add_lv2`, or `LV2` | Windows, Linux, macOS |
+| AAX (Native) | `sonore_add_aax`, or `AAX` -- with Avid's SDK, see below | Windows, macOS |
 | Standalone application | `sonore_add_standalone` | Windows, Linux, macOS |
 | Browser (WebAssembly) | emscripten over `wasm_abi.h` | a browser, driven from an AudioWorklet (the worklet host is Sonorie's studio, not this repository) |
 
@@ -51,13 +52,45 @@ reports as a skip what a runner cannot do, and it builds
 `sdk/tests/mac_input_selftest.cpp` (input methods, VoiceOver) without running
 it. Those two are the first things to run on a Mac.
 
+## AAX, for Pro Tools
+
+Pro Tools loads AAX and nothing else. The format's SDK is Avid's: they give it
+to registered AAX developers at developer.avid.com/aax, under their licence or
+the GPLv3, and this repository does not carry it. Unpack it anywhere and
+configure with its path:
+
+```
+cmake -S . -B build -DSONORE_AAX_SDK_ROOT=C:/sdks/aax-sdk-2-9-0
+```
+
+A generated project already names an AAX target, filed under the same two
+codes as its Audio Unit; in your own CMake it is one more call, or one more
+format in `sonore_add_plugin`:
+
+```
+sonore_add_aax(MyPluginAAX SOURCES plugin.cpp MANUFACTURER "Manu" PRODUCT "Mypl")
+```
+
+`MANUFACTURER` is your four-character code and `PRODUCT` this plugin's; Pro
+Tools files the plugin under them and every session saves them, so choose them
+once. Left out, `PRODUCT` is derived from the descriptor's id. On Windows the
+bundle to install is `aax/MyPluginAAX.aaxplugin`, into
+`C:\Program Files\Common Files\Avid\Audio\Plug-Ins`; on macOS,
+`MyPluginAAX.aaxplugin` into `/Library/Application Support/Avid/Audio/Plug-Ins`.
+
+What it is: AAX Native, mono and stereo, effects and instruments, with MIDI in
+and out, Pro Tools' key input, aux output stems, latency, the master bypass,
+the plugin's saved state as its one chunk, and both editors inside Pro Tools'
+window. What it is not: AAX DSP (HDX hardware), AudioSuite, the page tables
+control surfaces read, or a main bus wider than stereo.
+
+A developer build of Pro Tools, from your Avid account, loads an unsigned
+build, which is how to test one. A retail Pro Tools loads only a plugin Avid
+has approved and PACE has signed: ask audiosdk@avid.com for the signing tools,
+then sign every build with PACE's `wraptool` and your iLok before it ships.
+
 ## Not available, and why
 
-- **AAX.** Avid's SDK is distributed only under their developer agreement, so
-  there is no public header to build against, and shipping AAX binaries needs
-  PACE signing. `sonore_add_aax()` exists and says why it is skipping. Once the
-  SDK is obtained, `SONORE_AAX_SDK_ROOT` points at it; the wrapper itself is
-  still to be written.
 - **VST2.** Steinberg ended VST2 licensing in October 2018 and no longer
   distributes the SDK, so a plugin licensed after that date cannot legally ship
   as VST2. `sonore_add_vst2()` is a configure error that says so. Every host that
