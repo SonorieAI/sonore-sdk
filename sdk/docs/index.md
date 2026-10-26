@@ -8,7 +8,7 @@ API reference generated from the headers' own comments.
 ## Guides
 
 1. [Getting started](guides/getting-started.md) -- a generated project, built,
-   checked and loaded into a DAW.
+   checked and loaded into a DAW, then a coding agent set up to write the next.
 2. [Parameters and state](guides/parameters-and-state.md) -- `ParamInfo`, the
    `StateBag`, the APVTS shape, and keeping old sessions loading.
 3. [The native editor](guides/native-editor.md) -- `createEditor`, widgets and

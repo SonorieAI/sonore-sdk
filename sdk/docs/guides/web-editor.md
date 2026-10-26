@@ -2,15 +2,15 @@
 
 A plugin's face as an HTML page, shown in the operating system's webview and
 wired to the plugin through `window.sonore`. The bridge is the same one the
-Sonorie studio's browser preview provides, so a page approved there opens
-unchanged in a DAW.
+browser preview in [Sonorie](https://sonorie.com)'s studio provides, so a page
+approved there opens unchanged in a DAW.
 
 ## Supplying the page
 
-Define `SONORE_UI_HTML` as the whole document, and `SONORE_UI_WIDTH` and
-`SONORE_UI_HEIGHT` as its size (700 by 420 when left out), before the last
-include. With a page and `PluginDescriptor::editor` left at
-`sonore::EditorKind::Auto`, the plugin opens the webview.
+Before the last include, define `SONORE_UI_HTML` as the whole HTML document,
+and `SONORE_UI_WIDTH` and `SONORE_UI_HEIGHT` as its size (700 by 420 when left
+out). A plugin with a page opens it in the webview, as long as
+`PluginDescriptor::editor` is left at `sonore::EditorKind::Auto`.
 
 ```cpp
 // test-run
@@ -88,9 +88,9 @@ window.addEventListener('sonore:ready', function () {
 ```
 
 The page starts work on the `sonore:ready` event, which fires once the bridge
-exists. A knob turned on the page emits the same parameter and gesture events a
-host-side control does, so it records as automation; values cross to the audio
-thread through a lock-free queue.
+exists. A knob turned on the page sends the same parameter and gesture events a
+host's own control does, so the host records it as automation. Values reach the
+audio thread through a lock-free queue.
 
 ## What the page gets
 
@@ -122,27 +122,28 @@ generates, member for member.
 ## Per platform
 
 - **Windows**: Edge WebView2. Its SDK (BSD-3-Clause) is fetched from nuget.org
-  when CMake configures and linked statically. `SONORE_WEBVIEW2_DIR` (a CMake
+  when CMake configures, and linked statically. `SONORE_WEBVIEW2_DIR` (a CMake
   or environment variable) keeps the download where it survives the build, and
-  `-DSONORE_GUI=OFF` leaves the webview out. A machine without the Edge
-  runtime gets the native editor in a CLAP or VST3. The page is served from
-  memory at an address of the plugin's own,
-  `https://<plugin id>-<hash>.sonore.invalid/editor.html`, which never leaves
-  the process: it reloads like any page, and `localStorage` and IndexedDB
-  work, kept per plugin (shared by its instances, not by other plugins) and
-  across sessions. Keep anything the session must restore in a parameter or in
-  the plugin's own state (what its `saveState` writes; the page reads it as
-  `sonore.state` and cannot write it), not there: a project moved to another
-  machine does not carry it.
-- **Linux**: GTK3 and WebKitGTK, loaded at run time, newest WebKit first, so
-  the plugin loads on distributions with either version and builds with no GTK
+  `-DSONORE_GUI=OFF` leaves the webview out. On a machine without the Edge
+  runtime, a CLAP or VST3 opens the native editor instead.
+- **Linux**: GTK3 and WebKitGTK, loaded at run time, newest WebKit first. The
+  plugin loads on distributions with either version, and builds with no GTK
   development packages installed.
 - **macOS**: WKWebView, driven through the Objective-C runtime, so a project
   stays plain C++.
 
+On Windows the page is served from memory at an address of the plugin's own,
+`https://<plugin id>-<hash>.sonore.invalid/editor.html`, which never leaves the
+process. It reloads like any page, and `localStorage` and IndexedDB work: kept
+per plugin (shared by its instances, not by other plugins) and across sessions.
 On Linux and macOS the page is loaded as a string with no address of its own,
-so a page that has to run on every platform should not depend on
-`localStorage` or on reloading itself.
+so a page that has to run on every platform should not depend on `localStorage`
+or on reloading itself.
+
+Either way, keep anything the session must restore in a parameter or in the
+plugin's own state (what its `saveState` writes; the page reads it as
+`sonore.state` and cannot write it), not in the page's storage: a project moved
+to another machine does not carry that.
 
 Only embedded windows are supported: the page lives inside the host's plugin
 window, never in a floating one.

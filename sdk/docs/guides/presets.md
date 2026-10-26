@@ -66,23 +66,30 @@ static const sonore::PluginDescriptor kDesc = {
 #include <sonore/formats.h>
 ```
 
-Each format lists them where its hosts look: CLAP through preset discovery
-(written out as preset files in the OS's cache folder, or declared inside the
-plugin when that folder cannot be written), VST3 as a program list, Audio
-Units as factory presets, LV2 as `pset:Preset` entries in the bundle's
-`presets.ttl`. A web page sees them as `sonore.presets` and loads one with
+Each format lists them where its hosts look:
+
+- **CLAP**, through preset discovery: written out as preset files in the OS's
+  cache folder, or declared inside the plugin when that folder cannot be
+  written.
+- **VST3**, as a program list.
+- **Audio Units**, as factory presets.
+- **LV2**, as `pset:Preset` entries in the bundle's `presets.ttl`.
+
+A web page sees them as `sonore.presets` and loads one with
 `sonore.loadPreset(i)`.
 
 ## The user's presets
 
 A plugin built with the SDK gets the user's own presets with nothing to write:
 the native editor's preset bar saves and browses them, and CLAP hosts find the
-folder through preset discovery. (A web page sees the factory list only.) A user
-preset is a file holding the plugin's whole state -- the same bytes a host saves
-in a session, so a sampler's preset names its sample, and the audio file stays
-where it is -- inside a small versioned container with a name, author, comment,
-category, tags and a checksum.
-The folder is one per plugin:
+folder through preset discovery. (A web page sees the factory list only.)
+
+A user preset is a file holding the plugin's whole state: the same bytes a host
+saves in a session. So a sampler's preset names its sample, and the audio file
+stays where it is. The state sits inside a small versioned container with a
+name, author, comment, category, tags and a checksum.
+
+Each plugin has one folder:
 
 | | |
 | --- | --- |
@@ -94,18 +101,20 @@ The environment variable `SONORE_PRESET_ROOT` moves every plugin's folder under
 one root (`<root>/<Vendor>/<Plugin>/Presets`), which is what tests and validators
 use.
 
-The instance's `sonore::PresetManager` puts factory and user presets in one
-list, with previous and next, the preset the user is on (saved with the session,
-so a project reopens on it), and whether the sound has changed since. The
-generic native editor shows it as a `sonore::gfx::PresetBar` along its top; an
-editor of your own adds the bar itself ([the native editor](native-editor.md)
-shows how). A preset loads through the same path a host's session restore
-takes, so a parameter added in a later version reads as its default from an old
-preset exactly as from an old session.
+Each plugin instance has a `sonore::PresetManager` that puts factory and user
+presets in one list. It knows previous and next, the preset the user is on
+(saved with the session, so a project reopens on it), and whether the sound has
+changed since it was loaded. The generic native editor shows it as a
+`sonore::gfx::PresetBar` along its top; an editor of your own adds the bar
+itself ([the native editor](native-editor.md) shows how).
+
+A preset loads through the same path a host's session restore takes. So a
+parameter added in a later version reads as its default from an old preset,
+exactly as it does from an old session.
 
 Deleting a preset moves the file to the Recycle Bin or Trash where the platform
-has one, and says so when it cannot; saving writes a temporary file and renames
-it, so a crash mid-save leaves the old preset.
+has one, and says so when it cannot. Saving writes a temporary file and renames
+it, so a crash mid-save leaves the old preset intact.
 
 ## Reading the folder yourself
 

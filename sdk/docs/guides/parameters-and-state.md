@@ -1,6 +1,7 @@
 # Parameters and state
 
-What a host can automate, and what a saved session brings back.
+How a plugin declares its parameters, the controls a host can automate, and
+what a saved session brings back.
 
 ## The parameter table
 
@@ -21,28 +22,29 @@ at. Its fields, in the order an aggregate initialiser fills them:
 and in every saved session. A shipped plugin only ever appends rows: reordering
 or removing one makes old sessions load values into the wrong controls.
 
-The wrappers and the native editor turn values into text with
-`sonore::formatParamValue` and typed text back into values with
-`sonore::parseParamValue`, and the web page's `sonore.format` mirrors the same
-rule, so the host's readout, the knob and the page never disagree.
+Values become text through `sonore::formatParamValue`, and typed text becomes a
+value again through `sonore::parseParamValue`. The wrappers and the native
+editor both use them, and a web page's `sonore.format` follows the same rule,
+so the host's readout, the knob and the page never disagree.
 
 ## State beyond the parameters
 
 The state every format saves holds the parameter values, the bypass, a few
 things of the SDK's own (the preset the user is on, the editor's size) and
-whatever the DSP adds. A DSP with more to remember -- which file it loaded, a
-curve the user drew -- declares `saveState` and `loadState` over a
-`sonore::StateBag`, a list of keys and values. Include `<sonore/state_bag.h>`
-before the struct, and make `saveState` `const`: the wrappers look for it on a
-const DSP.
+whatever the DSP adds.
 
-A host only knows a session changed when the host changed something. A plugin
-that changes its own state where the wrapper cannot see it -- a file opened
-from its native editor, a choice the DSP makes by itself -- says so through
-`consumeStateDirty()`, which returns true once per change, or the DAW closes
-without offering to save. A file a web page picks with `sonore.chooseFile`
-already marks the session in CLAP and VST3; the example declares the hook
-anyway, which costs nothing.
+A DSP with more to remember, such as which file it loaded or a curve the user
+drew, declares `saveState` and `loadState`. Both work on a `sonore::StateBag`,
+a list of keys and values. Include `<sonore/state_bag.h>` before the struct, and
+make `saveState` `const`: the wrappers look for it on a const DSP.
+
+A host only knows a session changed when the host changed something itself. A
+plugin that changes its own state where the wrapper cannot see it (a file
+opened from its native editor, a choice the DSP makes by itself) must say so,
+or the DAW closes without offering to save. It does that by declaring
+`consumeStateDirty()`, which returns true once per change. A file a web page
+picks with `sonore.chooseFile` already marks the session in CLAP and VST3; the
+example declares the hook anyway, which costs nothing.
 
 ```cpp
 // test-run
@@ -157,10 +159,11 @@ never saved.
 
 ## The other shape: AudioProcessorValueTreeState
 
-Code ported from the reference arrives with a `ParameterLayout` of
+Code ported from another framework often declares its parameters as an
+AudioProcessorValueTreeState (APVTS): a `ParameterLayout` of
 `AudioParameterFloat`, `AudioParameterChoice` and `AudioParameterBool`.
 `sonore::AudioProcessorValueTreeState` keeps that shape and turns it into the
-same `ParamInfo` table: `parameterInfos()` is what the descriptor points at, in
+same `ParamInfo` table. `parameterInfos()` is what the descriptor points at, in
 layout order, so the DSP's `p[i]` is layout entry `i`. The showcase example
 (`sdk/examples/showcase/plugin.cpp`) is built this way, and its editor binds
 widgets with the APVTS attachments.

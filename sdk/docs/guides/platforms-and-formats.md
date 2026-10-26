@@ -14,19 +14,20 @@ not available.
 | Standalone application | `sonore_add_standalone` | Windows, Linux, macOS |
 | Browser (WebAssembly) | emscripten over `wasm_abi.h` | a browser, driven from an AudioWorklet (the worklet host is Sonorie's studio, not this repository) |
 
-The CLAP wrapper owns the shared machinery -- the DSP instance, parameters,
-state, the page bridge -- and every other format adapts it, so a plugin cannot
+The CLAP wrapper owns the shared machinery: the DSP instance, parameters,
+state and the page bridge. Every other format adapts it, so a plugin cannot
 behave differently depending on which format a host loaded. `sonore_add_plugin`
 compiles the source once and links that object into each format's bundle.
 
 VST3 is built against Steinberg's one-file C API header (VST 3.8.1,
 BSD-3-Clause), so the plugin links no Steinberg SDK. Since VST 3.8 (October
 2025) Steinberg asks for no agreement to distribute a VST3, commercially or
-not; the VST name and logo are optional, and using them means following
-Steinberg's usage guidelines. The
-browser build takes the DSP half of the source -- everything before
-`#include <sonore/plugin.h>` -- so the preview runs the same DSP code as the
-shipped plugin; the SDK's [README](../../README.md) has the emscripten command
+not. The VST name and logo are optional; using them means following
+Steinberg's usage guidelines.
+
+The browser build takes the DSP half of the source, everything before
+`#include <sonore/plugin.h>`, so the preview runs the same DSP code as the
+shipped plugin. The SDK's [README](../../README.md) has the emscripten command
 line and the functions the worklet calls.
 
 ## What has run where
@@ -35,26 +36,28 @@ line and the functions the worklet calls.
   and clang-cl, the plugins under clap-validator and pluginval, the examples
   inside REAPER (`npm run verify:reaper`), and the native window with a real UI
   Automation client walking it.
-- **Linux**: built and tested in CI on Ubuntu 24.04 -- the same test suite,
-  the GUI tests under a virtual X display, the validators as an advisory step --
-  and under WSL by `npm run verify:sdk` on Windows. Window embedding is proven in a container
-  (`sdk/tests/linux-gui.Dockerfile`).
-- **macOS**: built and tested in CI on macOS 14 -- the same test suite, with
-  the example Audio Units installed so the hosting tests load them -- and the
-  Audio Unit wrapper passes Apple's `auval` on six of the nine example AUs (not
-  yet run on the sampler, the reverb and the showcase). What has not run on a
-  Mac with a person at it: that job runs `sdk/tests/mac_host_selftest.cpp`
-  (Audio Unit hosting, audio workgroups), which reports what a runner cannot do
-  as a skip, and builds `sdk/tests/mac_input_selftest.cpp` (input methods,
-  VoiceOver) without running it. Those two are the first things to run on a Mac.
+- **Linux**: built and tested in CI on Ubuntu 24.04: the same test suite, the
+  GUI tests under a virtual X display, and the validators as an advisory step.
+  Also under WSL by `npm run verify:sdk` on Windows. Window embedding is proven
+  in a container (`sdk/tests/linux-gui.Dockerfile`).
+- **macOS**: built and tested in CI on macOS 14: the same test suite, with the
+  example Audio Units installed so the hosting tests load them. The Audio Unit
+  wrapper passes Apple's `auval` on six of the nine example AUs (not yet run on
+  the sampler, the reverb and the showcase).
+
+What has not yet run on a Mac with a person at it: the CI job runs
+`sdk/tests/mac_host_selftest.cpp` (Audio Unit hosting, audio workgroups), which
+reports as a skip what a runner cannot do, and it builds
+`sdk/tests/mac_input_selftest.cpp` (input methods, VoiceOver) without running
+it. Those two are the first things to run on a Mac.
 
 ## Not available, and why
 
-- **AAX.** Avid's SDK is distributed only under their developer agreement --
-  there is no public header to build against -- and shipping AAX binaries needs
-  PACE signing. `sonore_add_aax()` exists and says why it is skipping; once the
-  SDK is obtained, `SONORE_AAX_SDK_ROOT` points at it and the wrapper is still
-  to be written.
+- **AAX.** Avid's SDK is distributed only under their developer agreement, so
+  there is no public header to build against, and shipping AAX binaries needs
+  PACE signing. `sonore_add_aax()` exists and says why it is skipping. Once the
+  SDK is obtained, `SONORE_AAX_SDK_ROOT` points at it; the wrapper itself is
+  still to be written.
 - **VST2.** Steinberg ended VST2 licensing in October 2018 and no longer
   distributes the SDK, so a plugin licensed after that date cannot legally ship
   as VST2. `sonore_add_vst2()` is a configure error that says so. Every host that
@@ -69,14 +72,15 @@ line and the functions the worklet calls.
 ## Which format, which host, at run time
 
 A DSP that declares `setHostInfo` is told once, when the plugin is created,
-which host it is in (an Audio Unit is told when its host names itself, which
-an AU host may not do; LV2 never says); `sonore::PluginHostType` turns that
+which host it is in. (An Audio Unit is told when its host names itself, which
+an AU host may not do; LV2 never says.) `sonore::PluginHostType` turns that
 into a known host and version, and `PluginHostType::getPluginLoadedAs()` says
-which format's entry point the host used. Use it for a support log or an About
-box. Branching the
-DSP on a host's name grows a code path per DAW that nobody can test, and every
-host difference the SDK knows about is asked of the host as a capability
-instead.
+which format's entry point the host used.
+
+Use it for a support log or an About box, not to change what the DSP does.
+Branching the DSP on a host's name grows a code path per DAW that nobody can
+test, and every host difference the SDK knows about is asked of the host as a
+capability instead.
 
 ```cpp
 // test-run

@@ -1,8 +1,10 @@
 # Hosting plugins
 
-The other direction: an application that loads other people's plugins.
-`sonore/host.h` scans folders, describes what it finds, loads a plugin and
-drives it with audio, MIDI, parameters and state.
+The other direction: an application of your own that loads other people's
+plugins, as a DAW does. `sonore/host.h` scans folders, describes what it finds,
+loads a plugin and drives it with audio, MIDI, parameters and state.
+
+Which formats it can load:
 
 | Format | |
 | --- | --- |
@@ -12,16 +14,19 @@ drives it with audio, MIDI, parameters and state.
 | Audio Units (v2 and v3) | macOS, through `host_au.h`; tested in CI on macOS (`sdk/tests/mac_host_selftest.cpp`, and the hosting tests with the example AUs) |
 | VST2 | never |
 
-Without `sonore_enable_hosting` a host still builds, hosts CLAP, and finds no
-VST3 or LV2 plugin at all, so call it for every program that hosts.
+Without `sonore_enable_hosting` a host still builds and hosts CLAP, but finds no
+VST3 or LV2 plugin at all. Call it for every program that hosts.
 
 ## Scan, load, run
 
-Scanning means running each file's own code, which is slow and can crash the
-host. `sonore::host::scanDirectoryCached` keeps a `sonore::host::PluginCache`:
-unchanged files are not opened again, and the path being scanned is written to
-the cache file and flushed to disk before the file is opened, so a plugin that
-kills the process is blacklisted on the next run instead of killing it again.
+Scanning means running each plugin file's own code, which is slow and can crash
+the host. `sonore::host::scanDirectoryCached` keeps a
+`sonore::host::PluginCache` so that neither happens twice:
+
+- a file that has not changed is not opened again;
+- before a file is opened, its path is written to the cache file and flushed to
+  disk, so a plugin that kills the process is blacklisted on the next run
+  instead of killing it again.
 
 ```cpp
 // test-compile
@@ -71,20 +76,28 @@ int main(int argc, char** argv) {
 ```
 
 `sonore::host::HostedPlugin` is the same interface whatever the format:
-parameters (`numParameters`, `parameterValue`, `setParameterValue`,
-`parameterText`), state (`saveState`, `loadState`), presets, latency and tail,
-MIDI in and out, bypass, and the plugin's editor (`hasEditor`, `openEditor`
-into a native parent window). The threading follows the plugin side's rules:
-scanning, loading, `prepare()`, state and parameter reads on the main thread;
-`process()` on the audio thread.
+
+- parameters: `numParameters`, `parameterValue`, `setParameterValue`,
+  `parameterText`;
+- state: `saveState`, `loadState`;
+- presets, latency and tail, MIDI in and out, and bypass;
+- the plugin's editor: `hasEditor`, and `openEditor` into a native parent
+  window.
+
+The threading follows the plugin side's rules. Scanning, loading, `prepare()`,
+state and parameter reads run on the main thread; `process()` runs on the audio
+thread.
 
 ## More than one plugin
 
 `sonore::host::PluginGraph` (`graph.h`) runs hosted plugins as a graph:
-`addNode()` takes a loaded plugin, `connect()` routes audio and
-`connectMidi()` routes the notes one plugin emits into another, and
-`process()` runs the graph in dependency order. `gfx/plugin_list.h` is the
-table a host shows of the plugins it knows about.
+
+- `addNode()` takes a loaded plugin;
+- `connect()` routes audio, and `connectMidi()` routes the notes one plugin
+  emits into another;
+- `process()` runs the graph in dependency order.
+
+`gfx/plugin_list.h` is the table a host shows of the plugins it knows about.
 
 ## Building a host
 

@@ -1,28 +1,47 @@
 # Getting started
 
-From nothing to a CLAP and a VST3 in a DAW. You need CMake 3.21 or newer and a
-C++17 compiler (Visual Studio 2022 or newer on Windows), and a checkout of this
-repository.
+From nothing to your own plugin in a DAW (a digital audio workstation, such as
+REAPER, Ableton Live or Logic Pro). You write one C++ file, and the SDK builds
+it as a CLAP and a VST3 plugin, an Audio Unit on macOS, an LV2 plugin and a
+standalone app. Step 5 sets up a coding agent to write the next one with you.
+
+## What you need
+
+- **CMake** 3.21 or newer.
+- **A C++17 compiler**: Visual Studio 2022 or newer on Windows, Xcode or its
+  command line tools on macOS, GCC on Linux.
+- **The SDK.** Clone it, and run every command below from its root folder:
+
+```
+git clone https://github.com/SonorieAI/sonore-sdk
+cd sonore-sdk
+```
 
 ## 1. Generate a project
-
-From the repository root:
 
 ```
 cmake -DNAME="My Filter" -DVENDOR="My Company" -P sdk/cmake/sonore_new_plugin.cmake
 ```
 
-This writes a folder `MyFilter/` with `src/plugin.cpp`, a `CMakeLists.txt`, a
-README and a `.gitignore`, and never writes into a folder that has anything in
-it. `-DTYPE=instrument` starts an eight-voice synth instead of a filter.
+This creates a folder, `MyFilter/`, holding the whole plugin in
+`src/plugin.cpp`, plus a `CMakeLists.txt`, a README and a `.gitignore`. It never
+writes into a folder that already has anything in it.
 
-Read what it prints. The plugin's id, `com.mycompany.myfilter`, is its identity
-in every saved session and every host's plugin list: pass `-DID=` now if that is
-not the one to keep, because changing it later orphans every session that used
-the plugin. The Audio Unit's four-character codes are derived too: the
-manufacturer from the vendor, shared by all your plugins, and the subtype from
-the id, so each plugin has its own (`-DAU_SUBTYPE=`, `-DAU_MANUFACTURER=` to
-choose your own, and to keep the codes of an Audio Unit already shipped).
+| Option | What it does |
+| --- | --- |
+| `-DTYPE=instrument` | starts an eight-voice synth instead of a filter |
+| `-DID=com.mycompany.myplugin` | sets the plugin's id (see below) |
+| `-DAU_SUBTYPE=`, `-DAU_MANUFACTURER=` | set the Audio Unit's four-character codes |
+
+**Choose the id now.** The generator prints the plugin's id, here
+`com.mycompany.myfilter`. It is how every host and every saved session
+recognises the plugin, so changing it later orphans every session that used it.
+If the derived id is not the one to keep, generate again with `-DID=`.
+
+The Audio Unit's codes are derived too: the manufacturer code from the vendor,
+shared by all your plugins, and the subtype from the id, so each plugin has its
+own. Set them yourself to keep the codes of an Audio Unit you have already
+shipped.
 
 ## 2. Build it, and let it check itself
 
@@ -32,17 +51,28 @@ cmake --build MyFilter/build --config Release
 ctest --test-dir MyFilter/build -C Release
 ```
 
-`ctest` runs two checks the project comes with: `MyFilterApp --verify`, which
-renders the plugin offline with no audio device and no window and fails on
-silence, NaN or a malformed descriptor; and, when the project was generated from
-a source checkout, the real-time audit, which fails on any allocation on the
-audio thread across sample rates and block sizes.
+The first command configures the project, the second builds every format, and
+the third runs the two checks the project comes with:
+
+- `MyFilterApp --verify` renders the plugin offline, with no audio device and
+  no window, and fails on silence, NaN (a sample that is not a number) or a
+  malformed descriptor.
+- The real-time audit, in a project generated from a source checkout like this
+  one, fails if anything allocates memory on the audio thread, at any sample
+  rate and block size it tries.
 
 ## 3. The plugin, all of it
 
-A plugin is one file: a `SonoreDsp` struct, a parameter table, a descriptor and
-one include at the end. This is the effect the generator writes, with its values
-filled in:
+A plugin is one file in four parts:
+
+1. `SonoreDsp`, a struct that processes the audio. `prepare()` runs before
+   audio starts, and `process()` runs for every block of samples.
+2. The parameter table, `kParamTable`: one row per control.
+3. The descriptor, `kDesc`: the plugin's id, name, vendor and version.
+4. `#include <sonore/formats.h>` at the end, which makes the file every plugin
+   format at once.
+
+This is the effect the generator writes, with its values filled in:
 
 ```cpp
 // test-run
@@ -114,18 +144,25 @@ static const sonore::PluginDescriptor kDesc = {
 #include <sonore/formats.h> // CLAP, and every format this target is built as
 ```
 
-The names are fixed: the DSP is `SonoreDsp`, the descriptor `kDesc`, and
-`SONORE_NUM_PARAMS` is the size of the table it points at. `p[i]` in
-`process()` is parameter `i`'s plain value, in its own units, held still for the
-block. The same file becomes every format: `formats.h` includes the CLAP wrapper
-always, and the VST3, AU, LV2 or standalone wrapper when the CMake target asks
-for it (`sonore_add_plugin` and `sonore_add_standalone` in the generated
-`CMakeLists.txt`).
+A few rules hold for every plugin:
+
+- The names are fixed: the DSP is `SonoreDsp`, the descriptor `kDesc`, and
+  `SONORE_NUM_PARAMS` is the number of rows in the parameter table.
+- `p[i]` in `process()` is parameter `i`'s plain value, in its own units (hertz,
+  decibels), held still for the whole block.
+- A parameter's position in the table is its identity in saved sessions. Once
+  the plugin ships, add new parameters at the end only.
+- `process()` runs on the audio thread: no allocation, no locks, no files.
+- The same file becomes every format. `formats.h` always includes the CLAP
+  wrapper, and the VST3, AU, LV2 or standalone wrapper when the CMake target
+  asks for it (`sonore_add_plugin` and `sonore_add_standalone` in the generated
+  `CMakeLists.txt`).
 
 ## 4. Into a DAW
 
-The build puts the outputs in `MyFilter/build/Release` (`MyFilter/build` with a
-single-configuration generator):
+The build puts the outputs in `MyFilter/build/Release` (in `MyFilter/build`
+with a single-configuration generator such as Ninja). Copy each one to where
+hosts look for it:
 
 | Output | Copy it to |
 | --- | --- |
@@ -134,9 +171,100 @@ single-configuration generator):
 | `MyFilterAU.component` (macOS) | `~/Library/Audio/Plug-Ins/Components` |
 | `MyFilterLV2.lv2` (a folder) | Windows `C:\Users\<you>\AppData\Roaming\LV2`; macOS `~/Library/Audio/Plug-Ins/LV2`; Linux `~/.lv2` |
 
-Then rescan in the DAW. With no editor of its own the plugin opens the native
-editor: a control per parameter, drawn by the SDK. `MyFilterApp` runs the same
-plugin without a DAW; `MyFilterApp --help` lists what it can do.
+Then rescan plugins in the DAW. A plugin with no editor of its own opens the
+native editor: one control per parameter, drawn by the SDK. To run the plugin
+without a DAW, start `MyFilterApp`; `MyFilterApp --help` lists what it can do.
+
+## 5. Write the next one with a coding agent
+
+Coding agents write good C++, but against a library they have not seen they
+invent: a class that sounds right and does not exist, or a real class given
+another library's method. The SDK ships two things that stop that, for Claude
+Code, Codex, Cursor, Antigravity and any other agent that reads skills or
+speaks MCP:
+
+- **The skill** goes into the agent's own context: the shape of a plugin, the
+  rules that cannot be guessed from the API, and how to work here. Look a name
+  up before writing it, start from a generated project, and do not call a
+  plugin done until its checks pass.
+- **The MCP server** gives the agent tools to look the API up instead of
+  guessing: `sonore_search` (does this name exist, and where),
+  `sonore_declaration` (its real declaration and comment), `sonore_header`,
+  `sonore_headers`, `sonore_example` (a complete working plugin) and
+  `sonore_rules`. It runs from your SDK checkout, only ever reads it, and has
+  no dependencies.
+
+Both need Node.js: the server runs on it, and the skill installs with `npx`.
+The commands below expect the SDK in `$HOME/sonore-sdk`, which reads the same in
+bash, zsh and PowerShell. To use the clone from the top of this guide instead,
+change that path.
+
+```
+git clone https://github.com/SonorieAI/sonore-sdk "$HOME/sonore-sdk"
+```
+
+### Claude Code
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a claude-code -g
+claude mcp add --scope user sonore-sdk -- node "$HOME/sonore-sdk/scripts/mcp-server.mjs"
+```
+
+Both are installed for your user, so every project gets them. `claude mcp list`
+shows whether the server is connected.
+
+### Codex
+
+The Codex CLI, its IDE extension and the ChatGPT desktop app share this setup:
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a codex -g
+codex mcp add sonore-sdk -- node "$HOME/sonore-sdk/scripts/mcp-server.mjs"
+```
+
+`codex mcp list` shows the server.
+
+### Cursor, Antigravity and other agents
+
+Install the skill with `-a cursor` or `-a antigravity`:
+
+```
+npx skills add SonorieAI/sonore-sdk --skill sonore-sdk -a cursor -g
+```
+
+Then add the server to `~/.cursor/mcp.json` (Cursor) or
+`~/.gemini/config/mcp_config.json` (Antigravity), merged with anything already
+there, and restart the editor. Write the full path to your clone: JSON does not
+expand `$HOME`. Any other MCP client takes the same entry:
+
+```json
+{
+  "mcpServers": {
+    "sonore-sdk": {
+      "command": "node",
+      "args": ["/path/to/sonore-sdk/scripts/mcp-server.mjs"]
+    }
+  }
+}
+```
+
+### Try it
+
+Open `MyFilter/` in the agent and ask for something real:
+
+> Add a Mix parameter that blends the filtered signal with the dry input, then
+> build the plugin and run ctest.
+
+With the skill and the server in place, the agent should look names up before
+it writes them (you will see it call `sonore_search` or `sonore_declaration`),
+and build and run the checks before it calls the plugin done. If it does
+neither, check that `sonore-sdk` is in its list of MCP servers.
+
+## Or describe it to Sonorie
+
+Rather start from a description than from code? [Sonorie](https://sonorie.com)
+turns one into a plugin: describe an effect or a synth and hear it a minute
+later. Every plugin Sonorie generates is built on Sonore.
 
 ## Where next
 
@@ -146,3 +274,5 @@ plugin without a DAW; `MyFilterApp --help` lists what it can do.
   face of its own.
 - [Testing your plugin](testing.md): the validators a host vendor runs first.
 - [Platforms and formats](platforms-and-formats.md): what runs where.
+- [Writing plugins with a coding agent](../../README.md#writing-plugins-with-a-coding-agent),
+  in the README: `llms.txt`, and what each MCP tool answers.

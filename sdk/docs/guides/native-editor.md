@@ -1,7 +1,7 @@
 # The native editor
 
-The interface the SDK draws itself: no browser process, about two megabytes, the
-same on every machine.
+The interface the SDK draws itself, with no browser behind it, so it looks and
+behaves the same on every machine.
 
 ## The one you get for free
 
@@ -10,9 +10,9 @@ native editor: a row per parameter, folded into sections by each parameter's
 `group`, a keyboard along the bottom for an instrument, and the preset bar
 along the top where the host gives the plugin its presets. Nothing to write.
 
-`PluginDescriptor::editor` overrides the choice: `sonore::EditorKind::Native`
-skips a page the plugin has, `sonore::EditorKind::Web` asks for a webview
-without one. `PluginDescriptor::editorLimits` sets the smallest and largest
+`PluginDescriptor::editor` overrides that choice: `sonore::EditorKind::Native`
+uses the native editor even when the plugin has a page, and
+`sonore::EditorKind::Web` asks for a webview without one. `PluginDescriptor::editorLimits` sets the smallest and largest
 size (`minWidth`, `minHeight`, `maxWidth`, `maxHeight`) and whether either
 direction resizes.
 
@@ -23,17 +23,26 @@ the webview instead.
 ## One of your own
 
 Declare `createEditor` in `SonoreDsp` and return a
-`sonore::gfx::AudioProcessorEditor`. It is called on the main thread each time
-the host opens the editor; the window that holds it runs a 33 ms clock that
-calls `editorTick()` before each repaint, and destroys the editor when the host
-closes the window. The DSP outlives every editor it makes, so an editor may keep
-a reference to it; anything handed to the audio thread still crosses by atomics.
+`sonore::gfx::AudioProcessorEditor`. Its life:
+
+- `createEditor` is called on the main thread each time the host opens the
+  editor.
+- The window that holds the editor runs a 33 ms clock, and calls
+  `editorTick()` before each repaint.
+- When the host closes the window, the editor is destroyed.
+
+The DSP outlives every editor it makes, so an editor may keep a reference to
+it. Anything the editor hands to the audio thread still goes through atomics.
 
 The widgets work in 0..1 and know nothing about parameters. An attachment binds
-one to a parameter through the `sonore::gfx::EditorHost` the wrapper passes
-in: `sonore::gfx::SliderAttachment`, `sonore::gfx::ButtonAttachment` (a
-two-state parameter) and `sonore::gfx::ComboAttachment` (a stepped one). A drag
-is one gesture -- one automation edit and one undo step in the host -- and
+one to a parameter, through the `sonore::gfx::EditorHost` the wrapper passes
+in:
+
+- `sonore::gfx::SliderAttachment` binds a slider or a knob,
+- `sonore::gfx::ButtonAttachment` binds a button to a two-state parameter,
+- `sonore::gfx::ComboAttachment` binds a combo box to a stepped one.
+
+A drag is one gesture: one automation edit and one undo step in the host.
 `sync()` pulls the host's value back, so the knob follows automation and preset
 loads.
 
@@ -159,13 +168,18 @@ static const sonore::PluginDescriptor kDesc = {
 
 ## Widgets
 
-`gfx/widgets.h` has `sonore::gfx::Slider` (rotary, linear and bar styles),
-`sonore::gfx::Button`, `sonore::gfx::Label` and `sonore::gfx::ComboBox`; the
-other headers under `gfx/` add text fields, tables, tree views, menus and a
-menu bar, toolbars, a colour selector, a code editor, an on-screen keyboard,
-images (PNG, JPEG, GIF, SVG through `sonore::gfx::Drawable`) and layout helpers
-(`sonore::gfx::FlexBox`, `sonore::gfx::Grid`). Each header's comment says what
-it is for; the [API reference](../index.md) lists them under *Native GUI*.
+`gfx/widgets.h` has the basics: `sonore::gfx::Slider` (rotary, linear and bar
+styles), `sonore::gfx::Button`, `sonore::gfx::Label` and
+`sonore::gfx::ComboBox`. The other headers under `gfx/` add:
+
+- text fields, tables and tree views,
+- menus, a menu bar and toolbars,
+- a colour selector, a code editor and an on-screen keyboard,
+- images: PNG, JPEG, GIF, and SVG through `sonore::gfx::Drawable`,
+- layout helpers: `sonore::gfx::FlexBox` and `sonore::gfx::Grid`.
+
+Each header's comment says what it is for, and the
+[API reference](../index.md) lists them under *Native GUI*.
 
 A `ComboBox` opens its list through the editor: set
 `box.onOpenMenu = [this](gfx::ComboBox& b) { openComboMenu(b); };`, and the
@@ -175,28 +189,29 @@ window drops it down as a real menu.
 
 Appearance lives in a `sonore::gfx::LookAndFeel`, separately from behaviour.
 `setLookAndFeel()` on a widget applies to it and everything inside it.
-`sonore::gfx::LookAndFeel_V4` draws from nine colours with four built-in
-schemes (`getDarkColourScheme()`, `getMidnightColourScheme()`,
-`getGreyColourScheme()`, `getLightColourScheme()`); for a look of your own,
-derive from `LookAndFeel` and override the `draw...` methods you want --
-`drawRotarySlider`, `drawButton`, `drawLinearSlider` and the rest.
+`sonore::gfx::LookAndFeel_V4` draws from nine colours, with four built-in
+schemes: `getDarkColourScheme()`, `getMidnightColourScheme()`,
+`getGreyColourScheme()` and `getLightColourScheme()`. For a look of your own,
+derive from `LookAndFeel` and override the `draw...` methods you want, such as
+`drawRotarySlider`, `drawButton` and `drawLinearSlider`.
 
 ## The preset bar
 
 `sonore::gfx::PresetBar` is the strip the generic editor shows: the preset's
-name with a mark when the sound has changed since it was loaded, previous and
+name (marked when the sound has changed since it was loaded), previous and
 next, Save, and a menu with Save As, Rename, Delete, Import, Export and Show
-Folder. Construct it with `host.presets` and call `tick()` each frame, as above;
-an editor with an undo history can make each load one undo step through
+Folder. Construct it with `host.presets` and call `tick()` each frame, as above.
+An editor with an undo history can make each load one undo step through
 `wrapLoad`. [Presets](presets.md) covers what it manages.
 
 ## Where it appears
 
-CLAP, VST3 and AU open the editor inside the host's window. The standalone
-application shows the webview instead, as does an LV2 build's interface on
-Windows; on Linux and macOS an LV2 build promises no interface of its own, and
-the host shows its generic controls. The showcase example
-(`sdk/examples/showcase/`) is a larger editor: menus, a code editor, an SVG
-logo, a colour selector and the APVTS attachments; `sdk/tests/showcase_test.cpp`
-drives it with no window at all, because an editor is a widget and renders into
-a bitmap.
+- **CLAP, VST3 and AU** open the editor inside the host's window.
+- **The standalone application** shows the webview instead.
+- **LV2** shows the webview on Windows. On Linux and macOS an LV2 build
+  promises no interface of its own, and the host shows its generic controls.
+
+The showcase example (`sdk/examples/showcase/`) is a larger editor: menus, a
+code editor, an SVG logo, a colour selector and the APVTS attachments.
+`sdk/tests/showcase_test.cpp` drives it with no window at all: an editor is a
+widget, and it renders into a bitmap.

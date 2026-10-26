@@ -1,25 +1,31 @@
 # Versions and compatibility
 
-The SDK follows Semantic Versioning from 1.0.0. What a version number promises
--- code that built keeps building within 1.x, nothing is removed without a
-deprecation first, and what a user saved keeps loading -- is written down once,
-in the SDK's [README](../../README.md), section *Versions and compatibility*.
-What has changed, and which changes can affect an existing plugin's sound or a
-saved session, is in `sdk/CHANGELOG.md`.
+The SDK follows Semantic Versioning from 1.0.0, so a version number makes
+promises about your code and your users' sessions:
+
+- code that built keeps building within 1.x;
+- nothing is removed without a deprecation first;
+- what a user saved keeps loading.
+
+The promises are written down once, in the SDK's [README](../../README.md),
+section *Versions and compatibility*. What has changed, and which changes can
+affect an existing plugin's sound or a saved session, is in `sdk/CHANGELOG.md`.
 
 ## In code
 
 `<sonore/version.h>` says which SDK a build has: `SONORE_SDK_VERSION_MAJOR`,
 `_MINOR`, `_PATCH`, `SONORE_SDK_VERSION_STRING`, and `SONORE_SDK_VERSION`, one
-number to compare (major * 10000 + minor * 100 + patch). `audio.h` includes
-it, so `dsp.h`, `plugin.h` and every plugin have it; anywhere else, include it
-yourself before testing the macros, as the example below does, since an `#if`
-reads a macro that was never defined as 0.
+number to compare (major * 10000 + minor * 100 + patch).
+
+`audio.h` includes it, so `dsp.h`, `plugin.h` and every plugin have it.
+Anywhere else, include it yourself before testing the macros, as the example
+below does: an `#if` reads a macro that was never defined as 0.
 
 A part of the API on its way out is marked
-`SONORE_DEPRECATED("<version>: use <replacement>")`: it keeps working and warns
-at every use for at least one minor release, and goes only in the next major. A build that cannot act on the
-warnings yet defines `SONORE_NO_DEPRECATION_WARNINGS`.
+`SONORE_DEPRECATED("<version>: use <replacement>")`. It keeps working, and
+warns at every use, for at least one minor release; it is removed only in the
+next major. A build that cannot act on the warnings yet defines
+`SONORE_NO_DEPRECATION_WARNINGS`.
 
 ```cpp
 // test-run

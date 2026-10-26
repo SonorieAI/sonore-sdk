@@ -1,45 +1,62 @@
 # MIDI and MPE
 
-Notes in, expression per note, and MIDI out.
+Instruments that play notes, MPE (MIDI Polyphonic Expression, which bends and
+shapes each note on its own), and plugins that send MIDI out.
 
 ## An instrument
 
-Setting `isInstrument` in the descriptor gives the plugin a note input, drops
-its audio input bus and files it with the instruments in CLAP, VST3 and LV2.
-An Audio Unit is filed by its CMake call instead: a project generated with
-`-DTYPE=instrument` passes `AU_TYPE aumu` to `sonore_add_plugin`, and one
-written by hand must too, or the AU registers as an effect. The DSP takes the
-notes in a third argument:
+Setting `isInstrument` in the descriptor does three things: it gives the plugin
+a note input, drops its audio input bus, and files it with the instruments in
+CLAP, VST3 and LV2 hosts.
+
+An Audio Unit is filed by its CMake call instead. A project generated with
+`-DTYPE=instrument` passes `AU_TYPE aumu` to `sonore_add_plugin`; a project
+written by hand must pass it too, or the AU registers as an effect.
+
+The DSP takes the notes in a third argument:
 
 ```
 void process(sonore::AudioBlock<float>& io, const float* p, sonore::MidiBuffer& midi);
 ```
 
-or, for everything at once -- MIDI in and out, per-note expression, aux
-outputs, the sidechain -- the `sonore::ProcessContext` form,
+To have everything at once (MIDI in and out, per-note expression, aux outputs,
+the sidechain), use the `sonore::ProcessContext` form instead:
 `void process(sonore::ProcessContext& ctx, const float* p)`.
 
-Each event in a `sonore::MidiBuffer` carries its frame (`samplePosition`)
-within the block; applying it at that frame rather than at the block's start is
-what keeps an instrument tight. `sonore::MidiMessage::getChannel()` answers 1
-to 16, as MIDI is written, while `noteOn(channel, ...)` and the other
-constructors take 0 to 15: `noteOn(m.getChannel() - 1, ...)` is the round trip.
+Each event in a `sonore::MidiBuffer` carries its frame within the block
+(`samplePosition`). Apply it at that frame rather than at the block's start:
+that is what keeps an instrument tight.
 
-`sonore::VoiceManager` does the bookkeeping for a polyphonic instrument: which
-voice a note gets, which one to steal (a released voice first, then a repeat of
-the same key, then the oldest that is neither the lowest nor the highest note
-held), and the sustain and sostenuto pedals, through `sonore::applyPedals`. A voice type needs four methods: `noteOn(int note, float
-velocity)`, `noteOff()`, `bool isActive()` and `float render()`.
+Channels are numbered two ways. `sonore::MidiMessage::getChannel()` answers 1
+to 16, as MIDI is written, while `noteOn(channel, ...)` and the other
+constructors take 0 to 15. So `noteOn(m.getChannel() - 1, ...)` is the round
+trip.
+
+`sonore::VoiceManager` does the bookkeeping for a polyphonic instrument:
+
+- which voice a note gets;
+- which voice to steal when all are busy: a released voice first, then a repeat
+  of the same key, then the oldest that is neither the lowest nor the highest
+  note held;
+- the sustain and sostenuto pedals, through `sonore::applyPedals`.
+
+A voice type needs four methods: `noteOn(int note, float velocity)`,
+`noteOff()`, `bool isActive()` and `float render()`.
 
 ## MPE
 
-An MPE controller bends, presses and brightens each finger on its own.
-`supportsMpe = true` in the descriptor declares MPE to CLAP and VST3 hosts (an
-Audio Unit does not report `kAudioUnitProperty_SupportsMPE`), decodes MPE's
-channel-per-note MIDI into expression events in every format, and fills
-`ctx.expression`. It needs the `ProcessContext` form: the simpler signatures
-have nowhere to put the expression. Match each event to its voice by key AND
-channel -- under MPE two fingers on the same key are two notes:
+An MPE controller bends, presses and brightens each finger on its own. Setting
+`supportsMpe = true` in the descriptor does three things:
+
+- it declares MPE to CLAP and VST3 hosts (an Audio Unit does not report
+  `kAudioUnitProperty_SupportsMPE`);
+- it decodes MPE's channel-per-note MIDI into expression events, in every
+  format;
+- it fills `ctx.expression`.
+
+It needs the `ProcessContext` form: the simpler signatures have nowhere to put
+the expression. Match each event to its voice by key AND channel: under MPE,
+two fingers on the same key are two notes.
 
 ```cpp
 // test-run
@@ -158,17 +175,17 @@ fields far down the struct.
 
 ## MIDI out
 
-A plugin whose output is notes -- an arpeggiator, a chord generator -- sets
-`producesMidi` and takes the `ProcessContext` form; it adds events to
-`ctx.midiOut` with their frames, as they arrive on the input side:
+A plugin whose output is notes, such as an arpeggiator or a chord generator,
+sets `producesMidi` and takes the `ProcessContext` form. It adds events to
+`ctx.midiOut` with their frames, the same way they arrive on the input side:
 
 ```
 ctx.midiOut.addEvent(sonore::MidiMessage::noteOn(0, note, 100), (int) i);
 ```
 
-Pass on what the plugin does not understand -- the sustain pedal, the mod
-wheel, a clock -- or everything downstream of it stops working;
-`sonore::forwardSysex(ctx.midi, ctx.midiOut)` does it for SysEx. The arp example
+Pass on what the plugin does not use itself, such as the sustain pedal, the mod
+wheel or a clock, or everything after it in the chain stops working.
+`sonore::forwardSysex(ctx.midi, ctx.midiOut)` does that for SysEx. The arp example
 (`sdk/examples/arp/plugin.cpp`) is the whole pattern.
 
 ## Beyond a plugin's notes

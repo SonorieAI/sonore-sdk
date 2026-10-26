@@ -7,25 +7,30 @@ From a unit test of one filter to a DAW driving the built binary.
 `ctest` in a project from `sonore_new_plugin.cmake` runs:
 
 - **`MyFilterApp --verify`**: the standalone build renders the plugin offline,
-  with no audio device and no window, and fails on a NaN or an infinity, on
+  with no audio device and no window. It fails on a NaN or an infinity, on
   silence where there should be sound, on a render that blows up, and on a
   malformed descriptor. An effect is also fed a file it writes itself; an
   instrument must sound on a held note and fall silent after its release.
 - **The real-time audit** (`sonore_add_rt_test`, with a source checkout of the
-  SDK): your plugin's source compiled into a program that counts every
-  allocation made on the audio thread, across sample rates and block sizes.
-  Allocations only; locks are not measured.
+  SDK): your plugin's source, compiled into a program that counts every memory
+  allocation made on the audio thread, across sample rates and block sizes. It
+  counts allocations only; locks are not measured.
 
 `MyFilterApp --render out.wav 2` writes two seconds of the plugin to a WAV, for
 listening or for a comparison of your own.
 
 ## Unit tests
 
-`sonore/unit_test.h` is a small framework in the shape code from the reference
-expects: a `sonore::UnitTest` per area, `beginTest` and the `expect` family
-inside `runTest()`, a static instance that registers itself, and a
-`sonore::UnitTestRunner`. Each test gets a reproducible random generator
-(`getRandom()`), and the runner logs the seed so a failure can be replayed.
+`sonore/unit_test.h` is a small test framework, in the shape that code ported
+from another framework often expects:
+
+- a `sonore::UnitTest` per area, with `beginTest` and the `expect` family
+  inside its `runTest()`;
+- a static instance of it, which registers itself;
+- a `sonore::UnitTestRunner` that runs them all.
+
+Each test gets a reproducible random generator (`getRandom()`), and the runner
+logs the seed so a failure can be replayed.
 
 ```cpp
 // test-run
@@ -66,8 +71,8 @@ int main() {
 ```
 
 Register it like any program: `add_executable`, `target_link_libraries(... sonore_sdk)`,
-`add_test`. Grade against a number you can defend -- the standard, the paper,
-the analytic result -- not against what the code printed last time.
+`add_test`. Check against a number you can defend (the standard, the paper, the
+analytic result), not against what the code printed last time.
 
 ## The format owners' validators
 
@@ -83,34 +88,41 @@ What a host vendor or a store runs first:
   (`aumu` for an instrument) after copying the `.component` into
   `~/Library/Audio/Plug-Ins/Components`.
 
-On Windows, clap-validator refuses a preset location that does not begin with
-`/`, which every drive-letter path fails, so its preset-discovery checks fail
-on the default preset folder. Run it with `SONORE_PRESET_ROOT` set to a folder
-spelled `//?/C:/...`: Windows opens that like any other path, and the
-validator accepts it.
+On Windows, clap-validator's preset-discovery checks fail on the default preset
+folder: it refuses a preset location that does not begin with `/`, and a
+drive-letter path never does. Run it with `SONORE_PRESET_ROOT` set to a folder
+spelled `//?/C:/...`. Windows opens that like any other path, and the validator
+accepts it.
 
 ## A real DAW
 
 `npm run verify:reaper` hands the CLAP, VST3 and LV2 builds of the SDK's
 examples to REAPER (the trim has no LV2 build) and checks what REAPER made of
 them: the scan, offline renders against the SDK's own host, automation, a
-session saved and reopened, latency compensation, editors opening and closing.
-It runs on Windows, from the repository root, with REAPER installed
-(`SONORE_REAPER` points at it outside the default folder) and a Release build
-in `sdk/build/Release` (`--build <dir>` names another); anywhere else it skips.
-It runs REAPER with a profile of its own and never touches yours; `--only`,
-`--skip-editor` and `--rates` narrow it.
-It is the check to run after changing anything in a process path, state,
-parameters, presets or latency in the SDK itself.
+session saved and reopened, latency compensation, and editors opening and
+closing. It is the check to run after changing anything in a process path,
+state, parameters, presets or latency in the SDK itself.
+
+- It runs on Windows only; anywhere else it skips.
+- Run it from the repository root, with REAPER installed (`SONORE_REAPER`
+  points at it outside the default folder) and a Release build in
+  `sdk/build/Release` (`--build <dir>` names another).
+- It runs REAPER with a profile of its own and never touches yours.
+- `--only`, `--skip-editor` and `--rates` narrow it.
 
 ## The SDK's own tests
 
-For a change to the SDK, each area has a standalone test program,
-`sdk/tests/<area>_test.cpp`: a main function, a `check(bool, const char*)` helper
-printing `  ok   message` or `  FAIL message`, real numbers rather than "it
-compiles" (round trips, published test vectors, reference outputs), a last line
-`<AREA> TESTS PASSED` or `FAILED`, and a non-zero exit on any failure. Parsers
-of untrusted input also get a fuzzer, `sdk/tests/fuzz_<area>.cpp`, run under
-AddressSanitizer. `npm run verify:sdk` builds and runs all of it with the
+For a change to the SDK itself, each area has a standalone test program,
+`sdk/tests/<area>_test.cpp`. Each one has:
+
+- a main function, and a `check(bool, const char*)` helper printing
+  `  ok   message` or `  FAIL message`;
+- real numbers rather than "it compiles": round trips, published test vectors,
+  reference outputs;
+- a last line, `<AREA> TESTS PASSED` or `FAILED`, and a non-zero exit on any
+  failure.
+
+Parsers of untrusted input also get a fuzzer, `sdk/tests/fuzz_<area>.cpp`, run
+under AddressSanitizer. `npm run verify:sdk` builds and runs all of it, with the
 validators and the browser build; `npm run verify:sanitize` runs the slow
 sanitizer legs. CONTRIBUTING.md at the repository root has the rules.
