@@ -47,3 +47,23 @@ void CFRunLoopAddSource(CFRunLoopRef rl, CFRunLoopSourceRef source, CFRunLoopMod
 void CFRunLoopRemoveSource(CFRunLoopRef rl, CFRunLoopSourceRef source, CFRunLoopMode mode);
 void CFRunLoopSourceInvalidate(CFRunLoopSourceRef source);
 void CFRunLoopSourceSignal(CFRunLoopSourceRef source);
+
+// A repeating timer on a run loop, with a C callout: the AUv3 unit's
+// main-thread clock (auv3_wrapper.h), which retains nothing it is given.
+typedef double CFAbsoluteTime;
+typedef struct __CFRunLoopTimer* CFRunLoopTimerRef;
+typedef void (*CFRunLoopTimerCallBack)(CFRunLoopTimerRef timer, void* info);
+struct CFRunLoopTimerContext {
+  CFIndex version;
+  void* info;
+  const void* (*retain)(const void* info);
+  void (*release)(const void* info);
+  CFStringRef (*copyDescription)(const void* info);
+};
+CFAbsoluteTime CFAbsoluteTimeGetCurrent(void);
+CFRunLoopTimerRef CFRunLoopTimerCreate(CFAllocatorRef allocator, CFAbsoluteTime fireDate,
+                                       CFTimeInterval interval, CFOptionFlags flags, CFIndex order,
+                                       CFRunLoopTimerCallBack callout,
+                                       CFRunLoopTimerContext* context);
+void CFRunLoopAddTimer(CFRunLoopRef rl, CFRunLoopTimerRef timer, CFRunLoopMode mode);
+void CFRunLoopTimerInvalidate(CFRunLoopTimerRef timer);

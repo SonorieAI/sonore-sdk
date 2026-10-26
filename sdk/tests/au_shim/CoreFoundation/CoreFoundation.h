@@ -74,6 +74,9 @@ CFIndex CFStringGetMaximumSizeForEncoding(CFIndex, CFStringEncoding);
 const char* CFStringGetCStringPtr(CFStringRef, CFStringEncoding);
 void CFRelease(CFTypeRef);
 CFTypeRef CFRetain(CFTypeRef);
+// Hands a +1 reference to the current autorelease pool: how a CF object is
+// returned from an Objective-C getter, which callers expect at +0.
+CFTypeRef CFAutorelease(CFTypeRef);
 
 CFBundleRef CFBundleGetBundleWithIdentifier(CFStringRef);
 // The process's own bundle, which plugin_host_type.h asks for its identifier

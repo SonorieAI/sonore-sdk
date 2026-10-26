@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 271 headers, 742 public types.
+not have. 273 headers, 752 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -112,6 +112,14 @@ AnalyticsEvent, AnalyticsDestination, Analytics, ThreadedAnalyticsDestination
 an Apple block, built by hand, for the APIs that take one
 
 `sdk/include/sonore/apple_block.h`
+
+(no public types)
+
+### apple_platform.h
+
+which Apple platform this is -- the Mac, or one of the UIKit ones
+
+`sdk/include/sonore/apple_platform.h`
 
 (no public types)
 
@@ -298,6 +306,14 @@ reading an audio file without holding all of it
 `sdk/include/sonore/audiostream.h`
 
 AudioFileReader
+
+### auv3_wrapper.h
+
+the Audio Unit v3 format wrapper (AUAudioUnit), for macOS and iOS
+
+`sdk/include/sonore/auv3_wrapper.h`
+
+EventHeader, ParameterEvent, MidiEvent, UmpPacket, UmpEventList, MidiEventListEvent, BlockHeader, SuperRef, Unit, ClassRegistrar
 
 ### bigint.h
 

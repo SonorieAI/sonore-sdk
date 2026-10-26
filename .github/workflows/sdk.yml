@@ -197,6 +197,40 @@ jobs:
             exit 1
           fi
 
+      # The AUv3 extensions, registered the way a user's Mac registers them:
+      # the containing app known to Launch Services, the extension added to
+      # pluginkit, and the registrar restarted so auval sees them now. Each
+      # example's AUv3 has its own subtype (Sat3, Syn3, Arp3) beside its AUv2,
+      # so the two are never one component listed twice.
+      - name: Register the AUv3 extensions
+        if: runner.os == 'macOS'
+        run: |
+          set -x
+          mkdir -p ~/Applications
+          LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+          found=0
+          for appex in $(find sdk/build -path "*.app/Contents/PlugIns/*.appex" -prune); do
+            app="${appex%/Contents/PlugIns/*}"
+            codesign -dv --entitlements - "$appex" || true
+            rm -rf ~/Applications/"$(basename "$app")"
+            cp -R "$app" ~/Applications/
+            installed=~/Applications/"$(basename "$app")"
+            "$LSREGISTER" -f -R -trusted "$installed" || true
+            pluginkit -a "$installed/Contents/PlugIns/$(basename "$appex")"
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "no AUv3 extension was built - auval below would test nothing"
+            exit 1
+          fi
+          pluginkit -m -v -p com.apple.AudioUnit-UI || true
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          for i in $(seq 1 20); do
+            auval -a 2>/dev/null | grep -q "Sat3" && break
+            sleep 3
+          done
+          auval -a 2>/dev/null | grep -E "Sat3|Syn3|Arp3" || { echo "macOS registered none of the AUv3 extensions"; exit 1; }
+
       # A desktop session the editor can attach to. Without one the GUI tests
       # skip, and a green run would mean less than it appears to.
       #
@@ -232,6 +266,11 @@ jobs:
           auval -v aufx Trm1 Sonr
           auval -v aufx Spl1 Sonr
           auval -v aumu Arp1 Sonr
+          # The same three plugins as AUv3 app extensions, across the process
+          # boundary the in-process self-test (ctest's auv3_*) cannot reach.
+          auval -v aufx Sat3 Sonr
+          auval -v aumu Syn3 Sonr
+          auval -v aumu Arp3 Sonr
 
       # The format owners' validators, beside auval above: clap-validator
       # (free-audio) on the CLAP builds and pluginval (Tracktion, strictness 10)

@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 271 headers, 742 public types.
+not have. 273 headers, 752 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -88,6 +88,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [aax_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/aax_wrapper.h): the AAX format wrapper (AAX Native), for Pro Tools
 - [analytics.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/analytics.h): Analytics: events a plugin decides to record, and the destinations it
 - [apple_block.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/apple_block.h): an Apple block, built by hand, for the APIs that take one
+- [apple_platform.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/apple_platform.h): which Apple platform this is -- the Mac, or one of the UIKit ones
 - [application.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/application.h): An application built on the SDK: the object that owns the process, and the
 - [application_properties.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/application_properties.h): An application's settings files: one for the user, one for the machine
 - [asio_format.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/asio_format.h): ASIO sample formats, and the conversion to and from them
@@ -111,6 +112,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [audiofile.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile.h): audio files beyond WAV
 - [audiofile_codecs.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiofile_codecs.h): the lossy decoders, vendored
 - [audiostream.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/audiostream.h): reading an audio file without holding all of it
+- [auv3_wrapper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/auv3_wrapper.h): the Audio Unit v3 format wrapper (AUAudioUnit), for macOS and iOS
 - [bigint.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/bigint.h): BigInteger: signed integers of any size
 - [bluetooth_midi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/bluetooth_midi.h): Pairing a Bluetooth LE MIDI device: the system's own dialogue, where there is
 - [broadcaster.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/broadcaster.h): "Something changed": told to whoever asked, without either side knowing the

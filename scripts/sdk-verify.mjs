@@ -733,8 +733,8 @@ log("\n── format matrix (artifacts on disk, not claims) ──────�
     ["LV2", has((n) => n.endsWith(".lv2")), "built + host-tested + lv2lint (Linux leg)"],
     ["Standalone", has((n) => /App(\.exe)?$/.test(n)), "built + offline --verify"],
     ["AUv2", 0, "macOS only: built and auval'd in CI, never on this box"],
-    ["AUv3", 0, "app EXTENSION: needs a containing app + Xcode target (iOS / App Store)"],
-    ["AAX", 0, "blocked: Avid developer agreement + PACE signing"],
+    ["AUv3", 0, "Apple only: built, self-tested and auval'd in CI, never on this box"],
+    ["AAX", 0, "built against the developer's own Avid SDK; shipping needs Avid + PACE signing"],
     ["VST2", 0, "deliberately never: Steinberg ended licensing in 2018"],
   ];
   for (const [name, count, note] of rows) {

@@ -136,15 +136,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # format, so both ways of using the helpers are proven on every run.
   # AAX builds only where SONORE_AAX_SDK_ROOT points at Avid's SDK, which
   # this repository does not carry; elsewhere sonore_add_aax() says it skipped.
+  # AUv3 beside AUv2 on Apple, each under its own subtype (Sat1/Sat3): one
+  # component per code is what a Mac host expects.
   sonore_add_plugin(SonoreSaturator SOURCES examples/saturator/plugin.cpp
     CLAP SonoreSaturator VST3 SonoreSaturatorVST3 AU SonoreSaturatorAU LV2 SonoreSaturatorLV2
-    AAX SonoreSaturatorAAX
-    AU_SUBTYPE "Sat1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie"
+    AAX SonoreSaturatorAAX AUV3 SonoreSaturatorAUv3
+    AU_SUBTYPE "Sat1" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie" AUV3_SUBTYPE "Sat3"
     AAX_MANUFACTURER "Sonr" AAX_PRODUCT "Sat1")
   sonore_add_plugin(SonoreSynth SOURCES examples/synth/plugin.cpp
     CLAP SonoreSynth VST3 SonoreSynthVST3 AU SonoreSynthAU LV2 SonoreSynthLV2
-    AAX SonoreSynthAAX
-    AU_SUBTYPE "Syn1" AU_TYPE "aumu" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie"
+    AAX SonoreSynthAAX AUV3 SonoreSynthAUv3
+    AU_SUBTYPE "Syn1" AU_TYPE "aumu" AU_MANUFACTURER "Sonr" AU_VENDOR "Sonorie" AUV3_SUBTYPE "Syn3"
     AAX_MANUFACTURER "Sonr" AAX_PRODUCT "Syn1")
   sonore_add_clap(SonoreDucker SOURCES examples/ducker/plugin.cpp)
   sonore_add_clap(SonoreTrim SOURCES examples/trim/plugin.cpp)
@@ -334,7 +336,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # tests/mac_syntax_plugin.cpp for what it does and does not prove.
     # One target each: both define the plugin's exports, and a library made
     # of the two objects warned of the duplicates (LNK4006).
-    foreach(_mac plugin standalone audio_io modules opengl app_infra app_windows mac_input mac_host showcase player)
+    foreach(_mac plugin standalone audio_io modules opengl app_infra app_windows mac_input mac_host showcase player auv3 auv3_host)
       add_library(sonore_mac_syntax_${_mac} OBJECT tests/mac_syntax_${_mac}.cpp)
       target_compile_features(sonore_mac_syntax_${_mac} PRIVATE cxx_std_17)
       target_include_directories(sonore_mac_syntax_${_mac} PRIVATE
@@ -840,7 +842,30 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   sonore_add_au(SonoreArpAU SUBTYPE "Arp1" MANUFACTURER "Sonr" VENDOR "Sonorie" TYPE "aumu" SOURCES examples/arp/plugin.cpp)
   sonore_add_au(SonoreSamplerAU SUBTYPE "Smp1" MANUFACTURER "Sonr" VENDOR "Sonorie" TYPE "aumu" SOURCES examples/sampler/plugin.cpp)
   sonore_add_au(SonoreReverbAU SUBTYPE "Rvb1" MANUFACTURER "Sonr" VENDOR "Sonorie" TYPE "aufx" SOURCES examples/reverb/plugin.cpp)
-  sonore_add_auv3(SonoreSaturatorAUv3)
+  # The note effect as an AUv3: MIDI in, MIDI out through the host's block.
+  sonore_add_auv3(SonoreArpAUv3 SUBTYPE "Arp3" MANUFACTURER "Sonr" VENDOR "Sonorie" TYPE "aumu"
+    SOURCES examples/arp/plugin.cpp)
+  # The AUv3 wrapper driven in process as a host drives it (tests/
+  # auv3_selftest.cpp): an effect, an instrument and a note effect. auval
+  # checks the built extensions on CI's Mac as well, across the process
+  # boundary these cannot reach.
+  if(APPLE)
+    foreach(_ex saturator synth arp)
+      add_executable(auv3_selftest_${_ex} tests/auv3_selftest.cpp examples/${_ex}/plugin.cpp)
+      target_link_libraries(auv3_selftest_${_ex} PRIVATE sonore_sdk
+        "-framework Foundation" "-framework AudioToolbox" "-framework AVFoundation"
+        "-framework CoreAudioKit" "-framework CoreMIDI" "-framework CoreFoundation" "-framework WebKit" objc)
+      if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        target_link_libraries(auv3_selftest_${_ex} PRIVATE "-framework UIKit")
+      else()
+        target_link_libraries(auv3_selftest_${_ex} PRIVATE "-framework AppKit")
+      endif()
+      target_compile_definitions(auv3_selftest_${_ex} PRIVATE SONORE_BUILD_AUV3=1)
+    endforeach()
+    add_test(NAME auv3_effect COMMAND auv3_selftest_saturator --effect --params 4 --presets 3 --subtype Sat9)
+    add_test(NAME auv3_instrument COMMAND auv3_selftest_synth --instrument --params 22 --presets 0 --subtype Syn9)
+    add_test(NAME auv3_midi_out COMMAND auv3_selftest_arp --instrument --midi-out --params 3 --subtype Arp9)
+  endif()
 
   add_executable(vst3_host_test tests/vst3_host_test.cpp)
   target_link_libraries(vst3_host_test PRIVATE sonore_sdk)

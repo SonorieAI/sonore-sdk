@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  An app extension runs sandboxed, and an Audio Unit extension's process is
+  refused without the sandbox entitlement. Nothing else is asked for: the
+  editor's page is loaded from memory and the extension opens no file of its
+  own. sonore_add_auv3 signs the extension with this file.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+</dict>
+</plist>

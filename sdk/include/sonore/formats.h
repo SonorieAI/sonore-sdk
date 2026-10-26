@@ -10,7 +10,8 @@
 // parameters, state, the editor -- and every other format adapts it, so the
 // formats cannot drift. Then each format the CMake helpers ask for, by the
 // macro they define on the target: sonore_add_vst3 SONORE_BUILD_VST3,
-// sonore_add_au SONORE_BUILD_AU, sonore_add_lv2 SONORE_BUILD_LV2 (and, for
+// sonore_add_au SONORE_BUILD_AU, sonore_add_auv3 SONORE_BUILD_AUV3,
+// sonore_add_lv2 SONORE_BUILD_LV2 (and, for
 // its TTL generator, SONORE_LV2_TTLGEN), sonore_add_aax SONORE_BUILD_AAX,
 // sonore_add_standalone SONORE_BUILD_STANDALONE, and sonore_add_plugin each
 // one it builds.
@@ -31,6 +32,12 @@
 #if defined(SONORE_BUILD_AU)
 #include "au_wrapper.h"
 #include "au_view.h"
+#endif
+
+// AUv3: an AUAudioUnit subclass for the .appex sonore_add_auv3 builds, and
+// for an app that hosts its own unit in-process (the iOS standalone).
+#if defined(SONORE_BUILD_AUV3)
+#include "auv3_wrapper.h"
 #endif
 
 #if defined(SONORE_BUILD_LV2)

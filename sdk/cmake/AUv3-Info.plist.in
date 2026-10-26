@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  An Audio Unit v3 is an app extension: the system finds it through the
+  NSExtension dictionary below, inside the application that ships it, never
+  by scanning a plug-ins folder. The extension point says it is an Audio Unit
+  with a user interface; NSExtensionPrincipalClass names the runtime class
+  auv3_wrapper.h registers, which makes the units and owns their editor; the
+  AudioComponents array is the same registration an AUv2 carries (type,
+  subtype, manufacturer, the version the registrar caches by). factoryFunction
+  names the same class, for a host loading the extension in process.
+  (No double hyphen anywhere in this comment: XML forbids one there.)
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>@SONORE_AUV3_DISPLAY_NAME@</string>
+  <key>CFBundleExecutable</key>
+  <string>@SONORE_AUV3_EXECUTABLE@</string>
+  <key>CFBundleIdentifier</key>
+  <string>@SONORE_AUV3_BUNDLE_ID@</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>@SONORE_AUV3_EXECUTABLE@</string>
+  <key>CFBundlePackageType</key>
+  <string>XPC!</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SONORE_AUV3_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SONORE_AUV3_VERSION@</string>
+@SONORE_AUV3_PLATFORM_KEYS@
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionAttributes</key>
+    <dict>
+      <key>AudioComponents</key>
+      <array>
+        <dict>
+          <key>name</key>
+          <string>@SONORE_AUV3_VENDOR@: @SONORE_AUV3_DISPLAY_NAME@</string>
+          <key>description</key>
+          <string>@SONORE_AUV3_DISPLAY_NAME@</string>
+          <key>factoryFunction</key>
+          <string>@SONORE_AUV3_FACTORY_CLASS@</string>
+          <key>type</key>
+          <string>@SONORE_AUV3_TYPE@</string>
+          <key>subtype</key>
+          <string>@SONORE_AUV3_SUBTYPE@</string>
+          <key>manufacturer</key>
+          <string>@SONORE_AUV3_MANUFACTURER@</string>
+          <key>version</key>
+          <integer>@SONORE_AUV3_VERSION_INT@</integer>
+          <key>sandboxSafe</key>
+          <true/>
+          <key>tags</key>
+          <array>
+            <string>@SONORE_AUV3_TAG@</string>
+          </array>
+        </dict>
+      </array>
+    </dict>
+    <key>NSExtensionPointIdentifier</key>
+    <string>com.apple.AudioUnit-UI</string>
+    <key>NSExtensionPrincipalClass</key>
+    <string>@SONORE_AUV3_FACTORY_CLASS@</string>
+  </dict>
+</dict>
+</plist>

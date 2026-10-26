@@ -835,14 +835,20 @@ const MAP = [
   ["client", "LV2 wrapper", "lv2_wrapper.h", "LV2_Descriptor"],
   ["client", "Standalone wrapper", "standalone.h", "inline int runInteractive"],
   ["client", "(the reference has no CLAP)", "clap_wrapper.h", "clap_plugin_entry"],
+  // AUv3 was a guarded ABSENCE while there was no Mac to check one on. macOS
+  // CI now builds the extension, registers it and runs auval on it, and the
+  // iOS job runs the same in-process self-test in the simulator.
   ["client", "AUv3 app extension",
-   "an app EXTENSION: needs a containing app and an Xcode target. Not fabricated " +
-   "without a Mac to build one on",
-   // AudioUnitViewController is the class an AUv3 must supply and
-   // NSExtensionPrincipalClass the plist key that names it: neither can appear
-   // in prose, which the first attempt at this regex did -- "AUv3" matches a
-   // comment in host.h that merely says the format exists.
-   null, "AudioUnitViewController|NSExtensionPrincipalClass"],
+   "auv3_wrapper.h: an AUAudioUnit subclass registered at runtime (no .mm), in " +
+   "an .appex sonore_add_auv3() builds inside a container app, for macOS and " +
+   "iOS. Parameter tree with gestures, render events split at parameter changes " +
+   "(automationGranularity), MIDI 1.0 and MIDI 2.0 event lists in, MIDI out " +
+   "through the host's block, transport, the SNRS state in AUv2's ClassInfo " +
+   "layout, factory presets, the shared bypass crossfade, the track's name, and " +
+   "both editors through an AUViewController. Validated in process by " +
+   "tests/auv3_selftest.cpp and on the Mac by auval; never opened in a host's " +
+   "window by anyone in this loop",
+   "SonoreAUv3RegisterInProcess"],
   // AAX was a guarded ABSENCE until Avid's SDK was in hand: the rule was not
   // to write a wrapper against a guessed ABI, and the row failed the build if
   // one appeared. It was then written against the real SDK (2.9.0), which the

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The application an AUv3 extension ships inside, on macOS. Registering the
+  app with Launch Services (opening it once, or pluginkit on its extension)
+  is what makes the extension's Audio Unit appear in hosts. The extension's
+  bundle identifier is this one with a suffix, as the system requires.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>@SONORE_AUV3_DISPLAY_NAME@</string>
+  <key>CFBundleExecutable</key>
+  <string>@SONORE_AUV3_CONTAINER_EXECUTABLE@</string>
+  <key>CFBundleIdentifier</key>
+  <string>@SONORE_AUV3_CONTAINER_ID@</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>@SONORE_AUV3_DISPLAY_NAME@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SONORE_AUV3_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SONORE_AUV3_VERSION@</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>@SONORE_AUV3_MIN_MACOS@</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>

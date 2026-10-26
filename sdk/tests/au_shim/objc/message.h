@@ -24,4 +24,9 @@ void objc_msgSend(void /* id self, SEL op, ... */);
 // that started using it and found nothing here would get a confusing error
 // about an undeclared identifier rather than a clear one about the shim.
 void objc_msgSend_stret(void /* void* stretAddr, id self, SEL op, ... */);
+// A message to the SUPERCLASS's implementation, for a class registered at
+// runtime that overrides a framework method and has to call the original
+// (auv3_wrapper.h: AUAudioUnit's initialiser, render resources, dealloc). The
+// first argument is a struct objc_super*: { receiver, super_class }.
+void objc_msgSendSuper(void /* struct objc_super* super, SEL op, ... */);
 }

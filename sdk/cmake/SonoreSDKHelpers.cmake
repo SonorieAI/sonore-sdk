@@ -498,11 +498,11 @@ function(sonore_add_lv2 TARGET)
   add_dependencies(${TARGET} ${TARGET}_ttlgen)
 endfunction()
 
-# ── sonore_add_plugin(<name> SOURCES a.cpp [CLAP <t>] [VST3 <t>] [AU <t>] [LV2 <t>] [AAX <t>]) ──
+# ── sonore_add_plugin(<name> SOURCES a.cpp [CLAP <t>] [VST3 <t>] [AU <t>] [AUV3 <t>] [LV2 <t>] [AAX <t>]) ──
 #
 #   sonore_add_plugin(MyPlugin SOURCES plugin.cpp
-#     CLAP MyPlugin  VST3 MyPluginVST3  AU MyPluginAU  LV2 MyPluginLV2  AAX MyPluginAAX
-#     AU_SUBTYPE "Mypl" AU_MANUFACTURER "Manu" AU_TYPE aufx  VERSION 1.2.0
+#     CLAP MyPlugin  VST3 MyPluginVST3  AU MyPluginAU  AUV3 MyPluginAUv3  LV2 MyPluginLV2  AAX MyPluginAAX
+#     AU_SUBTYPE "Mypl" AU_MANUFACTURER "Manu" AU_TYPE aufx  AUV3_SUBTYPE "Myp3"  VERSION 1.2.0
 #     AU_VENDOR "My Company" AU_NAME "My Plugin" AU_BUNDLE_ID com.mycompany.myplugin
 #     AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl")
 #
@@ -517,14 +517,36 @@ endfunction()
 # sonore_add_aax(), against the developer's copy of Avid's SDK. In the shared
 # object, the AAX code would make every other bundle need Avid's library to
 # link. Without SONORE_AAX_SDK_ROOT it is skipped, as sonore_add_aax() says.
+# AUv3 is the other: sonore_add_auv3() compiles it on its own, as an app
+# extension linking AVFoundation, CoreAudioKit and WebKit, which no host
+# loading the other formats should pay for. It takes the AU_* identity, with
+# AUV3_SUBTYPE for its own code (a product shipping AUv2 and AUv3 needs two,
+# or a Mac host sees one component twice); Apple platforms only.
 function(sonore_add_plugin NAME)
-  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
+  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;AUV3;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AUV3_SUBTYPE;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
                         "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): SOURCES is required")
   endif()
-  if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2 OR ARG_AAX))
-    message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/LV2/AAX)")
+  if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_AUV3 OR ARG_LV2 OR ARG_AAX))
+    message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/AUV3/LV2/AAX)")
+  endif()
+  if(ARG_AUV3 AND APPLE)
+    set(_auv3_args)
+    foreach(_k MANUFACTURER TYPE VENDOR NAME BUNDLE_ID)
+      if(ARG_AU_${_k})
+        list(APPEND _auv3_args ${_k} "${ARG_AU_${_k}}")
+      endif()
+    endforeach()
+    if(ARG_AUV3_SUBTYPE)
+      list(APPEND _auv3_args SUBTYPE "${ARG_AUV3_SUBTYPE}")
+    elseif(ARG_AU_SUBTYPE)
+      list(APPEND _auv3_args SUBTYPE "${ARG_AU_SUBTYPE}")
+    endif()
+    if(ARG_VERSION)
+      list(APPEND _auv3_args VERSION "${ARG_VERSION}")
+    endif()
+    sonore_add_auv3(${ARG_AUV3} SOURCES ${ARG_SOURCES} ${_auv3_args})
   endif()
   if(ARG_AAX)
     set(_aax_args)
@@ -537,9 +559,9 @@ function(sonore_add_plugin NAME)
       list(APPEND _aax_args VERSION "${ARG_VERSION}")
     endif()
     sonore_add_aax(${ARG_AAX} SOURCES ${ARG_SOURCES} ${_aax_args})
-    if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2))
-      return()
-    endif()
+  endif()
+  if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2))
+    return()
   endif()
   if(ARG_AU AND NOT APPLE)
     set(ARG_AU "")
@@ -737,31 +759,203 @@ function(sonore_add_vst2 TARGET)
           "licensed after that date cannot legally ship as VST2. Use VST3 or CLAP.")
 endfunction()
 
-# ── AUv3 ─────────────────────────────────────────────────────────────────────
-# AUv2 (sonore_add_au) is what Logic, Live, Cubase and every macOS DESKTOP host
-# actually load, and it is what we build. AUv3 is a different thing: an app
-# EXTENSION (.appex) shipped inside a containing application, which is what iOS
-# requires and what sandboxed / App Store distribution requires.
+# ── sonore_add_auv3(<target> SOURCES a.cpp [...] SUBTYPE Abcd MANUFACTURER Manu [...]) ──
+# An Audio Unit v3: the plugin as an APP EXTENSION (<target>.appex) inside the
+# application that ships it, which is the only kind of plugin iOS loads and
+# the only kind the Mac App Store takes. Mac hosts load it beside AUv2.
 #
-# It cannot be built from CMake alone (it needs an Xcode extension target, an
-# NSExtension Info.plist and a host application to embed it) and it cannot be
-# compile-checked anywhere but a Mac. So the hook skips LOUDLY rather than
-# pretending, exactly like AAX and ASIO.
+#   sonore_add_auv3(MyPluginAUv3 SOURCES plugin.cpp
+#     SUBTYPE "Mypl" MANUFACTURER "Manu" TYPE aufx VENDOR "My Company"
+#     NAME "My Plugin" BUNDLE_ID com.mycompany.myplugin VERSION 1.2.0
+#     [CONTAINER MyPluginApp])
+#
+# The plugin is compiled on its own here, with SONORE_BUILD_AUV3 (formats.h
+# then includes auv3_wrapper.h): AUv3 links AVFoundation, CoreAudioKit and
+# WebKit, which no other format should drag into a host. The identity is the
+# AUv2 helper's -- the same four-character codes, the same version integer the
+# registrar caches by -- and a product shipping both formats gives each its
+# own SUBTYPE, or a host sees one component twice.
+#
+# The extension goes inside CONTAINER, an app target of the caller's, or
+# else inside a small app built here (<target>Container, named <target>.app):
+# on macOS one alert saying the plugin is installed. On iOS the app is the
+# plugin's own (CONTAINER, required there). The extension is signed AD HOC
+# with the sandbox entitlement an Audio Unit extension needs, then the app
+# around it; shipping to other people needs a Developer ID (macOS) or a
+# provisioning profile (iOS) instead, which this does not replace.
 function(sonore_add_auv3 TARGET)
   if(NOT APPLE)
     return()
   endif()
-  if(NOT DEFINED SONORE_AUV3_CONTAINER_APP)
-    message(STATUS "sonore_add_auv3(${TARGET}): SKIPPED: AUv3 is an app EXTENSION and "
-                   "needs a containing application plus an Xcode extension target. "
-                   "AUv2 (sonore_add_au) already covers every macOS desktop host; AUv3 "
-                   "matters for iOS and App Store distribution. Set "
-                   "SONORE_AUV3_CONTAINER_APP once that container exists.")
-    return()
+  cmake_parse_arguments(ARG "" "SUBTYPE;MANUFACTURER;TYPE;VERSION;NAME;VENDOR;BUNDLE_ID;CONTAINER;MIN_MACOS;MIN_IOS"
+                        "SOURCES" ${ARGN})
+  if(NOT ARG_SOURCES)
+    message(FATAL_ERROR "sonore_add_auv3(${TARGET}): SOURCES is required -- the extension compiles the plugin "
+                        "on its own, with SONORE_BUILD_AUV3")
   endif()
-  message(FATAL_ERROR "sonore_add_auv3(${TARGET}): SONORE_AUV3_CONTAINER_APP is set but the "
-                      "AUv3 extension target is not implemented yet. Implement it against "
-                      "a real Mac now that there is somewhere to embed it.")
+  if(NOT ARG_VERSION)
+    set(ARG_VERSION "1.0.0")
+  endif()
+  if(NOT ARG_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "sonore_add_auv3(${TARGET}): VERSION must be major.minor.patch, got '${ARG_VERSION}'")
+  endif()
+  string(REPLACE "." ";" _ver "${ARG_VERSION}")
+  list(GET _ver 0 _vmaj)
+  list(GET _ver 1 _vmin)
+  list(GET _ver 2 _vpat)
+  math(EXPR SONORE_AUV3_VERSION_INT "${_vmaj} * 65536 + ${_vmin} * 256 + ${_vpat}")
+  set(SONORE_AUV3_VERSION "${ARG_VERSION}")
+  set(_missing)
+  foreach(_k SUBTYPE MANUFACTURER VENDOR)
+    if(NOT ARG_${_k})
+      list(APPEND _missing ${_k})
+    endif()
+  endforeach()
+  if(_missing)
+    string(REPLACE ";" ", " _missing "${_missing}")
+    message(WARNING "sonore_add_auv3(${TARGET}): no ${_missing} given, so this AUv3 registers with "
+                    "Sonorie's defaults (subtype Snr3, manufacturer Sonr), which every AUv3 built without "
+                    "them shares. Pass your own four-character SUBTYPE and MANUFACTURER and your VENDOR.")
+  endif()
+  if(NOT ARG_SUBTYPE)
+    set(ARG_SUBTYPE "Snr3")
+  endif()
+  if(NOT ARG_MANUFACTURER)
+    set(ARG_MANUFACTURER "Sonr")
+  endif()
+  if(NOT ARG_VENDOR)
+    set(ARG_VENDOR "Sonorie")
+  endif()
+  if(NOT ARG_NAME)
+    set(ARG_NAME "${TARGET}")
+  endif()
+  if(NOT ARG_BUNDLE_ID)
+    set(ARG_BUNDLE_ID "com.sonorie.${TARGET}")
+  endif()
+  if(NOT ARG_TYPE)
+    set(ARG_TYPE "aufx")
+  endif()
+  if(NOT ARG_MIN_MACOS)
+    set(ARG_MIN_MACOS "11.0")
+  endif()
+  if(NOT ARG_MIN_IOS)
+    set(ARG_MIN_IOS "15.0")
+  endif()
+  foreach(_k SUBTYPE MANUFACTURER)
+    string(LENGTH "${ARG_${_k}}" _len)
+    if(NOT _len EQUAL 4)
+      message(FATAL_ERROR "sonore_add_auv3(${TARGET}): ${_k} must be exactly four characters, got '${ARG_${_k}}'")
+    endif()
+  endforeach()
+  # What hosts sort the plugin under: the tags Apple's own units carry.
+  if(ARG_TYPE STREQUAL "aumu")
+    set(_tag "Synthesizer")
+  elseif(ARG_TYPE STREQUAL "aumi")
+    set(_tag "MIDI")
+  else()
+    set(_tag "Effects")
+  endif()
+  # The principal class the plist names. Fixed when the plist is written, so
+  # it carries the codes and the target: two different products loaded in one
+  # process (a Mac host loading extensions in process) never share one.
+  string(MAKE_C_IDENTIFIER "SonoreAUv3_${ARG_MANUFACTURER}${ARG_SUBTYPE}_${TARGET}" _factory)
+
+  set(_ios FALSE)
+  if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(_ios TRUE)
+  endif()
+
+  # ── The extension ──
+  add_executable(${TARGET} MACOSX_BUNDLE ${ARG_SOURCES})
+  target_link_libraries(${TARGET} PRIVATE sonore_sdk
+    "-framework Foundation" "-framework AudioToolbox" "-framework AVFoundation"
+    "-framework CoreAudioKit" "-framework CoreMIDI" "-framework CoreFoundation" "-framework WebKit" objc)
+  if(_ios)
+    target_link_libraries(${TARGET} PRIVATE "-framework UIKit" "-framework CoreGraphics")
+  else()
+    target_link_libraries(${TARGET} PRIVATE "-framework AppKit" "-framework CoreAudio" "-framework AudioUnit")
+  endif()
+  target_compile_definitions(${TARGET} PRIVATE SONORE_BUILD_AUV3=1
+    "SONORE_AUV3_FACTORY_CLASS=\"${_factory}\"")
+  # An extension's entry point is NSExtensionMain, which instantiates the
+  # principal class; -fapplication-extension holds the binary to the APIs an
+  # extension may call.
+  target_compile_options(${TARGET} PRIVATE -fapplication-extension)
+  target_link_options(${TARGET} PRIVATE -fapplication-extension "LINKER:-e,_NSExtensionMain")
+  set(_appex_id "${ARG_BUNDLE_ID}.auv3")
+  set(SONORE_AUV3_EXECUTABLE "${TARGET}")
+  _sonore_xml_escape(SONORE_AUV3_DISPLAY_NAME "${ARG_NAME}")
+  _sonore_xml_escape(SONORE_AUV3_VENDOR "${ARG_VENDOR}")
+  _sonore_xml_escape(SONORE_AUV3_BUNDLE_ID "${_appex_id}")
+  _sonore_xml_escape(SONORE_AUV3_TYPE "${ARG_TYPE}")
+  _sonore_xml_escape(SONORE_AUV3_SUBTYPE "${ARG_SUBTYPE}")
+  _sonore_xml_escape(SONORE_AUV3_MANUFACTURER "${ARG_MANUFACTURER}")
+  set(SONORE_AUV3_FACTORY_CLASS "${_factory}")
+  set(SONORE_AUV3_TAG "${_tag}")
+  if(_ios)
+    set(SONORE_AUV3_PLATFORM_KEYS "  <key>MinimumOSVersion</key>\n  <string>${ARG_MIN_IOS}</string>")
+  else()
+    set(SONORE_AUV3_PLATFORM_KEYS "  <key>LSMinimumSystemVersion</key>\n  <string>${ARG_MIN_MACOS}</string>")
+  endif()
+  configure_file("${SONORE_SDK_DIR}/cmake/AUv3-Info.plist.in"
+                 "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-Info.plist" @ONLY)
+  set_target_properties(${TARGET} PROPERTIES
+    BUNDLE_EXTENSION "appex"
+    XCODE_PRODUCT_TYPE "com.apple.product-type.app-extension"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "${_appex_id}"
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-Info.plist")
+
+  # ── The app it ships in ──
+  if(ARG_CONTAINER)
+    set(_container ${ARG_CONTAINER})
+  elseif(_ios)
+    message(FATAL_ERROR "sonore_add_auv3(${TARGET}): on iOS the extension ships inside the plugin's app; "
+                        "pass CONTAINER <target> naming a sonore_add_standalone() target")
+  else()
+    set(_container ${TARGET}Container)
+    add_executable(${_container} MACOSX_BUNDLE "${SONORE_SDK_DIR}/cmake/auv3_container_main.cpp")
+    target_compile_features(${_container} PRIVATE cxx_std_17)
+    target_link_libraries(${_container} PRIVATE "-framework AppKit" "-framework Foundation" objc)
+    target_compile_definitions(${_container} PRIVATE "SONORE_AUV3_CONTAINER_TITLE=\"${ARG_NAME}\"")
+    set(SONORE_AUV3_CONTAINER_EXECUTABLE "${TARGET}")
+    _sonore_xml_escape(SONORE_AUV3_CONTAINER_ID "${ARG_BUNDLE_ID}")
+    set(SONORE_AUV3_MIN_MACOS "${ARG_MIN_MACOS}")
+    configure_file("${SONORE_SDK_DIR}/cmake/AUv3-Container-Info.plist.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/${_container}-Info.plist" @ONLY)
+    set_target_properties(${_container} PROPERTIES
+      OUTPUT_NAME "${TARGET}"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "${ARG_BUNDLE_ID}"
+      MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/${_container}-Info.plist")
+  endif()
+  add_dependencies(${_container} ${TARGET})
+  if(_ios)
+    set(_plugins "$<TARGET_BUNDLE_DIR:${_container}>/PlugIns")
+  else()
+    set(_plugins "$<TARGET_BUNDLE_DIR:${_container}>/Contents/PlugIns")
+  endif()
+
+  # Signed inside out: the extension with its entitlement, copied into the
+  # app, then the app around it. A cross build with no codesign leaves both
+  # to its own signer, as _sonore_adhoc_sign does.
+  find_program(SONORE_CODESIGN codesign)
+  if(SONORE_CODESIGN)
+    add_custom_command(TARGET ${TARGET} POST_BUILD
+      COMMAND "${SONORE_CODESIGN}" --force --sign - --timestamp=none
+              --entitlements "${SONORE_SDK_DIR}/cmake/AUv3.entitlements" "$<TARGET_BUNDLE_DIR:${TARGET}>"
+      COMMENT "Ad-hoc signing the ${TARGET} extension")
+  else()
+    message(STATUS "Sonore: no codesign on this machine (cross build) -- ${TARGET} is left for the builder to sign")
+  endif()
+  add_custom_command(TARGET ${_container} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${_plugins}/${TARGET}.appex"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_plugins}"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "$<TARGET_BUNDLE_DIR:${TARGET}>" "${_plugins}/${TARGET}.appex"
+    COMMENT "Embedding ${TARGET}.appex in ${_container}")
+  if(SONORE_CODESIGN)
+    add_custom_command(TARGET ${_container} POST_BUILD
+      COMMAND "${SONORE_CODESIGN}" --force --sign - --timestamp=none "$<TARGET_BUNDLE_DIR:${_container}>"
+      COMMENT "Ad-hoc signing ${_container} around its extension")
+  endif()
 endfunction()
 
 # ── ARA (Audio Random Access) ────────────────────────────────────────────────

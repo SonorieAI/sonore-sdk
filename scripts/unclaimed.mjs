@@ -95,6 +95,12 @@ const NOT_A_CAPABILITY = new Set([
   // pointer it carries back to the data model, and the taper a parameter's
   // curve is handed to Pro Tools through: what the "AAX wrapper" row is made of.
   "Effect", "Gui", "Taper", "RenderContext", "PrivateData",
+  // AUv3's render events and MIDI event list, restated from Objective-C-only
+  // headers; a block's leading fields, for calling a host's block; objc_super's
+  // layout; and the static that registers the runtime classes before
+  // NSExtensionMain asks for them: what the "AUv3 app extension" row is made of.
+  "EventHeader", "ParameterEvent", "MidiEvent", "UmpPacket", "UmpEventList", "MidiEventListEvent",
+  "BlockHeader", "SuperRef", "ClassRegistrar",
   // The standalone's per-block buffers, owned by its App: the "standalone app"
   // row is what somebody looks for.
   "StandaloneScratch",
