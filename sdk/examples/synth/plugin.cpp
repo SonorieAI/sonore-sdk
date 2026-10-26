@@ -1,21 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Sonore SDK example: a polyphonic subtractive synth. The instrument shape:
-// process() takes a third MidiBuffer argument, which is what flips note ports,
-// drops the audio input bus and marks the plugin as an instrument everywhere.
-#define SONORE_NUM_PARAMS 5
+// process() takes the whole ProcessContext, whose MIDI is what makes this an
+// instrument -- note ports, no audio input bus, filed as an instrument in
+// every format.
+//
+// What a synth needs past an oscillator, and where each part lives:
+//   VoiceManager        which voice plays which note, stealing without a
+//                       click, the pedals, Poly / Mono / Legato, polyphony
+//   renderVoices()      the block's MIDI and expression applied at their exact
+//                       frames, the voices rendered between them
+//   Portamento          the glide a mono line makes between notes
+//   pitchBendRange()    the wheel's range for a keyboard that is not MPE
+//   setMpe(true)        bend and pressure per finger, from an MPE controller
+#define SONORE_NUM_PARAMS 10
+// Tall enough for the generic editor to show all four groups of controls and
+// the keyboard under them without scrolling: a keyboard below the fold is one
+// a player does not know is there.
+#define SONORE_UI_WIDTH 700
+#define SONORE_UI_HEIGHT 640
 
 #include <sonore/dsp.h>
 
 namespace {
 
+// The table's rows by name, in the order the table has them -- which is their
+// identity in every saved session, so a new control is only ever appended.
+enum Param { kCutoff, kResonance, kAttack, kRelease, kLevel, kVoices, kMode, kGlide, kBendRange, kSpread };
+
 struct Voice {
   sonore::Oscillator osc;
   sonore::ADSR env;
   sonore::LadderFilter filter;
+  sonore::Portamento glide;
   float velocity = 1.0f;
   float cutoff = 4000.0f;
   float resonance = 0.2f;
   float sampleRate = 48000.0f;
+  /** Glide only where a line is played: a poly chord gliding each note from
+   *  whatever its voice last played would smear every chord change. */
+  bool glides = false;
 
   void setSampleRate(float sr) {
     sampleRate = sr;
@@ -23,6 +46,7 @@ struct Voice {
     env.setSampleRate(sr);
     filter.setSampleRate(sr);
     filter.reset();
+    glide.setSampleRate(sr);
   }
   void setTone(float cutoffHz, float res) {
     cutoff = cutoffHz;
@@ -40,9 +64,24 @@ struct Voice {
     p.release = release;
     env.setParameters(p);
   }
+  void setGlide(float seconds, bool on) {
+    glide.setTime(seconds);
+    glides = on && seconds > 0.0f;
+  }
+  /** Where in the stereo field this voice sits, -1 left to 1 right: equal
+   *  power, so a note panned to one side is as loud as one in the middle. */
+  void setPan(float pan) {
+    const float a = (pan + 1.0f) * 0.25f * 3.14159265f;
+    gainL = std::cos(a);
+    gainR = std::sin(a);
+  }
+
   void noteOn(int note, float vel) {
     velocity = vel;
-    key = note;
+    // A voice still sounding glides to the new note (mono: "glide always");
+    // a silent one has no pitch to come from.
+    if (glides && env.isActive()) glide.glideTo((float) note);
+    else glide.jumpTo((float) note);
     bendSemis = 0.0f;
     // The filter goes back with the pressure. Zeroing only the number left
     // the ladder where the voice's last note had leant it -- four times the
@@ -50,25 +89,28 @@ struct Voice {
     // no change by that number, so it played the whole note that bright.
     pressure = 0.0f;
     filter.set(cutoff, resonance);
-    retune();
+    retune(glide.current());
     osc.reset();
     filter.reset();
     env.noteOn();
   }
+  /** Legato: the next note without a new attack, gliding if glide is on. */
+  void legatoTo(int note, float vel) {
+    velocity = vel;
+    if (glides) glide.glideTo((float) note);
+    else glide.jumpTo((float) note);
+  }
   void noteOff() { env.noteOff(); }
-  /** Silent now, with no release: what a reset means. */
+  /** Silent now, with no release: what a reset and All Sound Off mean. */
   void kill() {
     env.reset();
     filter.reset();
   }
   bool isActive() const { return env.isActive(); }
-
   /** Per-note expression, the whole point of MPE: this finger's bend and
-   *  pressure, not the instrument's. */
-  void setTuning(float semitones) {
-    bendSemis = semitones;
-    retune();
-  }
+   *  pressure, not the instrument's. A plain keyboard's wheel arrives the
+   *  same way, at the range pitchBendRange() gives. */
+  void setTuning(float semitones) { bendSemis = semitones; }
   void setPressure(float p) {
     const float clamped = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
     if (clamped == pressure) return;
@@ -78,17 +120,33 @@ struct Voice {
     // every sample is both wasteful and audible as a change in tone.
     filter.set(cutoff * (1.0f + 3.0f * pressure), resonance);
   }
+  /** The mod wheel: vibrato, up to half a semitone either way at 5.5 Hz. */
+  void setModWheel(float value) { vibratoDepth = 0.5f * value; }
 
-  float render() { return filter.process(osc.saw()) * env.getNextSample() * velocity; }
-
-private:
-  void retune() {
-    osc.setFreq((float) sonore::MidiMessage::getMidiNoteInHertz(key) *
-                std::pow(2.0f, bendSemis / 12.0f));
+  void render(float& left, float& right) {
+    float note = glide.next() + bendSemis;
+    if (vibratoDepth > 0.0f) {
+      vibratoPhase += 5.5f / sampleRate;
+      if (vibratoPhase >= 1.0f) vibratoPhase -= 1.0f;
+      note += vibratoDepth * std::sin(6.2831853f * vibratoPhase);
+    }
+    // The frequency only when the pitch moved: a steady note costs nothing.
+    if (note != lastNote) retune(note);
+    const float s = filter.process(osc.saw()) * env.getNextSample() * velocity;
+    left = s * gainL;
+    right = s * gainR;
   }
 
+private:
+  void retune(float note) {
+    lastNote = note;
+    osc.setFreq(440.0f * std::exp2((note - 69.0f) / 12.0f));
+  }
+  float gainL = 0.70710678f, gainR = 0.70710678f;
+  float vibratoPhase = 0.0f, vibratoDepth = 0.0f;
+  float lastNote = -1000.0f;
+
 public:
-  int key = 60;
   float bendSemis = 0.0f, pressure = 0.0f;
 };
 
@@ -99,18 +157,19 @@ struct SonoreDsp {
   sonore::Smooth levelSm;
   bool levelArrived = false; // the smoother has been put on the control
   float lastCutoff = -1.0f, lastRes = -1.0f, lastAttack = -1.0f, lastRelease = -1.0f;
+  float lastGlide = -1.0f, lastSpread = -1.0f;
+  int lastVoices = -1, lastMode = -1;
+  float bendRange = 2.0f;
 
   /** What a host needs to draw a voice meter and to decide how many MPE
    *  member channels are worth allocating. Answering nothing makes a host
    *  guess, and a guess that is too high sounds like voices stolen for no
    *  reason the player can see. */
   int voiceCapacity() const { return voices.kNumVoices; }
-  int activeVoices() const {
-    int n = 0;
-    for (int i = 0; i < voices.kNumVoices; ++i)
-      if (voices.voice(i).isActive()) ++n;
-    return n;
-  }
+  int activeVoices() const { return voices.activeVoices(); }
+  /** The wheel's range for a keyboard that is not MPE, from the Bend Range
+   *  control: the wrapper's decoder reads it before every block. */
+  float pitchBendRange() const { return bendRange; }
 
   void prepare(const sonore::ProcessSpec& spec) {
     const float sr = (float) spec.sampleRate;
@@ -125,42 +184,71 @@ struct SonoreDsp {
       voices.voice(i).kill();
       voices.voice(i).setSampleRate(sr);
     }
+    voices.allNotesOff();
+    voices.setSampleRate(spec.sampleRate); // the steal fade's 2 ms
+    // Bend and pressure arrive per note, decoded by the wrapper (the
+    // descriptor says supportsMpe): the voice manager leaves the raw wheel
+    // alone rather than bend every note twice.
+    voices.setMpe(true);
     levelSm.setup(sr, 15.0f);
     levelArrived = false; // it lands on the control in the next block
-    lastCutoff = lastRes = lastAttack = lastRelease = -1.0f;
+    lastCutoff = lastRes = lastAttack = lastRelease = lastGlide = lastSpread = -1.0f;
+    lastVoices = lastMode = -1;
   }
 
   void process(sonore::ProcessContext& ctx, const float* p) {
+    // Voice settings only touch the voices when a control actually moved.
+    if (p[kCutoff] != lastCutoff || p[kResonance] != lastRes) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setTone(p[kCutoff], p[kResonance]);
+      lastCutoff = p[kCutoff];
+      lastRes = p[kResonance];
+    }
+    if (p[kAttack] != lastAttack || p[kRelease] != lastRelease) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setEnvelope(p[kAttack], p[kRelease]);
+      lastAttack = p[kAttack];
+      lastRelease = p[kRelease];
+    }
+    const int mode = (int) (p[kMode] + 0.5f);
+    if (mode != lastMode) {
+      using Voices = sonore::VoiceManager<Voice, 8>;
+      voices.setMode(mode == 1 ? Voices::Mode::Mono : mode == 2 ? Voices::Mode::Legato : Voices::Mode::Poly);
+      lastMode = mode;
+      lastGlide = -1.0f; // glide is on in Mono and Legato only
+    }
+    if (p[kGlide] != lastGlide) {
+      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setGlide(p[kGlide], mode != 0);
+      lastGlide = p[kGlide];
+    }
+    const int polyphony = (int) (p[kVoices] + 0.5f);
+    if (polyphony != lastVoices) {
+      voices.setPolyphony(polyphony);
+      lastVoices = polyphony;
+    }
+    if (p[kSpread] != lastSpread) {
+      // The voices fan out from the middle, alternating sides, so the first
+      // notes of a chord are already apart: voice 0 left, 1 right, 2 a
+      // little less left...
+      const float spread = p[kSpread] / 100.0f;
+      for (int i = 0; i < voices.kNumVoices; ++i) {
+        const float side = (i % 2 == 0) ? -1.0f : 1.0f;
+        const float reach = 1.0f - (float) (i / 2) / (float) (voices.kNumVoices / 2);
+        voices.voice(i).setPan(spread * side * reach);
+      }
+      lastSpread = p[kSpread];
+    }
+    bendRange = p[kBendRange];
+
+    // Notes, pedals, wheels and per-note expression, each at its own frame.
+    sonore::renderVoices(voices, ctx);
+
+    // The level, smoothed. Once per block for the target: the control is
+    // constant across it, and the smoother does the ramp, so the dB-to-gain
+    // power need not run per sample.
     sonore::AudioBlock<float>& io = ctx.main;
-    sonore::MidiBuffer& midi = ctx.midi;
     const size_t n = io.getNumSamples();
     float* L = io.getChannelPointer(0);
-    float* R = io.getNumChannels() > 1 ? io.getChannelPointer(1) : L;
-
-    // Voice settings only touch the filters when a control actually moved.
-    if (p[0] != lastCutoff || p[1] != lastRes) {
-      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setTone(p[0], p[1]);
-      lastCutoff = p[0];
-      lastRes = p[1];
-    }
-    if (p[2] != lastAttack || p[3] != lastRelease) {
-      for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setEnvelope(p[2], p[3]);
-      lastAttack = p[2];
-      lastRelease = p[3];
-    }
-
-    auto event = midi.begin();
-    const auto end = midi.end();
-    // Expression events are interleaved with the notes by frame, so a bend
-    // that arrives mid-block bends from that frame rather than the next one.
-    const sonore::NoteExpressionBuffer::Entry* expr =
-        ctx.expression ? ctx.expression->begin() : nullptr;
-    const sonore::NoteExpressionBuffer::Entry* exprEnd =
-        ctx.expression ? ctx.expression->end() : nullptr;
-
-    // Once per block: the control is constant across it, and the smoother
-    // does the ramp, so the dB-to-gain power need not run per sample.
-    const float levelTarget = sonore::dbToGain(p[4]);
+    float* R = io.getNumChannels() > 1 ? io.getChannelPointer(1) : nullptr;
+    const float levelTarget = sonore::dbToGain(p[kLevel]);
     // The first block after prepare() LANDS on the control rather than
     // gliding to it: there is no earlier level to come from. It was snapped
     // to a fixed 0.3 in prepare() -- which also answers a reset and the
@@ -171,45 +259,21 @@ struct SonoreDsp {
       levelArrived = true;
     }
     for (size_t i = 0; i < n; ++i) {
-      // Notes apply at their exact frame: that is what keeps a synth tight.
-      while (event != end && (size_t) event->samplePosition <= i) {
-        const sonore::MidiMessage& m = event->getMessage();
-        // The CHANNEL travels with the note. Under MPE every finger has its
-        // own, so two fingers on the same key are two notes -- and without
-        // this, lifting one released both.
-        // The pedals first: a damper held while the hands lift is the
-        // difference between a playable instrument and one that stops dead.
-        if (sonore::applyPedals(voices, m)) {
-          ++event;
-          continue;
-        }
-        if (m.isNoteOn())
-          voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), m.getChannel() - 1);
-        else if (m.isNoteOff())
-          voices.noteOff(m.getNoteNumber(), m.getChannel() - 1);
-        ++event;
-      }
-      while (expr != exprEnd && (size_t) expr->samplePosition <= i) {
-        const int v = voices.voiceForNote(expr->key, expr->channel);
-        if (v >= 0) {
-          if (expr->expression == sonore::kExprTuning) voices.voice(v).setTuning(expr->value);
-          else if (expr->expression == sonore::kExprPressure)
-            voices.voice(v).setPressure(expr->value);
-        }
-        ++expr;
-      }
-      const float s = voices.render() * levelSm.next(levelTarget);
-      L[i] = s;
-      R[i] = s;
+      const float g = levelSm.next(levelTarget);
+      L[i] *= g;
+      if (R) R[i] *= g;
     }
   }
 };
 
 #include <sonore/plugin.h>
 
+static const char* const kModeNames[] = {"Poly", "Mono", "Legato"};
+
 static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     // The trailing name is the display GROUP: a host's generic editor folds
-    // these into "Filter", "Envelope" and "Output" rather than one flat list.
+    // these into "Filter", "Envelope", "Output" and "Voices" rather than one
+    // flat list.
     // SKEWED, and this is the control that makes the case. Linear from 80 Hz
     // to 16 kHz puts 1 kHz at six per cent of the knob: everything a player
     // reaches for is crushed into the bottom and the top half is all hiss.
@@ -223,6 +287,15 @@ static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     {"attack", "Attack", "s", 0.001f, 2.0f, 0.01f, 0, "Envelope"},
     {"release", "Release", "s", 0.01f, 4.0f, 0.3f, 0, "Envelope"},
     {"level", "Level", "dB", -40.0f, 6.0f, -12.0f, 0, "Output"},
+    // Appended after the first five, which sessions already know: their
+    // places are their identities, so every new control goes at the end.
+    {"voices", "Voices", "", 1.0f, 8.0f, 8.0f, 8, "Voices"},
+    {"mode", "Mode", "", 0.0f, 2.0f, 0.0f, 3, "Voices", kModeNames, 3},
+    // Most of a glide's useful range is under a quarter of a second.
+    {"glide", "Glide", "s", 0.0f, 1.0f, 0.0f, 0, "Voices", nullptr, 0, true, false, false,
+     sonore::skewForCentre(0.0f, 1.0f, 0.15f)},
+    {"bendrange", "Bend Range", "st", 1.0f, 24.0f, 2.0f, 24, "Voices"},
+    {"spread", "Spread", "%", 0.0f, 100.0f, 30.0f, 0, "Output"},
 };
 
 static const sonore::PluginDescriptor kDesc = {
@@ -230,7 +303,7 @@ static const sonore::PluginDescriptor kDesc = {
     "Sonore Synth",
     "Sonorie",
     "1.0.0",
-    "Eight-voice polyphonic saw synth with a ladder filter.",
+    "Eight-voice saw synth with a ladder filter: poly, mono and legato with glide, stereo spread, MPE.",
     "https://sonorie.com",
     true, // instrument
     kParamTable,

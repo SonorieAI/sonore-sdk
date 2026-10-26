@@ -1898,18 +1898,17 @@ int main(int argc, char** argv) {
         ValueQueue bend;
         bend.lpVtbl = &g_vqVtbl;
         bend.id = bendId;
-        // A WHOLE TONE, not the maximum.
+        // A WHOLE TONE: full deflection, at the synth's Bend Range of two.
         //
-        // The first version sent 1.0 and printed 110 Hz -> 251 Hz, which looks
-        // like a pass and is not one: MPE's default range is 48 semitones, so
-        // full deflection is 1760 Hz, and the autocorrelation below searches
-        // lags 48..800: it cannot see anything above 1000 Hz and locked onto
-        // a sub-multiple instead. The bend was right and the measurement was
-        // lying. A modest bend keeps the answer inside the instrument's range
-        // and turns "it moved" into an exact ratio worth checking.
+        // A host's pitch wheel is a plain keyboard's, not MPE, so it bends at
+        // the plugin's own range (pitchBendRange(), two semitones here) --
+        // not at MPE's per-note 48, which it used to: full deflection then
+        // threw the note four octaves, and this test sent 2/48 of the
+        // half-range to keep the answer where the autocorrelation below
+        // (lags 48..800, nothing above 1000 Hz) could see it.
         //
-        // 0.5 is centre; +2 of 48 semitones is +2/48 of the half-range.
-        bend.value = 0.5 + (2.0 / 48.0) * 0.5;
+        // 0.5 is centre; 1.0 is +2 semitones.
+        bend.value = 1.0;
         queues.push_back(bend);
         capture(oneSecond / 4);
         capture(oneSecond / 4);

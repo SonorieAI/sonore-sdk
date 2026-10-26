@@ -2121,10 +2121,11 @@ int main(int argc, char** argv) {
     capture(94, nullptr);
     const double plain = pitchOf(captured);
 
-    // A whole tone up. 8192 is centre; MPE's default range is 48 semitones,
-    // so +2 of those is 8192 + 8191 * 2/48.
+    // A whole tone up. A keyboard that is not MPE bends 2 semitones at full
+    // throw, MIDI's default, in an MPE plugin as in any other (the synth's
+    // Bend Range starts there too), so the wheel all the way up: 16383.
     sonore::MidiBuffer bend;
-    bend.addEvent(sonore::MidiMessage::pitchBend(0, 8192 + (int) (8191.0 * 2.0 / 48.0)), 0);
+    bend.addEvent(sonore::MidiMessage::pitchBend(0, 16383), 0);
     capture(94, &bend);
     capture(94, nullptr);
     const double bent = pitchOf(captured);

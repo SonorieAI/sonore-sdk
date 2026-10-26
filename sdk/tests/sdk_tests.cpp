@@ -1593,6 +1593,314 @@ static void testVoiceStealingAndPedals() {
 }
 
 /**
+ * What a synth needs from its voice manager past allocation: a steal that is
+ * not heard, stereo voices, a mono line that behaves like one, the wheels,
+ * and a note's end reported by the id the host gave it. Each is checked by
+ * what it does to the sound or to the notes, not by the flags behind it.
+ */
+static void testVoiceManagerForSynths() {
+  std::printf("voice manager: steals, stereo, mono and legato, wheels, note ends\n");
+
+  // A sine that starts at phase 0 and stops dead: the voice that makes a
+  // steal's seam as audible as it can be.
+  struct SineVoice {
+    double phase = 0.0, inc = 0.0;
+    bool active = false;
+    int noteOns = 0;
+    void noteOn(int note, float) {
+      inc = 2.0 * 3.14159265358979 * sonore::MidiMessage::getMidiNoteInHertz(note) / 48000.0;
+      phase = 0.0;
+      active = true;
+      ++noteOns;
+    }
+    void noteOff() { active = false; }
+    bool isActive() const { return active; }
+    float render() {
+      phase += inc;
+      return (float) std::sin(phase);
+    }
+  };
+
+  // ── A steal is not heard ─────────────────────────────────────────
+  //
+  // One voice, a note held long enough to be anywhere in its cycle, then a
+  // second note takes the voice. Restarted cold, the output steps from the old
+  // sine's value to 0; faded, it moves no faster than the two sines themselves.
+  {
+    sonore::VoiceManager<SineVoice, 1> voices;
+    voices.setSampleRate(48000.0);
+    voices.noteOn(69, 1.0f); // 440 Hz
+    float prev = 0.0f;
+    // Near the crest, where a cold restart to phase 0 would step by almost 1.
+    for (int i = 0; i < 1000 || prev < 0.95f; ++i) prev = voices.render();
+    voices.noteOn(81, 1.0f); // 880 Hz, in the same and only voice
+    float seam = 0.0f;
+    for (int i = 0; i < 400; ++i) {
+      const float s = voices.render();
+      seam = std::max(seam, std::fabs(s - prev));
+      prev = s;
+    }
+    // Continuous signals move at most by their slopes: 0.058 a sample for the
+    // old sine, 0.115 for the new one, plus the fade's own 0.016. A cut is a
+    // step of 0.95.
+    std::printf("  ---- steal at the crest: largest sample-to-sample move %.3f (a cut is 0.95) ----\n", seam);
+    check(seam < 0.25f, "a stolen voice leaves without a step: the seam moves no faster than the sines");
+    check(voices.stealFadeSamples() == 96, "…faded over 2 ms at 48 kHz");
+    int ended = 0;
+    voices.drainEndedNotes([&](const auto& e) {
+      if (e.note == 69) ++ended;
+    });
+    check(ended == 1, "…and the stolen note is reported as ended");
+  }
+
+  // ── Stereo voices ────────────────────────────────────────────────
+  {
+    struct LeftVoice {
+      bool active = false;
+      void noteOn(int, float) { active = true; }
+      void noteOff() { active = false; }
+      bool isActive() const { return active; }
+      void render(float& l, float& r) {
+        l = 1.0f;
+        r = 0.0f;
+      }
+    };
+    sonore::VoiceManager<LeftVoice, 4> voices;
+    voices.noteOn(60, 1.0f);
+    voices.noteOn(64, 1.0f);
+    float l = 0.0f, r = 0.0f;
+    voices.render(l, r);
+    check(l == 2.0f && r == 0.0f, "a stereo voice renders in stereo: two voices hard left sum left");
+    check(voices.render() == 1.0f, "…and the mono mix folds each to the middle");
+  }
+
+  // ── Mono: which key sounds, and the trill ─────────────────────────
+  {
+    sonore::VoiceManager<SineVoice, 4> voices;
+    voices.setMode(decltype(voices)::Mode::Mono);
+    voices.noteOn(60, 1.0f);
+    voices.noteOn(64, 1.0f);
+    check(voices.voiceForNote(64) == 0 && voices.voiceForNote(60) < 0,
+          "mono, last-note priority: the newest key sounds, on the one voice");
+    check(voices.activeVoices() == 1, "…and only one voice is ever used");
+    voices.noteOff(64);
+    check(voices.voiceForNote(60) == 0, "lifting it goes back to the key still held: a trill works");
+    voices.noteOff(60);
+    for (int i = 0; i < 10; ++i) voices.render();
+    check(voices.activeVoices() == 0, "lifting the last key ends the line");
+  }
+  {
+    sonore::VoiceManager<SineVoice, 4> voices;
+    voices.setMode(decltype(voices)::Mode::Mono);
+    voices.setNotePriority(decltype(voices)::NotePriority::Low);
+    voices.noteOn(60, 1.0f);
+    voices.noteOn(64, 1.0f);
+    check(voices.voiceForNote(60) == 0, "low-note priority: a higher key added over a bass note is not played");
+    voices.noteOff(60);
+    check(voices.voiceForNote(64) == 0, "…until the bass key comes up, and the line moves to it");
+  }
+  {
+    sonore::VoiceManager<SineVoice, 4> voices;
+    voices.setMode(decltype(voices)::Mode::Mono);
+    voices.setNotePriority(decltype(voices)::NotePriority::High);
+    voices.noteOn(72, 1.0f);
+    voices.noteOn(60, 1.0f);
+    check(voices.voiceForNote(72) == 0, "high-note priority: the lead stays on top of a lower key");
+  }
+
+  // ── Legato: overlapping notes move the voice without a restart ────
+  {
+    struct GlideVoice {
+      bool active = false;
+      int noteOns = 0, legatos = 0, note = 0;
+      void noteOn(int n, float) { active = true; ++noteOns; note = n; }
+      void legatoTo(int n, float) { ++legatos; note = n; }
+      void noteOff() { active = false; }
+      bool isActive() const { return active; }
+      float render() { return 0.0f; }
+    };
+    sonore::VoiceManager<GlideVoice, 4> voices;
+    voices.setMode(decltype(voices)::Mode::Legato);
+    voices.noteOn(60, 1.0f);
+    voices.noteOn(62, 1.0f); // played while 60 is held
+    check(voices.voice(0).noteOns == 1 && voices.voice(0).legatos == 1 && voices.voice(0).note == 62,
+          "legato: a note played over a held one moves the voice without retriggering it");
+    voices.noteOff(62);
+    check(voices.voice(0).legatos == 2 && voices.voice(0).note == 60,
+          "…and lifting it slides back to the key still down");
+    voices.noteOff(60);
+    voices.noteOn(64, 1.0f); // detached: nothing held
+    check(voices.voice(0).noteOns == 2, "a detached note starts the voice again: legato means overlapping");
+
+    sonore::VoiceManager<GlideVoice, 4> mono;
+    mono.setMode(decltype(mono)::Mode::Mono);
+    mono.noteOn(60, 1.0f);
+    mono.noteOn(62, 1.0f);
+    check(mono.voice(0).noteOns == 2 && mono.voice(0).legatos == 0,
+          "mono (not legato): every note retriggers, overlapping or not");
+  }
+
+  // ── The damper pedal holds a mono line too ────────────────────────
+  {
+    sonore::VoiceManager<SineVoice, 4> voices;
+    voices.setMode(decltype(voices)::Mode::Mono);
+    voices.sustainPedal(true);
+    voices.noteOn(60, 1.0f);
+    voices.noteOff(60);
+    check(voices.voiceForNote(60) == 0, "mono: a key lifted under the pedal keeps sounding");
+    voices.sustainPedal(false);
+    for (int i = 0; i < 10; ++i) voices.render();
+    check(voices.activeVoices() == 0, "…until the pedal comes up");
+  }
+
+  // ── A polyphony limit below the voices there are ──────────────────
+  {
+    sonore::VoiceManager<SineVoice, 8> voices;
+    voices.setPolyphony(2);
+    voices.noteOn(60, 1.0f);
+    voices.noteOn(64, 1.0f);
+    voices.noteOn(67, 1.0f);
+    check(voices.activeVoices() == 2, "setPolyphony(2): a third note steals rather than taking a third voice");
+    check(voices.voiceForNote(67) >= 0, "…and the new note is the one that sounds");
+    voices.setPolyphony(100);
+    check(voices.polyphony() == 8, "a limit above the voices there are is the voices there are");
+  }
+
+  // ── The wheels, through applyMidi() ───────────────────────────────
+  {
+    struct BendVoice {
+      bool active = false;
+      float bend = 0.0f, wheel = 0.0f, pressure = 0.0f;
+      void noteOn(int, float) { active = true; }
+      void noteOff() { active = false; }
+      bool isActive() const { return active; }
+      float render() { return 0.0f; }
+      void setPitchBend(float semis) { bend = semis; }
+      void setModWheel(float v) { wheel = v; }
+      void setPressure(float p) { pressure = p; }
+    };
+    sonore::VoiceManager<BendVoice, 4> voices;
+    check(sonore::applyMidi(voices, sonore::MidiMessage::noteOn(0, 60, 100)), "applyMidi takes a note-on");
+    sonore::applyMidi(voices, sonore::MidiMessage::pitchBend(0, 16383));
+    checkNear(voices.voice(voices.voiceForNote(60)).bend, 2.0, 1e-6, "the wheel at its top bends +2 semitones by default");
+    sonore::applyMidi(voices, sonore::MidiMessage::pitchBend(0, 0));
+    checkNear(voices.voice(voices.voiceForNote(60)).bend, -2.0, 1e-6, "…and at its bottom, -2");
+    voices.setPitchBendRange(12.0f);
+    sonore::applyMidi(voices, sonore::MidiMessage::pitchBend(0, 16383));
+    checkNear(voices.voice(voices.voiceForNote(60)).bend, 12.0, 1e-6, "setPitchBendRange(12): a full throw is an octave");
+    sonore::applyMidi(voices, sonore::MidiMessage::noteOn(0, 64, 100));
+    checkNear(voices.voice(voices.voiceForNote(64)).bend, 12.0, 1e-6,
+              "a note started while the wheel is up starts bent");
+    sonore::applyMidi(voices, sonore::MidiMessage::pitchBend(0, 8192));
+    checkNear(voices.voice(voices.voiceForNote(64)).bend, 0.0, 1e-6, "8192 is the centre: no bend");
+    sonore::applyMidi(voices, sonore::MidiMessage::controlChange(0, 1, 127));
+    checkNear(voices.voice(0).wheel, 1.0, 1e-6, "the mod wheel reaches the voices");
+    sonore::applyMidi(voices, sonore::MidiMessage::channelPressure(0, 127));
+    checkNear(voices.voice(voices.voiceForNote(64)).pressure, 1.0, 1e-6, "channel pressure reaches the voices on the channel");
+
+    voices.setMpe(true);
+    check(!sonore::applyMidi(voices, sonore::MidiMessage::pitchBend(0, 0)),
+          "under MPE the wheel is left to the per-note expression the wrapper made of it");
+    checkNear(voices.voice(voices.voiceForNote(64)).bend, 0.0, 1e-6, "…so nothing is bent twice");
+  }
+
+  // ── A note's end, by the host's id ────────────────────────────────
+  {
+    struct TailVoice {
+      bool active = false, releasing = false;
+      int left = 0;
+      void noteOn(int, float) { active = true; releasing = false; }
+      void noteOff() { releasing = true; left = 50; }
+      bool isActive() const { return active; }
+      float render() {
+        if (releasing && --left <= 0) active = false;
+        return 0.0f;
+      }
+    };
+    sonore::VoiceManager<TailVoice, 4> voices;
+    voices.noteOn(60, 1.0f, 0, 77);
+    check(voices.voiceForNoteId(77) >= 0, "a note started with an id is found by it");
+    voices.noteOff(60, 0);
+    int count = 0;
+    int32_t id = -1;
+    for (int i = 0; i < 100; ++i) voices.render();
+    voices.drainEndedNotes([&](const auto& e) {
+      ++count;
+      id = e.noteId;
+    });
+    check(count == 1 && id == 77, "when its release runs out, the note is reported ended, once, by its id");
+    voices.drainEndedNotes([&](const auto&) { ++count; });
+    check(count == 1, "…and draining forgets it");
+  }
+
+  // ── All Sound Off silences now ────────────────────────────────────
+  {
+    struct HeldVoice {
+      bool active = false;
+      void noteOn(int, float) { active = true; }
+      void noteOff() {} // a release that never ends
+      void kill() { active = false; }
+      bool isActive() const { return active; }
+      float render() { return 1.0f; }
+    };
+    sonore::VoiceManager<HeldVoice, 4> voices;
+    voices.noteOn(60, 1.0f);
+    sonore::applyMidi(voices, sonore::MidiMessage::controlChange(0, 120, 0));
+    float last = 1.0f;
+    for (int i = 0; i < voices.stealFadeSamples() + 4; ++i) last = voices.render();
+    check(voices.activeVoices() == 0 && last == 0.0f,
+          "CC 120 kills a voice that has kill(): silent once the fade is through, release or not");
+  }
+
+  // ── renderVoices: a note lands on its frame ───────────────────────
+  {
+    struct OneVoice {
+      bool active = false;
+      void noteOn(int, float) { active = true; }
+      void noteOff() { active = false; }
+      bool isActive() const { return active; }
+      float render() { return 1.0f; }
+    };
+    sonore::VoiceManager<OneVoice, 4> voices;
+    std::vector<float> l(64, 9.0f), r(64, 9.0f);
+    float* ch[2] = {l.data(), r.data()};
+    sonore::MidiBuffer midi, midiOut;
+    sonore::NoteExpressionBuffer expr;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 37);
+    sonore::AudioBlock<float> block(ch, 2, 64);
+    sonore::AudioBlock<float> aux[1] = {};
+    float* scp[2] = {nullptr, nullptr};
+    sonore::AudioBlock<float> sc(scp, 2, 0);
+    sonore::ProcessContext ctx{block, aux, 0, sc, midi, midiOut, nullptr, &expr};
+    sonore::renderVoices(voices, ctx);
+    check(l[36] == 0.0f && r[36] == 0.0f, "renderVoices writes silence before a note's frame");
+    check(l[37] == 1.0f && r[37] == 1.0f, "…and the note sounds from exactly its frame (37)");
+  }
+
+  // ── Portamento ────────────────────────────────────────────────────
+  {
+    sonore::Portamento glide;
+    glide.setSampleRate(1000.0f);
+    glide.setTime(0.1f); // 100 samples
+    glide.jumpTo(60.0f);
+    glide.glideTo(72.0f);
+    for (int i = 0; i < 50; ++i) glide.next();
+    checkNear(glide.current(), 66.0, 1e-4, "constant time: halfway through the time, halfway in pitch");
+    for (int i = 0; i < 50; ++i) glide.next();
+    checkNear(glide.current(), 72.0, 1e-6, "…and there at the end");
+    check(!glide.isGliding(), "…and done");
+
+    glide.setTiming(sonore::Portamento::Timing::ConstantRate); // 0.1 s per octave
+    glide.glideTo(96.0f); // two octaves: 200 samples
+    for (int i = 0; i < 100; ++i) glide.next();
+    checkNear(glide.current(), 84.0, 1e-4, "constant rate: two octaves take twice the time");
+    glide.setTime(0.0f);
+    glide.glideTo(60.0f);
+    checkNear(glide.next(), 60.0, 1e-6, "no time is no glide");
+  }
+}
+
+/**
  * Which keys a UI should draw as held. Read off the MIDI buffer every format
  * fills, so it is one tally rather than five decoders each keeping their own.
  */
@@ -11554,6 +11862,59 @@ static void testRpnDetector() {
 // MpeDecoder assumed 48 semitones -- the MPE default -- and a player whose
 // instrument is set to two would have been bent twenty-four times too far on
 // every note.
+// A keyboard that is not MPE bends at a keyboard's range. The decoder used
+// MPE's per-note 48 for every channel until a zone was announced, so in any
+// plugin that declared MPE support a plain pitch wheel threw a note four
+// octaves at full throw.
+static void testPlainKeyboardBendRange() {
+  auto fullBend = [](sonore::MpeDecoder& mpe, sonore::MidiBuffer& midi) {
+    sonore::NoteExpressionBuffer out;
+    mpe.process(midi, out);
+    float tuning = 0.0f;
+    for (const auto* e = out.begin(); e != out.end(); ++e)
+      if (e->expression == sonore::kExprTuning) tuning = e->value;
+    return tuning;
+  };
+  {
+    sonore::MpeDecoder mpe;
+    sonore::MidiBuffer midi;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 0), 1); // full throw down
+    checkNear(fullBend(mpe, midi), -2.0f, 0.01f,
+              "a plain keyboard's wheel bends two semitones, not MPE's forty-eight");
+  }
+  {
+    sonore::MpeDecoder mpe;
+    mpe.setLegacyBendRange(12.0f); // what a plugin's Bend Range control passes
+    sonore::MidiBuffer midi;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 0), 1);
+    checkNear(fullBend(mpe, midi), -12.0f, 0.01f, "\u2026or the plugin's own range, when it has one");
+  }
+  {
+    sonore::MpeDecoder mpe;
+    mpe.setLegacyBendRange(12.0f);
+    sonore::MidiBuffer midi;
+    midi.addEvent(sonore::MidiMessage::noteOn(0, 60, 100), 0);
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 101, 0), 1); // RPN 0: the keyboard
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 100, 0), 2); // says it bends five
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 6, 5), 3);
+    midi.addEvent(sonore::MidiMessage::pitchBend(0, 0), 4);
+    checkNear(fullBend(mpe, midi), -5.0f, 0.01f, "\u2026and the keyboard's own, when it announces one");
+  }
+  {
+    // Inside a zone, a member channel is MPE: forty-eight, as the spec says.
+    sonore::MpeDecoder mpe;
+    sonore::MidiBuffer midi;
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 101, 0), 0); // MCM: lower zone,
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 100, 6), 1); // RPN 6
+    midi.addEvent(sonore::MidiMessage::controlChange(0, 6, 5), 2);   // five members
+    midi.addEvent(sonore::MidiMessage::noteOn(1, 60, 100), 3);
+    midi.addEvent(sonore::MidiMessage::pitchBend(1, 0), 4);
+    checkNear(fullBend(mpe, midi), -48.0f, 0.01f, "a member channel of an MPE zone still bends at forty-eight");
+  }
+}
+
 static void testMpeBendRangeFromWire() {
   sonore::MpeDecoder mpe;
   sonore::MidiBuffer midi;
@@ -38687,6 +39048,7 @@ int main() {
   testResampler();
   testVoiceManager();
   testVoiceStealingAndPedals();
+  testVoiceManagerForSynths();
   testNoteState();
   testUserSettings();
   testUnicodePaths();
@@ -38775,6 +39137,7 @@ int main() {
   testRpnDetector();
   testMpeZones();
   testMpeBendRangeFromWire();
+  testPlainKeyboardBendRange();
   testCompensatedDryWetMixer();
   testFilterSettlingTimes();
   testAsioFormats();

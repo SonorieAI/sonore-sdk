@@ -913,7 +913,10 @@ inline void run(LV2_Handle handle, uint32_t sampleCount) {
     const uint32_t numRoles =
         rolesFromMask(defaultChannelMask(width), roles, clapwrap::kMaxAudioChannels);
     self->shared.expression.clear();
-    if (kDesc.supportsMpe) self->shared.mpe.process(self->shared.midi, self->shared.expression);
+    if (kDesc.supportsMpe) {
+      clapwrap::syncBendRange(self->shared.dsp, self->shared.mpe);
+      self->shared.mpe.process(self->shared.midi, self->shared.expression);
+    }
     // ctx.offline too: it was left false, so a DSP reading it -- as the
     // other formats let it -- never heard that the host was freewheeling.
     ProcessContext ctx{block,

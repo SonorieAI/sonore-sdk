@@ -803,7 +803,10 @@ private:
     const uint32_t numRoles = shared.mainRoles(roles, clapwrap::kMaxAudioChannels);
     shared.expression.clear();
     midi.clampPositions((int) frames);
-    if (kDesc.supportsMpe) shared.mpe.process(midi, shared.expression);
+    if (kDesc.supportsMpe) {
+      clapwrap::syncBendRange(shared.dsp, shared.mpe);
+      shared.mpe.process(midi, shared.expression);
+    }
     ProcessContext pc{block,
                       auxBlocks,
                       nAux,

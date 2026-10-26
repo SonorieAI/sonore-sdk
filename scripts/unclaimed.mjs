@@ -65,7 +65,7 @@ const NOT_A_CAPABILITY = new Set([
   "TakesMidi", "TakesSidechain", "TakesContext", "TakesDouble", "TakesDoubleCtx",
   "WantsTransport", "WantsHostInfo", "WantsTrackInfo", "WantsFile", "HasVoiceCapacity",
   "HasActiveVoices", "HasStateBag", "HasLatency", "HasTail", "HasPrepare", "HasReset",
-  "HasGainReduction",
+  "HasGainReduction", "HasPitchBendRange",
   "SonoreTakesMidi", "SonoreTakesContext", "SonoreTakesSidechain",
   "SonoreWantsTransport", "SonoreHasLatency", "SonoreHasGainReduction",
 

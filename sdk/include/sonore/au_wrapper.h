@@ -1835,7 +1835,10 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   // The offsets came with the MIDI, before this call said how long the block
   // is: one at or past its end was never reached, and the note hung.
   unit->shared.midi.clampPositions((int) frames);
-  if (kDesc.supportsMpe) unit->shared.mpe.process(unit->shared.midi, unit->shared.expression);
+  if (kDesc.supportsMpe) {
+    clapwrap::syncBendRange(unit->shared.dsp, unit->shared.mpe);
+    unit->shared.mpe.process(unit->shared.midi, unit->shared.expression);
+  }
   ProcessContext ctx{block,
                      auxBlocks,
                      nAux,

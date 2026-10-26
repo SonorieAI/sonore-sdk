@@ -194,7 +194,30 @@ const MAP = [
   ["basics", "NormalisableRange (skew)", "ParamInfo::skew", "inline float skewForCentre"],
   ["basics", "Reverb", "Reverb", "class Reverb"],
   ["basics", "SmoothedValue", "Smooth / LogSmooth", "class Smooth"],
-  ["basics", "Synthesiser", "VoiceManager", "class VoiceManager"],
+  ["basics", "Synthesiser",
+   "VoiceManager: steals what a listener misses least (a released voice, then a " +
+   "repeat of the same key, then the oldest that is neither the bass nor the top " +
+   "note), and steals without a click -- the stolen voice's next 2 ms rendered and " +
+   "faded under the new note; sustain and sostenuto pedals; a polyphony limit " +
+   "below the voices there are; stereo voices; and renderVoices(), the block's MIDI " +
+   "and expression applied at their exact frames with applyMidi() and " +
+   "applyExpression()",
+   "class VoiceManager"],
+  ["basics", "Mono and legato voicing, note priority, glide",
+   "dsp.h: VoiceManager::Mode -- Poly, Mono (every note retriggers) or Legato " +
+   "(an overlapping note moves the voice through its legatoTo(), no new attack) " +
+   "-- with last, low or high note priority and a stack of the keys held, so " +
+   "lifting a note returns the line to one still down. synth.h: Portamento, a " +
+   "glide linear in pitch, constant time or constant rate",
+   "enum class NotePriority"],
+  ["basics", "Portamento", "synth.h: a glide between notes, in semitones", "class Portamento"],
+  ["basics", "A keyboard's pitch wheel in an MPE plugin",
+   "audio.h: MpeDecoder bends a channel in no MPE zone -- an ordinary keyboard -- " +
+   "at two semitones, or at the range the plugin declares (pitchBendRange(), " +
+   "which every wrapper passes on) or the keyboard announces (RPN 0); a zone's " +
+   "members keep MPE's 48. It used 48 for every channel, so a plain wheel threw " +
+   "a note four octaves in any plugin that declared MPE",
+   "setLegacyBendRange"],
   ["basics", "AudioPlayHead::PositionInfo", "TransportInfo", "struct TransportInfo"],
 
   // ── dsp ─────────────────────────────────────────────────────────────

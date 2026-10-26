@@ -15,6 +15,8 @@
 #pragma once
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 #include "special.h" // fastmath, which the oscillator uses per sample
 #include "audio.h"
 #include "interpolation.h"
@@ -1659,6 +1661,50 @@ private:
   int latency_ = 0;
 };
 
+namespace detail {
+// What a voice can do beyond the four methods VoiceManager requires, asked at
+// compile time. A voice that has none of these is the voice it always was; one
+// that has them gets the matching behaviour, with nothing to register.
+template <typename V, typename = void>
+struct VoiceRendersMono : std::false_type {};
+template <typename V>
+struct VoiceRendersMono<V, std::void_t<decltype(std::declval<V&>().render())>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceRendersStereo : std::false_type {};
+template <typename V>
+struct VoiceRendersStereo<V, std::void_t<decltype(std::declval<V&>().render(std::declval<float&>(),
+                                                                           std::declval<float&>()))>>
+    : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasLegato : std::false_type {};
+template <typename V>
+struct VoiceHasLegato<V, std::void_t<decltype(std::declval<V&>().legatoTo(0, 0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasPitchBend : std::false_type {};
+template <typename V>
+struct VoiceHasPitchBend<V, std::void_t<decltype(std::declval<V&>().setPitchBend(0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasTuning : std::false_type {};
+template <typename V>
+struct VoiceHasTuning<V, std::void_t<decltype(std::declval<V&>().setTuning(0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasPressure : std::false_type {};
+template <typename V>
+struct VoiceHasPressure<V, std::void_t<decltype(std::declval<V&>().setPressure(0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasBrightness : std::false_type {};
+template <typename V>
+struct VoiceHasBrightness<V, std::void_t<decltype(std::declval<V&>().setBrightness(0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasModWheel : std::false_type {};
+template <typename V>
+struct VoiceHasModWheel<V, std::void_t<decltype(std::declval<V&>().setModWheel(0.0f))>> : std::true_type {};
+template <typename V, typename = void>
+struct VoiceHasKill : std::false_type {};
+template <typename V>
+struct VoiceHasKill<V, std::void_t<decltype(std::declval<V&>().kill())>> : std::true_type {};
+} // namespace detail
+
 /**
  * Polyphonic voice manager.
  *
@@ -1668,7 +1714,24 @@ private:
  * voices' behalf, so a DSP written against the old four methods gains all of
  * it without being touched.
  *
- * Two things here are the difference between a voice manager and a synth a
+ * A voice MAY offer more, and is found to at compile time:
+ *
+ *   void render(float& left, float& right)   a stereo voice: panned, spread
+ *                                            unison. Used by render(l, r) and
+ *                                            renderVoices(); may replace the
+ *                                            mono render() altogether.
+ *   void legatoTo(int note, float velocity)  move to a new note WITHOUT
+ *                                            retriggering: what Legato mode
+ *                                            calls, and where a glide starts.
+ *   void setPitchBend(float semitones)       the channel's pitch wheel.
+ *   void setTuning(float semitones)          this note's own bend (MPE).
+ *   void setPressure(float 0..1)             this note's pressure, or the
+ *                                            channel's aftertouch.
+ *   void setBrightness(float 0..1)           this note's timbre (MPE CC 74).
+ *   void setModWheel(float 0..1)             CC 1.
+ *   void kill()                              silent now: All Sound Off.
+ *
+ * Four things here are the difference between a voice manager and a synth a
  * player will tolerate:
  *
  * WHICH voice gets stolen. Taking the oldest is the obvious rule and it is
@@ -1680,21 +1743,62 @@ private:
  * note down. Bass and melody are the two lines an ear tracks, so they are the
  * last to go.
  *
+ * HOW it gets stolen. Restarting a voice that is mid-waveform puts a step in
+ * the output, and a step is a click: every stolen voice in a fast passage,
+ * every retrigger of a mono line. So the voice's next couple of milliseconds
+ * are rendered first, faded out with a raised cosine, and played out under
+ * the new note, which starts at once in the same voice. The listener hears
+ * the old note leave and the new one arrive, never the seam.
+ *
  * The SUSTAIN PEDAL. Without it a piano-style patch is unplayable: the player
  * holds the pedal, lifts their hands, and everything stops. CC 64 does not
  * reach a voice on its own -- a voice knows nothing about pedals -- so the
  * manager holds the release back instead, which is exactly what the damper on
  * a real instrument does. Sostenuto (CC 66) is the same trick applied only to
  * what was already down when the pedal fell.
+ *
+ * MONO and LEGATO. A bass or a lead is played one note at a time, and what
+ * makes it playable is what happens between notes: which of the keys held
+ * down sounds (the last, the lowest or the highest), what happens when that
+ * key comes up while another is still down (the line returns to it, as a
+ * trill needs), and whether an overlapping note retriggers the envelope
+ * (Mono) or slides into the new pitch without one (Legato, through the
+ * voice's legatoTo(), which is where a glide starts).
  */
 template <typename VoiceType, int MaxVoices = 8>
 class VoiceManager {
+  static_assert(MaxVoices >= 1, "a voice manager needs at least one voice");
+  // How a voice renders is asked only where the manager renders it -- render()
+  // and the steal fade -- so a DSP that mixes its voices itself (the sampler
+  // reads each channel through render(channel)) keeps using the bookkeeping.
+  static constexpr bool kCanRender =
+      detail::VoiceRendersMono<VoiceType>::value || detail::VoiceRendersStereo<VoiceType>::value;
+
 public:
   /** How many voices there are, MaxVoices: the range voice() is indexed by. */
   static constexpr int kNumVoices = MaxVoices;
   /** "Whichever voice is playing this key, on any channel." The default for
    *  every lookup, so a plain MIDI keyboard behaves exactly as it always did. */
   static constexpr int kAnyChannel = -1;
+  /** The keys Mono and Legato remember, newest last: more fingers than hands. */
+  static constexpr int kMaxHeldNotes = 32;
+  /** The longest steal fade, in samples: 2 ms at 192 kHz. */
+  static constexpr int kMaxStealFade = 384;
+
+  /** How notes share the voices. */
+  enum class Mode {
+    Poly,   ///< every note its own voice, up to polyphony()
+    Mono,   ///< one voice; every note starts it again
+    Legato, ///< one voice; a note played over a held one moves it without a restart
+  };
+  /** Which held key a mono line plays. */
+  enum class NotePriority {
+    Last, ///< the most recent key: what most synths and most players expect
+    Low,  ///< the lowest key held: a bass line under a hand that wanders
+    High, ///< the highest key held: a lead over sustained lower notes
+  };
+
+  VoiceManager() { setSampleRate(48000.0); }
 
   /** Voice `i`, 0 .. kNumVoices - 1, unchecked: to set every voice's
    *  parameters, or to reach the one voiceForNote() found. */
@@ -1702,14 +1806,77 @@ public:
   /** As above, read-only. */
   const VoiceType& voice(int i) const { return voices_[i]; }
 
+  /** The rate the steal fade is timed against: 2 ms, so the same fade at any
+   *  rate. Call from prepare(); before it, 48 kHz is assumed. */
+  void setSampleRate(double sampleRate) {
+    int n = sampleRate > 0.0 ? (int) (0.002 * sampleRate) : 96;
+    if (n < 16) n = 16;
+    if (n > kMaxStealFade) n = kMaxStealFade;
+    fadeLength_ = n;
+    // A raised cosine from 1 to 0: no corner where it starts, none where it
+    // ends, which a linear ramp has at both.
+    for (int k = 0; k < n; ++k)
+      fade_[k] = 0.5f * (1.0f + std::cos(3.14159265358979f * (float) (k + 1) / (float) n));
+  }
+  /** The steal fade's length, in samples. */
+  int stealFadeSamples() const { return fadeLength_; }
+
+  /** How many voices notes may use, 1 .. kNumVoices: a "Voices" control.
+   *  Voices above a lowered limit are released, not cut, and stealing then
+   *  happens within the limit. */
+  void setPolyphony(int voices) {
+    const int n = voices < 1 ? 1 : (voices > MaxVoices ? MaxVoices : voices);
+    // `i < MaxVoices` is always implied by polyphony_ and says so to a
+    // compiler's bounds check, which cannot see that it is.
+    for (int i = n; i < polyphony_ && i < MaxVoices; ++i) {
+      held_[i] = false;
+      pedalHeld_[i] = false;
+      sostenuto_[i] = false;
+      releaseSlot(i);
+    }
+    polyphony_ = n;
+  }
+  /** The limit setPolyphony() set; kNumVoices until then. */
+  int polyphony() const { return polyphony_; }
+
+  /** Poly, Mono or Legato. A change releases what is sounding: a chord has
+   *  no single note to become, and a note left over from the old mode would
+   *  have no key to end it. */
+  void setMode(Mode mode) {
+    if (mode == mode_) return;
+    allNotesOff();
+    mode_ = mode;
+  }
+  Mode mode() const { return mode_; }
+
+  /** Which held key a Mono or Legato line plays. */
+  void setNotePriority(NotePriority priority) { priority_ = priority; }
+  NotePriority notePriority() const { return priority_; }
+
+  /** Whether bend and pressure arrive as per-note expression (MPE, decoded
+   *  by the wrapper into kExprTuning and kExprPressure) rather than as
+   *  channel messages. On, applyMidi() leaves the pitch wheel and channel
+   *  pressure to the expression path, which has already folded them into
+   *  each note: applying them again would bend every note twice. */
+  void setMpe(bool on) { mpe_ = on; }
+  bool isMpe() const { return mpe_; }
+
   /** Start a note.
    *
    *  The CHANNEL is recorded, and that is not bookkeeping. MPE puts every
    *  finger on its own channel, so two fingers landing on the SAME key are two
    *  separate notes that arrive as (60, ch2) and (60, ch3). Without the
    *  channel this class could not tell them apart: lifting one finger released
-   *  both, and a bend on one bent whichever voice was found first. */
-  void noteOn(int note, float velocity, int channel = 0) {
+   *  both, and a bend on one bent whichever voice was found first.
+   *
+   *  `noteId` is the host's name for this note, where it has one (CLAP): kept
+   *  with the voice so voiceForNoteId() finds it and drainEndedNotes() can
+   *  say when it is gone. */
+  void noteOn(int note, float velocity, int channel = 0, int32_t noteId = -1) {
+    if (mode_ != Mode::Poly) {
+      monoNoteOn(note, velocity, channel, noteId);
+      return;
+    }
     // A key struck again while a pedal holds its last note -- the key is up,
     // the note sounds on the pedal's account -- releases that note first, as
     // the reference does and as a re-struck string is damped and struck
@@ -1723,20 +1890,17 @@ public:
           !released_[i])
         releaseSlot(i);
     int slot = -1;
-    for (int i = 0; i < MaxVoices; ++i) {
-      if (!voices_[i].isActive()) { slot = i; break; }
+    for (int i = 0; i < polyphony_; ++i) {
+      if (!voices_[i].isActive()) {
+        slot = i;
+        break;
+      }
     }
-    if (slot < 0) slot = voiceToSteal(note, channel);
-    notes_[slot] = note;
-    channels_[slot] = channel;
-    age_[slot] = ++counter_;
-    held_[slot] = true;
-    released_[slot] = false;
-    pedalHeld_[slot] = false;
-    // A key pressed while the sostenuto pedal is already down is NOT pinned:
-    // that pedal holds what was down when it fell and nothing after.
-    sostenuto_[slot] = false;
-    voices_[slot].noteOn(note, velocity);
+    if (slot < 0) {
+      slot = voiceToSteal(note, channel);
+      steal(slot);
+    }
+    start(slot, note, velocity, channel, noteId);
   }
 
   /** The voice sounding this key on this channel, or -1.
@@ -1764,6 +1928,30 @@ public:
     return found;
   }
 
+  /** The voice playing the note the host named `noteId`, or -1: how a CLAP
+   *  host addresses one note among several on the same key. */
+  int voiceForNoteId(int32_t noteId) const {
+    if (noteId < 0) return -1;
+    for (int i = 0; i < MaxVoices; ++i)
+      if (noteIds_[i] == noteId && voices_[i].isActive()) return i;
+    return -1;
+  }
+
+  /** What voice `i` is playing: its key, its channel and the host's id for
+   *  the note (-1 where there was none). */
+  int noteOf(int i) const { return notes_[i]; }
+  int channelOf(int i) const { return channels_[i]; }
+  int32_t noteIdOf(int i) const { return noteIds_[i]; }
+
+  /** Voices sounding now, release tails included: what a voice meter shows
+   *  and what CLAP's voice-info and a DSP's activeVoices() report. */
+  int activeVoices() const {
+    int n = 0;
+    for (int i = 0; i < MaxVoices; ++i)
+      if (voices_[i].isActive()) ++n;
+    return n;
+  }
+
   /** Lift a key. With a channel, only the finger that played it; without one,
    *  every voice on that key.
    *
@@ -1771,6 +1959,10 @@ public:
    *  is what separates them. So this always records that the key is up, and
    *  only releases the voice when nothing is holding it. */
   void noteOff(int note, int channel = kAnyChannel) {
+    if (mode_ != Mode::Poly) {
+      monoNoteOff(note, channel);
+      return;
+    }
     for (int i = 0; i < MaxVoices; ++i)
       if (notes_[i] == note && voices_[i].isActive() &&
           (channel == kAnyChannel || channels_[i] == channel)) {
@@ -1827,6 +2019,7 @@ public:
    *  button mean: a voice still sounding afterwards because a pedal was down
    *  is the exact failure the user pressed the button to stop. */
   void allNotesOff() {
+    stackSize_ = 0;
     for (int i = 0; i < MaxVoices; ++i) {
       held_[i] = false;
       pedalHeld_[i] = false;
@@ -1835,21 +2028,221 @@ public:
     }
   }
 
-  /** Sum every active voice for one sample. */
+  /** Silence now, CC 120 and a host's choke: what allNotesOff() does, and a
+   *  voice with kill() is stopped outright rather than left to its release.
+   *  Through the steal fade either way, so silence arrives without a click. */
+  void allSoundOff() {
+    if constexpr (detail::VoiceHasKill<VoiceType>::value) {
+      for (int i = 0; i < MaxVoices; ++i)
+        if (voices_[i].isActive()) {
+          fadeOut(i);
+          voices_[i].kill();
+        }
+    }
+    allNotesOff();
+  }
+
+  /** The pitch wheel, in semitones, for one channel or for all of them. Voices
+   *  with setPitchBend() hear it now, and a note started later on that channel
+   *  starts bent. */
+  void pitchBend(float semitones, int channel = kAnyChannel) {
+    for (int c = 0; c < 16; ++c)
+      if (channel == kAnyChannel || channel == c) bend_[c] = semitones;
+    if constexpr (detail::VoiceHasPitchBend<VoiceType>::value) {
+      for (int i = 0; i < MaxVoices; ++i)
+        if (voices_[i].isActive() && (channel == kAnyChannel || channels_[i] == channel))
+          voices_[i].setPitchBend(semitones);
+    }
+  }
+  /** A channel's wheel, as pitchBend() last set it; 0 for kAnyChannel. */
+  float pitchBendOf(int channel) const { return channel >= 0 && channel < 16 ? bend_[channel] : 0.0f; }
+  /** How far a full wheel throw bends, in semitones, for applyMidi(): 2 by
+   *  default, as the MIDI spec has it and as most keyboards are set. */
+  void setPitchBendRange(float semitones) { bendRange_ = semitones; }
+  float pitchBendRange() const { return bendRange_; }
+
+  /** Channel aftertouch, 0 .. 1, to the voices on that channel that have
+   *  setPressure(). */
+  void channelPressure(float pressure, int channel = kAnyChannel) {
+    if constexpr (detail::VoiceHasPressure<VoiceType>::value) {
+      for (int i = 0; i < MaxVoices; ++i)
+        if (voices_[i].isActive() && (channel == kAnyChannel || channels_[i] == channel))
+          voices_[i].setPressure(pressure);
+    } else {
+      (void) pressure;
+      (void) channel;
+    }
+  }
+
+  /** The mod wheel, CC 1, 0 .. 1: kept, and passed to every voice that has
+   *  setModWheel(), sounding or not, so a note started later starts with it. */
+  void modWheel(float value) {
+    modWheel_ = value;
+    if constexpr (detail::VoiceHasModWheel<VoiceType>::value)
+      for (int i = 0; i < MaxVoices; ++i) voices_[i].setModWheel(value);
+  }
+  float modWheelValue() const { return modWheel_; }
+
+  /** Sum every active voice for one sample: the mono mix. A stereo-only voice
+   *  is folded to the middle. */
   inline float render() {
+    static_assert(kCanRender, "VoiceManager::render() needs a voice with float render(), or "
+                              "void render(float& left, float& right)");
     float sum = 0.0f;
-    for (int i = 0; i < MaxVoices; ++i)
-      if (voices_[i].isActive()) sum += voices_[i].render();
+    for (int i = 0; i < MaxVoices; ++i) {
+      if (voices_[i].isActive()) {
+        if constexpr (detail::VoiceRendersMono<VoiceType>::value) {
+          sum += voices_[i].render();
+        } else {
+          float l = 0.0f, r = 0.0f;
+          voices_[i].render(l, r);
+          sum += 0.5f * (l + r);
+        }
+        sounding_[i] = true;
+      } else if (sounding_[i]) {
+        sounding_[i] = false;
+        noteEnded(i);
+      }
+      if (tailPos_[i] < tailLen_[i]) {
+        sum += tailStereo_ ? 0.5f * (tailL_[i][tailPos_[i]] + tailR_[i][tailPos_[i]])
+                           : tailL_[i][tailPos_[i]];
+        ++tailPos_[i];
+      }
+    }
     return sum;
   }
 
+  /** Sum every active voice for one sample, in stereo. A mono voice sits in
+   *  the middle, the same sample on both sides. */
+  inline void render(float& left, float& right) {
+    static_assert(kCanRender, "VoiceManager::render(l, r) needs a voice with float render(), or "
+                              "void render(float& left, float& right)");
+    float l = 0.0f, r = 0.0f;
+    for (int i = 0; i < MaxVoices; ++i) {
+      if (voices_[i].isActive()) {
+        if constexpr (detail::VoiceRendersStereo<VoiceType>::value) {
+          float vl = 0.0f, vr = 0.0f;
+          voices_[i].render(vl, vr);
+          l += vl;
+          r += vr;
+        } else {
+          const float s = voices_[i].render();
+          l += s;
+          r += s;
+        }
+        sounding_[i] = true;
+      } else if (sounding_[i]) {
+        sounding_[i] = false;
+        noteEnded(i);
+      }
+      if (tailPos_[i] < tailLen_[i]) {
+        l += tailL_[i][tailPos_[i]];
+        r += tailStereo_ ? tailR_[i][tailPos_[i]] : tailL_[i][tailPos_[i]];
+        ++tailPos_[i];
+      }
+    }
+    left = l;
+    right = r;
+  }
+
+  /** A note that has stopped sounding: its key, channel and the host's id. */
+  struct EndedNote {
+    int note = 0;
+    int channel = 0;
+    int32_t noteId = -1;
+  };
+  /** Hand every note that has finished since the last call to `f(EndedNote)`
+   *  and forget them: voices whose release ran out, and notes a steal or All
+   *  Sound Off cut short. A CLAP host needs to hear this (note end) to stop
+   *  modulating a voice that is gone. The last 64 are kept. */
+  template <typename F>
+  void drainEndedNotes(F&& f) {
+    for (int i = 0; i < endedCount_; ++i) f(ended_[i]);
+    endedCount_ = 0;
+  }
+
 private:
+  void start(int slot, int note, float velocity, int channel, int32_t noteId) {
+    notes_[slot] = note;
+    channels_[slot] = channel;
+    noteIds_[slot] = noteId;
+    age_[slot] = ++counter_;
+    held_[slot] = true;
+    released_[slot] = false;
+    pedalHeld_[slot] = false;
+    // A key pressed while the sostenuto pedal is already down is NOT pinned:
+    // that pedal holds what was down when it fell and nothing after.
+    sostenuto_[slot] = false;
+    sounding_[slot] = true;
+    voices_[slot].noteOn(note, velocity);
+    if constexpr (detail::VoiceHasPitchBend<VoiceType>::value)
+      voices_[slot].setPitchBend(channel >= 0 && channel < 16 ? bend_[channel] : 0.0f);
+    if constexpr (detail::VoiceHasModWheel<VoiceType>::value) voices_[slot].setModWheel(modWheel_);
+  }
+
   void releaseSlot(int i) {
     pedalHeld_[i] = false;
     if (!released_[i]) {
       released_[i] = true;
       voices_[i].noteOff();
     }
+  }
+
+  /** A sounding voice is taken for another note: its note ends here, and its
+   *  next moments are kept as a fade so the cut is not heard. */
+  void steal(int slot) {
+    if (!voices_[slot].isActive()) return;
+    fadeOut(slot);
+    sounding_[slot] = false;
+    noteEnded(slot);
+  }
+
+  /** Render the voice's next fadeLength_ samples into its tail, faded to
+   *  silence, so they play out under whatever the voice does next. Whatever
+   *  is left of an earlier tail in the slot is carried into the new one.
+   *
+   *  A voice the manager cannot render is mixed by its DSP (the sampler reads
+   *  each channel itself), and keeps its own counsel about steals: no fade. */
+  void fadeOut(int slot) {
+    if constexpr (kCanRender) fadeOutRendered(slot);
+    else (void) slot;
+  }
+
+  void fadeOutRendered(int slot) {
+    if (!voices_[slot].isActive()) return;
+    float* tl = tailL_[slot];
+    float* tr = tailR_[slot];
+    const int left = tailLen_[slot] - tailPos_[slot];
+    if (left > 0 && tailPos_[slot] > 0) {
+      for (int k = 0; k < left; ++k) {
+        tl[k] = tl[tailPos_[slot] + k];
+        tr[k] = tr[tailPos_[slot] + k];
+      }
+    }
+    const int carried = left > 0 ? left : 0;
+    const int n = fadeLength_;
+    for (int k = 0; k < n; ++k) {
+      const float g = fade_[k];
+      float l = 0.0f, r = 0.0f;
+      if constexpr (detail::VoiceRendersStereo<VoiceType>::value) {
+        voices_[slot].render(l, r);
+      } else {
+        l = r = voices_[slot].render();
+      }
+      tl[k] = (k < carried ? tl[k] : 0.0f) + l * g;
+      tr[k] = (k < carried ? tr[k] : 0.0f) + r * g;
+    }
+    tailPos_[slot] = 0;
+    tailLen_[slot] = n > carried ? n : carried;
+    tailStereo_ = tailStereo_ || detail::VoiceRendersStereo<VoiceType>::value;
+  }
+
+  void noteEnded(int i) {
+    if (endedCount_ >= kMaxEnded) return; // full: nobody drained; the oldest stay
+    ended_[endedCount_].note = notes_[i];
+    ended_[endedCount_].channel = channels_[i];
+    ended_[endedCount_].noteId = noteIds_[i];
+    ++endedCount_;
   }
 
   /**
@@ -1860,16 +2253,16 @@ private:
    * note is not; then the oldest that is neither the lowest nor the highest
    * note sounding. The last rule is the one that matters -- an ear follows
    * the bass and the top line, and taking the oldest voice outright takes the
-   * bass of every held chord.
+   * bass of every held chord. Within the polyphony limit.
    */
   int voiceToSteal(int note, int channel) const {
     int oldestReleased = -1, sameKey = -1, oldestInner = -1, oldest = 0;
     int lowest = 0, highest = 0;
-    for (int i = 1; i < MaxVoices; ++i) {
+    for (int i = 1; i < polyphony_; ++i) {
       if (notes_[i] < notes_[lowest]) lowest = i;
       if (notes_[i] > notes_[highest]) highest = i;
     }
-    for (int i = 0; i < MaxVoices; ++i) {
+    for (int i = 0; i < polyphony_; ++i) {
       if (age_[i] < age_[oldest]) oldest = i;
       if (released_[i] && (oldestReleased < 0 || age_[i] < age_[oldestReleased]))
         oldestReleased = i;
@@ -1885,9 +2278,104 @@ private:
     return oldest; // two voices, both of them extremes: something has to go
   }
 
+  // ── Mono and Legato ──────────────────────────────────────────────────────
+  // One voice, slot 0, and a stack of the keys that are down. The stack is
+  // what makes a trill work: lift the top note of two and the line goes back
+  // to the one still held, which a synth that only remembers one key cannot.
+
+  /** One key held in Mono or Legato, as it was struck. */
+  struct Held {
+    int note;
+    float velocity;
+    int channel;
+    int32_t noteId;
+  };
+
+  void forgetHeld(int note, int channel) {
+    int w = 0;
+    for (int r = 0; r < stackSize_; ++r)
+      if (!(held(r).note == note && (channel == kAnyChannel || held(r).channel == channel)))
+        stack_[w++] = stack_[r];
+    stackSize_ = w;
+  }
+  const Held& held(int i) const { return stack_[i]; }
+
+  /** The key the line should play: an index into the stack, or -1. */
+  int chosenHeld() const {
+    if (stackSize_ == 0) return -1;
+    int pick = stackSize_ - 1;
+    if (priority_ == NotePriority::Low) {
+      for (int i = 0; i < stackSize_; ++i)
+        if (stack_[i].note < stack_[pick].note) pick = i;
+    } else if (priority_ == NotePriority::High) {
+      for (int i = 0; i < stackSize_; ++i)
+        if (stack_[i].note > stack_[pick].note) pick = i;
+    }
+    return pick;
+  }
+
+  bool monoSounds(int note, int channel) const {
+    return voices_[0].isActive() && !released_[0] && notes_[0] == note &&
+           (channel == kAnyChannel || channels_[0] == channel);
+  }
+
+  void monoNoteOn(int note, float velocity, int channel, int32_t noteId) {
+    // Overlapping: another key was still down when this one came. That, and
+    // not the timing, is what legato means.
+    const bool overlapping = stackSize_ > 0;
+    forgetHeld(note, channel);
+    if (stackSize_ == kMaxHeldNotes) { // more keys than fingers: forget the oldest
+      for (int i = 1; i < stackSize_; ++i) stack_[i - 1] = stack_[i];
+      --stackSize_;
+    }
+    stack_[stackSize_++] = Held{note, velocity, channel, noteId};
+    const Held& target = stack_[chosenHeld()];
+    // A key that does not win the priority changes nothing audible: a low
+    // note added under a High-priority lead is remembered, not played.
+    if (monoSounds(target.note, target.channel)) return;
+    moveTo(target, overlapping);
+  }
+
+  void monoNoteOff(int note, int channel) {
+    forgetHeld(note, channel);
+    if (!monoSounds(note, channel)) return; // a key that was not the one sounding
+    const int next = chosenHeld();
+    if (next >= 0) {
+      moveTo(stack_[next], true); // back to a key still down
+      return;
+    }
+    held_[0] = false;
+    if (sustainDown_ || sostenuto_[0]) pedalHeld_[0] = true;
+    else releaseSlot(0);
+  }
+
+  /** The one voice to `target`: in Legato, while it is sounding and the
+   *  voice can, without a restart; otherwise a fresh start, faded across. */
+  void moveTo(const Held& target, bool overlapping) {
+    if constexpr (detail::VoiceHasLegato<VoiceType>::value) {
+      if (mode_ == Mode::Legato && overlapping && voices_[0].isActive() && !released_[0]) {
+        sounding_[0] = false;
+        noteEnded(0); // the host's note ended, though the sound carries on
+        notes_[0] = target.note;
+        channels_[0] = target.channel;
+        noteIds_[0] = target.noteId;
+        held_[0] = true;
+        pedalHeld_[0] = false;
+        sounding_[0] = true;
+        voices_[0].legatoTo(target.note, target.velocity);
+        return;
+      }
+    }
+    steal(0);
+    start(0, target.note, target.velocity, target.channel, target.noteId);
+  }
+
+  static constexpr int kMaxEnded = 64;
+
   VoiceType voices_[MaxVoices];
   int channels_[MaxVoices] = {};
   int notes_[MaxVoices] = {0};
+  int32_t noteIds_[MaxVoices] = {};
   uint64_t age_[MaxVoices] = {0};
   uint64_t counter_ = 0;
   /** The KEY is down. Distinct from the voice sounding, which a pedal can
@@ -1901,7 +2389,32 @@ private:
   bool pedalHeld_[MaxVoices] = {false};
   /** Pinned by the sostenuto pedal. */
   bool sostenuto_[MaxVoices] = {false};
+  /** Was active at the last render: how a note ending is noticed. */
+  bool sounding_[MaxVoices] = {false};
   bool sustainDown_ = false;
+
+  Mode mode_ = Mode::Poly;
+  NotePriority priority_ = NotePriority::Last;
+  int polyphony_ = MaxVoices;
+  bool mpe_ = false;
+  Held stack_[kMaxHeldNotes] = {};
+  int stackSize_ = 0;
+
+  float bend_[16] = {};
+  float bendRange_ = 2.0f;
+  float modWheel_ = 0.0f;
+
+  // The steal fades: each slot's last notes, faded, playing out.
+  float fade_[kMaxStealFade] = {};
+  int fadeLength_ = 96;
+  float tailL_[MaxVoices][kMaxStealFade] = {};
+  float tailR_[MaxVoices][kMaxStealFade] = {};
+  int tailPos_[MaxVoices] = {};
+  int tailLen_[MaxVoices] = {};
+  bool tailStereo_ = false;
+
+  EndedNote ended_[kMaxEnded];
+  int endedCount_ = 0;
 };
 
 /**
@@ -1925,11 +2438,145 @@ inline bool applyPedals(VoiceManagerType& voices, const MidiMessage& m) {
   switch (cc) {
     case 64: voices.sustainPedal(down); return true;
     case 66: voices.sostenutoPedal(down); return true;
-    case 120: // All Sound Off
-    case 123: // All Notes Off
+    case 120: // All Sound Off: now, a voice with kill() silenced outright
+      voices.allSoundOff();
+      return true;
+    case 123: // All Notes Off: released, tails and all
       voices.allNotesOff();
       return true;
     default: return false;
+  }
+}
+
+/**
+ * Everything a voice manager takes from MIDI, in one call: notes (with their
+ * channel), the pedals and the panic messages, the pitch wheel at the
+ * manager's bend range, channel pressure and the mod wheel. Returns true if
+ * the message was one of them.
+ *
+ * Written once here because each synth used to write it again, and each one
+ * got a different part of it wrong: a note-on at velocity 0 that is really a
+ * note-off, the wheel's centre at 8192 rather than 8191.5, a channel off by
+ * one. Under MPE (setMpe(true)) the wheel and pressure are left alone: the
+ * wrapper has already turned them into each note's own expression.
+ */
+template <typename VoiceManagerType>
+inline bool applyMidi(VoiceManagerType& voices, const MidiMessage& m) {
+  if (applyPedals(voices, m)) return true;
+  const int channel = m.getChannel() - 1;
+  if (m.isNoteOn()) { // velocity 0 is a note-off, and isNoteOn() says so
+    voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), channel);
+    return true;
+  }
+  if (m.isNoteOff()) {
+    voices.noteOff(m.getNoteNumber(), channel);
+    return true;
+  }
+  if (m.isController() && m.getControllerNumber() == 1) {
+    voices.modWheel((float) m.getControllerValue() / 127.0f);
+    return true;
+  }
+  if (voices.isMpe()) return false;
+  if (m.isPitchWheel()) {
+    const int v = m.getPitchWheelValue();
+    // Centred at 8192, and a full throw either way is the range: down to 0 is
+    // -8192 steps and up to 16383 is +8191, so each side divides by its own.
+    const float t = v >= 8192 ? (float) (v - 8192) / 8191.0f : (float) (v - 8192) / 8192.0f;
+    voices.pitchBend(t * voices.pitchBendRange(), channel);
+    return true;
+  }
+  if (m.isChannelPressure()) {
+    voices.channelPressure((float) m.getChannelPressureValue() / 127.0f, channel);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * One note's expression, to the voice playing it: tuning (semitones),
+ * pressure and brightness, through the voice's setTuning(), setPressure() and
+ * setBrightness() where it has them. Found by the host's note id when there is
+ * one, by key and channel otherwise.
+ */
+template <typename VoiceType>
+inline void applyExpressionTo(VoiceType& voice, const NoteExpressionBuffer::Entry& e) {
+  switch (e.expression) {
+    case kExprTuning:
+      if constexpr (detail::VoiceHasTuning<VoiceType>::value) voice.setTuning(e.value);
+      break;
+    case kExprPressure:
+      if constexpr (detail::VoiceHasPressure<VoiceType>::value) voice.setPressure(e.value);
+      break;
+    case kExprBrightness:
+      if constexpr (detail::VoiceHasBrightness<VoiceType>::value) voice.setBrightness(e.value);
+      break;
+    default:
+      break;
+  }
+  (void) voice;
+  (void) e;
+}
+
+template <typename VoiceManagerType>
+inline void applyExpression(VoiceManagerType& voices, const NoteExpressionBuffer::Entry& e) {
+  int v = voices.voiceForNoteId(e.noteId);
+  if (v < 0 && e.key >= 0) v = voices.voiceForNote(e.key, e.channel < 0 ? VoiceManagerType::kAnyChannel : e.channel);
+  if (v >= 0) {
+    applyExpressionTo(voices.voice(v), e);
+    return;
+  }
+  // No key: the expression is for every note (on its channel, if it names one).
+  if (e.key >= 0 || e.noteId >= 0) return;
+  for (int i = 0; i < VoiceManagerType::kNumVoices; ++i)
+    if (voices.voice(i).isActive() && (e.channel < 0 || voices.channelOf(i) == e.channel))
+      applyExpressionTo(voices.voice(i), e);
+}
+
+/**
+ * A whole instrument block: the block's MIDI and note expression applied at
+ * their exact frames, and the voices rendered between them into the main bus
+ * (stereo voices in stereo, mono voices in the middle; a mono bus gets the
+ * fold). Overwrites the bus: an instrument's output starts from nothing.
+ *
+ * Sample-accurate, which is what keeps a synth tight: a note at frame 37 starts
+ * at frame 37, not at the top of the block. This is the loop every synth used
+ * to write for itself, and the one place a synth's timing goes wrong.
+ */
+template <typename VoiceManagerType>
+inline void renderVoices(VoiceManagerType& voices, ProcessContext& ctx) {
+  AudioBlock<float>& io = ctx.main;
+  const size_t n = io.getNumSamples();
+  const size_t channels = io.getNumChannels();
+  if (channels == 0) return;
+  float* L = io.getChannelPointer(0);
+  float* R = channels > 1 ? io.getChannelPointer(1) : nullptr;
+  auto event = ctx.midi.begin();
+  const auto eventEnd = ctx.midi.end();
+  const NoteExpressionBuffer::Entry* expr = ctx.expression ? ctx.expression->begin() : nullptr;
+  const NoteExpressionBuffer::Entry* exprEnd = ctx.expression ? ctx.expression->end() : nullptr;
+  for (size_t i = 0; i < n; ++i) {
+    while (event != eventEnd && (size_t) event->samplePosition <= i) {
+      applyMidi(voices, event->getMessage());
+      ++event;
+    }
+    while (expr != exprEnd && (size_t) expr->samplePosition <= i) {
+      applyExpression(voices, *expr);
+      ++expr;
+    }
+    float l = 0.0f, r = 0.0f;
+    voices.render(l, r);
+    if (R) {
+      L[i] = l;
+      R[i] = r;
+    } else {
+      L[i] = 0.5f * (l + r);
+    }
+  }
+  // Any further channels of a wide bus get silence rather than whatever the
+  // host left in them.
+  for (size_t c = 2; c < channels; ++c) {
+    float* out = io.getChannelPointer(c);
+    for (size_t i = 0; i < n; ++i) out[i] = 0.0f;
   }
 }
 

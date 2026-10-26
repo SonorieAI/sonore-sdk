@@ -541,7 +541,24 @@ public:
                                        : (numParams_ > 0 ? numParams_ : 1);
     return kPadding * 2.0f + (float) flat * kRowHeight +
            (groups_.count > 0 ? panel_.preferredHeight() : 0.0f) +
-           (keyboard_ ? kKeyboardHeight + kPadding : 0.0f);
+           (keyboard_ && !keyboardDocked_ ? kKeyboardHeight + kPadding : 0.0f);
+  }
+
+  /**
+   * Hand the keyboard to whatever holds this editor, to keep in view.
+   *
+   * Under the rows it scrolls with them, and an instrument with more controls
+   * than the window is tall has its keyboard below the fold: there, and found
+   * by nobody. The window docks it along its own bottom edge instead, outside
+   * the scrolling area. This editor keeps owning it -- keyboard() still finds
+   * it -- and lays out without it. Null on an effect.
+   */
+  MidiKeyboard* dockKeyboard() {
+    if (keyboard_ && !keyboardDocked_) {
+      removeChild(keyboard_.get());
+      keyboardDocked_ = true;
+    }
+    return keyboard_.get();
   }
 
   /**
@@ -614,7 +631,7 @@ public:
    */
   void resized() override {
     const float w = localBounds().w;
-    if (keyboard_) {
+    if (keyboard_ && !keyboardDocked_) {
       // Along the bottom, full width, where every soft synth puts one.
       keyboard_->setBounds({kPadding, localBounds().h - kKeyboardHeight - kPadding,
                             w - kPadding * 2.0f, kKeyboardHeight});
@@ -731,6 +748,8 @@ private:
   }
 
   std::unique_ptr<MidiKeyboard> keyboard_;
+  /** dockKeyboard() has given the keyboard to the window. */
+  bool keyboardDocked_ = false;
   const ParamInfo* params_;
   int numParams_;
   EditorHost host_;

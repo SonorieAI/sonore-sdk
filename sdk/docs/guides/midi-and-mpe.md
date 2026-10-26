@@ -34,14 +34,59 @@ trip.
 
 `sonore::VoiceManager` does the bookkeeping for a polyphonic instrument:
 
-- which voice a note gets;
+- which voice a note gets, up to a limit you can lower at run time
+  (`setPolyphony()`, a "Voices" control);
 - which voice to steal when all are busy: a released voice first, then a repeat
   of the same key, then the oldest that is neither the lowest nor the highest
   note held;
-- the sustain and sostenuto pedals, through `sonore::applyPedals`.
+- how it is stolen: the voice's next 2 ms are rendered and faded out under the
+  new note, so a steal is not heard as a click (`setSampleRate()` times it);
+- the sustain and sostenuto pedals;
+- Poly, Mono and Legato (`setMode()`), below.
 
 A voice type needs four methods: `noteOn(int note, float velocity)`,
-`noteOff()`, `bool isActive()` and `float render()`.
+`noteOff()`, `bool isActive()` and `float render()`. It may have more, and the
+manager finds them at compile time:
+
+| Method | What it gets |
+| --- | --- |
+| `void render(float& left, float& right)` | a stereo voice: panned, spread; it may replace `render()` |
+| `void legatoTo(int note, float velocity)` | in Legato, the next note without a new attack: where a glide starts |
+| `void setPitchBend(float semitones)` | the pitch wheel of the voice's channel |
+| `void setTuning(float semitones)` | this note's own bend (MPE) |
+| `void setPressure(float)`, `void setBrightness(float)` | this note's pressure and timbre, 0 to 1 |
+| `void setModWheel(float)` | CC 1, 0 to 1 |
+| `void kill()` | silence now: All Sound Off (CC 120) stops the voice outright |
+
+`sonore::renderVoices(voices, ctx)` is a whole instrument block. It applies every
+MIDI event and every note expression at its frame and renders the voices
+between them into `ctx.main`, stereo voices in stereo. The MIDI goes through
+`sonore::applyMidi()`, which also works on its own:
+
+- notes, with their channel;
+- the pedals, and All Notes Off and All Sound Off;
+- the pitch wheel, at `setPitchBendRange()` (2 semitones by default);
+- channel pressure, and the mod wheel.
+
+`drainEndedNotes()` reports each note that has finished sounding, release tail
+included: its key, its channel and, where `noteOn()` was given one, the host's
+id for it.
+
+## Mono, legato and glide
+
+`setMode(Mode::Mono)` plays one note at a time and starts the voice again for
+each one. `setMode(Mode::Legato)` does the same, except that a note played
+while another key is still down moves the voice there through its `legatoTo()`,
+with no new attack. Either way the manager remembers the keys held:
+
+- lifting the note that sounds returns to a key still down, which is what a
+  trill needs;
+- `setNotePriority()` picks which held key sounds: the last pressed (the
+  default), the lowest (a bass line) or the highest (a lead).
+
+The glide itself is the voice's: `sonore::Portamento` moves a pitch in
+semitones, over a fixed time or at a rate per octave. `jumpTo()` the note in
+`noteOn()`, `glideTo()` it in `legatoTo()`, and read `next()` every sample.
 
 ## MPE
 
@@ -55,8 +100,16 @@ An MPE controller bends, presses and brightens each finger on its own. Setting
 - it fills `ctx.expression`.
 
 It needs the `ProcessContext` form: the simpler signatures have nowhere to put
-the expression. Match each event to its voice by key AND channel: under MPE,
-two fingers on the same key are two notes.
+the expression. Each event belongs to a voice by key AND channel, since under
+MPE two fingers on the same key are two notes; `renderVoices()` matches them
+for you.
+
+Call `voices.setMpe(true)`: the wrapper has already folded the pitch wheel and
+channel pressure into each note's expression, and the voice manager then
+leaves the raw messages alone rather than bend every note twice. A keyboard
+that is not MPE still has a wheel, and it bends at two semitones, or at what the
+DSP's `float pitchBendRange() const` returns (a "Bend Range" control); the
+wrapper passes that on before every block.
 
 ```cpp
 // test-run
@@ -68,12 +121,14 @@ two fingers on the same key are two notes.
 struct Voice {
   sonore::Oscillator osc;
   sonore::ADSR env;
-  int key = 60;
+  sonore::Portamento glide;
   float velocity = 1.0f, bend = 0.0f, pressure = 0.0f;
 
   void setSampleRate(float sr) {
     osc.setSampleRate(sr);
     env.setSampleRate(sr);
+    glide.setSampleRate(sr);
+    glide.setTime(0.08f); // 80 ms from one legato note to the next
     sonore::ADSR::Parameters a;
     a.attack = 0.005f;
     a.decay = 0.2f;
@@ -83,73 +138,64 @@ struct Voice {
   }
   // The four methods VoiceManager calls.
   void noteOn(int note, float vel) {
-    key = note;
     velocity = vel;
     bend = pressure = 0.0f;
-    retune();
+    glide.jumpTo((float) note);
     osc.reset();
     env.noteOn();
   }
   void noteOff() { env.noteOff(); }
   bool isActive() const { return env.isActive(); }
-  float render() { return osc.saw() * env.getNextSample() * velocity * (0.6f + 0.4f * pressure); }
-
-  void retune() {
-    osc.setFreq((float) sonore::MidiMessage::getMidiNoteInHertz(key) * std::pow(2.0f, bend / 12.0f));
+  float render() {
+    osc.setFreq(440.0f * std::exp2((glide.next() + bend - 69.0f) / 12.0f));
+    return osc.saw() * env.getNextSample() * velocity * (0.6f + 0.4f * pressure);
   }
+  // Found at compile time, because they exist.
+  void legatoTo(int note, float vel) { // Legato: the next note, no new attack
+    velocity = vel;
+    glide.glideTo((float) note);
+  }
+  void setTuning(float semitones) { bend = semitones; } // this finger's bend
+  void setPressure(float p) { pressure = p; }            // and its pressure, 0..1
 };
 
+using Voices = sonore::VoiceManager<Voice, 8>;
+
 struct SonoreDsp {
-  sonore::VoiceManager<Voice, 8> voices;
+  Voices voices;
   sonore::Smooth levelSm;
 
   void prepare(const sonore::ProcessSpec& spec) {
     for (int i = 0; i < voices.kNumVoices; ++i) voices.voice(i).setSampleRate((float) spec.sampleRate);
+    voices.setSampleRate(spec.sampleRate); // times the 2 ms steal fade
+    voices.setMpe(true);                   // bend and pressure arrive per note
     levelSm.setup((float) spec.sampleRate, 15.0f);
     levelSm.snap(0.25f);
   }
 
-  void process(sonore::ProcessContext& ctx, const float* p) {
-    sonore::AudioBlock<float>& io = ctx.main;
-    auto event = ctx.midi.begin();
-    const auto end = ctx.midi.end();
-    const sonore::NoteExpressionBuffer::Entry* expr = ctx.expression ? ctx.expression->begin() : nullptr;
-    const sonore::NoteExpressionBuffer::Entry* exprEnd = ctx.expression ? ctx.expression->end() : nullptr;
-    const float level = sonore::dbToGain(p[0]);
+  // How far a keyboard that is not MPE bends: read before every block.
+  float pitchBendRange() const { return 2.0f; }
 
+  void process(sonore::ProcessContext& ctx, const float* p) {
+    voices.setMode(p[1] >= 0.5f ? Voices::Mode::Legato : Voices::Mode::Poly);
+    // Notes, pedals and per-note expression, each at its own frame.
+    sonore::renderVoices(voices, ctx);
+    sonore::AudioBlock<float>& io = ctx.main;
+    const float level = sonore::dbToGain(p[0]);
     for (size_t i = 0; i < io.getNumSamples(); ++i) {
-      // Notes at their own frame. The channel travels with the note.
-      for (; event != end && (size_t) event->samplePosition <= i; ++event) {
-        const sonore::MidiMessage& m = event->getMessage();
-        if (sonore::applyPedals(voices, m)) continue; // sustain and sostenuto
-        if (m.isNoteOn())
-          voices.noteOn(m.getNoteNumber(), m.getFloatVelocity(), m.getChannel() - 1);
-        else if (m.isNoteOff())
-          voices.noteOff(m.getNoteNumber(), m.getChannel() - 1);
-      }
-      // Per-note expression, also at its own frame.
-      for (; expr != exprEnd && (size_t) expr->samplePosition <= i; ++expr) {
-        const int v = voices.voiceForNote(expr->key, expr->channel);
-        if (v < 0) continue;
-        Voice& voice = voices.voice(v);
-        if (expr->expression == sonore::kExprTuning) { // semitones from the key
-          voice.bend = expr->value * p[1];
-          voice.retune();
-        } else if (expr->expression == sonore::kExprPressure) { // 0..1
-          voice.pressure = expr->value;
-        }
-      }
-      const float s = voices.render() * levelSm.next(level);
-      for (size_t c = 0; c < io.getNumChannels(); ++c) io.getChannelPointer(c)[i] = s;
+      const float g = levelSm.next(level);
+      for (size_t c = 0; c < io.getNumChannels(); ++c) io.getChannelPointer(c)[i] *= g;
     }
   }
 };
 
 #include <sonore/plugin.h>
 
+static const char* const kModeNames[] = {"Poly", "Legato"};
+
 static const sonore::ParamInfo kParamTable[SONORE_NUM_PARAMS] = {
     {"level", "Level", "dB", -40.0f, 6.0f, -12.0f},
-    {"bendAmount", "Bend Amount", "", 0.0f, 1.0f, 1.0f},
+    {"mode", "Mode", "", 0.0f, 1.0f, 0.0f, 2, nullptr, kModeNames, 2},
 };
 
 static const sonore::PluginDescriptor kDesc = [] {

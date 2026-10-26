@@ -1503,7 +1503,10 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
   // No block to play them in: they wait, at offset 0, for the next one.
   if (frames <= 0) return Steinberg_kResultOk;
 
-  if (kDesc.supportsMpe) plugin->shared.mpe.process(plugin->shared.midi, plugin->shared.expression);
+  if (kDesc.supportsMpe) {
+    clapwrap::syncBendRange(plugin->shared.dsp, plugin->shared.mpe);
+    plugin->shared.mpe.process(plugin->shared.midi, plugin->shared.expression);
+  }
 
   if (data->numOutputs < 1 || !data->outputs) {
     clapwrap::discardEvents(&plugin->shared);

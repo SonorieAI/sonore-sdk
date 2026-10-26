@@ -541,6 +541,29 @@ template <typename T>
 struct HasActiveVoices<T, std::void_t<decltype(std::declval<const T&>().activeVoices())>>
     : std::true_type {};
 
+/** Does the DSP have a pitch-bend range of its own -- a "bend range" control
+ *  -- for MIDI that is not MPE? Optional: `float pitchBendRange() const`, in
+ *  semitones. The wrapper's MPE decoder turns a plain keyboard's wheel into
+ *  each note's tuning at this range (two semitones when the DSP has none). */
+template <typename T, typename = void>
+struct HasPitchBendRange : std::false_type {};
+/** The match for HasPitchBendRange: T declares `pitchBendRange() const`. */
+template <typename T>
+struct HasPitchBendRange<T, std::void_t<decltype(std::declval<const T&>().pitchBendRange())>>
+    : std::true_type {};
+
+/** [audio-thread] The DSP's bend range, to the decoder, before it reads the
+ *  block's MIDI: every format calls this just before mpe.process(), so the
+ *  control a player sets takes effect from the next block in all of them. */
+template <typename T>
+inline void syncBendRange(const T& dsp, MpeDecoder& mpe) {
+  if constexpr (HasPitchBendRange<T>::value) mpe.setLegacyBendRange((float) dsp.pitchBendRange());
+  else {
+    (void) dsp;
+    (void) mpe;
+  }
+}
+
 /** A DSP's own reset(): start over -- forget what is sounding, keep what
  *  prepare() sized. Optional; see resetDsp(). */
 template <typename T, typename = void>
@@ -3255,7 +3278,10 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
 
   // Raw-MIDI hosts express per note through MPE's channel layout instead of
   // through typed events, so the same block is read both ways.
-  if (kDesc.supportsMpe) inst->mpe.process(inst->midi, inst->expression);
+  if (kDesc.supportsMpe) {
+    syncBendRange(inst->dsp, inst->mpe);
+    inst->mpe.process(inst->midi, inst->expression);
+  }
 
   // Then whatever the user did to the INTERFACE since the last block. These go
   // back out to the host as live events too, which is what makes turning a knob

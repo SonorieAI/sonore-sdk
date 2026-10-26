@@ -1103,6 +1103,20 @@ public:
    *  being configured puts it back to 48. */
   float pitchBendRange() const { return bendRange_; }
 
+  /** The bend range for MIDI that is NOT MPE: a channel in no zone -- every
+   *  channel, until a controller announces one -- which is what an ordinary
+   *  keyboard's pitch wheel is. Two semitones unless set, as MIDI has it and
+   *  as nearly every keyboard ships; a range announced through RPN 0 on such
+   *  a channel takes over. A plugin that offers its own "bend range" control
+   *  passes it here (the wrappers do, for a DSP that declares
+   *  pitchBendRange()).
+   *
+   *  It used to be the per-note 48 -- MPE's default, applied to a keyboard that
+   *  never said it was MPE -- so a plain pitch wheel threw a note four octaves
+   *  in any plugin that declared MPE support. */
+  void setLegacyBendRange(float semitones) { legacyBendRange_ = semitones >= 0.0f ? semitones : 0.0f; }
+  float legacyBendRange() const { return legacyBendRange_; }
+
   /** The zone, if a controller has announced one. Inactive until then, and
    *  while it is inactive every channel is treated independently -- which is
    *  exactly what a plain MIDI keyboard needs and what this did before zones
@@ -1172,8 +1186,12 @@ public:
               // channel it is the zone's global bend; anywhere else it is the
               // per-note one.
               const int ch = rpn.channel - 1;
-              if (lower_.isMaster(ch) || upper_.isMaster(ch)) masterBendRange_ = semis;
-              else bendRange_ = semis;
+              if (lower_.isMaster(ch) || upper_.isMaster(ch)) {
+                masterBendRange_ = semis;
+              } else {
+                bendRange_ = semis;
+                rangeAnnounced_ = true; // a plain channel said what it wants, too
+              }
             }
           } else if (rpn.parameterNumber == kRpnMpeConfiguration) {
             applyConfiguration(rpn.channel - 1, rpn.is14Bit ? (rpn.value >> 7) : rpn.value);
@@ -1309,9 +1327,12 @@ private:
   /** The tuning, in semitones, of a note on `channel`: its own bend, and
    *  the zone's from the master channel when it is a member of one. */
   float tuningOf(int channel) const {
-    float semitones = ((float) bend_[channel] - 8192.0f) / 8192.0f * bendRange_;
     const MpeZone* zone =
         lower_.hasMember(channel) ? &lower_ : (upper_.hasMember(channel) ? &upper_ : nullptr);
+    // A member channel bends at the per-note range; any other channel is a
+    // plain one, at the legacy range unless it announced its own.
+    const float range = (zone || rangeAnnounced_) ? bendRange_ : legacyBendRange_;
+    float semitones = ((float) bend_[channel] - 8192.0f) / 8192.0f * range;
     if (zone)
       semitones += ((float) bend_[zone->masterChannel] - 8192.0f) / 8192.0f * masterBendRange_;
     return semitones;
@@ -1364,6 +1385,7 @@ private:
     // the specification says it should.
     bendRange_ = 48.0f;
     masterBendRange_ = 2.0f;
+    rangeAnnounced_ = false;
   }
 
   MpeZone lower_, upper_;
@@ -1372,6 +1394,10 @@ private:
   /** MPE's default, and only the default. A controller that announces its own
    *  through RPN 0 replaces this the moment it does. */
   float bendRange_ = 48.0f;
+  /** A plain channel's range (see setLegacyBendRange), and whether a range
+   *  announced through RPN 0 outside any zone has replaced it. */
+  float legacyBendRange_ = 2.0f;
+  bool rangeAnnounced_ = false;
 };
 
 /** What a channel MEANS. Width alone is not enough: a limiter that ducks the

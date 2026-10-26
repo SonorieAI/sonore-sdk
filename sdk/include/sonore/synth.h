@@ -12,6 +12,7 @@
 //   FmOperator                        a phase-modulation operator, with
 //                                     feedback, to stack into algorithms
 //   Dahdsr                            delay-attack-hold-decay-sustain-release
+//   Portamento                        a glide between notes, in pitch
 //   KarplusStrong                     a plucked string
 //   ModalResonator                    a struck body: a bank of ringing modes
 //
@@ -558,6 +559,83 @@ private:
   int counter_ = 0;
   Parameters p_{};
   float decayK_ = 0.0f, releaseK_ = 0.0f;
+};
+
+// ── Portamento ───────────────────────────────────────────────────────────────
+
+/**
+ * A glide between notes, in pitch: what a mono or legato line does between
+ * one key and the next.
+ *
+ * Linear in SEMITONES, which is exponential in hertz, as the ear hears it: a
+ * glide over an octave spends as long on the lower half as on the upper one,
+ * where a glide linear in hertz rushes through the bass and crawls at the
+ * top. next() returns the note it has reached -- fractional, so 60.5 is a
+ * quarter tone above middle C -- for the voice to turn into a frequency with
+ * whatever bend it adds.
+ *
+ * Two ways to time it, as hardware synths offer:
+ *   ConstantTime  every glide takes setTime() seconds, a semitone or two
+ *                 octaves: the same feel whatever the interval.
+ *   ConstantRate  setTime() seconds per OCTAVE: a wide leap takes longer,
+ *                 which is what a slide on a string does.
+ *
+ * In a voice: jumpTo() at noteOn() when the voice was silent (there is no
+ * pitch to come from), glideTo() at legatoTo(), and glideTo() at noteOn() too
+ * for "glide always". No allocation; call next() once per sample.
+ */
+class Portamento {
+public:
+  enum class Timing { ConstantTime, ConstantRate };
+
+  void setSampleRate(float sampleRate) { sr_ = sampleRate > 0.0f ? sampleRate : 48000.0f; }
+  /** The glide's time: its whole length, or its length per octave (see
+   *  Timing). 0 is no glide: every move lands at once. */
+  void setTime(float seconds) { time_ = seconds > 0.0f ? seconds : 0.0f; }
+  void setTiming(Timing timing) { timing_ = timing; }
+
+  /** Be at `note` now, with no glide. */
+  void jumpTo(float note) {
+    from_ = to_ = current_ = note;
+    remaining_ = 0;
+  }
+  /** Glide from wherever the pitch is now -- mid-glide included -- to `note`. */
+  void glideTo(float note) {
+    from_ = current_;
+    to_ = note;
+    float seconds = time_;
+    if (timing_ == Timing::ConstantRate) seconds *= std::fabs(to_ - from_) / 12.0f;
+    const int samples = (int) (seconds * sr_ + 0.5f);
+    if (samples <= 0 || from_ == to_) {
+      jumpTo(note);
+      return;
+    }
+    total_ = samples;
+    remaining_ = samples;
+  }
+
+  /** The note this sample: one step of the glide, or the target once there. */
+  inline float next() {
+    if (remaining_ > 0) {
+      --remaining_;
+      const float t = 1.0f - (float) remaining_ / (float) total_;
+      current_ = from_ + (to_ - from_) * t;
+    }
+    return current_;
+  }
+  /** Where the pitch is, without stepping. */
+  float current() const { return current_; }
+  /** Where it is going. */
+  float target() const { return to_; }
+  bool isGliding() const { return remaining_ > 0; }
+
+private:
+  float sr_ = 48000.0f;
+  float time_ = 0.0f;
+  Timing timing_ = Timing::ConstantTime;
+  float from_ = 60.0f, to_ = 60.0f, current_ = 60.0f;
+  int remaining_ = 0;
+  int total_ = 1;
 };
 
 // ── Karplus-Strong ───────────────────────────────────────────────────────────

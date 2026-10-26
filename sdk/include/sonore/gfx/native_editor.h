@@ -314,6 +314,16 @@ private:
   bool open_ = false;
 };
 
+/** The strip along a window's bottom edge where an instrument's keyboard
+ *  is docked (GenericEditor::dockKeyboard): painted as the editor is, so the
+ *  padding around the keys is not whatever the window last held there. */
+namespace detail {
+class KeyboardDock : public Widget {
+public:
+  void paint(Graphics& g) override { g.fillAll(lookAndFeel().background()); }
+};
+} // namespace detail
+
 /**
  * A GenericEditor with a window around it.
  *
@@ -417,10 +427,17 @@ public:
       // last parameters cannot be reached. The viewport is always there and
       // shows a bar only when there is something to scroll, so a four-knob
       // plugin looks exactly as it did.
+      // An instrument's keyboard stays in view along the bottom edge rather
+      // than scrolling away under the rows (see dockKeyboard).
+      if (MidiKeyboard* keys = editor_->dockKeyboard()) {
+        keyboardDock_ = std::unique_ptr<detail::KeyboardDock>(new detail::KeyboardDock());
+        keyboardDock_->addChild(keys);
+      }
       viewport_ = std::unique_ptr<Viewport>(new Viewport());
-      viewport_->setBounds({0.0f, top, (float) width, (float) height - top});
+      viewport_->setBounds({0.0f, top, (float) width, (float) height - top - dockHeight()});
       editor_->setSize((float) width - ScrollBar::kThickness, editor_->preferredHeight());
       viewport_->setViewedComponent(editor_.get());
+      placeDock((float) width, (float) height);
     }
 
     // ── The root, which used to be the viewport itself ─────────────────────
@@ -437,6 +454,7 @@ public:
     root_->setAccessibilityIgnored(true);
     if (custom_) root_->addChild(custom_.get());
     else root_->addChild(viewport_.get());
+    if (keyboardDock_) root_->addChild(keyboardDock_.get());
     if (presetBar_) root_->addChild(presetBar_.get());
 
     border_ = std::unique_ptr<ResizableBorder>(new ResizableBorder());
@@ -562,6 +580,8 @@ public:
     root_.reset();
     border_.reset();
     viewport_.reset();
+    // Before the editor, which owns the keyboard this strip holds.
+    keyboardDock_.reset();
     editor_.reset();
     custom_.reset();
 #endif
@@ -656,6 +676,20 @@ public:
 #endif
   }
 
+  /** The docked keyboard's strip: the keys and padding above and below. */
+  float dockHeight() const {
+    return keyboardDock_ ? GenericEditor::kKeyboardHeight + GenericEditor::kPadding * 2.0f : 0.0f;
+  }
+
+  /** The strip along the bottom edge, and the keys inside it. */
+  void placeDock(float w, float h) {
+    if (!keyboardDock_ || !editor_ || !editor_->keyboard()) return;
+    const float strip = dockHeight();
+    keyboardDock_->setBounds({0.0f, h - strip, w, strip});
+    editor_->keyboard()->setBounds({GenericEditor::kPadding, GenericEditor::kPadding,
+                                    w - GenericEditor::kPadding * 2.0f, GenericEditor::kKeyboardHeight});
+  }
+
   /** The rows are laid out to the WIDTH, so a host making the editor wider has
    *  to reach the content and not only the viewport around it. The height is the
    *  content's own -- that is the whole point of scrolling. */
@@ -677,9 +711,10 @@ public:
     }
     const float top = presetBar_ ? PresetBar::kHeight : 0.0f;
     if (presetBar_) presetBar_->setBounds({0.0f, 0.0f, w, top});
-    viewport_->setBounds({0.0f, top, w, h - top});
+    viewport_->setBounds({0.0f, top, w, h - top - dockHeight()});
     editor_->setSize(w - ScrollBar::kThickness, editor_->preferredHeight());
     viewport_->contentResized();
+    placeDock(w, h);
 #endif
   }
 
@@ -980,6 +1015,8 @@ private:
   /** The size the editor opened at: where a fixed axis is pinned. */
   float naturalWidth_ = 0.0f, naturalHeight_ = 0.0f;
   std::unique_ptr<Viewport> viewport_;
+  /** An instrument's keyboard, docked along the bottom; null otherwise. */
+  std::unique_ptr<detail::KeyboardDock> keyboardDock_;
   PopupWindow popup_;
   TooltipManager tooltips_;
   TooltipWindow tooltipWindow_;
