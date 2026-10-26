@@ -1479,6 +1479,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   install(FILES third_party/minimp3.h third_party/stb_vorbis.c
           DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sonore/third_party")
   install(DIRECTORY cmake DESTINATION "${CMAKE_INSTALL_DATADIR}/SonoreSDK")
+  install(DIRECTORY android DESTINATION "${CMAKE_INSTALL_DATADIR}/SonoreSDK")
   install(EXPORT SonoreSDKTargets
           NAMESPACE SonoreSDK::
           DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SonoreSDK")

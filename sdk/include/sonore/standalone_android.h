@@ -5,10 +5,13 @@
 // Instance, processBlock, the same parameters and state -- inside an Android
 // activity (android_app.h) instead of a desktop window:
 //
-//  - The editor fills the screen: the SDK-drawn native editor, sized to the
-//    surface in logical pixels at the screen's density, re-laid out when the
-//    phone turns. An instrument's editor carries its on-screen keyboard, which
-//    a finger plays; a pinch of fingers plays a chord.
+//  - The editor fills the screen, by the choice every format makes: the
+//    plugin's page in a WebView when it has one (webview_android.h), else the
+//    SDK-drawn native editor, sized to the surface in logical pixels at the
+//    screen's density, re-laid out when the phone turns. An instrument's
+//    editor carries its on-screen keyboard, which a finger plays.
+//  - A MIDI keyboard plugged in plays it: every device that sends MIDI, the
+//    ones plugged in later too (Android 10 and later; midi_input.h).
 //  - Sound runs while the app is on screen: AAudio opens at start and closes
 //    at stop. An app that keeps playing in the background needs a foreground
 //    service, which is the app's to declare, not this file's.
@@ -44,6 +47,7 @@ public:
     clapwrap::primeParamsBlock(&app_.instance);
     if (!kDesc.isInstrument && !android::hasPermission(kRecordAudio))
       android::requestPermission(kRecordAudio);
+    startMidi(app_);
   }
 
   void started() override { startSound(); }
@@ -56,17 +60,32 @@ public:
   void windowReady(int width, int height, float scale) override {
     const int w = (int) ((float) width / scale), h = (int) ((float) height / scale);
     Instance& inst = app_.instance;
-    if (inst.nativeEditor.isOpen()) {
-      inst.nativeEditor.setSize(w, h);
+    if (inst.guiCreated) {
+      if (inst.guiIsNative) inst.nativeEditor.setSize(w, h);
+      else inst.webview.setSize((uint32_t) w, (uint32_t) h);
       return;
     }
+    // The page when the plugin has one and the APK can show it; the native
+    // editor otherwise, and whenever the page will not open.
+    const EditorChoice choice = clapwrap::editorChoice();
+    if (choice.backend == EditorBackend::Web) {
+      inst.webview.onMessage = [&inst](const BridgeMessage& m) { clapwrap::guiOnMessage(&inst, m); };
+      inst.webview.onTick = [&inst]() { clapwrap::guiTick(&inst); };
+      inst.guiIsNative = false;
+      inst.guiCreated = inst.webview.create(nullptr, (uint32_t) w, (uint32_t) h, clapwrap::uiHtml(),
+                                            clapwrap::bridgeScriptFor(inst), kDesc.id);
+      if (inst.guiCreated) return;
+      android::log("the page did not open (%s): the native editor instead", inst.webview.status().c_str());
+    }
+    inst.guiIsNative = true;
     inst.nativeEditor.setContentFactory(clapwrap::customEditorFactory(inst.dsp));
-    if (!inst.nativeEditor.open(nullptr, kDesc.params, (int) kDesc.numParams, clapwrap::makeEditorHost(&inst), w,
-                                h))
-      android::log("the editor did not open");
+    inst.guiCreated = inst.nativeEditor.open(nullptr, kDesc.params, (int) kDesc.numParams,
+                                             clapwrap::makeEditorHost(&inst), w, h);
+    if (!inst.guiCreated) android::log("the editor did not open");
   }
 
   void frame() override {
+    if (app_.instance.guiCreated && !app_.instance.guiIsNative) app_.instance.webview.tick();
     if (!running_) return;
     // A route that went away under the stream -- headphones pulled, an
     // interface unplugged: reopened on the new one.
@@ -87,7 +106,9 @@ public:
 
   void destroyed() override {
     stopSound();
+    stopMidi(app_);
     app_.instance.nativeEditor.close();
+    app_.instance.webview.destroy();
   }
 
 private:

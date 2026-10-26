@@ -438,7 +438,7 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
   js += "if(window.top!==window)return;\n";
   js += "var post=function(m){try{window.chrome.webview.postMessage(JSON.stringify(m));}"
         "catch(e){try{window.webkit.messageHandlers.sonore.postMessage(JSON.stringify(m));}"
-        "catch(e2){}}};\n";
+        "catch(e2){try{window.sonoreAndroid.post(JSON.stringify(m));}catch(e3){}}}};\n";
   // Keys the page did not use go to the HOST. A focused webview keeps every
   // keystroke, and WebView2's AcceleratorKeyPressed -- which the Windows
   // backend already forwards -- reports only modifier combinations, keys

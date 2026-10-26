@@ -18,6 +18,7 @@
 //   core_data_test            the whole suite
 //   core_data_test --leak-child   (internal: the process that leaks on purpose)
 #if defined(_WIN32)
+#include <sonore/apple_platform.h> // SONORE_IOS: what an iPhone may not do
 #include <windows.h>
 #endif
 
@@ -1414,7 +1415,11 @@ void testLeakDetector(const char* argv0) {
   sonore::setLeakReportHandler(nullptr);
 
   // The real thing: a child process that leaks a Leaky and exits. The report
-  // comes from the counter's destructor during static destruction.
+  // comes from the counter's destructor during static destruction. Not on
+  // iOS, where an app starts no process and std::system does not exist.
+#if defined(SONORE_IOS)
+  std::printf("  SKIPPED the leaking child process: iOS starts no processes\n");
+#else
   const std::string out = sonoretest::tempDir() + "/leak_child.txt";
 #if defined(_WIN32)
   const std::string command = "\"\"" + std::string(argv0) + "\" --leak-child 2> \"" + out + "\"\"";
@@ -1432,6 +1437,7 @@ void testLeakDetector(const char* argv0) {
   check(contains(text, "*** Leaked objects detected: 1 instance(s) of class Leaky were never deleted"),
         "a child process that leaks one Leaky reports it at exit (rc " + std::to_string(rc) + ")");
   std::remove(out.c_str());
+#endif
 }
 
 // What the child does: one Leaky that is never destroyed. Placement-new into

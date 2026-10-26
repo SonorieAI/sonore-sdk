@@ -416,6 +416,9 @@ endfunction()
 # with the Android SDK's own tools and no Gradle:
 #
 #   aapt2      the manifest, compiled against the platform's android.jar
+#   javac, d8  the SDK's Java helper (sdk/android/java: MIDI devices and the
+#              plugin's page, what the framework answers through callbacks)
+#              into classes.dex
 #   (zip)      the library added under lib/<abi>/, every entry STORED, by the
 #              JDK's jar -- Android wants native code and resources.arsc
 #              uncompressed so it can map them where they lie
@@ -486,8 +489,9 @@ function(_sonore_android_app TARGET)
   set(_jdkHints "$ENV{JAVA_HOME}/bin" "C:/Program Files/Android/Android Studio/jbr/bin"
                 "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin")
   find_program(SONORE_JAR jar HINTS ${_jdkHints})
+  find_program(SONORE_JAVAC javac HINTS ${_jdkHints})
   find_program(SONORE_KEYTOOL keytool HINTS ${_jdkHints})
-  if(NOT _sdk OR NOT _bt OR NOT _androidJar OR NOT SONORE_JAR OR NOT SONORE_KEYTOOL)
+  if(NOT _sdk OR NOT _bt OR NOT _androidJar OR NOT SONORE_JAR OR NOT SONORE_KEYTOOL OR NOT SONORE_JAVAC)
     message(STATUS "sonore_add_standalone(${TARGET}): the APK is not packaged -- it needs the Android SDK "
                    "(build-tools and a platform; set ANDROID_HOME) and a JDK (set JAVA_HOME). "
                    "lib${TARGET}.so is built.")
@@ -537,6 +541,21 @@ function(_sonore_android_app TARGET)
     endif()
   endif()
 
+  # The Java helper, once per app: javac against the platform, d8 to dex.
+  set(_java "${SONORE_SDK_DIR}/android/java/com/sonorie/sonore/SonoreBridge.java")
+  set(_dex "${_dir}/dex/classes.dex")
+  add_custom_command(OUTPUT "${_dex}"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${_dir}/classes"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}/classes" "${_dir}/dex"
+    COMMAND "${SONORE_JAVAC}" --release 11 -Xlint:-options -nowarn -cp "${_androidJar}" -d "${_dir}/classes" "${_java}"
+    COMMAND ${CMAKE_COMMAND} -E chdir "${_dir}/classes" "${SONORE_JAR}" cf "${_dir}/classes.jar" .
+    COMMAND ${CMAKE_COMMAND} -E env "JAVA_HOME=${_javaHome}"
+            "${_bt}/d8${_bat}" --release --min-api ${SONORE_ANDROID_MIN_SDK} --lib "${_androidJar}"
+            --output "${_dir}/dex" "${_dir}/classes.jar"
+    DEPENDS "${_java}"
+    COMMENT "Compiling the SDK's Java helper for ${TARGET}"
+    VERBATIM)
+
   set(_apk "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.apk")
   add_custom_command(OUTPUT "${_apk}"
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${_dir}/stage"
@@ -545,6 +564,7 @@ function(_sonore_android_app TARGET)
             -I "${_androidJar}" --min-sdk-version ${SONORE_ANDROID_MIN_SDK}
             --target-sdk-version ${SONORE_ANDROID_TARGET_SDK}
     COMMAND ${CMAKE_COMMAND} -E chdir "${_dir}/stage" ${CMAKE_COMMAND} -E tar xf "${_dir}/base.apk"
+    COMMAND ${CMAKE_COMMAND} -E copy "${_dex}" "${_dir}/stage/classes.dex"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${_lib}>" "${_dir}/stage/lib/${ANDROID_ABI}/"
     # Without the debug information: a device has no use for it, and it is
     # most of the library's size. The built one keeps it, for a debugger.
@@ -555,7 +575,7 @@ function(_sonore_android_app TARGET)
     COMMAND ${CMAKE_COMMAND} -E env "JAVA_HOME=${_javaHome}"
             "${_bt}/apksigner${_bat}" sign --ks "${_keystore}" --ks-pass pass:android --key-pass pass:android
             --ks-key-alias androiddebugkey --out "${_apk}" "${_dir}/aligned.apk"
-    DEPENDS ${_lib} "${_dir}/AndroidManifest.xml"
+    DEPENDS ${_lib} "${_dir}/AndroidManifest.xml" "${_dex}"
     COMMENT "Packaging ${TARGET}.apk"
     VERBATIM)
   add_custom_target(${TARGET}Apk ALL DEPENDS "${_apk}")

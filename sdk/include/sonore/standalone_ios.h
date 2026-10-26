@@ -246,6 +246,9 @@ inline BOOL didFinishLaunching(id, SEL, id, id) {
   CFRunLoopTimerContext context{};
   r.clock = CFRunLoopTimerCreate(nullptr, CFAbsoluteTimeGetCurrent() + 0.5, 0.5, 0, 0, &clockTick, &context);
   if (r.clock) CFRunLoopAddTimer(CFRunLoopGetMain(), r.clock, kCFRunLoopCommonModes);
+  // A keyboard: CoreMIDI is the same on an iPhone -- a USB keyboard through
+  // the camera adapter, a Bluetooth one already paired, a network session.
+  startMidi(*r.app);
   startSound();
   return YES;
 }

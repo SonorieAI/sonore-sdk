@@ -49,6 +49,7 @@
 #include <cstring>
 #include <string>
 
+#include "android_jni.h"
 #include "gfx/window_android.h"
 #include "message_manager.h"
 
@@ -89,27 +90,8 @@ struct ActivityHooks {
   virtual void destroyed() {}
 };
 
-/** The activity this process is showing, while it shows one. */
-inline ANativeActivity*& currentActivity() {
-  static ANativeActivity* activity = nullptr;
-  return activity;
-}
-
-// ── JNI, on framework classes ────────────────────────────────────────────────
-
-/** The main thread's JNIEnv: the one every callback here runs on. */
-inline JNIEnv* env() {
-  ANativeActivity* a = currentActivity();
-  return a ? a->env : nullptr;
-}
-
-/** Whether a Java exception is pending; cleared either way, so one failed
- *  call never poisons the next. */
-inline bool failed(JNIEnv* e) {
-  if (!e->ExceptionCheck()) return false;
-  e->ExceptionClear();
-  return true;
-}
+// ── JNI, on framework classes (currentActivity, env and failed are in
+// android_jni.h, with the SDK's own Java class) ─────────────────────────────
 
 /** The density scale: one logical pixel in device pixels (dpi / 160). */
 inline float densityScale(ANativeActivity* activity) {

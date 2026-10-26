@@ -37,6 +37,13 @@
 #elif defined(__APPLE__) || defined(SONORE_APPLE_SYNTAX_CHECK)
 #include <CoreMIDI/CoreMIDI.h>
 #include <dlfcn.h>
+#elif defined(__ANDROID__) && !defined(SONORE_APPLE_SYNTAX_CHECK)
+#include <dlfcn.h>
+#include <sys/types.h>
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include "android_jni.h"
 #elif defined(__linux__) && !defined(SONORE_APPLE_SYNTAX_CHECK)
 #include <dlfcn.h>
 #include <poll.h> // the reader thread waits in poll(), not a blocking read
@@ -488,6 +495,282 @@ private:
 };
 
 // ── Linux: ALSA sequencer, dlopened ─────────────────────────────────────────
+#elif defined(__ANDROID__) && !defined(SONORE_APPLE_SYNTAX_CHECK)
+
+namespace amididetail {
+
+/**
+ * AMidi, the NDK's way to read a MIDI device Java opened. Android 10 (API 29)
+ * and later, in libamidi.so, opened by name: this SDK's Android floor is 9,
+ * where an app still loads and simply has no MIDI.
+ */
+struct Api {
+  bool ok = false;
+  int32_t (*deviceFromJava)(JNIEnv*, jobject, void**) = nullptr;
+  int32_t (*deviceRelease)(const void*) = nullptr;
+  ssize_t (*numOutputPorts)(const void*) = nullptr;
+  int32_t (*outputPortOpen)(const void*, int32_t, void**) = nullptr;
+  ssize_t (*receive)(const void*, int32_t*, uint8_t*, size_t, size_t*, int64_t*) = nullptr;
+  void (*outputPortClose)(const void*) = nullptr;
+};
+
+inline const Api& api() {
+  static Api a = [] {
+    Api r;
+    void* lib = dlopen("libamidi.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return r;
+    bool all = true;
+    auto bind = [&](const char* name, void* slot) {
+      void* sym = dlsym(lib, name);
+      if (!sym) all = false;
+      std::memcpy(slot, &sym, sizeof(sym));
+    };
+    bind("AMidiDevice_fromJava", &r.deviceFromJava);
+    bind("AMidiDevice_release", &r.deviceRelease);
+    bind("AMidiDevice_getNumOutputPorts", &r.numOutputPorts);
+    bind("AMidiOutputPort_open", &r.outputPortOpen);
+    bind("AMidiOutputPort_receive", &r.receive);
+    bind("AMidiOutputPort_close", &r.outputPortClose);
+    r.ok = all;
+    return r;
+  }();
+  return a;
+}
+
+/** One output port of one device, and where its byte stream had got to:
+ *  a packet may end mid-message, and running status carries across. */
+struct Port {
+  int id = 0;
+  void* device = nullptr;
+  void* port = nullptr;
+  std::string name;
+  uint8_t status = 0;
+  uint8_t data[2] = {0, 0};
+  int have = 0;
+  int need = 0;
+  std::vector<uint8_t> sysex;
+  bool inSysex = false;
+};
+
+/**
+ * Every MIDI device Java opened (SonoreBridge.startMidi), read by one thread
+ * into whichever queue is listening. Process-wide: there is one MidiManager,
+ * and devices come and go whether or not an input is open.
+ */
+class Hub {
+public:
+  static Hub& instance() {
+    static Hub hub;
+    return hub;
+  }
+
+  /** [main-thread] Once: the natives bound and MidiManager asked to open
+   *  every device that sends MIDI, now and when one is plugged in. */
+  bool start(std::string* why) {
+    if (started_) return true;
+    if (!api().ok) {
+      if (why) *why = "MIDI needs Android 10 or later";
+      return false;
+    }
+    JNIEnv* e = android::env();
+    jclass bridge = android::bridgeClass();
+    ANativeActivity* activity = android::currentActivity();
+    if (!e || !bridge || !activity) {
+      if (why) *why = "MIDI needs the app's activity (an APK built by sonore_add_standalone)";
+      return false;
+    }
+    static const JNINativeMethod natives[] = {
+        {"midiDeviceOpened", "(Ljava/lang/Object;Ljava/lang/String;I)V", (void*) &Hub::nativeOpened},
+        {"midiDeviceRemoved", "(I)V", (void*) &Hub::nativeRemoved},
+    };
+    if (!android::registerNatives(natives, 2)) {
+      if (why) *why = "the app's SonoreBridge class has no MIDI methods";
+      return false;
+    }
+    jmethodID startMidi = e->GetStaticMethodID(bridge, "startMidi", "(Landroid/app/Activity;)V");
+    if (android::failed(e) || !startMidi) {
+      if (why) *why = "SonoreBridge.startMidi is missing";
+      return false;
+    }
+    running_.store(true);
+    reader_ = std::thread([this] { readLoop(); });
+    reader_.detach(); // the process's: devices outlive any one input
+    e->CallStaticVoidMethod(bridge, startMidi, activity->clazz);
+    android::failed(e);
+    started_ = true;
+    return true;
+  }
+
+  void setQueue(MessageQueue* queue) { queue_.store(queue, std::memory_order_release); }
+
+  std::vector<std::string> names() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> out;
+    for (const Port& p : ports_)
+      if (std::find(out.begin(), out.end(), p.name) == out.end()) out.push_back(p.name);
+    return out;
+  }
+
+private:
+  Hub() = default;
+
+  static void nativeOpened(JNIEnv* e, jclass, jobject device, jstring name, jint id) {
+    instance().opened(e, device, android::utf8(e, name), (int) id);
+  }
+  static void nativeRemoved(JNIEnv*, jclass, jint id) { instance().removed((int) id); }
+
+  void opened(JNIEnv* e, jobject javaDevice, const std::string& name, int id) {
+    const Api& a = api();
+    void* device = nullptr;
+    if (!a.ok || a.deviceFromJava(e, javaDevice, &device) != 0 || !device) return;
+    const ssize_t count = a.numOutputPorts(device);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (ssize_t i = 0; i < count; ++i) {
+      void* port = nullptr;
+      if (a.outputPortOpen(device, (int32_t) i, &port) != 0 || !port) continue;
+      Port p;
+      p.id = id;
+      p.device = device;
+      p.port = port;
+      p.name = name;
+      ports_.push_back(std::move(p));
+    }
+    devices_.push_back({id, device});
+  }
+
+  void removed(int id) {
+    const Api& a = api();
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = ports_.begin(); it != ports_.end();) {
+      if (it->id == id) {
+        a.outputPortClose(it->port);
+        it = ports_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = devices_.begin(); it != devices_.end();) {
+      if (it->first == id) {
+        a.deviceRelease(it->second);
+        it = devices_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  /** Bytes into whole messages: running status, real-time bytes anywhere,
+   *  SysEx between F0 and F7. */
+  void parse(Port& p, const uint8_t* bytes, size_t n, MessageQueue* q) {
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t b = bytes[i];
+      if (b >= 0xF8) {
+        q->push(b, 0, 0);
+        continue;
+      }
+      if (b == 0xF0) {
+        p.inSysex = true;
+        p.sysex.assign(1, b);
+        continue;
+      }
+      if (p.inSysex) {
+        if (b == 0xF7) {
+          p.sysex.push_back(b);
+          q->pushSysex(p.sysex.data(), p.sysex.size());
+          p.inSysex = false;
+          continue;
+        }
+        if (b < 0x80) {
+          if (p.sysex.size() < 4096) p.sysex.push_back(b);
+          continue;
+        }
+        p.inSysex = false; // a status byte ends a SysEx nobody closed, and is read below
+      }
+      if (b >= 0x80) {
+        p.status = b;
+        p.have = 0;
+        p.need = shortMessageLength(b) - 1;
+        if (p.need <= 0) {
+          q->push(b, 0, 0);
+          p.status = b >= 0xF0 ? 0 : p.status;
+        }
+        continue;
+      }
+      if (!p.status || p.need <= 0) continue; // data with no status: dropped
+      p.data[p.have++] = b;
+      if (p.have >= p.need) {
+        q->push(p.status, p.data[0], p.need > 1 ? p.data[1] : 0);
+        p.have = 0;
+        if ((p.status & 0xF0) == 0xF0) p.status = 0; // system common has no running status
+      }
+    }
+  }
+
+  /** One thread for every port: AMidi has no blocking read, so it polls,
+   *  at a millisecond while something is open. */
+  void readLoop() {
+    const Api& a = api();
+    uint8_t buffer[1024];
+    while (running_.load()) {
+      bool any = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        MessageQueue* q = queue_.load(std::memory_order_acquire);
+        for (Port& p : ports_) {
+          any = true;
+          for (;;) {
+            int32_t opcode = 0;
+            size_t got = 0;
+            int64_t when = 0;
+            const ssize_t r = a.receive(p.port, &opcode, buffer, sizeof(buffer), &got, &when);
+            if (r <= 0) break;
+            if (opcode == 1 /* AMIDI_OPCODE_DATA */ && q && got > 0) parse(p, buffer, got, q);
+          }
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(any ? 1 : 20));
+    }
+  }
+
+  std::mutex mutex_;
+  std::vector<Port> ports_;
+  std::vector<std::pair<int, void*>> devices_;
+  std::thread reader_;
+  std::atomic<bool> running_{false};
+  std::atomic<MessageQueue*> queue_{nullptr};
+  bool started_ = false;
+};
+
+} // namespace amididetail
+
+/** The Android Device: every MIDI device plugged in, as one input -- a phone
+ *  has no patchbay to choose a port in, and a keyboard plugged in later
+ *  plays too. AMidi, through the app's activity (amididetail::Hub). */
+class Device {
+public:
+  static std::vector<std::string> listDevices() { return {std::string("All MIDI devices")}; }
+  const std::string& deviceName() const { return deviceName_; }
+  bool open(MessageQueue* queue, int = -1) {
+    close();
+    error_.clear();
+    if (!amididetail::Hub::instance().start(&error_)) return false;
+    queue_ = queue;
+    amididetail::Hub::instance().setQueue(queue);
+    deviceName_ = "All MIDI devices";
+    return true;
+  }
+  void close() {
+    if (queue_) amididetail::Hub::instance().setQueue(nullptr);
+    queue_ = nullptr;
+  }
+  const std::string& error() const { return error_; }
+  ~Device() { close(); }
+
+private:
+  MessageQueue* queue_ = nullptr;
+  std::string error_, deviceName_;
+};
+
 #elif defined(__linux__) && !defined(SONORE_APPLE_SYNTAX_CHECK)
 
 /** The Linux Device: the contract of the winmm one above, over one ALSA

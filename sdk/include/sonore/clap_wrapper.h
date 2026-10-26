@@ -72,7 +72,9 @@
 #include "webview_win32.h"
 #elif defined(__APPLE__)
 #include "webview_cocoa.h"
-#elif defined(__linux__) && !defined(__ANDROID__)
+#elif defined(__ANDROID__)
+#include "webview_android.h"
+#elif defined(__linux__)
 #include "webview_gtk.h"
 #endif
 
@@ -103,13 +105,14 @@ using PlatformWebView = win32::WebViewHost;
 #elif defined(__APPLE__)
 using PlatformWebView = cocoa::WebViewHost;
 #define SONORE_HAS_WEBVIEW_BACKEND 1
-#elif defined(__linux__) && !defined(__ANDROID__)
+#elif defined(__ANDROID__)
+// Android's own WebView, through the Java the APK carries (webview_android.h).
+using PlatformWebView = android::WebViewHost;
+#define SONORE_HAS_WEBVIEW_BACKEND 1
+#elif defined(__linux__)
 using PlatformWebView = gtk::WebViewHost;
 #define SONORE_HAS_WEBVIEW_BACKEND 1
 #endif
-// Android: no webview backend yet -- WebKitGTK is not there, and Android's own
-// WebView is a Java object -- so an Android build opens the native editor
-// (gfx/window_android.h), whatever the descriptor prefers.
 
 // ── Fixed capacities ─────────────────────────────────────────────────────────
 // Bounded so every per-block pointer table stays on the stack: 8 channels
@@ -4412,7 +4415,7 @@ inline int64_t webviewParkAfterMs() {
 inline bool attachWebviewTo(Instance* inst, void* parent, uint32_t w, uint32_t h) {
 #if defined(_WIN32)
   return inst->webview.create((HWND) parent, w, h, uiHtml(), bridgeScriptFor(*inst), kDesc.id);
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
   return inst->webview.create(parent, w, h, uiHtml(), bridgeScriptFor(*inst), kDesc.id);
 #else
   return inst->webview.create((unsigned long) (uintptr_t) parent, w, h, uiHtml(),

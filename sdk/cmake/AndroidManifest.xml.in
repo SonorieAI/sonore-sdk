@@ -4,8 +4,9 @@
 
   android.app.NativeActivity is the framework's activity for an app written in
   C++: it loads the library android.app.lib_name names and calls its
-  ANativeActivity_onCreate. hasCode is false because the APK carries no dex:
-  every Java call the app makes is to a framework class, through JNI.
+  ANativeActivity_onCreate. The APK's one dex is the SDK's SonoreBridge, the
+  Java that what the framework answers through callbacks needs: MIDI devices,
+  and the plugin's page in a WebView.
 
   configChanges: a rotation, a keyboard or a new density re-lays the editor out
   in place (onConfigurationChanged) instead of recreating the activity, which
@@ -23,8 +24,9 @@
   <uses-feature android:name="android.hardware.audio.low_latency" android:required="false" />
   <uses-feature android:name="android.hardware.audio.pro" android:required="false" />
   <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+  <uses-feature android:name="android.software.midi" android:required="false" />
   <application android:label="@SONORE_ANDROID_LABEL@"
-               android:hasCode="false"
+               android:hasCode="true"
                android:extractNativeLibs="false"
                android:allowBackup="true"
                android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">

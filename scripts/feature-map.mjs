@@ -860,9 +860,14 @@ const MAP = [
    "android_app.h and standalone_android.h: a plugin's standalone as an APK " +
    "sonore_add_standalone packages with the SDK's tools and no Gradle -- " +
    "NativeActivity, no dex, every framework call through JNI. ActivityHooks " +
-   "over the activity's life; AndroidApp runs the shared App: the native editor " +
-   "full screen at the display's density, AAudio while visible, an effect's " +
-   "microphone once allowed and only while the sound goes to headphones. " +
+   "over the activity's life; AndroidApp runs the shared App: the plugin's page " +
+   "in a WebView (webview_android.h, a PopupWindow over the activity, the " +
+   "bridge through a @JavascriptInterface) or the native editor, full screen at " +
+   "the display's density; AAudio while visible; every MIDI device plugged in " +
+   "through AMidi (midi_input.h, Android 10 and later); an effect's microphone " +
+   "once allowed and only while the sound goes to headphones. The one dex is the " +
+   "SDK's SonoreBridge (sdk/android/java), for what the framework answers through " +
+   "callbacks. " +
    "Android 9 (API 28) and later. Run in an Android 15 emulator, its suites " +
    "too (tests/mobile.cmake); not yet on a phone",
    "struct ActivityHooks"],

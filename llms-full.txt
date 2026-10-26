@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 280 headers, 765 public types.
+not have. 282 headers, 769 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -114,6 +114,14 @@ an Android app's activity, in C++
 `sdk/include/sonore/android_app.h`
 
 ActivityHooks, ActivityState
+
+### android_jni.h
+
+the JNI an Android app's C++ uses -- the activity, its thread's
+
+`sdk/include/sonore/android_jni.h`
+
+(no public types)
 
 ### apple_block.h
 
@@ -1689,7 +1697,7 @@ live MIDI input for the standalone build
 
 `sdk/include/sonore/midi_input.h`
 
-MessageQueue, StreamParser, Device
+MessageQueue, StreamParser, Device, Api, Port, Hub
 
 ### midi_output.h
 
@@ -2282,6 +2290,14 @@ waveform peaks, for drawing
 `sdk/include/sonore/waveform.h`
 
 WaveformBucket, WaveformPeaks
+
+### webview_android.h
+
+the Android webview backend -- the plugin's page in an Android
+
+`sdk/include/sonore/webview_android.h`
+
+WebViewHost
 
 ### webview_cocoa.h
 
