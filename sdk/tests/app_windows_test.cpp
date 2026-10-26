@@ -730,7 +730,10 @@ static void testProgressWindow() {
     check(window != nullptr && IsWindowVisible((HWND) window->getWindowHandle()),
           "launchThread shows the window and returns at once");
     progressd::Window* pw = job.getWindowDetail();
-    pumpUntil([&]() { return pw->progressBar().progress() == 0.5; }, 5000);
+    // Waits for both: the job sets its progress and then its status, and a
+    // tick of the window's clock between the two carries the first alone.
+    pumpUntil([&]() { return pw->progressBar().progress() == 0.5 && pw->statusLabel().text() == "half way"; },
+              5000);
     check(pw->progressBar().progress() == 0.5 && pw->statusLabel().text() == "half way",
           "the window's clock carries the job's progress and status across");
     pumpFor(80);

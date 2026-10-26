@@ -6602,6 +6602,19 @@ static void testMidiInputQueue() {
 static void testOsc() {
   using namespace sonore::osc;
 
+  // A receive is non-blocking, so a datagram on the loopback is polled for,
+  // up to two seconds. 200 polls back to back took microseconds, which the
+  // iOS simulator's loopback did not always beat.
+  auto receiveWithin2s = [](Receiver& receiver) {
+    std::vector<Message> got;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (got.empty() && std::chrono::steady_clock::now() < deadline) {
+      got = receiver.poll();
+      if (got.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return got;
+  };
+
   {
     Message m;
     m.address = "/sonore/param/drive";
@@ -6793,9 +6806,7 @@ static void testOsc() {
       m.arguments.push_back(Argument::makeFloat(0.5f));
       check(sender.send(m), "a message is sent over UDP");
 
-      // Non-blocking receive: give the loopback a moment across a few polls.
-      std::vector<Message> got;
-      for (int i = 0; i < 200 && got.empty(); ++i) got = receiver.poll();
+      const std::vector<Message> got = receiveWithin2s(receiver);
       check(!got.empty(), "...and arrives at the receiver");
       if (!got.empty()) {
         check(got[0].address == "/live" && got[0].arguments.size() == 1 &&
@@ -6831,8 +6842,7 @@ static void testOsc() {
       m.address = "/moved";
       check(moved.port() != 0 && senders.front().send(m),
             "a moved receiver keeps its port, and a sender moved by a growing vector still sends");
-      std::vector<Message> got;
-      for (int i = 0; i < 200 && got.empty(); ++i) got = moved.poll();
+      const std::vector<Message> got = receiveWithin2s(moved);
       check(!got.empty() && got[0].address == "/moved", "...and the datagram arrives");
       Receiver taken = std::move(moved);
       check(moved.port() == 0 && taken.port() != 0,
