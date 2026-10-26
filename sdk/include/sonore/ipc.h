@@ -615,6 +615,23 @@ private:
   static bool socketPath(const std::string& name, sockaddr_un& out) {
     std::memset(&out, 0, sizeof(out));
     out.sun_family = AF_UNIX;
+#if defined(__ANDROID__)
+    // Android: a bare name goes in the ABSTRACT namespace -- a leading NUL, no
+    // file. SELinux refuses socket files almost everywhere (an adb shell's
+    // /data/local/tmp, an app's anything outside its own folder), and an
+    // abstract name needs none; the user id in it keeps one user's from
+    // another's, as the file's 0600 does elsewhere. Gone with its listener,
+    // so there is never a stale one to clear.
+    if (name.find('/') == std::string::npos) {
+      char uid[24];
+      std::snprintf(uid, sizeof(uid), "%lu", (unsigned long) ::getuid());
+      const std::string abstractName =
+          "sonore-" + std::string(uid) + "-" + processdetail::legalObjectName(name, 40);
+      if (abstractName.size() + 1 >= sizeof(out.sun_path)) return false;
+      std::memcpy(out.sun_path + 1, abstractName.c_str(), abstractName.size());
+      return true;
+    }
+#endif
     const std::string path = name.find('/') != std::string::npos
                                  ? name
                                  : processdetail::userRendezvousPrefix(sizeof(out.sun_path)) +

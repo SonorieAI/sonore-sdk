@@ -531,6 +531,8 @@ std::vector<uint8_t> seedFont(std::string* which) {
       "C:/Windows/Fonts/tahoma.ttf",
       "C:/Windows/Fonts/verdana.ttf",
 #endif
+      "/system/fonts/RobotoStatic-Regular.ttf", // Android
+      "/system/fonts/Roboto-Regular.ttf",
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
       "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
       "/usr/share/fonts/truetype/freefont/FreeSans.ttf",

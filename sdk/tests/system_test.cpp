@@ -1491,6 +1491,9 @@ void testProcesses() {
 #elif defined(__APPLE__)
     DynamicLibrary lib("/usr/lib/libSystem.B.dylib");
     const char* fn = "getpid";
+#elif defined(__ANDROID__)
+    DynamicLibrary lib("libc.so"); // bionic's has no version suffix
+    const char* fn = "getpid";
 #else
     DynamicLibrary lib("libc.so.6");
     const char* fn = "getpid";

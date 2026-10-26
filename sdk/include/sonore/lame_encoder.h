@@ -69,6 +69,7 @@
 #endif
 #include <windows.h>
 #else
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -203,6 +204,14 @@ inline ProcessResult runProcess(const std::string& exe, const std::vector<std::s
   argv.push_back(const_cast<char*>(exe.c_str()));
   for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
   argv.push_back(nullptr);
+#if defined(__ANDROID__)
+  // Bionic's posix_spawn succeeds and lets the child exit 127 when the exec
+  // fails (process.h says more); the file is checked first instead.
+  if (::access(exe.c_str(), X_OK) != 0) {
+    result.error = "the encoder could not be started (errno " + std::to_string(errno) + ")";
+    return result;
+  }
+#endif
 
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);

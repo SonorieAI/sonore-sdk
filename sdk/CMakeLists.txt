@@ -17,6 +17,9 @@ cmake_minimum_required(VERSION 3.21)
 # industry tools on every format it claims; a 0.x would be false modesty on a
 # library that people are already selling plugins built with.
 project(SonoreSDK VERSION 1.0.0 LANGUAGES CXX)
+# Threads::Threads rather than a literal -lpthread: on Android the threads
+# are in libc, and there is no libpthread to find.
+find_package(Threads REQUIRED)
 
 # ── The SDK itself: header-only, so an INTERFACE target ──────────────────────
 set(SONORE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "Sonore SDK root")
@@ -128,8 +131,16 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SonoreSDKHelpers.cmake")
 
 # The example builds only when the SDK is the top-level project, so a generated
-# plugin embedding the SDK never pays for it.
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+# plugin embedding the SDK never pays for it. A phone or tablet build takes its
+# own list (tests/mobile.cmake): the desktop one drives every format with a
+# desktop host.
+set(SONORE_MOBILE FALSE)
+if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(SONORE_MOBILE TRUE)
+endif()
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND SONORE_MOBILE)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/tests/mobile.cmake")
+elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # The saturator and the synth -- the two every validator and host test
   # exercises -- are built the way the farm builds a plugin: ONE compile, one
   # bundle per format (sonore_add_plugin). The rest stay one target per
@@ -184,7 +195,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(SonorePlayer PRIVATE "-framework AudioToolbox" "-framework AudioUnit"
       "-framework CoreAudio" "-framework CoreFoundation" "-framework Cocoa" objc)
   elseif(UNIX)
-    target_link_libraries(SonorePlayer PRIVATE ${CMAKE_DL_LIBS} pthread)
+    target_link_libraries(SonorePlayer PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
   endif()
 
   enable_testing()
@@ -424,7 +435,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_include_directories(fuzz_parsers PRIVATE
     "${SONORE_SDK_DIR}/third_party/vst3" "${SONORE_SDK_DIR}/third_party/lv2/include")
   if(UNIX AND NOT APPLE)
-    target_link_libraries(fuzz_parsers PRIVATE dl pthread)
+    target_link_libraries(fuzz_parsers PRIVATE dl Threads::Threads)
   endif()
   # Every fuzzer runs a shorter walk in Debug, where it is twenty times
   # slower: the Debug suite is there for what only a debug build checks --
@@ -439,7 +450,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # As every test with a plugin compiled in: the wrapper's backends dlopen and
   # its handovers start threads, and glibc before 2.34 keeps both apart.
   if(UNIX AND NOT APPLE)
-    target_link_libraries(fuzz_state PRIVATE dl pthread)
+    target_link_libraries(fuzz_state PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME fuzz_state COMMAND fuzz_state)
   # Every order of calls the CLAP specification allows, walked at random --
@@ -452,7 +463,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_compile_definitions(fuzz_calls_${fx} PRIVATE
       SONORE_FUZZ_PLUGIN="${CMAKE_CURRENT_SOURCE_DIR}/examples/${fx}/plugin.cpp")
     if(UNIX AND NOT APPLE)
-      target_link_libraries(fuzz_calls_${fx} PRIVATE dl pthread)
+      target_link_libraries(fuzz_calls_${fx} PRIVATE dl Threads::Threads)
     endif()
     add_test(NAME fuzz_calls_${fx} COMMAND fuzz_calls_${fx} --steps $<IF:$<CONFIG:Debug>,2000,20000>)
   endforeach()
@@ -475,7 +486,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(fuzz_graphics tests/fuzz_graphics.cpp)
   target_link_libraries(fuzz_graphics PRIVATE sonore_sdk)
   if(UNIX AND NOT APPLE)
-    target_link_libraries(fuzz_graphics PRIVATE pthread)
+    target_link_libraries(fuzz_graphics PRIVATE Threads::Threads)
   endif()
   add_test(NAME fuzz_graphics COMMAND fuzz_graphics --steps $<IF:$<CONFIG:Debug>,300,1500>)
 
@@ -545,7 +556,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(sampler_stress tests/sampler_stress_test.cpp)
   target_link_libraries(sampler_stress PRIVATE sonore_sdk)
   if(UNIX AND NOT APPLE)
-    target_link_libraries(sampler_stress PRIVATE dl pthread)
+    target_link_libraries(sampler_stress PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME sampler_handover COMMAND sampler_stress 3)
 
@@ -554,7 +565,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(reverb_stress tests/reverb_stress_test.cpp)
   target_link_libraries(reverb_stress PRIVATE sonore_sdk)
   if(UNIX AND NOT APPLE)
-    target_link_libraries(reverb_stress PRIVATE dl pthread)
+    target_link_libraries(reverb_stress PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME reverb_handover COMMAND reverb_stress 3)
 
@@ -567,7 +578,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(concurrency_test tests/concurrency_test.cpp)
   target_link_libraries(concurrency_test PRIVATE sonore_sdk)
   if(UNIX AND NOT APPLE)
-    target_link_libraries(concurrency_test PRIVATE dl pthread)
+    target_link_libraries(concurrency_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME concurrency_clap COMMAND concurrency_test 3)
   # A state loaded on the main thread while audio runs reaches a block whole
@@ -575,7 +586,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(state_race_test tests/state_race_test.cpp)
   target_link_libraries(state_race_test PRIVATE sonore_sdk)
   if(UNIX AND NOT APPLE)
-    target_link_libraries(state_race_test PRIVATE dl pthread)
+    target_link_libraries(state_race_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME state_race COMMAND state_race_test 1)
 
@@ -801,7 +812,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(midi_stack_test PRIVATE
       "-framework CoreMIDI" "-framework CoreFoundation" objc)
   elseif(UNIX)
-    target_link_libraries(midi_stack_test PRIVATE dl pthread)
+    target_link_libraries(midi_stack_test PRIVATE dl Threads::Threads)
   elseif(WIN32)
     target_link_libraries(midi_stack_test PRIVATE winmm)
   endif()
@@ -948,7 +959,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_include_directories(host_flush_test PRIVATE
     "${SONORE_SDK_DIR}/third_party/lv2/include" "${SONORE_SDK_DIR}/third_party/vst3")
   if(UNIX AND NOT APPLE)
-    target_link_libraries(host_flush_test PRIVATE dl pthread)
+    target_link_libraries(host_flush_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME host_flush
            COMMAND host_flush_test "$<TARGET_FILE:SonoreFlushFixture>")
@@ -968,7 +979,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_include_directories(host_params_test PRIVATE
     "${SONORE_SDK_DIR}/third_party/lv2/include" "${SONORE_SDK_DIR}/third_party/vst3")
   if(UNIX AND NOT APPLE)
-    target_link_libraries(host_params_test PRIVATE dl pthread)
+    target_link_libraries(host_params_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME host_params
            COMMAND host_params_test "$<TARGET_FILE:SonoreParamsFixture>")
@@ -987,7 +998,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_include_directories(host_bus_test PRIVATE
     "${SONORE_SDK_DIR}/third_party/lv2/include" "${SONORE_SDK_DIR}/third_party/vst3")
   if(UNIX AND NOT APPLE)
-    target_link_libraries(host_bus_test PRIVATE dl pthread)
+    target_link_libraries(host_bus_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME host_bus
            COMMAND host_bus_test "$<TARGET_FILE:SonoreBusFixture>")
@@ -1151,7 +1162,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   if(WIN32)
     target_link_libraries(standalone_rt_test PRIVATE ole32 shell32)
   elseif(UNIX AND NOT APPLE)
-    target_link_libraries(standalone_rt_test PRIVATE dl pthread)
+    target_link_libraries(standalone_rt_test PRIVATE dl Threads::Threads)
   endif()
   add_test(NAME standalone_rt COMMAND standalone_rt_test)
   # The output guard: a probe that emits NaN or infinity on demand, compiled
@@ -1167,7 +1178,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(WIN32)
       target_link_libraries(${_guard}_test PRIVATE ole32 shell32)
     elseif(UNIX AND NOT APPLE)
-      target_link_libraries(${_guard}_test PRIVATE dl pthread)
+      target_link_libraries(${_guard}_test PRIVATE dl Threads::Threads)
     endif()
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${_guard}_run")
     add_test(NAME ${_guard} COMMAND ${_guard}_test
@@ -1241,7 +1252,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_link_libraries(lv2_worker_test PRIVATE sonore_sdk)
   target_include_directories(lv2_worker_test PRIVATE "${SONORE_SDK_DIR}/third_party/lv2/include")
   if(UNIX)
-    target_link_libraries(lv2_worker_test PRIVATE pthread)
+    target_link_libraries(lv2_worker_test PRIVATE Threads::Threads)
   endif()
   add_test(NAME lv2_worker COMMAND lv2_worker_test)
   # The host's timeline into a DSP that takes the transport: time:Position.
@@ -1384,7 +1395,7 @@ endif()
 # tests above -- a plugin that add_subdirectory()'s the SDK must never build them
 # (their sources aren't even vendored into an export). So they live under the
 # same top-level guard: they exist only when the SDK is the project being built.
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT SONORE_MOBILE)
   # The native UI, rendered to a file so a person can LOOK at it.
   #
   # Not a test and deliberately not one: every rule the widgets follow is

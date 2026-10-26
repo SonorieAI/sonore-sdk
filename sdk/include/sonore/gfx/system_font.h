@@ -186,6 +186,14 @@ inline std::shared_ptr<Typeface> systemTypeface() {
       "/System/Library/Fonts/SFNS.ttf",
       "/System/Library/Fonts/Helvetica.ttc",
       "/Library/Fonts/Arial.ttf",
+#elif defined(__ANDROID__)
+      // Android's own, in /system/fonts, which every app may read. The static
+      // Roboto first: Roboto-Regular.ttf became a variable font in Android 12.
+      // Droid Sans is the face older releases fall back to.
+      "/system/fonts/RobotoStatic-Regular.ttf",
+      "/system/fonts/Roboto-Regular.ttf",
+      "/system/fonts/DroidSans.ttf",
+      "/system/fonts/NotoSans-Regular.ttf",
 #else
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
       "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -377,6 +385,12 @@ inline std::shared_ptr<Typeface> fallbackTypeface(uint32_t codepoint) {
       // script in it, and the largest.
       SONORE_FALLBACK_ANY("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
       SONORE_FALLBACK_ANY("/Library/Fonts/Arial Unicode.ttf"),
+#elif defined(__ANDROID__)
+      SONORE_FALLBACK("/system/fonts/NotoSansCJK-Regular.ttc", kHangul),
+      SONORE_FALLBACK("/system/fonts/NotoSansCJK-Regular.ttc", kCjk),
+      SONORE_FALLBACK_ANY("/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf"),
+      SONORE_FALLBACK_ANY("/system/fonts/NotoSansSymbols-Regular-Subsetted2.ttf"),
+      SONORE_FALLBACK_ANY("/system/fonts/DroidSans.ttf"),
 #else
       // Not DejaVu Sans, which is the face systemTypeface picks here: a
       // character it lacks, it lacks.

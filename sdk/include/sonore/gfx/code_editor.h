@@ -316,7 +316,8 @@ inline uint32_t delimiterHash(const char32_t* s, int n) {
 /**
  * A monospaced typeface from the usual places, or null: Consolas, Courier
  * New or Lucida Console on Windows; Menlo, SF Mono or Monaco on macOS; DejaVu
- * Sans Mono, Liberation Mono, Noto Sans Mono or FreeMono on Linux. Read once
+ * Sans Mono, Liberation Mono, Noto Sans Mono or FreeMono on Linux; Droid Sans
+ * Mono on Android. Read once
  * and kept, as systemTypeface() is. The editor below uses it when nobody has
  * given it a font.
  */
@@ -332,6 +333,9 @@ inline std::shared_ptr<Typeface> monospacedTypeface() {
         "/System/Library/Fonts/SFNSMono.ttf",
         "/System/Library/Fonts/Monaco.ttf",
         "/System/Library/Fonts/Supplemental/Courier New.ttf",
+#elif defined(__ANDROID__)
+        "/system/fonts/DroidSansMono.ttf",
+        "/system/fonts/CutiveMono.ttf",
 #else
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",

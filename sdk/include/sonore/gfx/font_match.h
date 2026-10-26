@@ -784,6 +784,9 @@ private:
     folders = {"/System/Library/Fonts", "/Library/Fonts"};
     const std::string home = ::sonore::pathio::environment("HOME");
     if (!home.empty()) folders.push_back(home + "/Library/Fonts");
+#elif defined(__ANDROID__)
+    // The system's faces, and the ones a device maker adds beside them.
+    folders = {"/system/fonts", "/product/fonts", "/system_ext/fonts"};
 #else
     folders = {"/usr/share/fonts", "/usr/local/share/fonts"};
     const std::string home = ::sonore::pathio::environment("HOME");

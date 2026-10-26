@@ -49,6 +49,8 @@ std::shared_ptr<Typeface> loadAnyTypeface() {
 #if defined(_WIN32)
       "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf",
 #endif
+      "/system/fonts/RobotoStatic-Regular.ttf", // Android
+      "/system/fonts/Roboto-Regular.ttf",
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
       "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
       "/System/Library/Fonts/Helvetica.ttc",

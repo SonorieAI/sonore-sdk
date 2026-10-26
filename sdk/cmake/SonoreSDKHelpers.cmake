@@ -438,7 +438,8 @@ function(sonore_add_standalone TARGET)
       "-framework CoreMIDI" "-framework Cocoa" objc)
   elseif(UNIX)
     # ALSA and GTK are dlopened; only dl and threads are linked.
-    target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS} pthread)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
   endif()
 endfunction()
 
@@ -448,6 +449,11 @@ endfunction()
 # same source, so the metadata can never disagree with connect_port(), which
 # in a real host is a crash, not a warning.
 function(sonore_add_lv2 TARGET)
+  # No LV2 host runs on Android, and its UI half is X11's: skipped, as AU is
+  # skipped off Apple, so one CMakeLists builds there too.
+  if(ANDROID)
+    return()
+  endif()
   cmake_parse_arguments(ARG "" "OBJECTS" "SOURCES" ${ARGN})
 
   set(_bundle "$<TARGET_FILE_DIR:${TARGET}>/${TARGET}.lv2")
@@ -565,6 +571,9 @@ function(sonore_add_plugin NAME)
   endif()
   if(ARG_AU AND NOT APPLE)
     set(ARG_AU "")
+  endif()
+  if(ARG_LV2 AND ANDROID)
+    set(ARG_LV2 "")
   endif()
 
   set(_obj ${NAME}_objects)

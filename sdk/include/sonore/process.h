@@ -210,7 +210,7 @@ inline std::string legalObjectName(const std::string& name, size_t maxReadableCh
 #if !defined(_WIN32)
 /** Where a POSIX rendezvous -- a lock file, a pipe's socket -- is made: in
  *  $XDG_RUNTIME_DIR, the user's own directory (0700, on a tmpfs) where there
- *  is one, else in the temporary directory; and with the user id in the name
+ *  is one, else in $TMPDIR, else /tmp; and with the user id in the name
  *  either way. A bare /tmp/sonore-<name> is shared by every user of the
  *  machine, so one could squat another's name before it was made, or make it
  *  a link to somewhere else. `budget` is the room the caller has for the
@@ -222,6 +222,14 @@ inline std::string userRendezvousPrefix(size_t budget) {
   const char* runtime = std::getenv("XDG_RUNTIME_DIR");
   if (runtime && runtime[0] == '/' && std::strlen(runtime) + 64 < budget)
     return std::string(runtime) + "/sonore-";
+  // Android has no /tmp: an app's temporary directory is its own cache, which
+  // the activity puts in TMPDIR (android_app.h), as an adb shell's is.
+  const char* tmp = std::getenv("TMPDIR");
+  if (tmp && tmp[0] == '/' && std::strlen(tmp) + 64 < budget) {
+    std::string dir = tmp;
+    while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+    return dir + "/sonore-" + std::string(uid) + "-";
+  }
   return "/tmp/sonore-" + std::string(uid) + "-";
 }
 #endif
@@ -574,6 +582,13 @@ private:
       for (int fd : {outPipe[0], outPipe[1], errPipe[0], errPipe[1]})
         if (fd >= 0) ::close(fd);
     };
+#if defined(__ANDROID__)
+    // Bionic's posix_spawn reports success when the exec then fails -- POSIX
+    // allows it, and the child just exits 127 -- where glibc's and Apple's say
+    // the program was not found. Looked up first, so start() means one thing
+    // on every platform.
+    if (!findsProgram(args[0])) return false;
+#endif
     if ((flags & wantStdOut) && !makePipe(outPipe)) return false;
     if ((flags & wantStdErr) && !makePipe(errPipe)) {
       closeAll();
@@ -628,6 +643,26 @@ private:
     startReaders(outPipe[0], errPipe[0]);
     return true;
   }
+
+#if defined(__ANDROID__)
+  /** Whether `program` names something exec could run: the file itself when
+   *  it has a slash, else the first match along $PATH, as execvp searches. */
+  static bool findsProgram(const std::string& program) {
+    if (program.empty()) return false;
+    if (program.find('/') != std::string::npos) return ::access(program.c_str(), X_OK) == 0;
+    const char* path = std::getenv("PATH");
+    std::string dirs = path && *path ? path : "/system/bin:/system/xbin";
+    size_t start = 0;
+    while (start <= dirs.size()) {
+      size_t end = dirs.find(':', start);
+      if (end == std::string::npos) end = dirs.size();
+      const std::string dir = dirs.substr(start, end - start);
+      if (!dir.empty() && ::access((dir + "/" + program).c_str(), X_OK) == 0) return true;
+      start = end + 1;
+    }
+    return false;
+  }
+#endif
 
   static bool makePipe(int fds[2]) {
 #if defined(__linux__)
