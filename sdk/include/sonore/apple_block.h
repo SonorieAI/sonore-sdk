@@ -51,6 +51,20 @@
 // its completion has run, and au_wrapper.h keeps the observer inside the
 // instance the OS stops rendering before it disposes.
 //
+// ── And when nothing can be guaranteed: a HEAP block ────────────────────────
+//
+// An AUv3 hands AUAudioUnit its render block, and AUAudioUnit wraps it in
+// blocks of its own -- the render block a host asks for, autoreleased -- that
+// capture ours and are released when Apple's code is done with them, after
+// the unit is gone if an autorelease pool drains late. A global block inside
+// the unit is then read after it was freed (auv3_wrapper.h found this in the
+// iOS simulator). makeHeapBlock() builds what Block_copy builds instead: a
+// block on the heap whose flags carry BLOCK_NEEDS_FREE and a reference count,
+// so every copy Apple takes keeps it alive and the last release frees it. Its
+// owner holds one reference and lets go with releaseHeapBlock(), which first
+// clears the capture: a block still called after its owner is gone finds a
+// null capture, never a freed owner.
+//
 // ── What it cannot do ───────────────────────────────────────────────────────
 //
 // arm64e. Pointer authentication signs a block's invoke pointer with the
@@ -72,6 +86,7 @@
 #include <dlfcn.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #if defined(__has_feature)
 #if __has_feature(ptrauth_calls)
@@ -138,6 +153,59 @@ inline bool makeGlobalBlock(BlockLiteral<Capture, Invoke>& block, Invoke invoke,
 template <typename Capture, typename Invoke>
 inline Capture blockCapture(void* block) {
   return static_cast<BlockLiteral<Capture, Invoke>*>(block)->capture;
+}
+
+/** BLOCK_NEEDS_FREE, and one reference: libclosure keeps the count in the
+ *  flags' bits 1 to 15, two to a reference (Block_private.h). */
+constexpr int kBlockNeedsFree = 1 << 24;
+constexpr int kBlockOneReference = 2;
+
+/** _NSConcreteMallocBlock: the class of a block on the heap. */
+inline void* blockMallocClass() {
+  static void* const isa = dlsym(RTLD_DEFAULT, "_NSConcreteMallocBlock");
+  return isa;
+}
+
+/** _Block_release, which drops one reference to a heap block and frees it
+ *  with free() at the last. Looked up like the classes above; null if absent. */
+using BlockReleaseFn = void (*)(const void*);
+inline BlockReleaseFn blockReleaseFunction() {
+  static const BlockReleaseFn release = reinterpret_cast<BlockReleaseFn>(dlsym(RTLD_DEFAULT, "_Block_release"));
+  return release;
+}
+
+/** A block on the heap with one reference, its owner's (see "a HEAP block"
+ *  above). False, and `block` left null, if the runtime's class or its
+ *  release could not be found, or memory ran out. No copy or dispose
+ *  helpers: the capture is a plain value, with nothing to copy or destroy. */
+template <typename Capture, typename Invoke>
+inline bool makeHeapBlock(BlockLiteral<Capture, Invoke>*& block, Invoke invoke, const Capture& capture) {
+  using Literal = BlockLiteral<Capture, Invoke>;
+  static const BlockDescriptor descriptor = {0, sizeof(Literal)};
+  block = nullptr;
+  void* isa = blockMallocClass();
+  if (!isa || !invoke || !blockReleaseFunction()) return false;
+  // calloc, because the runtime frees it with free().
+  auto* made = static_cast<Literal*>(std::calloc(1, sizeof(Literal)));
+  if (!made) return false;
+  made->isa = isa;
+  made->flags = kBlockNeedsFree | kBlockOneReference;
+  made->invoke = invoke;
+  made->descriptor = &descriptor;
+  made->capture = capture;
+  block = made;
+  return true;
+}
+
+/** The owner lets go of its heap block: the capture cleared, then its
+ *  reference released. Whoever else holds the block keeps it until they let
+ *  go too; a call made meanwhile finds a null capture. */
+template <typename Capture, typename Invoke>
+inline void releaseHeapBlock(BlockLiteral<Capture, Invoke>*& block) {
+  if (!block) return;
+  block->capture = Capture{};
+  if (BlockReleaseFn release = blockReleaseFunction()) release(block);
+  block = nullptr;
 }
 
 } // namespace detail

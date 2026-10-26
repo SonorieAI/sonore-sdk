@@ -442,7 +442,9 @@ jobs:
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
       - name: Test (in the simulator)
-        run: ctest --test-dir sdk/build-ios --output-on-failure --timeout 900
+        # 30 minutes a test: audio_sources' thread hand-over rounds take 10 to
+        # 15 minutes in a simulator on a shared runner (14 s on the Mac itself).
+        run: ctest --test-dir sdk/build-ios --output-on-failure --timeout 1800
       - name: The crashed thread of any test that crashed
         if: failure()
         run: |

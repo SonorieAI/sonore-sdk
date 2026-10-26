@@ -54,8 +54,11 @@ line and the functions the worklet calls.
   tests in an emulator, and keeps the APKs. Not yet on a phone.
 - **iOS**: built for the simulator by CI, which runs the suites, the AUv3
   self-test and the apps' `--verify` in a booted iPhone simulator, then
-  launches both example apps and keeps screenshots. Not yet on an iPhone, and
-  not yet inside GarageBand or AUM.
+  installs and launches both example apps and keeps screenshots: the synth's
+  native editor in the safe area, the saturator's page in its WKWebView
+  showing the plugin's values, and both apps' AUv3 extensions registered with
+  the simulator's pluginkit. Not yet on an iPhone, and not yet inside
+  GarageBand or AUM.
 - **AUv3 on the Mac**: CI builds the example extensions inside their apps,
   registers them with pluginkit and validates them with `auval`, and drives
   the unit in process (`sdk/tests/auv3_selftest.cpp`). Not yet opened in a

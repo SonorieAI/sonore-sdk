@@ -386,12 +386,17 @@ struct Unit {
   bool prepared = false;
   std::atomic<bool> bypassed{false};
 
+  /** The blocks AUAudioUnit and the parameter tree are handed: on the heap,
+   *  with a reference count (apple_block.h), because Apple's own blocks
+   *  around them -- the render block a host is given, autoreleased -- can
+   *  outlive the Unit. The Unit holds one reference to each, let go in its
+   *  destructor with the capture cleared, so a late call finds no Unit. */
   using RenderBlockLiteral = ::sonore::detail::BlockLiteral<Unit*, RenderInvoke>;
-  RenderBlockLiteral renderBlock{};
-  ::sonore::detail::BlockLiteral<Unit*, ValueObserverInvoke> valueObserver{};
-  ::sonore::detail::BlockLiteral<Unit*, ValueProviderInvoke> valueProvider{};
-  ::sonore::detail::BlockLiteral<Unit*, StringFromValueInvoke> stringFromValue{};
-  ::sonore::detail::BlockLiteral<Unit*, ValueFromStringInvoke> valueFromString{};
+  RenderBlockLiteral* renderBlock = nullptr;
+  ::sonore::detail::BlockLiteral<Unit*, ValueObserverInvoke>* valueObserver = nullptr;
+  ::sonore::detail::BlockLiteral<Unit*, ValueProviderInvoke>* valueProvider = nullptr;
+  ::sonore::detail::BlockLiteral<Unit*, StringFromValueInvoke>* stringFromValue = nullptr;
+  ::sonore::detail::BlockLiteral<Unit*, ValueFromStringInvoke>* valueFromString = nullptr;
 
   /** The host's blocks, copied at allocateRenderResources and released at
    *  deallocate. Read on the render thread: Apple's own guidance is to cache
@@ -418,6 +423,15 @@ struct Unit {
    *  that owns it (unretained: the controller owns the editor, not this). */
   id editorView = nil;
   id viewController = nil;
+
+  ~Unit() {
+    using ::sonore::detail::releaseHeapBlock;
+    releaseHeapBlock(renderBlock);
+    releaseHeapBlock(valueObserver);
+    releaseHeapBlock(valueProvider);
+    releaseHeapBlock(stringFromValue);
+    releaseHeapBlock(valueFromString);
+  }
 };
 
 /** The runtime class's instance variable that holds the Unit. */
@@ -563,17 +577,16 @@ inline void buildParameterTree(Unit* unit) {
   unit->parameterTree = retain(tree);
 
   // The implementor's blocks, on the TREE: every node without its own uses
-  // its nearest ancestor's. Global blocks living in the Unit, which outlives
-  // the tree (dealloc releases the tree first).
+  // its nearest ancestor's. The tree copies each, which a heap block counts.
   using namespace ::sonore::detail;
-  if (makeGlobalBlock(unit->valueObserver, &observeValue, unit))
-    send<void>(tree, "setImplementorValueObserver:", (void*) &unit->valueObserver);
-  if (makeGlobalBlock(unit->valueProvider, &provideValue, unit))
-    send<void>(tree, "setImplementorValueProvider:", (void*) &unit->valueProvider);
-  if (makeGlobalBlock(unit->stringFromValue, &stringFromValue, unit))
-    send<void>(tree, "setImplementorStringFromValueCallback:", (void*) &unit->stringFromValue);
-  if (makeGlobalBlock(unit->valueFromString, &valueFromString, unit))
-    send<void>(tree, "setImplementorValueFromStringCallback:", (void*) &unit->valueFromString);
+  if (makeHeapBlock(unit->valueObserver, &observeValue, unit))
+    send<void>(tree, "setImplementorValueObserver:", (void*) unit->valueObserver);
+  if (makeHeapBlock(unit->valueProvider, &provideValue, unit))
+    send<void>(tree, "setImplementorValueProvider:", (void*) unit->valueProvider);
+  if (makeHeapBlock(unit->stringFromValue, &stringFromValue, unit))
+    send<void>(tree, "setImplementorStringFromValueCallback:", (void*) unit->stringFromValue);
+  if (makeHeapBlock(unit->valueFromString, &valueFromString, unit))
+    send<void>(tree, "setImplementorValueFromStringCallback:", (void*) unit->valueFromString);
 }
 
 /** [main-thread] Tell the host one parameter moved because the PLUGIN moved
@@ -1272,7 +1285,7 @@ inline id auInit(id self, SEL, AudioComponentDescription desc, uint32_t options,
   buildParameterTree(unit);
   buildFactoryPresets(unit);
   setCurrentPresetObject(unit, makePreset(-1, "Default"));
-  ::sonore::detail::makeGlobalBlock(unit->renderBlock, &render, unit);
+  ::sonore::detail::makeHeapBlock(unit->renderBlock, &render, unit);
   // At the largest the host may ask for, so the most this unit can be handed.
   send<void>(self, "setMaximumFramesToRender:", (FrameCount) 4096);
   startHousekeeping(unit);
@@ -1347,7 +1360,7 @@ inline id auOutputBusses(id self, SEL) {
 
 inline void* auInternalRenderBlock(id self, SEL) {
   Unit* unit = unitOf(self);
-  return unit && unit->renderBlock.invoke ? (void*) &unit->renderBlock : nullptr;
+  return unit && unit->renderBlock ? (void*) unit->renderBlock : nullptr;
 }
 
 /** -allocateRenderResourcesAndReturnError: */
