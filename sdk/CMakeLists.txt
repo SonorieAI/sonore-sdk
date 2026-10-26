@@ -910,6 +910,11 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_test(NAME auv3_effect COMMAND auv3_selftest_saturator --effect --params 4 --presets 3 --subtype Sat9)
     add_test(NAME auv3_instrument COMMAND auv3_selftest_synth --instrument --params 22 --presets 0 --subtype Syn9)
     add_test(NAME auv3_midi_out COMMAND auv3_selftest_arp --instrument --midi-out --params 3 --subtype Arp9)
+    # Freed memory scribbled over, here and (SIMCTL_CHILD_) in the simulator:
+    # a unit read after it is freed then fails every time, where the Mac's
+    # allocator once left a freed one readable and the test passed.
+    set_tests_properties(auv3_effect auv3_instrument auv3_midi_out PROPERTIES
+      ENVIRONMENT "MallocScribble=1;SIMCTL_CHILD_MallocScribble=1")
   endif()
 
   add_executable(vst3_host_test tests/vst3_host_test.cpp)

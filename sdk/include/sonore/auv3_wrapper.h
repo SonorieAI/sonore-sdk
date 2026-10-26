@@ -1291,9 +1291,16 @@ inline void teardownUnit(void* context) {
   delete unit;
 }
 
-/** -dealloc. A host may release its last reference on any thread. */
+/** -dealloc. A host may release its last reference on any thread.
+ *
+ *  The Unit is taken down only after AUAudioUnit's own dealloc has run: that
+ *  releases the blocks it made around ours -- the render block it wraps -- and
+ *  ours live in the Unit, so a Unit already deleted is read there. (The Mac's
+ *  allocator happened to leave the memory readable; the iOS simulator's had
+ *  unmapped it, and the self-test crashed in AUEventSchedule's destructor.) */
 inline void auDealloc(id self, SEL) {
-  if (Unit* unit = unitOf(self)) {
+  Unit* unit = unitOf(self);
+  if (unit) {
     object_setInstanceVariable(self, kUnitIvar, nullptr);
     unit->self = nil;
     objc_storeWeak(&unit->weakSelf, nil);
@@ -1320,10 +1327,12 @@ inline void auDealloc(id self, SEL) {
     release(unit->inputBusArray);
     release(unit->outputBusArray);
     unit->factoryPresets = unit->currentPreset = unit->inputBusArray = unit->outputBusArray = nil;
+  }
+  sendSuper<void>(self, audioUnitBaseClass(), "dealloc");
+  if (unit) {
     if (isMainThread()) teardownUnit(unit);
     else onMainThread(unit, &teardownUnit);
   }
-  sendSuper<void>(self, audioUnitBaseClass(), "dealloc");
 }
 
 inline id auInputBusses(id self, SEL) {
