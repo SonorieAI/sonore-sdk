@@ -176,7 +176,10 @@ styles), `sonore::gfx::Button`, `sonore::gfx::Label` and
 - menus, a menu bar and toolbars,
 - a colour selector, a code editor and an on-screen keyboard,
 - images: PNG, JPEG, GIF, and SVG through `sonore::gfx::Drawable`,
-- layout helpers: `sonore::gfx::FlexBox` and `sonore::gfx::Grid`.
+- layout helpers: `sonore::gfx::FlexBox` and `sonore::gfx::Grid`,
+- audio displays in `gfx/audio_display.h`: `sonore::gfx::AudioVisualiser` (a
+  scope), `sonore::gfx::WaveformView` (a recording with a playhead) and
+  `sonore::gfx::SpectrumView` (an analyzer).
 
 Each header's comment says what it is for, and the
 [API reference](../index.md) lists them under *Native GUI*.
@@ -184,6 +187,42 @@ Each header's comment says what it is for, and the
 A `ComboBox` opens its list through the editor: set
 `box.onOpenMenu = [this](gfx::ComboBox& b) { openComboMenu(b); };`, and the
 window drops it down as a real menu.
+
+## Showing the spectrum
+
+`SpectrumView` draws what a `sonore::SpectrumFeed` measured. The feed belongs
+to whatever owns the audio, as a scope's buffer does: `process()` pushes each
+block into it, and the view only points at it. The plugin wrappers already
+keep one for the output and one for the input, for the web bridge. A native
+editor can keep its own:
+
+```cpp
+// In SonoreDsp: a member, and the end of process() feeds it.
+sonore::SpectrumFeed spectrum;
+double rate = 48000.0; // set in prepare()
+// ...
+const float* ch[2] = {io.getChannelPointer(0),
+                      io.getNumChannels() > 1 ? io.getChannelPointer(1) : nullptr};
+spectrum.push(ch, 2, (uint32_t) io.getNumSamples()); // a null channel is skipped
+
+// createEditor() is a member of the DSP, so it can hand the editor the feed
+// and the rate. In the editor's constructor:
+view_.setFeeds(feed);       // an input feed, if you keep one, as a second argument
+view_.setSampleRate(rate);
+view_.setStyle(gfx::SpectrumView::Style::Curve);
+addChild(&view_);
+
+// And in editorTick(double dt):
+view_.update(dt);
+```
+
+`setFeeds` turns the feeds on (`setActive(true)`). It runs on the main thread,
+which is where a feed allocates its ring; until something turns a feed on,
+`push()` returns at once. The view draws a curve, a line, bars or LED ladders.
+It can smooth by a fraction of an octave, tilt the display in dB per octave,
+hold peaks, show the input faint behind the output, and draw an equaliser's
+response over the top (`setCurve`). Every colour defaults to the look and
+feel's.
 
 ## LookAndFeel
 

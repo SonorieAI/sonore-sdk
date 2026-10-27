@@ -762,6 +762,7 @@ private:
     if (clapwrap::HasLatency<SonoreDsp>::value)
       shared.bypass.follow(clapwrap::dspLatency(shared.dsp));
     clapwrap::bypassCapture(shared.bypass, chans, nch, frames);
+    shared.spectrumIn.push(chans, nch, frames);
     AudioBlock<float> block(chans, nch, (size_t) frames);
     AudioBlock<float> scBlock(scChans, 2, scChans[0] ? (size_t) frames : 0);
 
@@ -845,6 +846,7 @@ private:
     clapwrap::bypassApply(shared.bypass, chans, nch, frames);
     // NaN or infinity on any bus leaves as silence (output_guard.h).
     clapwrap::guardOutputs(&shared, chans, nch, auxBlocks, nAux, frames);
+    shared.spectrumOut.push(chans, nch, frames);
 
     shared.meter.push(measureBlock(chans[0], (size_t) frames));
     shared.scope.push(chans, 1, frames);

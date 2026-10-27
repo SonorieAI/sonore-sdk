@@ -1616,6 +1616,7 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
                                     nullptr, // no event for a note's end
                                     nullptr}; // nor for modulating one
       clapwrap::bypassCapture(plugin->shared.bypass, chans64, nch64, (uint32_t) frames);
+      plugin->shared.spectrumIn.push(chans64, nch64, (uint32_t) frames);
       trackNotes(plugin->shared.notes, ctx64.midi);
       clapwrap::runDspCtx64(plugin->shared.dsp, ctx64, plugin->shared.paramsBlock);
       emitVst3MidiOut(plugin, data, frames);
@@ -1624,6 +1625,7 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
       // poll: VST3 has no way to ask for the main thread.
       clapwrap::guardOutputs(&plugin->shared, chans64, nch64, auxBlocks64, nAux64,
                              (uint32_t) frames);
+      plugin->shared.spectrumOut.push(chans64, nch64, (uint32_t) frames);
 
       // measureBlock, as every other path: this was a copy of its 64-bit loop.
       plugin->shared.meter.push(measureBlock(chans64[0], (size_t) frames));
@@ -1709,6 +1711,7 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
   }
 
   clapwrap::bypassCapture(plugin->shared.bypass, chans, nch, (uint32_t) frames);
+  plugin->shared.spectrumIn.push(chans, nch, (uint32_t) frames);
   AudioBlock<float> block(chans, nch, (size_t) frames);
   plugin->shared.midiOut.clear();
   uint8_t roles[clapwrap::kMaxAudioChannels];
@@ -1737,6 +1740,7 @@ static Steinberg_tresult processVst3Block(Plugin* plugin, Steinberg_Vst_ProcessD
   // past the promised maximum comes through here piece by piece, so it is
   // guarded too.
   clapwrap::guardOutputs(&plugin->shared, chans, nch, auxBlocks, nAux, (uint32_t) frames);
+  plugin->shared.spectrumOut.push(chans, nch, (uint32_t) frames);
 
   // Meters for the editor: two atomic stores, the same as every other format.
   {

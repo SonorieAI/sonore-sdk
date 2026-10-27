@@ -537,6 +537,9 @@ inline void processBlock(App& app, float* left, float* right, uint32_t frames,
   // Never kept here, a page's keyboard stayed dark under every key played.
   trackNotes(inst->notes, inst->midi);
   clapwrap::snapshotParams(inst);
+  // What the DSP is about to hear, for a page's analyzer: the two channels a
+  // device delivers (the rest are silence this host made up).
+  inst->spectrumIn.push(chans, (uint32_t) (width > 2 ? 2 : width), frames);
   runDspStandalone(inst->dsp, block, inst->paramsBlock, inst->midi, app.midiSink,
                    (double) app.framesElapsed / app.sampleRate, app.sampleRate,
                    kDesc.supportsMpe ? &inst->mpe : nullptr, &app.scratch, inst->offline);
@@ -566,6 +569,10 @@ inline void processBlock(App& app, float* left, float* right, uint32_t frames,
   }
 
   inst->meter.push(measureBlock(left, (size_t) frames));
+  {
+    float* heard[2] = {left, right};
+    inst->spectrumOut.push(heard, right != left ? 2u : 1u, frames);
+  }
   // The scope and the load meter the editor shows, as every plugin format
   // feeds them. Only the level meter was fed: the CPU read 0, the scope
   // never moved.

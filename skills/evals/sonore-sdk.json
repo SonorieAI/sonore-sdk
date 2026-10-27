@@ -34,6 +34,15 @@
         "Sets the descriptor's instrument flag to true",
         "Reads an instrument example (sonore_example with kind instrument) or starts from -DTYPE=instrument"
       ]
+    },
+    {
+      "query": "Add a spectrum analyzer to the web page of my Sonore plugin.",
+      "expected_behavior": [
+        "Looks the spectrum up (sonore_search) and draws from sonore.onSpectrum rather than inventing data",
+        "Does not animate the display with Math.random, a sine or a timer of its own",
+        "Treats each frame as 256 dBFS points on the fixed 20 Hz to 20 kHz log grid, not as raw FFT bins",
+        "Says that LV2 does not feed a spectrum yet if the plugin is built as LV2"
+      ]
     }
   ]
 }

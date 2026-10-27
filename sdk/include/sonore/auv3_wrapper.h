@@ -990,6 +990,7 @@ inline void renderPiece(Unit* unit, float* const* chans, uint32_t nch, float* co
 
   if (clapwrap::HasLatency<SonoreDsp>::value) unit->shared.bypass.follow(clapwrap::dspLatency(unit->shared.dsp));
   clapwrap::bypassCapture(unit->shared.bypass, pc, nch, len);
+  unit->shared.spectrumIn.push(pc, nch, len);
   AudioBlock<float> block(pc, nch, (size_t) len);
   AudioBlock<float> scBlock(ps, 2, ps[0] ? (size_t) len : 0);
 
@@ -1187,6 +1188,7 @@ inline int32_t render(void* block, AudioUnitRenderActionFlags* flags, const Audi
 
   unit->auxRenderedAt = timestamp ? timestamp->mSampleTime : -1.0;
   clapwrap::guardOutputs(&unit->shared, chans, nch, auxWhole, nAux, frames);
+  unit->shared.spectrumOut.push(chans, nch, (uint32_t) frames);
   unit->shared.meter.push(measureBlock(chans[0], (size_t) frames));
   unit->shared.scope.push(chans, 1, (uint32_t) frames);
   unit->shared.load.record(

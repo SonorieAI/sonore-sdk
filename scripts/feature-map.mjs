@@ -1570,6 +1570,18 @@ const MAP = [
    "gfx/audio_display.h: WaveformView with a playhead and a drag-selection, " +
    "normalised to the peak so a quiet recording still fills its box",
    "class WaveformView"],
+  ["gui", "(the reference has no spectrum display; its tutorials draw one by hand)",
+   "spectrum_feed.h + gfx/audio_display.h: SpectrumFeed is fed from process() like the scope and " +
+   "measured on the interface's clock -- Blackman, ~170 ms at every rate, a full-scale sine " +
+   "reading 0.00 dBFS, onto a fixed 256-point log grid -- the SAME rule the Sonorie studio's " +
+   "browser preview measures by, so a page's analyzer (sonore.onSpectrum over the bridge) looks " +
+   "the same in the studio and in a DAW. SpectrumView draws it natively: curve, line, bars or " +
+   "LED ladders, fractional-octave smoothing, a tilt, peak hold, the input behind the output " +
+   "and an equaliser's response over the top. push() is measured at zero allocations",
+   "class SpectrumView"],
+  ["gui", "(the spectrum, measured for an interface)",
+   "spectrum_feed.h: SpectrumFeed -- the audio thread writes a lock-free ring and does nothing " +
+   "until a page or a view asks; the interface thread runs the transform", "class SpectrumFeed"],
 
   // ── graphics: the same audit ────────────────────────────────────────
   ["graphics", "ImageFileFormat (PNG)",

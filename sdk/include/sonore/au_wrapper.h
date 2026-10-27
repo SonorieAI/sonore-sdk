@@ -1807,6 +1807,7 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   if (clapwrap::HasLatency<SonoreDsp>::value)
     unit->shared.bypass.follow(clapwrap::dspLatency(unit->shared.dsp));
   clapwrap::bypassCapture(unit->shared.bypass, chans, nch, frames);
+  unit->shared.spectrumIn.push(chans, nch, frames);
   AudioBlock<float> block(chans, nch, (size_t) frames);
   AudioBlock<float> scBlock(scChans, 2, scChans[0] ? (size_t) frames : 0);
 
@@ -1890,6 +1891,7 @@ inline OSStatus render(void* self, AudioUnitRenderActionFlags* flags,
   // bus in the host's buffers, the aux buses in the scratch their elements
   // are copied out of. Told from the main thread by notifyHostOfChanges.
   clapwrap::guardOutputs(&unit->shared, chans, nch, auxBlocks, nAux, frames);
+  unit->shared.spectrumOut.push(chans, nch, frames);
 
   {
     // Vectorised: one pass each for peak and energy. Measured 1.7x native

@@ -90,7 +90,7 @@ const AREAS = [
       "dynamic_eq.h", "limiting.h", "plate.h", "screamer.h", "filter_design.h", "random.h", "simd.h",
       "fast_math.h", "denormals.h", "interpolation.h", "phase.h", "polynomial.h", "matrix.h",
       "special.h", "statistics.h", "channel_matrix.h", "sampler.h", "impulse.h", "scope_buffer.h",
-      "load.h",
+      "spectrum_feed.h", "load.h",
     ],
   },
   {

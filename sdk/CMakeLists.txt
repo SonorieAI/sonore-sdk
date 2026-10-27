@@ -280,7 +280,7 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # start threads and processes, or talk to the OS, so they stay out of
   # sdk_tests. Each prints its checks and fails on any.
   find_package(Threads REQUIRED)
-  foreach(_area dsp_maths midi_osc core_crypto audio_io core_data gui_widgets audio_sources gui_infra system modules opengl mac_input javascript app_infra app_windows mac_host)
+  foreach(_area dsp_maths spectrum midi_osc core_crypto audio_io core_data gui_widgets audio_sources gui_infra system modules opengl mac_input javascript app_infra app_windows mac_host)
     add_executable(${_area}_test tests/${_area}_test.cpp)
     target_link_libraries(${_area}_test PRIVATE sonore_sdk Threads::Threads)
     add_test(NAME ${_area} COMMAND ${_area}_test)

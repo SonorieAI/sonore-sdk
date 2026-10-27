@@ -103,6 +103,7 @@ audio thread through a lock-free queue.
 | `format(p, v)`, `toNormalised(p, v)`, `fromNormalised(p, n)` | the host's text, and its automation curve |
 | `onLevel(cb)`, `onVU(cb)` | meters, up to about thirty times a second while the level moves (not a clock) |
 | `onGR(cb)`, `gr` | gain reduction in positive dB, from a DSP that declares `float gainReduction() const`; 0 from one that does not |
+| `onSpectrum(cb, {input})`, `spectrumFrame`, `sampleRate` | the output's spectrum, and the input's when `input` is true: `cb(out, input, sampleRate)`, 256 dBFS values each (`input` is null unless asked for) on a fixed log grid from 20 Hz to 20 kHz, up to about thirty times a second; see *A spectrum on the page* below |
 | `noteOn(note, velocity)`, `noteOff(note)`, `onNotes(cb)` | on-screen keyboards for an instrument |
 | `presets`, `loadPreset(i)` | factory presets by name, applied in the plugin |
 | `chooseFile(purpose)`, `onFile(cb)` | a native file dialog; the path also reaches the DSP's `loadFile(purpose, path)` |
@@ -118,6 +119,39 @@ The complete list, with types, is `sonore/sonore.d.ts`, installed with the
 headers: reference it from TypeScript and the compiler checks the page against
 it. `npm run verify:bridge-types` checks that file against the bridge `gui.h`
 generates, member for member.
+
+## A spectrum on the page
+
+The plugin measures its spectrum only after the page asks. The first
+`sonore.onSpectrum(cb)` turns on the output's feed (`sonore::SpectrumFeed` in
+`spectrum_feed.h`), and `{input: true}` turns on the input's as well. A page
+that never calls it costs the audio thread nothing.
+
+Each frame has 256 values in dBFS. Point `i` is at
+`20 * 1000^(i / 255)` Hz, from 20 Hz to 20 kHz. A full-scale sine that sits on a
+bin reads 0 dBFS, and silence reads -140. The rule is fixed: the mono average
+of the channels, a Blackman window about 170 ms long at every rate (8192
+samples at 44.1 or 48 kHz), and each point shows the loudest bin inside its
+band. The Sonorie studio's browser preview measures by the same rule, so an
+analyzer looks the same there and in a DAW.
+
+```js
+const c = document.querySelector('canvas'), g = c.getContext('2d');
+sonore.onSpectrum((out) => {
+  g.clearRect(0, 0, c.width, c.height);
+  g.beginPath();
+  out.forEach((db, i) => {
+    const x = i / 255 * c.width;
+    const y = (12 - Math.max(-96, Math.min(12, db))) / 108 * c.height;
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  });
+  g.stroke();
+});
+```
+
+The frames arrive only when the spectrum changes, so do not use them as a
+clock. `sonore.spectrumFrame` holds the newest frame as `{out, in, sr}`. LV2 does not feed a
+spectrum yet, because its interface is a separate module that sees only ports.
 
 ## Per platform
 

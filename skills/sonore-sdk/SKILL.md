@@ -52,7 +52,7 @@ method you have not seen in this SDK:
   a complete working plugin of a given kind, and `sonore-sdk:sonore_rules`
   the rules below.
 - **Without it**, read `llms-full.txt` at the SDK root for the classes and
-  structs: every one in every header (282 headers, 766
+  structs: every one in every header (283 headers, 768
   types), so a class that is not in it does not exist. Functions, aliases and
   methods are not listed there; search the headers for those before deciding
   one is missing.
@@ -130,6 +130,7 @@ static const sonore::PluginDescriptor kDesc = {
 - **Rebuild filter coefficients only when a control moved.** Recomputing a biquad or a ladder every block costs more than the filter does. Keep the last value and compare, as the examples do.
 - **Big objects are members, never locals.** `FdnReverb<>` is about 1.1 MB, `StereoDelay<>` about 1.5 MB, `Convolver<256,32>` about 140 KB. Emscripten's default stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
 - **Parameters are plain values, in the order of the table.** `p[0]` is the first row of `kParamTable`. Not normalised: if the row says -24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each format's own convention.
+- **A meter or an analyzer shows what the plugin measured.** A web page reads `onLevel`, `onVU`, `onGR` and `onSpectrum` from the bridge; a native editor reads an `AudioScopeBuffer` or a `SpectrumFeed` that `process()` fills. Gain reduction comes from the DSP declaring `float gainReduction() const`, in positive dB. A display animated with random numbers looks alive and tells the user nothing.
 
 ## Building
 

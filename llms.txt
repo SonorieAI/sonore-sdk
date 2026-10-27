@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 282 headers, 766 public types.
+not have. 283 headers, 768 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -72,6 +72,7 @@ static const sonore::PluginDescriptor kDesc = {
 - **Rebuild filter coefficients only when a control moved.** Recomputing a biquad or a ladder every block costs more than the filter does. Keep the last value and compare, as the examples do.
 - **Big objects are members, never locals.** `FdnReverb<>` is about 1.1 MB, `StereoDelay<>` about 1.5 MB, `Convolver<256,32>` about 140 KB. Emscripten's default stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
 - **Parameters are plain values, in the order of the table.** `p[0]` is the first row of `kParamTable`. Not normalised: if the row says -24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each format's own convention.
+- **A meter or an analyzer shows what the plugin measured.** A web page reads `onLevel`, `onVU`, `onGR` and `onSpectrum` from the bridge; a native editor reads an `AudioScopeBuffer` or a `SpectrumFeed` that `process()` fills. Gain reduction comes from the DSP declaring `float gainReduction() const`, in positive dB. A display animated with random numbers looks alive and tells the user nothing.
 
 ## Building
 
@@ -218,6 +219,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [shaping.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/shaping.h): waveshaping, lookup tables, ballistics and chain composition
 - [simd.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/simd.h): SIMD
 - [special.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/special.h): the handful of functions the standard library does not carry
+- [spectrum_feed.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/spectrum_feed.h): The spectrum a plugin's interface draws, measured where the audio is
 - [spring.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/spring.h): a spring reverb
 - [standalone.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone.h): the standalone application
 - [standalone_android.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/standalone_android.h): a plugin's standalone, as an Android app
@@ -273,7 +275,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [alert.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/alert.h): Telling the user something, and asking them something
 - [animated_position.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/animated_position.h): AnimatedPosition: a position that a finger throws, and that carries on
 - [animator.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/animator.h): Bounds that move over time rather than jumping
-- [audio_display.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/audio_display.h): Two ways to look at audio: a scope that scrolls, and a waveform that sits
+- [audio_display.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/audio_display.h): Three ways to look at audio: a scope that scrolls, a waveform that sits
 - [backing.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/backing.h): The backing store a window peer paints into, and the one place scale lives
 - [bidi.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/bidi.h): The Unicode Bidirectional Algorithm (UAX #9, Unicode 15): which way each
 - [bitmap.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/gfx/bitmap.h): Bitmap: premultiplied RGBA8, and the antialiased rasteriser that fills it

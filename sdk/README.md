@@ -471,6 +471,7 @@ What the page gets:
 | `sonore.on(cb)` | `cb(values, index, value)` on any change, from the UI *or* host automation |
 | `sonore.onLevel(cb)` / `onVU(cb)` | meters, up to ~30 times a second -- when the level moves; a silent or steady signal sends nothing new, so do not use it as a clock |
 | `sonore.onGR(cb)` / `sonore.gr` | gain reduction in positive dB, from a DSP that declares `gainReduction() const`; 0 otherwise |
+| `sonore.onSpectrum(cb, {input})` / `sonore.spectrumFrame` | the output's spectrum (and the input's, when asked): 256 dBFS points on a fixed log grid, 20 Hz to 20 kHz, a full-scale sine reading 0 dBFS. The plugin measures nothing until the first call (`spectrum_feed.h`) |
 | `sonore.format(i, v)` | the same text the host shows |
 | `sonore.noteOn/noteOff` | on-screen keyboards for instruments |
 | `sonore.presets` / `loadPreset(i)` | factory preset names, applied C++-side |

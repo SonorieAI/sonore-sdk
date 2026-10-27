@@ -664,7 +664,7 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
         "try{changeCbs[i](v,p?p.__i:-1,p?p.value:0);}catch(e){}}}\n";
   js += "var stateSeen=false;\n";
   js += "var changeCbs=[],levelCbs=[],vuCbs=[],grCbs=[],noteCbs=[],fileCbs=[],stateCbs=[],"
-        "deviceCbs=[],cpuCbs=[];\n";
+        "deviceCbs=[],cpuCbs=[],specCbs=[],specOn=false,specIn=false;\n";
   // Every member is typed for a page in TypeScript by sonore.d.ts, beside this
   // header, and scripts/bridge-types.mjs fails the build when the two differ:
   // add a member here, type it there.
@@ -697,6 +697,13 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
   // compressor reads when it is not compressing, so a meter bound to this is
   // right either way.
   js += "  onGR:function(cb){if(typeof cb==='function')grCbs.push(cb);},\n";
+  // The plugin's spectrum: kPoints dBFS values on SpectrumFeed's fixed log
+  // grid, the output's and (once a subscriber asks for {input:true}) the
+  // input's. The plugin measures only after the first subscriber asks, so a
+  // page with no analyzer costs the audio thread nothing.
+  js += "  onSpectrum:function(cb,o){if(typeof cb!=='function')return;specCbs.push(cb);"
+        "var wi=!!(o&&o.input);if(!specOn||(wi&&!specIn)){specOn=true;specIn=specIn||wi;"
+        "post({type:'spectrum',on:1,input:specIn?1:0});}},\n";
   js += "  noteOn:function(n,v){post({type:'noteOn',note:n|0,velocity:v===undefined?100:v|0});},\n";
   js += "  noteOff:function(n){post({type:'noteOff',note:n|0});},\n";
   // Right-click on a control -> the HOST's menu, not ours. MIDI learn, "remove
@@ -777,7 +784,7 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
         "var span=p.max-p.min,d=span>=100?0:(span>=10?1:2);"
         "var a=Math.abs(v),e=(a===0||a>=10)?0:(a>=1?1:(a>=0.1?2:3));if(e>d)d=e;"
         "return v.toFixed(d)+(p.unit?' '+p.unit:'');},\n";
-  js += "  level:0, db:-100, vu:0, gr:0,\n";
+  js += "  level:0, db:-100, vu:0, gr:0, spectrumFrame:null, sampleRate:0,\n";
   // How much of the audio deadline this plugin is using, 0..1 and beyond.
   // A generated DSP has nobody who profiled it; the page can show what it
   // costs, and an interface that never asks pays nothing.
@@ -871,6 +878,9 @@ inline std::string bridgeScript(const PluginDescriptor& desc, const float* value
         "levelCbs.forEach(function(cb){try{cb(level,db);}catch(e){}});"
         "vuCbs.forEach(function(cb){try{cb(vu);}catch(e){}});"
         "grCbs.forEach(function(cb){try{cb(api.gr);}catch(e){}});};\n";
+  js += "api.__spectrum=function(out,inp,sr){var fr={out:out,'in':inp||null,sr:sr||0};"
+        "api.spectrumFrame=fr;if(sr)api.sampleRate=sr;"
+        "specCbs.forEach(function(cb){try{cb(fr.out,fr['in'],fr.sr);}catch(e){}});};\n";
   js += "window.sonore=api;\n";
   // Asked for before the page is told it is ready, so a listener registered
   // in the ready handler is already in place when the answer arrives.
@@ -1213,6 +1223,9 @@ struct BridgeMessage {
     ListDevices,  ///< the page asks, once, for the audio device lists
     Activate,     ///< an activation code in `text`, at most 4096 bytes
     Ready,        ///< the bridge is up in the page's real document
+    /** The page wants the spectrum: `value` 1 to start measuring the output,
+     *  `index` 1 to measure the input as well. */
+    Spectrum,
     /** A key the page did not use, for the host: index is the virtual-key
      *  code, value 1 for down and 0 for up. */
     Key
@@ -1444,6 +1457,14 @@ inline BridgeMessage parseBridgeMessage(const std::string& json) {
     msg.note = (int) d;
     if (jsonField(json, "velocity", &d)) msg.velocity = (int) d;
     msg.kind = type == "noteOn" ? BridgeMessage::Kind::NoteOn : BridgeMessage::Kind::NoteOff;
+  } else if (type == "spectrum") {
+    // Both fields default to "no": a page that sends neither asked for nothing.
+    double on = 0.0, input = 0.0;
+    jsonField(json, "on", &on);
+    jsonField(json, "input", &input);
+    msg.value = on != 0.0 ? 1.0 : 0.0;
+    msg.index = input != 0.0 ? 1 : 0;
+    msg.kind = BridgeMessage::Kind::Spectrum;
   } else if (type == "activate") {
     // An activation code the user pasted. Checked here only for length: what
     // it MEANS is decided by a signature check, which is the one opinion a

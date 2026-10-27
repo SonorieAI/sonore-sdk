@@ -67,6 +67,7 @@
 
 #include "gfx/native_editor.h"
 #include "scope_buffer.h"
+#include "spectrum_feed.h"
 
 #if defined(_WIN32)
 #include "webview_win32.h"
@@ -1152,6 +1153,11 @@ struct Instance {
    *  the last second of audio instead of starting blank -- the same reason the
    *  meter lives here. */
   AudioScopeBuffer scope;
+  /** The spectrum a page's analyzer draws: what the DSP put out, and what
+   *  went into it. Both idle until a page asks (BridgeMessage::Spectrum), and
+   *  owned here, beside the scope, so a window opened mid-session opens onto
+   *  the audio already playing. */
+  SpectrumFeed spectrumOut, spectrumIn;
   UiEventQueue uiEvents;
   /** Parameter values the PAGE last knows about, so the timer only pushes what
    *  actually changed: a host automating one control must not cost a full
@@ -1163,7 +1169,7 @@ struct Instance {
    *  numbers. The renderer is a process of its own, and an idle web editor
    *  kept it at 1.3-1.6% of a core doing exactly that. Cleared with the
    *  page (pageReady), which then needs everything again. */
-  std::string uiLastMeter, uiLastLoad;
+  std::string uiLastMeter, uiLastLoad, uiLastSpectrum;
   /** The parent the host handed to set_parent, kept so a PARKED webview can
    *  be re-attached on show. See guiHide for what parking is and why. */
   void* guiParentHandle = nullptr;
@@ -3648,10 +3654,12 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
                                     &inst->endedNotes,
                                     &inst->paramMods};
       bypassCapture(inst->bypass, chans64, nch64, frames);
+      inst->spectrumIn.push(chans64, nch64, frames); // what the DSP is about to hear
       trackNotes(inst->notes, ctx64.midi);
       runDspCtx64(inst->dsp, ctx64, blockParams);
       bypassApply(inst->bypass, chans64, nch64, frames);
       guardOutputs(inst, chans64, nch64, auxBlocks64, nAux64, frames);
+      inst->spectrumOut.push(chans64, nch64, frames);
 
       inst->meter.push(measureBlock(chans64[0], (size_t) frames));
       // The 64-bit path feeds the same scope. A plugin running in a
@@ -3770,10 +3778,13 @@ inline clap_process_status processBlock(Instance* inst, const clap_process_t* pr
   // Adding the parameter that lets a host press it is what finally made that
   // visible -- the check that measures the contract failed on the first run.
   bypassCapture(inst->bypass, chans, nch, frames);
+  // The spectrum feeds: nothing at all until a page asks for one.
+  inst->spectrumIn.push(chans, nch, frames); // what the DSP is about to hear
   trackNotes(inst->notes, ctx.midi);
   runDspCtx(inst->dsp, ctx, blockParams);
   bypassApply(inst->bypass, chans, nch, frames);
   guardOutputs(inst, chans, nch, auxBlocks, nAux, frames);
+  inst->spectrumOut.push(chans, nch, frames); // what the host hears
 
   // Publish what the meters should show. Two atomic stores: the interface can
   // be closed, opening, or absent and this costs the same either way.
@@ -4352,6 +4363,35 @@ inline std::string uiTickScript(Instance& inst) {
     inst.uiLastMeter = meterCall;
     js += meterCall;
   }
+  // The spectrum, once the page has asked for it: the output's and, when it
+  // asked for that too, the input's, measured here on the editor's clock (the
+  // audio thread only fills the rings). A plugin at rest sends the same floor
+  // every tick, so an unchanged frame is not sent again.
+  if (inst.spectrumOut.active()) {
+    float outDb[SpectrumFeed::kPoints], inDb[SpectrumFeed::kPoints];
+    inst.spectrumOut.analyse(inst.sampleRate, outDb);
+    const bool withInput = inst.spectrumIn.active();
+    if (withInput) inst.spectrumIn.analyse(inst.sampleRate, inDb);
+    std::string call = "window.sonore.__spectrum([";
+    SpectrumFeed::appendTenths(call, outDb, SpectrumFeed::kPoints);
+    call += "],";
+    if (withInput) {
+      call += "[";
+      SpectrumFeed::appendTenths(call, inDb, SpectrumFeed::kPoints);
+      call += "]";
+    } else {
+      call += "null";
+    }
+    char rate[40];
+    jsNumber(rate, sizeof(rate), inst.sampleRate);
+    call += ",";
+    call += rate;
+    call += ");";
+    if (call != inst.uiLastSpectrum) {
+      inst.uiLastSpectrum = call;
+      js += call;
+    }
+  }
   // The load to a tenth of a percent: finer than any readout shows, and
   // coarse enough that the jitter of a measured idle load does not count as
   // a change worth waking the page for.
@@ -4561,6 +4601,11 @@ inline void pageReady(Instance* inst) {
   inst->notesEchoValid = false;
   inst->uiLastMeter.clear();
   inst->uiLastLoad.clear();
+  // A new page asks again if it wants a spectrum; until it does, the audio
+  // thread stops feeding the ring.
+  inst->spectrumOut.setActive(false);
+  inst->spectrumIn.setActive(false);
+  inst->uiLastSpectrum.clear();
 #if defined(SONORE_LICENSED_BUILD)
   // And the licence overlay, for the same reason. The tick evaluated it into
   // the blank document before the navigation replaced it, then marked it
@@ -4585,6 +4630,12 @@ inline void guiOnMessage(Instance* inst, const BridgeMessage& msg) {
   switch (msg.kind) {
     case BridgeMessage::Kind::Ready:
       pageReady(inst);
+      return;
+    case BridgeMessage::Kind::Spectrum:
+      // Main thread to audio thread by one relaxed flag each: the feeds start
+      // filling their rings on the next block, and the tick starts sending.
+      inst->spectrumOut.setActive(msg.value != 0.0);
+      if (msg.index) inst->spectrumIn.setActive(true);
       return;
     case BridgeMessage::Kind::Activate: {
 #if defined(SONORE_LICENSED_BUILD)

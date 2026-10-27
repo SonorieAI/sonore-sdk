@@ -172,6 +172,13 @@ const RULES = [
    "`p[0]` is the first row of `kParamTable`. Not normalised: if the row says " +
    "-24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each " +
    "format's own convention."],
+
+  ["A meter or an analyzer shows what the plugin measured.",
+   "A web page reads `onLevel`, `onVU`, `onGR` and `onSpectrum` from the " +
+   "bridge; a native editor reads an `AudioScopeBuffer` or a `SpectrumFeed` " +
+   "that `process()` fills. Gain reduction comes from the DSP declaring " +
+   "`float gainReduction() const`, in positive dB. A display animated with " +
+   "random numbers looks alive and tells the user nothing."],
 ];
 
 // ── Emitting ────────────────────────────────────────────────────────────────

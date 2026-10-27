@@ -171,9 +171,14 @@ function wordsOf(query) {
 // A word also matches by its stem, so "oversampling" finds OversamplerT and
 // "compressors" finds Compressor.
 const stem = (w) => (w.length > 5 ? w.replace(/(?:ings?|ers?|ed|ions?|es|s)$/, "") : w);
+// The SDK spells the British way (SpectrumAnalyser, Colour, normalise), and an
+// agent asking for "spectrum analyzer" or "color" means the same thing; both
+// sides are folded to one spelling before they are compared.
+const fold = (s) => s.replace(/colour/g, "color").replace(/([iy])z/g, "$1s");
 const matches = (words, s) => {
-  const t = s.toLowerCase();
-  return words.every((w) => t.includes(w) || t.includes(stem(w))) || t.includes(words.join(""));
+  const t = fold(s.toLowerCase());
+  const ws = words.map(fold);
+  return ws.every((w) => t.includes(w) || t.includes(stem(w))) || t.includes(ws.join(""));
 };
 
 function distance(a, b) {
@@ -633,6 +638,7 @@ if (process.argv.includes("--check")) {
   expect("missing client capabilities", respond({ jsonrpc: "2.0", id: 7, method: "tools/list", params: { _meta: { [META_VERSION]: MODERN_VERSIONS[0] } } }), (r) => r?.error?.code === -32602);
   expect("legacy initialize falls back to the newest legacy version", respond({ jsonrpc: "2.0", id: 8, method: "initialize", params: { protocolVersion: "1999-01-01" } }), (r) => r?.result?.protocolVersion === LEGACY_VERSIONS[0]);
   expect("legacy tools/call by old name", respond({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "search", arguments: { query: "ladder filter" } } }), (r) => /LadderFilter/.test(textOf(r?.result)));
+  expect("American spelling finds the British name", respond({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { _meta: meta, name: "sonore_search", arguments: { query: "spectrum analyzer" } } }), (r) => /SpectrumAnalyser/.test(textOf(r?.result)));
   expect("unknown tool", respond({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "nope" } }), (r) => r?.error?.code === -32602);
 
   if (failures.length) {

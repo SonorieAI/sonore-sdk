@@ -17,7 +17,7 @@
 
 enable_testing()
 
-set(_sonore_area_tests dsp_maths midi_osc core_crypto audio_io core_data gui_widgets audio_sources
+set(_sonore_area_tests dsp_maths spectrum midi_osc core_crypto audio_io core_data gui_widgets audio_sources
     gui_infra system modules javascript app_infra)
 
 set(SONORE_IOS_BUILD FALSE)

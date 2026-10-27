@@ -124,11 +124,28 @@ interface Sonore {
    *  whose DSP does not declare gainReduction(), which is also what a
    *  compressor reads when it is not compressing. */
   onGR(callback: (db: number) => void): void;
+  /** The plugin's spectrum, up to thirty times a second once a page asks:
+   *  256 dBFS values on a fixed log grid from 20 Hz to 20 kHz (point i sits
+   *  at 20 * 1000^(i / 255) Hz), a full-scale sine reading 0 dBFS. `input` is
+   *  the same for what enters the plugin when `{ input: true }` was asked,
+   *  else null. Nothing is measured until the first call. */
+  onSpectrum(
+    callback: (out: ReadonlyArray<number>, input: ReadonlyArray<number> | null, sampleRate: number) => void,
+    options?: { input?: boolean },
+  ): void;
   /** The latest of each, for a page that draws on its own schedule. */
   readonly level: number;
   readonly db: number;
   readonly vu: number;
   readonly gr: number;
+  /** The last spectrum the plugin sent, or null before the first. */
+  readonly spectrumFrame: {
+    readonly out: ReadonlyArray<number>;
+    readonly in: ReadonlyArray<number> | null;
+    readonly sr: number;
+  } | null;
+  /** The plugin's sample rate, once a spectrum has said it; 0 before. */
+  readonly sampleRate: number;
 
   /** On-screen keyboards for an instrument. Velocity 1..127, 100 when not
    *  given. */
