@@ -545,9 +545,13 @@ void testMemoryDecoding() {
   std::puts("  SKIP the file-against-memory comparisons: no file system in this build");
   return;
 #endif
-  const char* files[] = {"ref16.wav",      "ref24.wav",      "refmono.wav",  "ref16be.aiff", "written.aiff",
-                         "written16.aiff", "ref16_c0.flac",  "ref24.flac",   "refmono.flac", "encoded.flac",
-                         "ref.mp3",        "refmono.mp3",    "tonal.mp3",    "ref.ogg"};
+  // COMMITTED fixtures only. tests/data also holds written.aiff,
+  // written16.aiff and encoded.flac, but sdk_tests writes those when it runs
+  // and they are gitignored: tests run in any order, and in a fresh checkout
+  // this one ran first and found three files that did not exist yet.
+  const char* files[] = {"ref16.wav",     "ref24.wav",  "refmono.wav",  "tonal.wav",   "ref16be.aiff",
+                         "ref16_c0.flac", "ref16_c8.flac", "ref24.flac", "refmono.flac", "ref.mp3",
+                         "refmono.mp3",   "tonal.mp3",  "ref.ogg"};
   int matched = 0, total = 0, twins = 0;
   for (const char* name : files) {
     const std::string path = std::string(SONORE_TEST_DATA_DIR) + "/" + name;

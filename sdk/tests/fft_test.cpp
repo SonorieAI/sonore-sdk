@@ -240,9 +240,17 @@ void testDynamic() {
   // 0.5 + 5j; X[2] = 1 + 2 + 0.5 - 3 = 0.5. (Within a few ulps: the float
   // twiddle cos(pi/2) is 6e-17, not 0.)
   auto near = [](float v, float want) { return std::fabs(v - want) < 1e-6f; };
-  check(near(a[0], 2.5f) && near(a[1], 0.5f) && near(b[1], 5.0f) && near(a[2], 0.5f) && b[0] == 0.0f &&
-            std::memcmp(a, c, sizeof a) == 0 && std::memcmp(b, d, sizeof b) == 0,
-        "4 points: the spectrum worked by hand, from both");
+  // The two run the SAME code, so the same bits -- unless DynamicFft is on
+  // vDSP, which is not bit-identical to the portable transform by design (the
+  // reason the backend is opt-in). There each must match the hand-worked
+  // answer on its own; asking for identical bits failed the first macOS run.
+  const bool portable = std::strcmp(DynamicFft::backend(), "portable") == 0;
+  const bool same = portable ? std::memcmp(a, c, sizeof a) == 0 && std::memcmp(b, d, sizeof b) == 0
+                             : near(c[0], 2.5f) && near(c[1], 0.5f) && near(d[1], 5.0f) && near(c[2], 0.5f) &&
+                                   d[0] == 0.0f;
+  check(near(a[0], 2.5f) && near(a[1], 0.5f) && near(b[1], 5.0f) && near(a[2], 0.5f) && b[0] == 0.0f && same,
+        portable ? "4 points: the spectrum worked by hand, from both, to the same bits"
+                 : "4 points: the spectrum worked by hand, from both (vDSP is not bit-identical by design)");
   four.realInverse(a, b, back);
   check(near(back[0], 1.0f) && near(back[1], -2.0f) && near(back[2], 0.5f) && near(back[3], 3.0f),
         "and back again");

@@ -67,8 +67,20 @@ endif()
 # stopped matching one given that rate. Off, every compiler rounds as written.
 # A build-interface flag for the reason /utf-8 is; SonoreSDKConfig.cmake adds
 # it again by the consumer's own compiler.
-if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(sonore_sdk INTERFACE $<BUILD_INTERFACE:-ffp-contract=off>)
+#
+# clang-cl too, which CMake counts as MSVC and so was skipped: it contracts by
+# default like any clang, and it needs no FMA instruction to do damage. The
+# optimiser FOLDS a contracted a*b + c whose operands it knows as one fused
+# operation, while the same expression computed at run time rounds twice -- so
+# a value came out differently depending on whether a caller's constants were
+# inlined into it. ReverbAudioSource and a Reverb run by hand on the same input
+# drifted apart 383 samples into the tail, on clang-cl alone.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(MSVC)
+    target_compile_options(sonore_sdk INTERFACE $<BUILD_INTERFACE:/clang:-ffp-contract=off>)
+  else()
+    target_compile_options(sonore_sdk INTERFACE $<BUILD_INTERFACE:-ffp-contract=off>)
+  endif()
 endif()
 
 # advapi32 is the registry, and the registry is where a licensed build reads
