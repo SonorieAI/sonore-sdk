@@ -234,9 +234,18 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   add_executable(simd_identity_scalar tests/simd_identity.cpp)
   target_link_libraries(simd_identity_scalar PRIVATE sonore_sdk)
   target_compile_definitions(simd_identity_scalar PRIVATE SONORE_NO_SIMD=1)
+  # And on x86-64 a third build with AVX switched on, where Vec8f and Vec4d
+  # are one 256-bit register instead of two 128-bit ones: the same hash again.
+  set(_simd_wide "")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64|amd64)$" AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(simd_identity_avx tests/simd_identity.cpp)
+    target_link_libraries(simd_identity_avx PRIVATE sonore_sdk)
+    target_compile_options(simd_identity_avx PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX,-mavx>)
+    set(_simd_wide "-DWIDE=$<TARGET_FILE:simd_identity_avx>")
+  endif()
   add_test(NAME simd_identity
            COMMAND "${CMAKE_COMMAND}" "-DVECTOR=$<TARGET_FILE:simd_identity>"
-                   "-DSCALAR=$<TARGET_FILE:simd_identity_scalar>"
+                   "-DSCALAR=$<TARGET_FILE:simd_identity_scalar>" ${_simd_wide}
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/simd_identity.cmake")
 
   # The toolkit in two translation units of one program, which the vendored
@@ -280,11 +289,13 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   # start threads and processes, or talk to the OS, so they stay out of
   # sdk_tests. Each prints its checks and fails on any.
   find_package(Threads REQUIRED)
-  foreach(_area dsp_maths midi_osc core_crypto audio_io core_data gui_widgets audio_sources gui_infra system modules opengl mac_input javascript app_infra app_windows mac_host)
+  foreach(_area dsp_maths dsp_options filter_design simd_types fft convolution precision midi_osc core_crypto audio_io core_data gui_widgets audio_sources gui_infra system modules opengl mac_input javascript app_infra app_windows mac_host)
     add_executable(${_area}_test tests/${_area}_test.cpp)
     target_link_libraries(${_area}_test PRIVATE sonore_sdk Threads::Threads)
     add_test(NAME ${_area} COMMAND ${_area}_test)
   endforeach()
+  # dsp_options decodes the audio fixtures from memory against the files.
+  target_compile_definitions(dsp_options_test PRIVATE SONORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   # images reads its fixtures from tests/data; code_editor shares sdk_tests'
   # temp_path.h.
   add_executable(images_test tests/images_test.cpp)
@@ -316,6 +327,12 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_test(NAME box2d_renderer COMMAND box2d_renderer_test)
   endif()
   if(APPLE)
+    # DynamicFft on vDSP (SONORE_FFT_ACCELERATE): the same suite, held to the
+    # DFT's definition instead of the portable transform's bits.
+    add_executable(fft_accelerate_test tests/fft_test.cpp)
+    target_link_libraries(fft_accelerate_test PRIVATE sonore_sdk Threads::Threads "-framework Accelerate")
+    target_compile_definitions(fft_accelerate_test PRIVATE SONORE_FFT_ACCELERATE=1)
+    add_test(NAME fft_accelerate COMMAND fft_accelerate_test)
     target_link_libraries(mac_host_test PRIVATE "-framework AppKit" objc)
     # Run on a Mac, in a GUI session: what the AU host, the workgroups, the
     # accessibility bridge and the input methods find there. Never run here.

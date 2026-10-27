@@ -39,19 +39,20 @@ namespace sonore {
  * out of bounds at the top of the range: the classic off-by-one in every
  * hand-rolled lookup, and it corrupts exactly the loudest samples.
  */
-class LookupTable {
+template <typename T>
+class LookupTableT {
 public:
   /** Sample `fn` across [min, max] into `points` entries. Offline: this
    *  allocates, so it belongs in prepare(). */
   template <typename Fn>
-  void prepare(Fn&& fn, float min, float max, size_t points) {
+  void prepare(Fn&& fn, T min, T max, size_t points) {
     if (points < 2) points = 2;
     min_ = min;
-    max_ = max > min ? max : min + 1.0f;
-    scale_ = (float) (points - 1) / (max_ - min_);
+    max_ = max > min ? max : min + T(1.0);
+    scale_ = (T) (points - 1) / (max_ - min_);
     table_.resize(points + 1);
     for (size_t i = 0; i < points; ++i)
-      table_[i] = (float) fn(min_ + (float) i / scale_);
+      table_[i] = (T) fn(min_ + (T) i / scale_);
     // The guard point: equal to the last real one, so a value exactly at max
     // interpolates against itself instead of past the end.
     table_[points] = table_[points - 1];
@@ -63,20 +64,24 @@ public:
   /** [audio-thread] The function at `x`, interpolated between the two nearest
    *  points. Below min it is the value at min and above max the value at max;
    *  0 before prepare(). No allocation, no lock. */
-  inline float operator()(float x) const {
-    if (table_.empty()) return 0.0f;
+  inline T operator()(T x) const {
+    if (table_.empty()) return T(0.0);
     if (x <= min_) return table_.front();
     if (x >= max_) return table_[table_.size() - 2];
-    const float pos = (x - min_) * scale_;
+    const T pos = (x - min_) * scale_;
     const size_t index = (size_t) pos;
-    const float frac = pos - (float) index;
+    const T frac = pos - (T) index;
     return table_[index] + frac * (table_[index + 1] - table_[index]);
   }
 
 private:
-  std::vector<float> table_;
-  float min_ = 0.0f, max_ = 1.0f, scale_ = 1.0f;
+  std::vector<T> table_;
+  T min_ = T(0.0), max_ = T(1.0), scale_ = T(1.0);
 };
+
+/** LookupTable in float, the form every plugin written before the templates
+ *  uses; LookupTableT<double> is the same processor in double. */
+using LookupTable = LookupTableT<float>;
 
 // ── Waveshaper ───────────────────────────────────────────────────────────────
 
@@ -89,41 +94,46 @@ private:
  * DC introduced by the bias is removed on the way out, or it would offset
  * everything downstream.
  */
-class WaveShaper {
+template <typename T>
+class WaveShaperT {
 public:
   /** The input gain, linear (1 = none), applied before the curve. A negative
    *  value is taken as 0. */
-  void setDrive(float linearGain) { drive_ = linearGain > 0.0f ? linearGain : 0.0f; }
+  void setDrive(T linearGain) { drive_ = linearGain > T(0.0) ? linearGain : T(0.0); }
   /** An offset added to the driven input before the curve, in the curve's
    *  input units (0 = centred). The DC it leaves is removed on the way out. */
-  void setBias(float bias) { bias_ = bias; }
+  void setBias(T bias) { bias_ = bias; }
   /** Compensate for the level the drive added, so turning drive up changes the
    *  TONE rather than just the volume. */
   void setAutoGain(bool on) { autoGain_ = on; }
 
   /** Tunes the output DC blocker (a 10 Hz highpass) to the rate, in Hz.
    *  Call it in prepare(), before the first process(). */
-  void setSampleRate(float sr) { dc_.setSampleRate(sr); }
+  void setSampleRate(T sr) { dc_.setSampleRate(sr); }
   /** Clears the DC blocker's state; drive, bias and auto gain are kept. */
   void reset() { dc_.reset(); }
 
   /** Any callable float->float: std::tanh, a LookupTable, a lambda. */
   template <typename Shape>
-  inline float process(float x, Shape&& shape) {
-    const float shaped = (float) shape(x * drive_ + bias_);
-    const float out = dc_.process(shaped);
-    if (!autoGain_ || drive_ <= 1.0f) return out;
+  inline T process(T x, Shape&& shape) {
+    const T shaped = (T) shape(x * drive_ + bias_);
+    const T out = dc_.process(shaped);
+    if (!autoGain_ || drive_ <= T(1.0)) return out;
     // The compensation is the shaped value of unity: whatever the curve does
     // to a full-scale sample is what the output is divided by.
-    const float reference = (float) shape(drive_);
-    return reference > 1e-6f ? out / reference : out;
+    const T reference = (T) shape(drive_);
+    return reference > T(1e-6) ? out / reference : out;
   }
 
 private:
-  DcBlocker dc_;
-  float drive_ = 1.0f, bias_ = 0.0f;
+  DcBlockerT<T> dc_;
+  T drive_ = T(1.0), bias_ = T(0.0);
   bool autoGain_ = false;
 };
+
+/** WaveShaper in float, the form every plugin written before the templates
+ *  uses; WaveShaperT<double> is the same processor in double. */
+using WaveShaper = WaveShaperT<float>;
 
 // ── Ballistics ───────────────────────────────────────────────────────────────
 
@@ -134,7 +144,8 @@ private:
  * detection is what makes a compressor respond to LOUDNESS rather than to
  * transients, and the two sound entirely different on the same source.
  */
-class BallisticsFilter {
+template <typename T>
+class BallisticsFilterT {
 public:
   /** What the detector follows. */
   enum class Mode {
@@ -146,8 +157,8 @@ public:
    *  attack and release coefficients from the times last set. Until this or a
    *  setter runs, both coefficients are 0 and the output follows the input
    *  with no smoothing. */
-  void setSampleRate(float sr) {
-    sr_ = sr > 1.0f ? sr : 48000.0f;
+  void setSampleRate(T sr) {
+    sr_ = sr > T(1.0) ? sr : T(48000.0);
     setAttack(attackMs_);
     setRelease(releaseMs_);
   }
@@ -156,43 +167,47 @@ public:
   void setMode(Mode mode) { mode_ = mode; }
   /** The time constant, in milliseconds, used while the level rises: the time
    *  to cover 63% of a step. Values below 0.001 ms are taken as 0.001. */
-  void setAttack(float ms) {
+  void setAttack(T ms) {
     attackMs_ = ms;
     attack_ = coefficient(ms);
   }
   /** The time constant, in milliseconds, used while the level falls. Values
    *  below 0.001 ms are taken as 0.001. */
-  void setRelease(float ms) {
+  void setRelease(T ms) {
     releaseMs_ = ms;
     release_ = coefficient(ms);
   }
   /** Back to silence: the level is 0. */
-  void reset() { state_ = 0.0f; }
+  void reset() { state_ = T(0.0); }
 
   /** [audio-thread] Takes one sample and returns the smoothed level, linear
    *  (1 = full scale). No allocation, no lock. */
-  inline float process(float x) {
-    const float value = mode_ == Mode::Rms ? x * x : std::fabs(x);
+  inline T process(T x) {
+    const T value = mode_ == Mode::Rms ? x * x : std::fabs(x);
     // Attack when rising, release when falling: one filter, two time
     // constants, which is what "ballistics" means.
-    const float a = value > state_ ? attack_ : release_;
-    state_ = flushDenormal(value + a * (state_ - value));
+    const T a = value > state_ ? attack_ : release_;
+    state_ = flushDenormalT(value + a * (state_ - value));
     return mode_ == Mode::Rms ? std::sqrt(state_) : state_;
   }
 
   /** The level after the last process(), linear, without taking a sample. */
-  float value() const { return mode_ == Mode::Rms ? std::sqrt(state_) : state_; }
+  T value() const { return mode_ == Mode::Rms ? std::sqrt(state_) : state_; }
 
 private:
-  float coefficient(float ms) const {
-    const float safe = ms > 0.001f ? ms : 0.001f;
-    return std::exp(-1.0f / (0.001f * safe * sr_));
+  T coefficient(T ms) const {
+    const T safe = ms > T(0.001) ? ms : T(0.001);
+    return std::exp(-T(1.0) / (T(0.001) * safe * sr_));
   }
 
   Mode mode_ = Mode::Peak;
-  float sr_ = 48000.0f, attackMs_ = 10.0f, releaseMs_ = 100.0f;
-  float attack_ = 0.0f, release_ = 0.0f, state_ = 0.0f;
+  T sr_ = T(48000.0), attackMs_ = T(10.0), releaseMs_ = T(100.0);
+  T attack_ = T(0.0), release_ = T(0.0), state_ = T(0.0);
 };
+
+/** BallisticsFilter in float, the form every plugin written before the templates
+ *  uses; BallisticsFilterT<double> is the same processor in double. */
+using BallisticsFilter = BallisticsFilterT<float>;
 
 // ── Fractional-delay interpolation ───────────────────────────────────────────
 //
@@ -390,16 +405,17 @@ private:
  *  frames is 10 ms and at a split block of 16 is a third of a millisecond: a
  *  0 -> 1 move at a block of 1 was a step, and hosts that split blocks at
  *  every automation point send blocks that small. */
-class Gain {
+template <typename T>
+class GainT {
 public:
   /** The gain to ramp to, linear (1 = unity). The 10 ms ramp starts at the
    *  next process(). A plain member, not atomic: set it on the thread that
    *  calls process(). */
-  void setGainLinear(float g) { target_ = g; }
+  void setGainLinear(T g) { target_ = g; }
   /** The gain to ramp to, in decibels (0 dB = unity). As setGainLinear(). */
-  void setGainDecibels(float db) { target_ = dbToGain(db); }
+  void setGainDecibels(T db) { target_ = dbToGainT(db); }
   /** The gain last set, linear: the ramp's target, not where the ramp is. */
-  float getGainLinear() const { return target_; }
+  T getGainLinear() const { return target_; }
 
   /** Sizes the ramp to 10 ms at spec.sampleRate (at least one sample) and
    *  jumps to the target, as reset() does. */
@@ -418,27 +434,27 @@ public:
    *  linearly towards a changed target; a target changed mid-ramp starts a
    *  new 10 ms ramp from where the gain is. At a settled unity gain the block
    *  is not touched. No allocation, no lock. */
-  void process(AudioBlock<float>& block) {
+  void process(AudioBlock<T>& block) {
     if (target_ != rampTarget_) {
       rampTarget_ = target_;
       remaining_ = rampLength_;
-      step_ = (rampTarget_ - current_) / (float) remaining_;
+      step_ = (rampTarget_ - current_) / (T) remaining_;
     }
     const size_t n = block.getNumSamples(), nch = block.getNumChannels();
     if (remaining_ == 0) {
       // Settled: a plain gain, and nothing at all at unity.
-      if (current_ != 1.0f)
+      if (current_ != T(1.0))
         for (size_t c = 0; c < nch; ++c) {
-          float* x = block.getChannelPointer(c);
+          T* x = block.getChannelPointer(c);
           for (size_t i = 0; i < n; ++i) x[i] *= current_;
         }
       return;
     }
-    const float start = current_;
+    const T start = current_;
     const int ramping = remaining_ < (int) n ? remaining_ : (int) n;
     for (size_t c = 0; c < nch; ++c) {
-      float* x = block.getChannelPointer(c);
-      float g = start;
+      T* x = block.getChannelPointer(c);
+      T g = start;
       for (int i = 0; i < ramping; ++i) {
         g += step_;
         x[i] *= g;
@@ -446,38 +462,47 @@ public:
       for (size_t i = (size_t) ramping; i < n; ++i) x[i] *= rampTarget_;
     }
     remaining_ -= ramping;
-    current_ = remaining_ > 0 ? start + step_ * (float) ramping : rampTarget_;
+    current_ = remaining_ > 0 ? start + step_ * (T) ramping : rampTarget_;
   }
 
 private:
-  float target_ = 1.0f, current_ = 1.0f, rampTarget_ = 1.0f, step_ = 0.0f;
+  T target_ = T(1.0), current_ = T(1.0), rampTarget_ = T(1.0), step_ = T(0.0);
   int rampLength_ = 480, remaining_ = 0;
 };
+
+/** Gain in float, the form every plugin written before the templates
+ *  uses; GainT<double> is the same processor in double. */
+using Gain = GainT<float>;
 
 /** A DC offset. On its own it does nothing audible; its use is BEFORE a
  *  waveshaper, where pushing the signal off centre is what asks an odd curve
  *  for even harmonics. */
-class Bias {
+template <typename T>
+class BiasT {
 public:
   /** The offset added to every sample, in sample units (1 = full scale). It
    *  takes effect at once, with no ramp. */
-  void setBias(float bias) { bias_ = bias; }
+  void setBias(T bias) { bias_ = bias; }
   /** Nothing to prepare; here so the stage fits a ProcessorChain. */
   void prepare(const ProcessSpec&) {}
   /** Nothing to reset; here so the stage fits a ProcessorChain. */
   void reset() {}
 
   /** [audio-thread] Adds the bias to every sample of every channel, in place. */
-  void process(AudioBlock<float>& block) {
+  void process(AudioBlock<T>& block) {
     for (size_t c = 0; c < block.getNumChannels(); ++c) {
-      float* data = block.getChannelPointer(c);
+      T* data = block.getChannelPointer(c);
       for (size_t i = 0; i < block.getNumSamples(); ++i) data[i] += bias_;
     }
   }
 
 private:
-  float bias_ = 0.0f;
+  T bias_ = T(0.0);
 };
+
+/** Bias in float, the form every plugin written before the templates
+ *  uses; BiasT<double> is the same processor in double. */
+using Bias = BiasT<float>;
 
 namespace stagedetail {
 
@@ -580,34 +605,39 @@ private:
  * target, which is what a FADE needs. This one approaches for ever, which is
  * what a knob being turned needs.
  */
-class LogSmooth {
+template <typename T>
+class LogSmoothT {
 public:
   /** The rate in Hz and the time constant in milliseconds: the time to cover
    *  63% of the way to a new target, as a ratio. Below 0.01 ms is taken as
    *  0.01. Before setup() the output jumps straight to each target. */
-  void setup(float sampleRate, float ms = 20.0f) {
-    a_ = std::exp(-1.0f / (0.001f * (ms > 0.01f ? ms : 0.01f) * sampleRate));
+  void setup(T sampleRate, T ms = T(20.0)) {
+    a_ = std::exp(-T(1.0) / (T(0.001) * (ms > T(0.01) ? ms : T(0.01)) * sampleRate));
   }
   /** Jumps to `v` with no glide. The value starts at 1 until this is called,
    *  so call it with the first value before the first next(). Values at or
    *  below 1e-6 are taken as 1e-6: this smooths positive quantities only. */
-  void snap(float v) { logZ_ = std::log(v > kFloor ? v : kFloor); }
+  void snap(T v) { logZ_ = std::log(v > kFloor ? v : kFloor); }
 
   /** [audio-thread] One sample's step towards `target` (floored at 1e-6 like
    *  snap()), returning the new value. Calls log and exp once each; no
    *  allocation. */
-  inline float next(float target) {
-    const float t = std::log(target > kFloor ? target : kFloor);
+  inline T next(T target) {
+    const T t = std::log(target > kFloor ? target : kFloor);
     logZ_ = t + a_ * (logZ_ - t);
     return std::exp(logZ_);
   }
 
   /** The value after the last next() or snap(), without taking a step. */
-  float value() const { return std::exp(logZ_); }
+  T value() const { return std::exp(logZ_); }
 
 private:
-  static constexpr float kFloor = 1e-6f; // log(0) is where this would explode
-  float a_ = 0.0f, logZ_ = 0.0f;
+  static constexpr T kFloor = T(1e-6); // log(0) is where this would explode
+  T a_ = T(0.0), logZ_ = T(0.0);
 };
+
+/** LogSmooth in float, the form every plugin written before the templates
+ *  uses; LogSmoothT<double> is the same processor in double. */
+using LogSmooth = LogSmoothT<float>;
 
 } // namespace sonore

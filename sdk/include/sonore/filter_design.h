@@ -20,9 +20,12 @@
 #pragma once
 
 #include <cmath>
+#include <complex>
 #include <cstddef>
+#include <limits>
 
 #include "dsp.h"
+#include "special.h"
 
 namespace sonore {
 
@@ -292,6 +295,117 @@ inline Chebyshev2Section chebyshev2SectionFor(int order, int section, double sto
   return out;
 }
 
+// ── Elliptic (Cauer) ─────────────────────────────────────────────────────────
+//
+// The steepest filter of its order: equiripple in the passband AND the
+// stopband. Chebyshev I ripples only where it keeps, Chebyshev II only where
+// it throws away; the elliptic design ripples in both, and is paid for that
+// with the narrowest transition any order can have. An order-5 elliptic does
+// what an order-9 Chebyshev or an order-17 Butterworth needs to.
+//
+// The construction is the one in Orfanidis's lecture notes on elliptic filter
+// design (Rutgers, 2006), in the same conventions as special.h: the modulus
+// k, and the Jacobi functions with their argument in quarter periods. On the
+// analog prototype the passband edge is at 1 and the stopband edge at 1/k,
+// and for the order N to deliver ripple Ap AND rejection As across exactly
+// that transition, k must satisfy the DEGREE EQUATION
+//
+//     N K'(k) / K(k) = K'(k1) / K(k1),     k1 = eps_p / eps_s,
+//
+// which says the nome of k is the N-th root of the nome of k1. Everything
+// else follows: zeros at j / (k cd(u_i K, k)), poles at j cd((u_i - j v0) K, k)
+// with u_i = (2i - 1) / N, and an odd order's real pole at j sn(j v0 K, k),
+// where v0 = -j asne(j / eps_p, k1) / N.
+
+/** The families CascadedIir can design to a specification. */
+enum class IirFamily {
+  Butterworth, ///< maximally flat; the widest transition of the four
+  Chebyshev1,  ///< equiripple passband, monotone stopband
+  Chebyshev2,  ///< flat passband, equiripple stopband
+  Elliptic,    ///< equiripple in both bands; the narrowest transition of the four
+};
+
+/** The ripple or the rejection, in dB, as the epsilon the designs use:
+ *  sqrt(10^(dB/10) - 1). */
+inline double iirEpsilon(double db) { return std::sqrt(std::pow(10.0, db / 10.0) - 1.0); }
+
+/**
+ * Solve the elliptic degree equation: the selectivity k of an order-`order`
+ * elliptic filter whose discrimination is `k1` (eps_p / eps_s, in (0, 1)).
+ *
+ * Through the nome, q = exp(-pi K'/K): the degree equation is q(k) = q(k1)^(1/N),
+ * and k is recovered from its nome by the theta-function quotient
+ *     k = 4 sqrt(q) (sum_{m>=0} q^(m(m+1)))^2 / (1 + 2 sum_{m>=1} q^(m^2))^2,
+ * whose series converge like q^(m^2) -- a dozen terms reach the last digit of
+ * a double for any q a filter produces. Returns NaN outside (0, 1).
+ */
+inline double ellipticDegree(int order, double k1) {
+  if (order < 1 || !(k1 > 0.0) || !(k1 < 1.0)) return std::numeric_limits<double>::quiet_NaN();
+  if (order == 1) return k1;
+  double K1 = 0.0, K1p = 0.0;
+  special::ellipticIntegralK(k1, K1, K1p);
+  const double pi = 3.14159265358979323846;
+  const double q = std::exp(-pi * K1p / (K1 * (double) order));
+  double num = 1.0, den = 1.0;
+  for (int m = 1; m < 64; ++m) {
+    const double a = std::pow(q, (double) m * (double) (m + 1));
+    const double b = std::pow(q, (double) m * (double) m);
+    num += a;
+    den += 2.0 * b;
+    if (b < 1e-18) break;
+  }
+  const double ratio = num / den;
+  return 4.0 * std::sqrt(q) * ratio * ratio;
+}
+
+/**
+ * The lowest order of `family` that meets a specification: a passband edge
+ * and a stopband edge in Hz at `sampleRate`, at most `rippleDb` of passband
+ * ripple (or loss, for Butterworth) and at least `stopbandDb` of rejection.
+ * A LOWPASS when passEdgeHz < stopEdgeHz, a HIGHPASS when it is above.
+ *
+ * Worked out on the prewarped frequencies, tan(pi f / fs), because that is
+ * where the bilinear transform puts them: the edges land exactly where they
+ * are asked for, not near them. Returns 0 for an impossible request (edges
+ * equal or outside (0, Nyquist), ripple not above 0, rejection not above the
+ * ripple).
+ */
+inline int iirOrderFor(IirFamily family, double passEdgeHz, double stopEdgeHz, double sampleRate,
+                       double rippleDb, double stopbandDb) {
+  const double nyquist = sampleRate * 0.5;
+  if (!(sampleRate > 0.0) || !(passEdgeHz > 0.0) || !(stopEdgeHz > 0.0)) return 0;
+  if (!(passEdgeHz < nyquist) || !(stopEdgeHz < nyquist) || passEdgeHz == stopEdgeHz) return 0;
+  if (!(rippleDb > 0.0) || !(stopbandDb > rippleDb)) return 0;
+  const double pi = 3.14159265358979323846;
+  const double wp = std::tan(pi * passEdgeHz / sampleRate);
+  const double ws = std::tan(pi * stopEdgeHz / sampleRate);
+  // Selectivity: the passband edge over the stopband edge on the LOWPASS
+  // prototype. A highpass maps through S -> 1/S, which inverts the ratio.
+  const double k = wp < ws ? wp / ws : ws / wp;
+  const double k1 = iirEpsilon(rippleDb) / iirEpsilon(stopbandDb);
+  double exact = 0.0;
+  switch (family) {
+    case IirFamily::Butterworth:
+      exact = std::log(1.0 / k1) / std::log(1.0 / k);
+      break;
+    case IirFamily::Chebyshev1:
+    case IirFamily::Chebyshev2:
+      exact = std::acosh(1.0 / k1) / std::acosh(1.0 / k);
+      break;
+    case IirFamily::Elliptic: {
+      double K = 0.0, Kp = 0.0, K1 = 0.0, K1p = 0.0;
+      special::ellipticIntegralK(k, K, Kp);
+      special::ellipticIntegralK(k1, K1, K1p);
+      exact = (K * K1p) / (Kp * K1);
+      break;
+    }
+  }
+  // A hair under an integer is that integer: the spec is met exactly at it,
+  // and rounding up for the last ulp would cost a whole order.
+  const int order = (int) std::ceil(exact - 1e-9);
+  return order < 1 ? 1 : order;
+}
+
 /**
  * A cascade of biquads, plus at most one first-order section.
  *
@@ -300,7 +414,7 @@ inline Chebyshev2Section chebyshev2SectionFor(int order, int section, double sto
  * clamped: a caller that asked for 12th order and silently got 8th has a
  * crossover that leaks, and would never find out from here.
  */
-template <int MaxOrder = 8>
+template <int MaxOrder = 8, typename T = float>
 class CascadedIir {
 public:
   /** Biquad storage: (MaxOrder + 1) / 2 sections, enough for every pole
@@ -310,8 +424,8 @@ public:
   /** The rate in Hz; 0 or less means 48 kHz. Set it before designing: a
    *  design is made for the rate set at the time, and a later change does
    *  not redesign, so design again after it. */
-  void setSampleRate(float sr) {
-    sr_ = sr > 0.0f ? sr : 48000.0f;
+  void setSampleRate(T sr) {
+    sr_ = sr > T(0.0) ? sr : T(48000.0);
     for (int i = 0; i < kMaxSections; ++i) sections_[i].setSampleRate(sr_);
     onePole_.setSampleRate(sr_);
   }
@@ -327,13 +441,13 @@ public:
 
   /** Maximally flat lowpass. Returns false, and leaves the filter as it was,
    *  if the order does not fit or is not a positive number. */
-  bool designButterworthLowpass(float freq, int order) { return design(freq, order, false); }
+  bool designButterworthLowpass(T freq, int order) { return design(freq, order, false); }
   /** Maximally flat highpass, `freq` its -3 dB point in Hz. Refused, with
    *  false and the filter left as it was, for an order outside 1 ..
    *  MaxOrder or a frequency not between 0 and Nyquist. Like every design
    *  here it keeps the filter's state when the order and kind stay the
    *  same, so it may be called every block with a moving cutoff. */
-  bool designButterworthHighpass(float freq, int order) { return design(freq, order, true); }
+  bool designButterworthHighpass(T freq, int order) { return design(freq, order, true); }
 
   /**
    * Chebyshev Type I: steeper than Butterworth of the same order, at the cost
@@ -345,13 +459,13 @@ public:
    * caller swapping one for the other and expecting -3 dB at the same
    * frequency will find the corner has moved.
    */
-  bool designChebyshevLowpass(float freq, int order, float rippleDb) {
+  bool designChebyshevLowpass(T freq, int order, T rippleDb) {
     return designChebyshev(freq, order, rippleDb, false);
   }
   /** Type I highpass: `freq` is the passband edge, where the response is
    *  -rippleDb, and the ripple must be above 0 dB. Refused as the lowpass
    *  is. */
-  bool designChebyshevHighpass(float freq, int order, float rippleDb) {
+  bool designChebyshevHighpass(T freq, int order, T rippleDb) {
     return designChebyshev(freq, order, rippleDb, true);
   }
 
@@ -368,20 +482,70 @@ public:
    * what it THROWS AWAY. For an anti-alias filter that makes Type II close to
    * free -- the stopband is discarded, so ripple there costs nothing.
    */
-  bool designChebyshev2Lowpass(float freq, int order, float stopbandDb) {
+  bool designChebyshev2Lowpass(T freq, int order, T stopbandDb) {
     return designChebyshev2(freq, order, stopbandDb, false);
   }
   /** Type II highpass: `freq` is the stopband edge, below which the
    *  rejection is at least `stopbandDb` (above 0). Refused, with false and
    *  the filter unchanged, for an order outside 1 .. MaxOrder or a
    *  frequency not between 0 and Nyquist. */
-  bool designChebyshev2Highpass(float freq, int order, float stopbandDb) {
+  bool designChebyshev2Highpass(T freq, int order, T stopbandDb) {
     return designChebyshev2(freq, order, stopbandDb, true);
+  }
+
+  /**
+   * Elliptic (Cauer): equiripple in BOTH bands -- `rippleDb` of passband
+   * ripple, at least `stopbandDb` of rejection -- and the narrowest
+   * transition any filter of this order can have.
+   *
+   * `freq` is the PASSBAND EDGE, as for Chebyshev Type I: the response there
+   * is -rippleDb, and the stopband starts at the edge the order and the two
+   * figures decide (designLowpassToSpec() works the order out from a stopband
+   * edge instead). Refused, with false and the filter unchanged, for an order
+   * outside 1 .. MaxOrder, a frequency not between 0 and Nyquist, a ripple
+   * not above 0, or a rejection not above the ripple.
+   */
+  bool designEllipticLowpass(T freq, int order, T rippleDb, T stopbandDb) {
+    return designElliptic(freq, order, rippleDb, stopbandDb, false);
+  }
+  /** The elliptic highpass: `freq` is the passband edge, above which the
+   *  ripple is at most `rippleDb`; below the stopband edge the rejection is
+   *  at least `stopbandDb`. Refused as the lowpass is. */
+  bool designEllipticHighpass(T freq, int order, T rippleDb, T stopbandDb) {
+    return designElliptic(freq, order, rippleDb, stopbandDb, true);
+  }
+
+  /**
+   * The lowest-order filter of `family` that meets a specification, designed.
+   *
+   * What a caller knows is the job -- "flat to within 0.1 dB up to 18 kHz,
+   * at least 80 dB down from 20 kHz" -- not an order, and these turn the job
+   * into one: iirOrderFor() picks the order, and the design puts the edge the
+   * family is defined by exactly where it was asked for (the passband edge
+   * for Chebyshev I and elliptic, the stopband edge for Chebyshev II, and for
+   * Butterworth the -3 dB point that puts the passband edge at -rippleDb).
+   *
+   * A LOWPASS: `passEdgeHz` below `stopEdgeHz`. Returns the order designed,
+   * or 0 -- with the filter unchanged -- when the request is impossible or
+   * needs more than MaxOrder: refused rather than delivered shallower,
+   * because a caller who asked for -80 dB and got -50 would ship the -50.
+   */
+  int designLowpassToSpec(IirFamily family, T passEdgeHz, T stopEdgeHz, T rippleDb,
+                          T stopbandDb) {
+    if (!(passEdgeHz < stopEdgeHz)) return 0;
+    return designToSpec(family, passEdgeHz, stopEdgeHz, rippleDb, stopbandDb, false);
+  }
+  /** The highpass form: `passEdgeHz` ABOVE `stopEdgeHz`. Returns the order,
+   *  or 0 with the filter unchanged, as designLowpassToSpec(). */
+  int designHighpassToSpec(IirFamily family, T passEdgeHz, T stopEdgeHz, T rippleDb,
+                           T stopbandDb) {
+    if (!(passEdgeHz > stopEdgeHz)) return 0;
+    return designToSpec(family, passEdgeHz, stopEdgeHz, rippleDb, stopbandDb, true);
   }
 
   /** [audio-thread] One sample through the cascade. Before the first
    *  design it passes the input through. No allocation. */
-  inline float process(float x) {
+  inline T process(T x) {
     if (hasOnePole_) x = onePole_.process(x);
     for (int i = 0; i < biquads_; ++i) x = sections_[i].process(x);
     return x * gain_;
@@ -389,21 +553,117 @@ public:
 
   /** The whole cascade's gain at a frequency, in dB: the sections' responses
    *  add, because they are in series and dB is a logarithm. */
-  float magnitudeDb(float freq) const {
-    float sum = gain_ > 0.0f ? 20.0f * std::log10(gain_) : -300.0f;
+  T magnitudeDb(T freq) const {
+    T sum = gain_ > T(0.0) ? T(20.0) * std::log10(gain_) : -T(300.0);
     if (hasOnePole_) sum += onePole_.magnitudeDb(freq);
     for (int i = 0; i < biquads_; ++i) sum += sections_[i].magnitudeDb(freq);
     return sum;
   }
 
 private:
-  bool designChebyshev2(float freq, int order, float stopbandDb, bool highpass) {
-    if (order < 1 || order > MaxOrder || !(stopbandDb > 0.0f)) return false;
-    const float nyquist = sr_ * 0.5f;
-    if (!(freq > 0.0f) || freq >= nyquist) return false;
+  int designToSpec(IirFamily family, T passEdgeHz, T stopEdgeHz, T rippleDb,
+                   T stopbandDb, bool highpass) {
+    const int order = iirOrderFor(family, (double) passEdgeHz, (double) stopEdgeHz, (double) sr_,
+                                  (double) rippleDb, (double) stopbandDb);
+    if (order < 1 || order > MaxOrder) return 0;
+    bool ok = false;
+    switch (family) {
+      case IirFamily::Butterworth: {
+        // The -3 dB point that puts the passband edge at exactly -rippleDb:
+        // |H|^2 = 1 / (1 + (W / W0)^2N) is eps_p^2 down at the edge when
+        // W0 = Wp eps_p^(-1/N) (and Wp eps_p^(1/N) for the highpass, whose
+        // prototype runs the other way).
+        const double pi = 3.14159265358979323846;
+        const double wp = std::tan(pi * (double) passEdgeHz / (double) sr_);
+        const double ep = iirEpsilon((double) rippleDb);
+        const double w0 = highpass ? wp * std::pow(ep, 1.0 / (double) order)
+                                   : wp * std::pow(ep, -1.0 / (double) order);
+        const T f0 = (T) (std::atan(w0) * (double) sr_ / pi);
+        ok = design(f0, order, highpass);
+        break;
+      }
+      case IirFamily::Chebyshev1:
+        ok = designChebyshev(passEdgeHz, order, rippleDb, highpass);
+        break;
+      case IirFamily::Chebyshev2:
+        ok = designChebyshev2(stopEdgeHz, order, stopbandDb, highpass);
+        break;
+      case IirFamily::Elliptic:
+        ok = designElliptic(passEdgeHz, order, rippleDb, stopbandDb, highpass);
+        break;
+    }
+    return ok ? order : 0;
+  }
+
+  bool designElliptic(T freq, int order, T rippleDb, T stopbandDb, bool highpass) {
+    if (order < 1 || order > MaxOrder) return false;
+    if (!(rippleDb > T(0.0)) || !(stopbandDb > rippleDb)) return false;
+    const T nyquist = sr_ * T(0.5);
+    if (!(freq > T(0.0)) || freq >= nyquist) return false;
+
+    const double ep = iirEpsilon((double) rippleDb);
+    const double k1 = ep / iirEpsilon((double) stopbandDb);
+    const double k = ellipticDegree(order, k1);
+    if (!(k > 0.0) || !(k < 1.0)) return false;
+    // v0 from the passband ripple: asne of an imaginary argument is
+    // imaginary, and -j times it is the real number the poles are offset by.
+    const double v0 = special::asne(std::complex<double>(0.0, 1.0 / ep), k1).imag() / (double) order;
+
+    shape(order, highpass ? 7 : 6);
+
+    for (int i = 0; i < biquads_; ++i) {
+      const double u = (double) (2 * i + 1) / (double) order;
+      // Zero on the imaginary axis at 1 / (k cd(u K, k)): beyond the stopband
+      // edge 1/k, as a notch of the stopband should be.
+      const double zeta = special::cde(std::complex<double>(u, 0.0), k).real();
+      const double wz = 1.0 / (k * zeta);
+      // Pole at j cd((u - j v0) K, k). Left half-plane by construction; the
+      // magnitude of the real part is taken so a rounding at the axis cannot
+      // put it on the wrong side.
+      const std::complex<double> pole =
+          std::complex<double>(0.0, 1.0) * special::cde(std::complex<double>(u, -v0), k);
+      const double pr = -std::fabs(pole.real());
+      const double pm2 = pole.real() * pole.real() + pole.imag() * pole.imag();
+
+      // (S^2 + wz^2) / (S^2 - 2 pr S + |p|^2), unity at DC; the highpass by
+      // S -> 1/S, which reverses each polynomial, and is then unity at
+      // Nyquist, where its passband is.
+      double b2 = 1.0, b1 = 0.0, b0 = wz * wz;
+      double a2 = 1.0, a1 = -2.0 * pr, a0 = pm2;
+      const double scale = pm2 / (wz * wz);
+      b2 *= scale;
+      b0 *= scale;
+      if (highpass) {
+        std::swap(b2, b0);
+        std::swap(a2, a0);
+      }
+      bilinearSection(b2, b1, b0, a2, a1, a0, (double) freq, (double) sr_, sections_[i]);
+    }
+
+    if (hasOnePole_) {
+      // The odd order's real pole, j sn(j v0 K, k): sn of an imaginary
+      // argument is imaginary, so the pole is real, and negative.
+      const std::complex<double> s0 = special::sne(std::complex<double>(0.0, v0), k);
+      const double sigma = std::fabs(s0.imag());
+      if (highpass)
+        bilinearFirstOrder(1.0, 0.0, 1.0, 1.0 / sigma, (double) freq, (double) sr_, onePole_);
+      else
+        bilinearFirstOrder(0.0, sigma, 1.0, sigma, (double) freq, (double) sr_, onePole_);
+    }
+
+    // As Chebyshev I: an even order starts its passband at -rippleDb and
+    // ripples UP to 0, an odd order starts at 0.
+    gain_ = (order % 2 == 0) ? (T) (1.0 / std::sqrt(1.0 + ep * ep)) : T(1.0);
+    return true;
+  }
+
+  bool designChebyshev2(T freq, int order, T stopbandDb, bool highpass) {
+    if (order < 1 || order > MaxOrder || !(stopbandDb > T(0.0))) return false;
+    const T nyquist = sr_ * T(0.5);
+    if (!(freq > T(0.0)) || freq >= nyquist) return false;
 
     shape(order, highpass ? 5 : 4);
-    gain_ = 1.0f;
+    gain_ = T(1.0);
 
     for (int i = 0; i < biquads_; ++i) {
       const Chebyshev2Section section = chebyshev2SectionFor(order, i, (double) stopbandDb);
@@ -462,10 +722,10 @@ private:
     return true;
   }
 
-  bool designChebyshev(float freq, int order, float rippleDb, bool highpass) {
-    if (order < 1 || order > MaxOrder || !(rippleDb > 0.0f)) return false;
-    const float nyquist = sr_ * 0.5f;
-    if (!(freq > 0.0f) || freq >= nyquist) return false;
+  bool designChebyshev(T freq, int order, T rippleDb, bool highpass) {
+    if (order < 1 || order > MaxOrder || !(rippleDb > T(0.0))) return false;
+    const T nyquist = sr_ * T(0.5);
+    if (!(freq > T(0.0)) || freq >= nyquist) return false;
 
     const double eps = chebyshevEpsilon((double) rippleDb);
     const double v0 =
@@ -511,14 +771,14 @@ private:
     // order is supposed to START at -rippleDb and ripple UP to 0. Without
     // this the whole passband sits `rippleDb` too high and the filter is
     // quietly louder than it was asked to be.
-    gain_ = (order % 2 == 0) ? (float) (1.0 / std::sqrt(1.0 + eps * eps)) : 1.0f;
+    gain_ = (order % 2 == 0) ? (T) (1.0 / std::sqrt(1.0 + eps * eps)) : T(1.0);
     return true;
   }
 
-  bool design(float freq, int order, bool highpass) {
+  bool design(T freq, int order, bool highpass) {
     if (order < 1 || order > MaxOrder) return false;
-    const float nyquist = sr_ * 0.5f;
-    if (!(freq > 0.0f) || freq >= nyquist) return false;
+    const T nyquist = sr_ * T(0.5);
+    if (!(freq > T(0.0)) || freq >= nyquist) return false;
 
     shape(order, highpass ? 1 : 0);
 
@@ -535,7 +795,7 @@ private:
         bilinearSection(0.0, 0.0, 1.0, 1.0, damping, 1.0, (double) freq, (double) sr_, sections_[i]);
     }
 
-    gain_ = 1.0f;
+    gain_ = T(1.0);
     if (hasOnePole_) {
       // A real pole, by the bilinear transform. Expressed through the biquad
       // with its second-order terms at zero, because that is genuinely what a
@@ -569,12 +829,12 @@ private:
 
   IirSection sections_[kMaxSections];
   IirSection onePole_;
-  float sr_ = 48000.0f;
+  T sr_ = T(48000.0);
   /** An overall trim, needed only by even-order Chebyshev. One for everything
    *  else, which costs a multiply nobody will measure. */
-  float gain_ = 1.0f;
+  T gain_ = T(1.0);
   int order_ = 0, biquads_ = 0;
-  int kind_ = -1; // Butterworth / Chebyshev I / II, low or high: see shape()
+  int kind_ = -1; // Butterworth / Chebyshev I / II / elliptic, low or high: see shape()
   bool hasOnePole_ = false;
 };
 
@@ -596,7 +856,7 @@ private:
  * construction is two identical halves, and half of an odd number is not a
  * filter order.
  */
-template <int MaxOrder = 8>
+template <int MaxOrder = 8, typename T = float>
 class LinkwitzRileyN {
 public:
   /** The highest order of each Butterworth half: MaxOrder / 2. */
@@ -605,7 +865,7 @@ public:
   /** The rate in Hz for all four cascades (0 or less means 48 kHz). Set it
    *  before setCrossover(), which designs for the rate set at the time; a
    *  later rate change needs setCrossover() again. */
-  void setSampleRate(float sr) {
+  void setSampleRate(T sr) {
     lowA_.setSampleRate(sr);
     lowB_.setSampleRate(sr);
     highA_.setSampleRate(sr);
@@ -613,7 +873,7 @@ public:
   }
 
   /** `order` is the LINKWITZ-RILEY order: 4 means 24 dB/octave. */
-  bool setCrossover(float freq, int order) {
+  bool setCrossover(T freq, int order) {
     if (order < 2 || (order & 1) != 0 || order > MaxOrder) return false;
     const int half = order / 2;
     // TWICE, which is the definition and not an optimisation to skip. A
@@ -654,14 +914,14 @@ public:
   /** [audio-thread] One sample into the low and the high band, whose sum is
    *  flat in level at every frequency. Before a setCrossover() both are the
    *  input unchanged. No allocation. */
-  void process(float x, float& lowOut, float& highOut) {
+  void process(T x, T& lowOut, T& highOut) {
     lowOut = lowB_.process(lowA_.process(x));
     highOut = highB_.process(highA_.process(x));
     if (invertHigh_) highOut = -highOut;
   }
 
 private:
-  CascadedIir<kHalfMax> lowA_, lowB_, highA_, highB_;
+  CascadedIir<kHalfMax, T> lowA_, lowB_, highA_, highB_;
   int order_ = 0;
   bool invertHigh_ = false;
 };

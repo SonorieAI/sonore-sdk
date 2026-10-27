@@ -17,7 +17,7 @@
 
 enable_testing()
 
-set(_sonore_area_tests dsp_maths midi_osc core_crypto audio_io core_data gui_widgets audio_sources
+set(_sonore_area_tests dsp_maths dsp_options filter_design simd_types fft convolution precision midi_osc core_crypto audio_io core_data gui_widgets audio_sources
     gui_infra system modules javascript app_infra)
 
 set(SONORE_IOS_BUILD FALSE)
@@ -69,6 +69,8 @@ foreach(_area ${_sonore_area_tests})
   target_link_libraries(${_area}_test PRIVATE sonore_sdk Threads::Threads)
   add_test(NAME ${_area} COMMAND ${_area}_test)
 endforeach()
+
+target_compile_definitions(dsp_options_test PRIVATE SONORE_TEST_DATA_DIR="${_sonore_data}")
 
 add_executable(images_test tests/images_test.cpp)
 target_link_libraries(images_test PRIVATE sonore_sdk Threads::Threads)

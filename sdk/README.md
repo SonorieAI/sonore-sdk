@@ -61,10 +61,13 @@ sdk/
     dsp.h             the toolkit's entry point (pulls in everything indented below)
       effects.h       reverb, chorus, phaser, limiter, gate, crossover, panner
       transport.h     tempo, bar position, note lengths, tempo-synced LFO
-      fft.h           FFT, windows, spectrum analyser, partitioned convolution
-      resample.h      oversampling (FIR + minimum-phase IIR), rate conversion
+      fft.h           FFT (compile-time and run-time sized, real transforms, opt-in vDSP),
+                      windows, spectrum analyser, a compact partitioned convolver
+      resample.h      oversampling (FIR + minimum-phase IIR; factor fixed or chosen at
+                      run time), rate conversion
       shaping.h       waveshaper, lookup table, ballistics, processor chain
-      fir.h           FIR design to a spec (windowed sinc)
+      fir.h           FIR design: windowed sinc to a spec, least squares, equiripple
+                      (Parks-McClellan), equiripple half-band
       metering.h      BS.1770 K-weighting, LUFS (M/S/I) + LRA, true peak, correlation
       dynamics.h      expander, upward compressor, transient shaper, de-esser
       lofi.h          bit crusher, decimator, wavefolder, Oversampled<> wrapper
@@ -99,9 +102,13 @@ sdk/
       limiting.h      true-peak limiter: BS.1770-4 4x detection, dBTP ceiling
       plate.h         the Dattorro 1997 plate, paper-exact delays and taps
       screamer.h      the TS-808 drive stage as its netlist (op-amp + diode pair)
-    filter_design.h   Butterworth / Chebyshev cascades to an order
+    filter_design.h   Butterworth / Chebyshev I and II / elliptic cascades, to an order or a spec
+    convolution.h     convolution of any length at zero latency, impulses loaded off the
+                      audio thread and crossfaded in
     random.h          white, pink, velvet noise, dither
-    simd.h            SSE2 / NEON / wasm-simd128 / scalar, 4 floats at a time
+    simd.h            SSE2 / NEON / wasm-simd128 / scalar: 4 floats, and 8 floats (AVX),
+                      doubles, int8/16/32/64 lanes (signed and unsigned), complex
+                      lanes, the same bits on every backend
     plugin.h          ParamInfo, PluginDescriptor, value formatting/parsing
     presets.h         factory presets, compiled in rather than files on disk
     gui.h             the window.sonore bridge, meters + VU, UI event queue
@@ -357,7 +364,7 @@ non-const `latencySamples()`, `tailSamples()`, `saveState()` or
 | `int voiceCapacity() const` | a CLAP host learns the polyphony (voice-info), for voice stacking and MPE allocation |
 | `process(AudioBlock<float>& io, AudioBlock<float>& sidechain, const float* p)` | a second, key input bus |
 | `process(sonore::ProcessContext& ctx, const float* p)` | everything at once: MIDI in and out, aux outputs, MPE expression, offline flag |
-| `process(AudioBlock<double>& io, const float* p)` | 64-bit processing where the host offers it |
+| `process(AudioBlock<double>& io, const float* p)` | 64-bit processing where the host offers it; the toolkit's processors have double forms (`BiquadT<double>`, `DelayLine<N, double>`, `Oversampler<2, 33, double>`, ...) for a DSP written as a template |
 
 **What runs where.** `process()` and `reset()` run on the audio thread:
 nothing there may allocate, lock or touch a file. `prepare()` is where

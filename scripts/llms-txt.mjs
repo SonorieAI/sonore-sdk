@@ -76,6 +76,14 @@ function publicTypes(text) {
       const inDetail = namespaces.some((n) => /detail$/i.test(n));
       if (!inDetail) names.push(decl[2]);
     }
+    // A name given to a class template listed above -- a processor's float
+    // form, `using Biquad = BiquadT<float>;`, or a lane type, `using Vec8i16 =
+    // VecIntT<int16_t>;` -- is the name a plugin writes, so it is listed beside
+    // the template rather than vanishing from a list that says "not here means
+    // not in the SDK".
+    const alias = line.match(/^\s*using\s+([A-Z]\w*)\s*=\s*([A-Z]\w*)\s*</);
+    if (alias && depth === 0 && names.includes(alias[2]) && !namespaces.some((n) => /detail$/i.test(n)))
+      names.push(alias[1]);
     for (const ch of line) {
       if (ch === "{") depth++;
       else if (ch === "}") { if (depth > 0) depth--; else namespaces.pop(); }
@@ -265,8 +273,9 @@ function llmsFullTxt(headers) {
 
 If a class or struct is not in this list, the SDK does not have it. Reaching for
 a class that sounds like it should exist is the most common way generated code
-fails to compile against this library. Functions, aliases and methods are not
-listed here (dbToGain is a function, ProcessContext an alias): look for those in
+fails to compile against this library. The names given to a listed class template
+are listed beside it (Biquad beside BiquadT, Vec8i16 beside VecIntT); functions,
+methods and other aliases are not (dbToGain is a function): look for those in
 the header itself, or ask the MCP server's \`sonore_search\`, which covers them.
 
 ${body}
@@ -379,9 +388,9 @@ method you have not seen in this SDK:
   the rules below.
 - **Without it**, read \`llms-full.txt\` at the SDK root for the classes and
   structs: every one in every header (${headers.length} headers, ${typeCount}
-  types), so a class that is not in it does not exist. Functions, aliases and
-  methods are not listed there; search the headers for those before deciding
-  one is missing.
+  types), so a class that is not in it does not exist. Functions, methods and
+  aliases of anything but a listed class are not listed there; search the
+  headers for those before deciding one is missing.
 
 ## Start from a generated project
 

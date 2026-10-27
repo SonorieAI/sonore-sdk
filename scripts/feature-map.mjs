@@ -225,31 +225,163 @@ const MAP = [
   ["dsp", "BallisticsFilter", "BallisticsFilter", "class BallisticsFilter"],
   ["dsp", "Chorus", "Chorus", "class Chorus"],
   ["dsp", "Compressor", "Compressor", "class Compressor"],
-  ["dsp", "Convolution", "partitioned convolver, over an ImpulseResponse loaded from a " +
-   "file -- the IR is a separate type because loading one is a disk read and convolving " +
-   "with it is not", "class Convolver"],
+  ["dsp", "Convolution", "convolution.h: Convolution, over an ImpulseResponse -- any length, " +
+   "sized when it is loaded; ZERO latency (the first head block a direct FIR, sample by " +
+   "sample) or one head block of it; non-uniformly partitioned after Gardner (JAES 1995), two " +
+   "partitions a size doubling from the head block to maxBlock, every size on DynamicFft's real " +
+   "transforms. A long block's multiply-accumulate is SPREAD over the block it is for, a slice " +
+   "at each head-block boundary: a 4-second impulse's 22 tail partitions arrive at most 2 at a " +
+   "time, not all at once. Measured against convolution computed in double by an FFT that " +
+   "shares no code with the SDK: within 5e-7 of the peak for impulses of 1 to 200000 samples, " +
+   "host blocks of any size, both latency modes, stereo and mono-on-stereo. fft.h's " +
+   "compile-time Convolver stays, for a cabinet. RUN on Windows (MSVC), and Linux under " +
+   "ASan, UBSan and TSan", "class Convolution {"],
+  ["dsp", "Convolution: loading on a background thread, crossfaded", "convolution.h: an Engine " +
+   "is everything built from one impulse; loadImpulseResponse() builds it on the calling " +
+   "thread, loadImpulseResponseAsync() on a background one (where threads exist; wasm without " +
+   "pthreads builds in place), and either hands it to the audio thread through ONE atomic " +
+   "pointer. The audio thread crossfades to it over ConvolutionOptions::crossfadeSeconds " +
+   "(raised cosine, equal gain) and retires the old one through a lock-free queue that a " +
+   "non-audio thread empties: nothing on the audio thread allocates, locks or frees -- measured, " +
+   "zero allocations over 4000 blocks that picked up, faded and retired an engine. An inverting " +
+   "impulse swapped in mid-sine moves the output by at most the sine's own slope (0.0072 a " +
+   "sample); cut over, 0.965. Twelve loads, sync and async, under a running audio thread: no " +
+   "stall, no NaN, the last one exactly what plays. prepare() at a new rate rebuilds the held " +
+   "impulse at that rate", "loadImpulseResponseAsync"],
+  ["dsp", "ConvolutionEngine / ConvolutionOptions", "convolution.h: ConvolutionEngine, the " +
+   "built form a Convolution swaps (usable alone where a plugin manages its own handover), and " +
+   "ConvolutionOptions -- head block, largest block, zero latency, crossfade time -- read when " +
+   "an impulse is loaded", "class ConvolutionEngine"],
   ["dsp", "Convolution::loadImpulseResponse", "impulse.h: ImpulseResponse, which owns the " +
    "samples and their normalisation. Normalised on LOAD rather than per block, because an " +
    "IR that changed the output level when it was swapped would make every comparison " +
    "between two of them a comparison of their gains", "class ImpulseResponse"],
   ["dsp", "DelayLine", "DelayLine", "class DelayLine"],
-  ["dsp", "DryWetMixer", "DryWetMixer", "class DryWetMixer"],
-  ["dsp", "FFT", "Fft", "class Fft"],
-  ["dsp", "FIR::Filter + FilterDesign", "fir.h", "designLowpassToSpec"],
-  ["dsp", "IIR coefficient design", "filter_design.h", "class CascadedIir"],
-  ["dsp", "LadderFilter", "LadderFilter", "class LadderFilter"],
+  ["dsp", "DryWetMixer", "dsp.h: DryWetMixer, equal power by default and any of PanLaw's seven " +
+   "curves through setLaw() -- linear, balanced, sine at -3/-4.5/-6 dB, square root at -3/-4.5 " +
+   "dB, the reference's DryWetMixingRule set -- a change of law gliding like a change of mix. " +
+   "Adding the laws found the glide STALLING in float about 3e-5 short of a gain of 1, so a mix " +
+   "automated back to 0 % never gave back exactly the dry signal; it lands now, and dsp_options " +
+   "holds it to the bit", "class DryWetMixer"],
+  ["dsp", "FFT", "fft.h: Fft<Size>, compile-time sized, and DynamicFft, sized at run time " +
+   "(setSize() allocates, transforms do not), one radix-2 kernel for both -- the same bits for " +
+   "the same size. Measured against the reference's own portable FFT (its transform wherever it " +
+   "has no vendor library: Windows and Linux), MSVC release, same machine: 1024 complex points " +
+   "1.8 us against 6.0, 4096 8.1 against 26.2, 8192 18.6 against 70.3", "class DynamicFft"],
+  ["dsp", "FFT::performRealOnlyForwardTransform / Inverse", "fft.h: realForward and " +
+   "realInverse on both FFTs -- n real samples through ONE complex transform of n/2 and a " +
+   "twiddle pass, packed into bit-reversed order as it is read and the pass four pairs to a " +
+   "vector, so the same bits as the scalar build. 1024 real points 1.03 us; the reference's " +
+   "real-only transform is a full complex one, 6.07. Held to the DFT's definition in double, " +
+   "4 to 8192 points, relative L2 error 3e-7 at the largest", "inline void realForward"],
+  ["dsp", "FFT vendor backend (vDSP on Apple)", "fft.h: SONORE_FFT_ACCELERATE puts " +
+   "DynamicFft's complex transforms on vDSP and keeps the real packing above it. OPT-IN, and " +
+   "why is the point: vDSP is faster on a Mac and is NOT bit-identical to the portable " +
+   "transform, so a plugin built with it no longer matches its browser preview to the bit. " +
+   "The glue (half-size transforms, scaling, packing) RUN on Windows against a stand-in written " +
+   "from Apple's documented semantics; the real vDSP path is built and run by the macOS ctest " +
+   "fft_accelerate, which holds it to the DFT's definition. IPP and FFTW are not wired: the " +
+   "portable transform is already ahead of the reference's own on those platforms, FFTW is " +
+   "GPL, and neither can be run here", "SONORE_FFT_ACCELERATE"],
+  ["dsp", "FIR::Filter + FilterDesign", "fir.h: FirFilter -- windowed sinc to a spec " +
+   "(designLowpassToSpec, Kaiser), and the two OPTIMAL designs over FirBand edges: weighted " +
+   "least squares (designLeastSquares: the normal equations in closed form, Cholesky; " +
+   "scipy.signal.firls's kernel to 1e-7) and equiripple (designEquiripple: Parks-McClellan, " +
+   "the barycentric weights in logarithms, the original program's single exchange, all r + 1 " +
+   "points interpolated). Every one certified optimal by the alternation theorem, counted on the " +
+   "taps; no worse than scipy.signal.remez on its own designs; converges from 101 to 4095 taps " +
+   "at 60, 90 and 120 dB, three of which scipy refuses. designEquirippleLowpassToSpec finds the " +
+   "shortest kernel that meets a spec, checked on a grid eight times the design's: 0.1 dB to " +
+   "18 kHz and 80 dB from 20 kHz in 81 taps, where the Kaiser window needs 125",
+   "designLowpassToSpec"],
+  ["dsp", "FilterDesign::designFIRLowpassHalfBandEquirippleMethod", "fir.h: designHalfBand / " +
+   "designHalfBandToSpec -- the Vaidyanathan-Nguyen construction (a Type II equiripple of half " +
+   "the length, spread onto the even taps, 1/2 at the centre): exactly half-band, every other " +
+   "tap zero, A(f) + A(fs/2 - f) = 1 to 1e-6. 100 dB across 2.4 kHz in 123 taps, measured " +
+   "101.5", "designHalfBand"],
+  ["dsp", "IIR coefficient design", "filter_design.h: CascadedIir -- Butterworth, Chebyshev " +
+   "I and II, and ELLIPTIC (designEllipticLowpass/Highpass: Orfanidis's construction on " +
+   "special.h's Jacobi functions, the degree equation solved through the nome), in double " +
+   "sections. scipy.signal.ellip's response at 19 frequencies for five designs, orders 3 to 8, " +
+   "to a thousandth of a dB", "class CascadedIir"],
+  ["dsp", "FilterDesign::designIIRLowpassHighOrder*Method (order from a spec)", "filter_design.h: " +
+   "iirOrderFor and CascadedIir::designLowpassToSpec / designHighpassToSpec for every IirFamily: " +
+   "the lowest order meeting a passband edge, a stopband edge, a ripple and a rejection, on the " +
+   "prewarped frequencies, then the design that puts the family's defining edge exactly there. " +
+   "scipy's buttord, cheb1ord, cheb2ord and ellipord orders for five specifications, all twenty; " +
+   "every family measured to meet the spec, low- and highpass; past MaxOrder refused, never " +
+   "delivered shallower", "inline int iirOrderFor"],
+  ["dsp", "LadderFilter", "dsp.h: LadderFilter, the Moog ladder solved zero-delay, with " +
+   "LadderMode's six outputs from the same four stages: lowpass, highpass and bandpass at 12 and " +
+   "24 dB (the reference's LPF12..BPF24), the highpasses and bandpasses being binomial mixes of " +
+   "the stage outputs, so every mode resonates through the same loop and self-oscillates past " +
+   "k = 4. Each mode held to its transfer function, gain AND phase, to 1e-4 in float and 1e-12 " +
+   "in double, at no resonance and at half", "enum class LadderMode"],
   ["dsp", "LinkwitzRileyFilter", "LinkwitzRileyN", "class LinkwitzRileyN"],
   ["dsp", "LookupTable", "LookupTable", "class LookupTable"],
   ["dsp", "NoiseGate", "NoiseGate", "class NoiseGate"],
   ["dsp", "Oscillator", "Oscillator", "class Oscillator"],
-  ["dsp", "Oversampling", "OversamplerT", "class OversamplerT"],
-  ["dsp", "Panner", "Panner", "class Panner"],
+  ["dsp", "Oversampling", "resample.h: Oversampler and OversamplerIir with the factor fixed when " +
+   "compiled (OversamplerT), and DynamicOversampler and DynamicOversamplerIir with it chosen at " +
+   "run time (DynamicOversamplerT: setFactor() takes 1, 2, 4 .. up to 32x and refuses anything " +
+   "else, latencySamples() follows). At every factor the runtime one computes the fixed one's " +
+   "bits, per sample and per block, float and double", "class DynamicOversamplerT"],
+  ["dsp", "Panner", "effects.h: Panner, constant power by default and any of PanLaw's seven laws " +
+   "through setLaw() -- linear, balanced, sine at -3/-4.5/-6 dB, square root at -3/-4.5 dB, the " +
+   "reference's PanningRule set. Each law held to the arithmetic that defines it: the centre " +
+   "level, a^2 + b^2 = 1 or a + b = 1 where the law promises it, monotonic, finite at both ends; " +
+   "the default still the cos/sin it always computed, to the bit", "enum class PanLaw"],
   ["dsp", "Phaser", "Phaser", "class Phaser"],
   ["dsp", "StateVariableTPTFilter", "SVF", "class SVF"],
   ["dsp", "WaveShaper", "softClip / tanhClip / hardClip", "inline float softClip"],
-  ["dsp", "WindowingFunction", "fft.h windows", "BlackmanHarris"],
+  ["dsp", "WindowingFunction", "fft.h windows: rectangular, triangular, Hann, Hamming, " +
+   "Blackman, Blackman-Harris, flat-top and Kaiser with its beta (special::kaiser, whose ends " +
+   "were 0 rather than 1/I0(beta) -- every Kaiser-windowed FIR had its two end taps cut -- and " +
+   "are now right: beta 0 is the rectangle)", "BlackmanHarris"],
   ["dsp", "SIMDRegister", "simd.h -- Vec4f, four floats wide on SSE and NEON and a plain " +
    "struct everywhere else, so the same DSP source compiles for wasm", "class Vec4f"],
+  ["dsp", "SIMDRegister (AVX, double and integer lanes)", "simd.h: Vec8f (one AVX register " +
+   "where -mavx or /arch:AVX is given, two 128-bit ones elsewhere), Vec2d and Vec4d (double: " +
+   "SSE2, AArch64 NEON, wasm f64x2), Vec4i (int32, wrapping, shifts modulo 32 on every unit), " +
+   "Vec4Of/Vec4<T> for a template over its sample type, and on Vec4f divide, sqrt, compares, " +
+   "select, reversed, interleave and deinterleave. The same BITS on every backend by " +
+   "construction: lane by lane IEEE, and sum() in one order for every width -- held by " +
+   "simd_types (every operation against scalar arithmetic) and simd_identity, which now hashes " +
+   "an AVX build too: SSE2, AVX, scalar, wasm-simd128 and wasm-scalar agree. It found the " +
+   "scalar Vec4f::abs leaving -0.0 negative where every vector unit clears the sign. NEON " +
+   "compiled for arm64 and armv7 with the NDK; run by the macOS and Android ctest", "class Vec8f"],
+  ["dsp", "SIMDRegister (int8, int16, int64 and unsigned lanes)", "simd.h: VecIntT -- Vec16i8, " +
+   "Vec8i16 and Vec2i64 beside Vec4i, every integer width a 128-bit register holds. Unsigned is " +
+   "the same register read differently, so the operations that differ come in both forms " +
+   "(lessThanUnsigned, minUnsigned, maxUnsigned, shiftRightLogical, and on Vec4i too); the narrow " +
+   "lanes have saturating + and -, signed and unsigned, which mixing PCM wants; widen() and " +
+   "narrowSaturate() move between int8, int16 and int32 (16-bit PCM to float, exactly), " +
+   "widenLow/widenHigh to int64 and toDouble() back. What a unit lacks is built from what it has, " +
+   "to the same bits: SSE2's 8-bit multiply and shifts, its 64-bit multiply, arithmetic right " +
+   "shift and compare, NEON's 64-bit multiply, wasm's 8-bit multiply. Every operation against " +
+   "the scalar formula in simd_types on each unit, and one chained hash agreeing on SSE2, AVX, " +
+   "scalar, wasm-simd128 and wasm-scalar", "class VecIntT"],
+  ["dsp", "SIMDRegister (complex lanes)", "simd.h: ComplexVec4T -- Vec4cf and Vec4cd, four " +
+   "std::complex<float> or <double> in split form (the real parts in one register, the imaginary " +
+   "in another, vDSP's DSPSplitComplex layout), so a complex multiply is four multiplies and two " +
+   "adds with nothing to shuffle; load() and store() take an ordinary interleaved array. The " +
+   "product is (ac - bd) + (ad + bc)i in that order on every unit, conj() turns +0 into -0 as " +
+   "std::conj does, and sum() is Vec4f's order", "class ComplexVec4T"],
+  ["dsp", "processors templated on SampleType (float and double)", "dsp.h, effects.h, " +
+   "shaping.h, resample.h, fir.h, filter_design.h: SmoothT, GlideT, LogRampT, OnePoleT, " +
+   "BiquadT, SVFT, LadderFilterT, DcBlockerT, OscillatorT, EnvFollowerT, CompressorT, " +
+   "DryWetMixerT, ChorusT, PhaserT, NoiseGateT, LinkwitzRileyT, StereoWidenerT, PannerT, " +
+   "LookupTableT, WaveShaperT, BallisticsFilterT, GainT, BiasT, LogSmoothT and FirFilterT, " +
+   "each with its old name the float form (using Biquad = BiquadT<float>), and DelayLine, " +
+   "Allpass, Comb, Limiter, HalfBandFilter, PolyphaseIirHalfBand, Oversampler, OversamplerIir, " +
+   "CascadedIir and LinkwitzRileyN with a defaulted sample-type parameter. The float forms are " +
+   "the old code to the BIT -- a hash of 29 processors and their dependents, driven through " +
+   "every method, identical before and after -- and the double forms are double through: " +
+   "std::tanh not the float approximation, a 1e-30 denormal floor. Measured where float fails: a " +
+   "20 Hz lowpass at 192 kHz holds DC at 0.99999999974 (float reads 1.33), a 997 Hz oscillator " +
+   "is 5e-10 cycles off after ten minutes (float 0.28), and 1 + 2^-40 passes a delay line, a " +
+   "FIR and a gain exactly. Every double form explicitly instantiated, member by member",
+   "using Biquad = BiquadT<float>"],
 
   // ── audio_formats ───────────────────────────────────────────────────
   ["formats", "WavAudioFormat", "wav.h", "inline bool writeWav"],
@@ -438,7 +570,9 @@ const MAP = [
   ["dsp", "dsp::LogRampedValue", "LogRamp", "class LogRamp"],
   ["dsp", "dsp::Panner", "Panner", "class Panner"],
   ["dsp", "dsp::LinkwitzRileyFilter", "LinkwitzRiley", "LinkwitzRiley"],
-  ["dsp", "dsp::FirstOrderTPTFilter", "OnePole", "class OnePole"],
+  ["dsp", "dsp::FirstOrderTPTFilter", "dsp.h: OnePole -- lp(), hp() and ap(), the reference's " +
+   "three types: ap() is the first-order allpass, (z^-1 - p) / (1 - p z^-1), measured unity gain " +
+   "everywhere and -90 degrees at the cutoff", "inline T ap(T x)"],
   ["dsp", "dsp::LookupTable", "shaping.h tables", "LookupTable"],
   ["dsp", "dsp::Chorus / flanger", "Chorus (cubic-interpolated)", "class Chorus"],
   ["dsp", "dsp::Phaser", "Phaser", "class Phaser"],
@@ -3849,6 +3983,14 @@ const MAP = [
    "(system_audio_format.h, see the CoreAudioFormat row) puts them behind the " +
    "fixed set, through setAudioFileFallback",
    "readAudioFile"],
+  ["extras", "AudioFormatReader over a MemoryInputStream (BinaryData)",
+   "audiofile.h: every reader has a twin that takes the file's BYTES -- readAudioFile(data, " +
+   "size, &out), and readWav/readAiff/readFlac/readMp3/readOgg likewise -- for audio compiled " +
+   "into the plugin, which cannot go missing the way a file beside it can. The file readers " +
+   "read the file and call the twin, so the two cannot disagree: dsp_options decodes fourteen " +
+   "WAV/AIFF/FLAC/MP3/Ogg fixtures both ways, bit for bit. ImpulseResponse::loadFromFileData() " +
+   "is the convolution's loadImpulseResponse from binary data",
+   "inline bool readAudioFile(const void* fileData"],
   ["extras", "CoreAudioFormat / WindowsMediaAudioFormat",
    "system_audio_format.h: WindowsMediaAudioFormat decodes through Media " +
    "Foundation -- a source reader over a FILE byte stream (MFCreateFile, so an " +
@@ -3932,11 +4074,14 @@ const MAP = [
    "callback IS the DSP call",
    "class AudioSourcePlayer"],
   ["dsp", "FastMathApproximations",
-   "fast_math.h: fastTanh, fastExp, fastSin, fastCos and fastLog, each with " +
-   "its measured worst-case error stated in the header rather than described " +
-   "as \"fast\". That matters more here than the speed does -- a saturator " +
+   "fast_math.h: fastTanh, fastExp, fastSin, fastCos, fastTan, fastSinh, fastCosh and " +
+   "fastLog, each with its measured worst-case error stated in the header rather than " +
+   "described as \"fast\". That matters more here than the speed does -- a saturator " +
    "built on a tanh approximation whose error nobody measured is a saturator " +
-   "with a distortion nobody chose",
+   "with a distortion nobody chose. fastTan is relative error 3e-7 right up to the poles, " +
+   "where a TPT coefficient at Nyquist lives: pi split in three (Cody and Waite) and the " +
+   "reflected argument taken from x itself, because the float nearest pi/2 alone made it 72% " +
+   "wrong beside the pole. fastSinh is the series below 1, where the two exponentials cancel",
    "fastTanh"],
   ["dsp", "LookupTableTransform",
    "dsp.h: LookupTable, which takes the function it tabulates. The reference separates " +

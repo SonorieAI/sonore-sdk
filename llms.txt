@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 282 headers, 766 public types.
+not have. 283 headers, 838 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -126,6 +126,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [clipper.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/clipper.h): the diode clipper, solved
 - [commands.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/commands.h): Named actions, and the keys that reach them
 - [compressors.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/compressors.h): The hardware compressors: opto, FET, VCA
+- [convolution.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/convolution.h): convolution of any length, at zero latency, with impulse
 - [crossover.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/crossover.h): a crossover into any number of bands that still sums flat
 - [crypto.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/crypto.h): BlowFish, RSAKey and Primes -- the reference's cryptography -- and the
 - [delay.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/delay.h): the delay as a finished machine

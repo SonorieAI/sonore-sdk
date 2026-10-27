@@ -56,8 +56,21 @@ public:
                            (double) file.sampleRate, targetSampleRate, normalise);
   }
 
-  /** Load from memory. `sourceSampleRate` is what the samples ARE, not what
-   *  they should become. */
+  /** Load from a FILE'S BYTES in memory -- a WAV, AIFF, FLAC, MP3 or Ogg
+   *  compiled into the plugin, so the factory impulses ship inside the
+   *  binary and cannot go missing -- decoded as loadFromFile() decodes a
+   *  path, and resampled to `targetSampleRate`. */
+  bool loadFromFileData(const void* fileData, size_t size, double targetSampleRate,
+                        ImpulseNormalise normalise = ImpulseNormalise::Energy) {
+    WavData file;
+    if (!readAudioFile(fileData, size, &file) || file.numChannels == 0 || file.samples.empty())
+      return false;
+    return loadFromSamples(file.samples.data(), file.numFrames(), file.numChannels,
+                           (double) file.sampleRate, targetSampleRate, normalise);
+  }
+
+  /** Load from samples already decoded, interleaved. `sourceSampleRate` is
+   *  what the samples ARE, not what they should become. */
   bool loadFromSamples(const float* interleaved, size_t numFrames, uint16_t numChannels,
                        double sourceSampleRate, double targetSampleRate,
                        ImpulseNormalise normalise = ImpulseNormalise::Energy) {
@@ -168,15 +181,15 @@ public:
     return peak;
   }
 
-private:
-  static constexpr double kReferenceRate = 48000.0;
-
-  /** The same response at another rate. Resampling keeps the VALUES, and
-   *  a response at twice the rate has twice the samples: convolved, it was
-   *  twice as loud (+6 dB at every doubling, +12 at 192 kHz). Each sample
-   *  stands for 1/rate of a second, so the values are scaled by the ratio of
-   *  the rates and the response sounds the same at both. */
+  /** The same response at another rate, `target` Hz. Resampling keeps the
+   *  VALUES, and a response at twice the rate has twice the samples:
+   *  convolved, it was twice as loud (+6 dB at every doubling, +12 at
+   *  192 kHz). Each sample stands for 1/rate of a second, so the values are
+   *  scaled by the ratio of the rates and the response sounds the same at
+   *  both. Already at that rate (or a rate of 0 or less): nothing changes.
+   *  Allocates. */
   void resampleTo(double target) {
+    if (!(target > 0.0) || std::fabs(target - sampleRate_) <= 1e-6 || channels_.empty()) return;
     const double ratio = target / sampleRate_;
     const float keep = (float) (sampleRate_ / target);
     for (std::vector<float>& channel : channels_) {
@@ -189,6 +202,9 @@ private:
     }
     sampleRate_ = target;
   }
+
+private:
+  static constexpr double kReferenceRate = 48000.0;
 
   void applyNormalisation(ImpulseNormalise mode) {
     if (mode == ImpulseNormalise::None || channels_.empty()) return;
