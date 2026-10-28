@@ -68,33 +68,26 @@ inline void writeU16(std::vector<uint8_t>& out, uint16_t v) {
 } // namespace wavdetail
 
 /**
- * Read a WAV file. Returns false (leaving `out` empty) on anything it does
- * not understand, rather than guessing at bytes: a wrong guess here becomes a
+ * Decode a WAV file that is already in memory: `size` bytes at `fileData`,
+ * exactly as they would be on disk -- an impulse response or a sample
+ * compiled into the plugin, or one that arrived over the network. The same
+ * decoder as the file reader below, with the same refusals and the same
+ * ceiling. Returns false (leaving `out` empty) on anything it does not
+ * understand, rather than guessing at bytes: a wrong guess here becomes a
  * blast of full-scale noise through a user's monitors.
  */
-inline bool readWav(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
-  if (!path || !out) return false;
+inline bool readWav(const void* fileData, size_t size, WavData* out,
+                    size_t maxSamples = kMaxDecodedSamples) {
+  if (!out) return false;
   out->samples.clear();
   out->sampleRate = 0;
   out->numChannels = 0;
-
-  std::FILE* f = ::sonore::pathio::open(path, "rb");
-  if (!f) return false;
-  std::fseek(f, 0, SEEK_END);
-  const long size = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
   // 1 GB of WAV is not an impulse response; refuse rather than swallow RAM.
-  if (size < 44 || size > (long) (1u << 30)) {
-    std::fclose(f);
-    return false;
-  }
-  std::vector<uint8_t> bytes((size_t) size);
-  const size_t got = std::fread(bytes.data(), 1, (size_t) size, f);
-  std::fclose(f);
-  if (got != (size_t) size) return false;
+  if (!fileData || size < 44 || size > (size_t) (1u << 30)) return false;
+  const uint8_t* const bytes = static_cast<const uint8_t*>(fileData);
 
   using namespace wavdetail;
-  if (std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0)
+  if (std::memcmp(bytes, "RIFF", 4) != 0 || std::memcmp(bytes + 8, "WAVE", 4) != 0)
     return false;
 
   // Walk the chunks. Real files carry LIST/INFO/bext chunks before data, so
@@ -105,34 +98,34 @@ inline bool readWav(const char* path, WavData* out, size_t maxSamples = kMaxDeco
   uint32_t dataSize = 0;
 
   size_t pos = 12;
-  while (pos + 8 <= bytes.size()) {
-    const uint8_t* header = bytes.data() + pos;
+  while (pos + 8 <= size) {
+    const uint8_t* header = bytes + pos;
     const uint32_t chunkSize = readU32(header + 4);
     const size_t body = pos + 8;
-    if (chunkSize > bytes.size() - body) { // body <= size: the loop guard
+    if (chunkSize > size - body) { // body <= size: the loop guard
       // A data chunk that claims more than the file holds is a take whose
       // header was never finished -- a crash, a full disk, a writer that
       // streams and leaves the length open. What is on the disk is read, as
       // the streaming reader always has; this reader refused the file and
       // the take with it.
       if (std::memcmp(header, "data", 4) == 0) {
-        const size_t there = bytes.size() - body;
-        data = bytes.data() + body;
+        const size_t there = size - body;
+        data = bytes + body;
         dataSize = (uint32_t) (there < 0xFFFFFFFFu ? there : 0xFFFFFFFFu);
       }
       break;
     }
 
     if (std::memcmp(header, "fmt ", 4) == 0 && chunkSize >= 16) {
-      format = readU16(bytes.data() + body);
-      channels = readU16(bytes.data() + body + 2);
-      rate = readU32(bytes.data() + body + 4);
-      bits = readU16(bytes.data() + body + 14);
+      format = readU16(bytes + body);
+      channels = readU16(bytes + body + 2);
+      rate = readU32(bytes + body + 4);
+      bits = readU16(bytes + body + 14);
       // WAVE_FORMAT_EXTENSIBLE wraps the real format in a GUID whose first two
       // bytes are the classic tag.
-      if (format == 0xFFFE && chunkSize >= 40) format = readU16(bytes.data() + body + 24);
+      if (format == 0xFFFE && chunkSize >= 40) format = readU16(bytes + body + 24);
     } else if (std::memcmp(header, "data", 4) == 0) {
-      data = bytes.data() + body;
+      data = bytes + body;
       dataSize = chunkSize;
     }
     pos = body + chunkSize + (chunkSize & 1); // chunks are word-aligned
@@ -196,6 +189,34 @@ inline bool readWav(const char* path, WavData* out, size_t maxSamples = kMaxDeco
     if (copyBytes > 0) std::memcpy(out->samples.data(), data, copyBytes);
   }
   return true;
+}
+
+/**
+ * Read a WAV file. Returns false (leaving `out` empty) on anything it does
+ * not understand: see the in-memory readWav() above, which this reads the
+ * file into and calls.
+ */
+inline bool readWav(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
+  if (!path || !out) return false;
+  out->samples.clear();
+  out->sampleRate = 0;
+  out->numChannels = 0;
+
+  std::FILE* f = ::sonore::pathio::open(path, "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  // Refused before it is read, by the same bounds the decoder holds to.
+  if (size < 44 || size > (long) (1u << 30)) {
+    std::fclose(f);
+    return false;
+  }
+  std::vector<uint8_t> bytes((size_t) size);
+  const size_t got = std::fread(bytes.data(), 1, (size_t) size, f);
+  std::fclose(f);
+  if (got != (size_t) size) return false;
+  return readWav(bytes.data(), bytes.size(), out, maxSamples);
 }
 
 /**

@@ -84,6 +84,68 @@ inline float flushDenormal(float x) {
   return (a >= 1e-18f && a <= 3.402823466e38f) ? x : 0.0f;
 }
 
+// ── Either precision ─────────────────────────────────────────────────────────
+//
+// The core processors below are templates over their sample type: `BiquadT<T>`,
+// `OnePoleT<T>`, `DelayLine<N, T>` and so on, with `Biquad`, `OnePole`, ...
+// naming the float forms every existing plugin uses -- unchanged, to the bit.
+// A plugin that wants 64-bit processing end to end writes its DSP as a
+// template too and instantiates the double forms; the wrappers already hand a
+// DSP double buffers when it can take them (ProcessContextT<double>).
+//
+// What changes between the two is only what the type implies: the float
+// forms call exactly the helpers they always did (flushDenormal, clampf, the
+// fastmath approximations), and the double forms the double-precision
+// equivalents -- std::tanh rather than an approximation good to 1e-7, a
+// denormal floor at 1e-30 rather than 1e-18 -- because a double processor
+// that quietly rounded through float helpers would be a float processor with
+// wider storage.
+
+/** pi and 2 pi in the precision asked for. The float values are exactly
+ *  kPi and kTwoPi. */
+template <typename T>
+constexpr T piT = T(3.14159265358979323846);
+/** 2 pi; see piT. */
+template <typename T>
+constexpr T twoPiT = T(6.28318530717958647692);
+
+/** clampf() in either precision: x held to [lo, hi], and a NaN to lo. */
+template <typename T>
+inline T clampT(T x, T lo, T hi) {
+  return x >= lo ? (x > hi ? hi : x) : lo;
+}
+
+/** flushDenormal() for a float; the same rule in double, with the floor at
+ *  1e-30 (the double sections' own) and the ceiling at double's largest. */
+inline float flushDenormalT(float x) { return flushDenormal(x); }
+/** flushDenormal() in double; see the float overload. */
+inline double flushDenormalT(double x) {
+  const double a = std::fabs(x);
+  return (a >= 1e-30 && a <= 1.7976931348623157e308) ? x : 0.0;
+}
+
+/** The ladder's and the saturators' tanh: fastmath::tanhApprox for a float
+ *  (good to the float's own noise floor, and cheap), std::tanh for a double
+ *  (an approximation good to 1e-7 has no place in a double path). */
+inline float tanhApproxT(float x) { return fastmath::tanhApprox(x); }
+/** std::tanh in double; see the float overload. */
+inline double tanhApproxT(double x) { return std::tanh(x); }
+
+/** sin(2 pi x) of a phase in turns: fastmath::sinTurns for a float, the
+ *  library sine for a double. */
+inline float sinTurnsT(float x) { return fastmath::sinTurns(x); }
+/** sin(2 pi x) in double; see the float overload. */
+inline double sinTurnsT(double x) { return std::sin(6.28318530717958647692 * (x - std::floor(x + 0.5))); }
+
+/** dbToGain() and gainToDb() in either precision. */
+inline float dbToGainT(float db) { return dbToGain(db); }
+/** dbToGain() in double. */
+inline double dbToGainT(double db) { return std::pow(10.0, db * 0.05); }
+/** gainToDb() for a float. */
+inline float gainToDbT(float g) { return gainToDb(g); }
+/** gainToDb() in double, with the same -180 dB floor. */
+inline double gainToDbT(double g) { return 20.0 * std::log10(g > 1e-9 ? g : 1e-9); }
+
 // ── Waveshaping ──────────────────────────────────────────────────────────────
 
 /** x / (1 + |x|): unity slope at zero, approaching +-1 without reaching it.
@@ -122,35 +184,40 @@ inline float asymmetric(float x, float bias) {
 
 /** One-pole parameter smoother: wrap user-facing controls to kill zipper noise.
  *  Every control that reaches a coefficient should go through one of these. */
-class Smooth {
+template <typename T>
+class SmoothT {
 public:
   /** The time constant, `ms` milliseconds (floored at 0.01) at `sampleRate`
    *  Hz (48 kHz if not above 1: a negative rate made the pole above 1, and
    *  the value ran away from its target): a step is 63% of the way there
    *  after `ms`, 99% after 4.6 times it. Before setup() there is no lag at
    *  all: next() returns its target. */
-  void setup(float sampleRate, float ms = 8.0f) {
-    const float sr = sampleRate > 1.0f ? sampleRate : 48000.0f;
-    a_ = std::exp(-1.0f / (0.001f * (ms > 0.01f ? ms : 0.01f) * sr));
+  void setup(T sampleRate, T ms = T(8.0)) {
+    const T sr = sampleRate > T(1.0) ? sampleRate : T(48000.0);
+    a_ = std::exp(-T(1.0) / (T(0.001) * (ms > T(0.01) ? ms : T(0.01)) * sr));
   }
   /** Jump to `v` with no glide. The value starts at 0, so a control that is
    *  not snapped in prepare() or reset() sweeps up from silence. */
-  void snap(float v) { z_ = v; }
+  void snap(T v) { z_ = v; }
   /** One sample's step toward `target`; returns the smoothed value. Call
    *  once per sample, with the control's current value. */
-  inline float next(float target) {
+  inline T next(T target) {
     // The STORED value is flushed, not only the one returned: settling on
     // zero, the raw state decayed through the subnormal range for thousands
     // of samples, each one slow arithmetic on a thread without flush-to-zero.
-    z_ = flushDenormal(target + a_ * (z_ - target));
+    z_ = flushDenormalT(target + a_ * (z_ - target));
     return z_;
   }
   /** The value next() last returned, or snap() set, without stepping. */
-  float value() const { return z_; }
+  T value() const { return z_; }
 
 private:
-  float a_ = 0.0f, z_ = 0.0f;
+  T a_ = T(0.0), z_ = T(0.0);
 };
+
+/** Smooth in float, the form every plugin written before the templates
+ *  uses; SmoothT<double> is the same processor in double. */
+using Smooth = SmoothT<float>;
 
 /**
  * A control that GLIDES to a new value once audio is running, and lands at
@@ -163,15 +230,16 @@ private:
  * input or threshold automated stepped the output up to 8.6 times its
  * largest natural step. reset() on the owner should snap() it.
  */
-struct Glide {
+template <typename T>
+struct GlideT {
   /** The glide's length against the rate it runs at; 10 ms by default. */
-  void setSampleRate(float sr, float ms = 10.0f) {
-    const float n = 0.001f * (ms > 0.1f ? ms : 0.1f) * (sr > 1.0f ? sr : 48000.0f);
-    k = 1.0f - std::exp(-1.0f / n);
+  void setSampleRate(T sr, T ms = T(10.0)) {
+    const T n = T(0.001) * (ms > T(0.1) ? ms : T(0.1)) * (sr > T(1.0) ? sr : T(48000.0));
+    k = T(1.0) - std::exp(-T(1.0) / n);
   }
   /** A new target. Before the first next(), or after snap(), the value
    *  lands on it at once; after that next() glides to it. */
-  void set(float v) {
+  void set(T v) {
     target = v;
     if (!running) now = v;
   }
@@ -184,11 +252,11 @@ struct Glide {
   /** One sample's step toward the target; returns the value. Within a
    *  millionth of the target (relative) it lands exactly, so a finished
    *  glide costs one comparison. Call once per sample. */
-  inline float next() {
+  inline T next() {
     running = true;
     if (now != target) {
       now += (target - now) * k;
-      if (std::fabs(target - now) <= 1e-6f * (1.0f + std::fabs(target))) now = target;
+      if (std::fabs(target - now) <= T(1e-6) * (T(1.0) + std::fabs(target))) now = target;
     }
     return now;
   }
@@ -197,12 +265,16 @@ struct Glide {
    *  the remaining distance covered per sample (set by setSampleRate()).
    *  Public so a Glide can be brace-initialised as `{now, target}`; read
    *  them, but change them through set() and snap(). */
-  float now = 0.0f, target = 0.0f, k = 0.00208116f; // 10 ms at 48 kHz
+  T now = T(0.0), target = T(0.0), k = T(0.00208116); // 10 ms at 48 kHz
   ///@}
   /** next() has run since construction or the last snap(), so set() glides
    *  rather than lands. */
   bool running = false;
 };
+
+/** Glide in float, the form every plugin written before the templates
+ *  uses; GlideT<double> is the same processor in double. */
+using Glide = GlideT<float>;
 
 /**
  * A ramp that is straight in DECIBELS, and that arrives.
@@ -231,27 +303,28 @@ struct Glide {
  * snapped to exactly at the end, so a fade-out really does end in silence
  * rather than in something inaudible but not zero.
  */
-class LogRamp {
+template <typename T>
+class LogRampT {
 public:
   /** The quietest value a ramp will pass through, as an amplitude. -120 dB is
    *  below the noise floor of anything this will ever fade. */
-  static constexpr float kFloor = 1.0e-6f;
+  static constexpr T kFloor = T(1.0e-6);
 
   /** The ramp's length: `milliseconds` (floored at 0.01) at `sampleRate` Hz
    *  (48 kHz if not positive), at least one sample. A ramp already running
    *  keeps the length it started with. Before setup(), setTarget() jumps. */
-  void setup(float sampleRate, float milliseconds) {
-    const float ms = milliseconds > 0.01f ? milliseconds : 0.01f;
-    steps_ = (int) (0.001f * ms * (sampleRate > 0.0f ? sampleRate : 48000.0f));
+  void setup(T sampleRate, T milliseconds) {
+    const T ms = milliseconds > T(0.01) ? milliseconds : T(0.01);
+    steps_ = (int) (T(0.001) * ms * (sampleRate > T(0.0) ? sampleRate : T(48000.0)));
     if (steps_ < 1) steps_ = 1;
   }
 
   /** Jump. For a state restore, where nothing is mid-flight to smooth. */
-  void snap(float value) {
+  void snap(T value) {
     current_ = value;
     target_ = value;
     remaining_ = 0;
-    factor_ = 1.0f;
+    factor_ = T(1.0);
   }
 
   /** Ramp from the current value to `target`, straight in dB, arriving in
@@ -260,28 +333,28 @@ public:
    *  target at or below kFloor it ramps to the floor and lands on the target
    *  on the last sample. For gains: the ramp works on magnitudes and keeps
    *  the current value's sign until it lands. One pow() per call. */
-  void setTarget(float target) {
+  void setTarget(T target) {
     if (target == target_ && remaining_ > 0) return;
     target_ = target;
     snapTo_ = target;
 
-    const float from = magnitude(current_);
-    const float to = magnitude(target);
+    const T from = magnitude(current_);
+    const T to = magnitude(target);
     if (steps_ <= 0 || from <= kFloor) {
       // Nothing to ramp FROM: a multiplicative ramp out of silence stays
       // silent for ever, so this is the one case that has to jump.
       current_ = target;
       remaining_ = 0;
-      factor_ = 1.0f;
+      factor_ = T(1.0);
       return;
     }
     remaining_ = steps_;
-    factor_ = (float) std::pow((double) to / (double) from, 1.0 / (double) steps_);
+    factor_ = (T) std::pow((double) to / (double) from, 1.0 / (double) steps_);
   }
 
   /** One sample of the ramp; returns the new value. Once it has landed it
    *  returns the target, exactly, until the next setTarget(). */
-  inline float next() {
+  inline T next() {
     if (remaining_ <= 0) return current_;
     current_ *= factor_;
     if (--remaining_ == 0) current_ = snapTo_; // land exactly, not nearly
@@ -289,22 +362,26 @@ public:
   }
 
   /** The current value, without stepping. */
-  float value() const { return current_; }
+  T value() const { return current_; }
   /** Where the ramp is going, or has arrived. */
-  float target() const { return target_; }
+  T target() const { return target_; }
   /** True while steps remain; false once landed, after snap(), or after a
    *  setTarget() that jumped. */
   bool isRamping() const { return remaining_ > 0; }
 
 private:
-  static float magnitude(float v) {
-    const float a = v < 0.0f ? -v : v;
+  static T magnitude(T v) {
+    const T a = v < T(0.0) ? -v : v;
     return a < kFloor ? kFloor : a;
   }
 
-  float current_ = 0.0f, target_ = 0.0f, snapTo_ = 0.0f, factor_ = 1.0f;
+  T current_ = T(0.0), target_ = T(0.0), snapTo_ = T(0.0), factor_ = T(1.0);
   int steps_ = 0, remaining_ = 0;
 };
+
+/** LogRamp in float, the form every plugin written before the templates
+ *  uses; LogRampT<double> is the same processor in double. */
+using LogRamp = LogRampT<float>;
 
 // ── Filters ──────────────────────────────────────────────────────────────────
 
@@ -324,77 +401,90 @@ private:
  * response helpers below evaluate exactly, so a loop that contains one can
  * subtract its phase delay and be in tune.
  */
-class OnePole {
+template <typename T>
+class OnePoleT {
 public:
   /** Sample rate in Hz (48 kHz if not above 1). Call setCutoff() after it:
    *  the coefficient is worked out there, not here. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** The corner in Hz, held to 1 Hz .. 0.49 of the sample rate: -3 dB there,
    *  exactly. One tan() per call; the state is kept, so it may move while
    *  audio runs. */
-  inline void setCutoff(float hz) {
-    const float g = std::tan(kPi * clampf(hz, 1.0f, sr_ * 0.49f) / sr_);
-    G_ = g / (1.0f + g);
+  inline void setCutoff(T hz) {
+    const T g = std::tan(piT<T> * clampT<T>(hz, T(1.0), sr_ * T(0.49)) / sr_);
+    G_ = g / (T(1.0) + g);
   }
   /** One sample through the lowpass; returns it. lp() and hp() share one
    *  state, so call one of them per sample, not both. */
-  inline float lp(float x) {
-    const float v = (x - z_) * G_;
-    const float y = v + z_;
-    z_ = flushDenormal(y + v);
+  inline T lp(T x) {
+    const T v = (x - z_) * G_;
+    const T y = v + z_;
+    z_ = flushDenormalT(y + v);
     return y;
   }
   /** One sample through the matching highpass, x - lp(x). It advances the
    *  same state as lp(): one or the other per sample. */
-  inline float hp(float x) { return x - lp(x); }
+  inline T hp(T x) { return x - lp(x); }
+  /** One sample through the matching FIRST-ORDER ALLPASS, lp(x) - hp(x):
+   *  unity gain at every frequency, the phase turning from 0 at DC through
+   *  -90 degrees at the cutoff to -180 at Nyquist. Exactly (z^-1 - p) /
+   *  (1 - p z^-1) with p = 1 - 2G, the bilinear image of (1 - s) / (1 + s):
+   *  what a phaser's stages and a Hilbert pair's branches are built from.
+   *  It advances the same state as lp(): one of the three per sample. */
+  inline T ap(T x) { return T(2.0) * lp(x) - x; }
   /** Clear the state, as after silence. */
-  void reset() { z_ = 0.0f; }
+  void reset() { z_ = T(0.0); }
 
   /** The lowpass's gain in dB at `hz`, from its own transfer function. */
-  float magnitudeDb(float hz) const {
-    const double w = kTwoPi * (double) hz / (double) sr_;
+  T magnitudeDb(T hz) const {
+    const double w = twoPiT<T> * (double) hz / (double) sr_;
     const double p = 1.0 - 2.0 * (double) G_;
     const double num = (double) G_ * std::sqrt(2.0 + 2.0 * std::cos(w));
     const double den = std::sqrt(1.0 - 2.0 * p * std::cos(w) + p * p);
     const double mag = den > 1e-30 ? num / den : 0.0;
-    return (float) (20.0 * std::log10(mag > 1e-15 ? mag : 1e-15));
+    return (T) (20.0 * std::log10(mag > 1e-15 ? mag : 1e-15));
   }
   /** The lowpass's PHASE DELAY at `hz`, in samples: what a feedback loop
    *  that contains it must subtract from its length to be in tune. Tends to
    *  (1 - G) / 2G at low frequency, which is 1/wc, the RC's own group delay. */
-  float phaseDelaySamples(float hz) const {
-    const double w = kTwoPi * (double) hz / (double) sr_;
-    if (w < 1e-9) return (float) ((1.0 - (double) G_) / (2.0 * (double) G_));
+  T phaseDelaySamples(T hz) const {
+    const double w = twoPiT<T> * (double) hz / (double) sr_;
+    if (w < 1e-9) return (T) ((1.0 - (double) G_) / (2.0 * (double) G_));
     const double p = 1.0 - 2.0 * (double) G_;
     // The zero at Nyquist contributes half a sample; the pole the rest.
-    return (float) (0.5 + std::atan2(p * std::sin(w), 1.0 - p * std::cos(w)) / w);
+    return (T) (0.5 + std::atan2(p * std::sin(w), 1.0 - p * std::cos(w)) / w);
   }
   /** G = g / (1 + g), the gain into the state per sample, between 0 and 1:
    *  the number in the transfer function above, for a caller that models a
    *  loop around this filter. */
-  float coefficient() const { return G_; }
+  T coefficient() const { return G_; }
 
 private:
-  float sr_ = 48000.0f, G_ = 0.1f, z_ = 0.0f;
+  T sr_ = T(48000.0), G_ = T(0.1), z_ = T(0.0);
 };
 
+/** OnePole in float, the form every plugin written before the templates
+ *  uses; OnePoleT<double> is the same processor in double. */
+using OnePole = OnePoleT<float>;
+
 /** Transposed-Direct-Form-II biquad with RBJ cookbook coefficients. */
-class Biquad {
+template <typename T>
+class BiquadT {
 public:
   /** Sample rate in Hz (48 kHz until set, and if not above 1: a design
    *  divides by it, and a rate of 0 made every coefficient NaN). Set it
    *  before a design call, which reads it; changing it does not redesign
    *  the section. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** Clear the two state values, as after silence; the coefficients stay. */
-  void reset() { z1_ = z2_ = 0.0f; }
+  void reset() { z1_ = z2_ = T(0.0); }
   /** One sample through the section; returns it. The state is passed
    *  through flushDenormal(), so a NaN or Inf sample does not stay in it.
    *  Until a design call the section passes its input unchanged. */
-  inline float process(float x) {
-    const float y = b0_ * x + z1_;
-    z1_ = flushDenormal(b1_ * x - a1_ * y + z2_);
-    z2_ = flushDenormal(b2_ * x - a2_ * y);
+  inline T process(T x) {
+    const T y = b0_ * x + z1_;
+    z1_ = flushDenormalT(b1_ * x - a1_ * y + z2_);
+    z2_ = flushDenormalT(b2_ * x - a2_ * y);
     return y;
   }
   /** 12 dB/oct lowpass at `freq` Hz, held to 10 Hz .. 0.49 of the sample
@@ -402,27 +492,27 @@ public:
    *  flattest with no peak). Every design call recomputes the coefficients
    *  and keeps the state; for a corner that moves every few samples, SVF or
    *  SvfSection is the structure that stays clean. */
-  void lowpass(float freq, float q) { rbj(freq, q, 0); }
+  void lowpass(T freq, T q) { rbj(freq, q, 0); }
   /** 12 dB/oct highpass; `freq` and `q` as lowpass(). */
-  void highpass(float freq, float q) { rbj(freq, q, 1); }
+  void highpass(T freq, T q) { rbj(freq, q, 1); }
   /** Bandpass with 0 dB at `freq` (the cookbook's constant-peak form); a
    *  higher `q` is a narrower band. Ranges as lowpass(). */
-  void bandpass(float freq, float q) { rbj(freq, q, 2); }
+  void bandpass(T freq, T q) { rbj(freq, q, 2); }
   /** Notch: no output at `freq`, a higher `q` a narrower notch. Ranges as
    *  lowpass(). */
-  void notch(float freq, float q) { rbj(freq, q, 3); }
+  void notch(T freq, T q) { rbj(freq, q, 3); }
   /** Second-order allpass: unity gain at every frequency, the phase turning
    *  through 180 degrees at `freq`, more abruptly for a higher `q`. */
-  void allpass(float freq, float q) { rbj(freq, q, 4); }
+  void allpass(T freq, T q) { rbj(freq, q, 4); }
   /** Peaking EQ: `gainDb` of boost (or cut, negative) centred on `freq`,
    *  with bandwidth set by `q`; 0 dB is flat. Ranges as lowpass(). */
-  void peak(float freq, float q, float gainDb) { rbjPeak(freq, q, gainDb); }
+  void peak(T freq, T q, T gainDb) { rbjPeak(freq, q, gainDb); }
   /** Low shelf: `gainDb` below `freq`, 0 dB above, half the gain in dB at
    *  `freq` itself. `q` is the cookbook's shelf Q: 0.7071 is the steepest
    *  slope with no overshoot; higher overshoots on both sides of it. */
-  void lowShelf(float freq, float q, float gainDb) { rbjShelf(freq, q, gainDb, false); }
+  void lowShelf(T freq, T q, T gainDb) { rbjShelf(freq, q, gainDb, false); }
   /** High shelf: `gainDb` above `freq`, 0 dB below; `q` as lowShelf(). */
-  void highShelf(float freq, float q, float gainDb) { rbjShelf(freq, q, gainDb, true); }
+  void highShelf(T freq, T q, T gainDb) { rbjShelf(freq, q, gainDb, true); }
 
   /** Coefficients from somewhere else, already normalised by a0.
    *
@@ -431,18 +521,18 @@ public:
    *  its pole pair sits on the Butterworth circle -- so the design lives in
    *  filter_design.h and hands the numbers here rather than the shapes being
    *  reinvented as named methods. */
-  void setCoefficients(float b0, float b1, float b2, float a1, float a2) {
+  void setCoefficients(T b0, T b1, T b2, T a1, T a2) {
     b0_ = b0; b1_ = b1; b2_ = b2; a1_ = a1; a2_ = a2;
   }
 
   /** Another section's coefficients, leaving this one's state alone: two
    *  channels through the same filter need one design, not two. */
-  void copyCoefficientsFrom(const Biquad& other) {
+  void copyCoefficientsFrom(const BiquadT& other) {
     b0_ = other.b0_; b1_ = other.b1_; b2_ = other.b2_; a1_ = other.a1_; a2_ = other.a2_;
   }
 
   /** The five numbers, normalised so a0 is 1 -- what setCoefficients takes. */
-  void getCoefficients(float& b0, float& b1, float& b2, float& a1, float& a2) const {
+  void getCoefficients(T& b0, T& b1, T& b2, T& a1, T& a2) const {
     b0 = b0_; b1 = b1_; b2 = b2_; a1 = a1_; a2 = a2_;
   }
 
@@ -452,8 +542,8 @@ public:
    *  it: a caller drawing a response curve should not have to run audio, and
    *  a TEST that does run audio then has something independent to disagree
    *  with. */
-  float magnitudeDb(float freq) const {
-    const double w = kTwoPi * (double) freq / (double) sr_;
+  T magnitudeDb(T freq) const {
+    const double w = twoPiT<T> * (double) freq / (double) sr_;
     const double cw = std::cos(w), sw = std::sin(w);
     const double c2 = std::cos(2.0 * w), s2 = std::sin(2.0 * w);
     const double nr = (double) b0_ + (double) b1_ * cw + (double) b2_ * c2;
@@ -462,39 +552,39 @@ public:
     const double di = -((double) a1_ * sw + (double) a2_ * s2);
     const double num = std::sqrt(nr * nr + ni * ni);
     const double den = std::sqrt(dr * dr + di * di);
-    if (den < 1e-30) return -300.0f;
+    if (den < 1e-30) return -T(300.0);
     const double mag = num / den;
-    return (float) (20.0 * std::log10(mag > 1e-15 ? mag : 1e-15));
+    return (T) (20.0 * std::log10(mag > 1e-15 ? mag : 1e-15));
   }
 
 private:
-  void norm(float a0, float a1, float a2, float b0, float b1, float b2) {
+  void norm(T a0, T a1, T a2, T b0, T b1, T b2) {
     b0_ = b0 / a0; b1_ = b1 / a0; b2_ = b2 / a0; a1_ = a1 / a0; a2_ = a2 / a0;
   }
-  void rbj(float freq, float q, int type) {
-    const float w0 = kTwoPi * clampf(freq, 10.0f, sr_ * 0.49f) / sr_;
-    const float cw = std::cos(w0), sw = std::sin(w0);
-    const float alpha = sw / (2.0f * (q < 0.05f ? 0.05f : q));
-    const float a0 = 1 + alpha, a1 = -2 * cw, a2 = 1 - alpha;
-    if (type == 0)      norm(a0, a1, a2, (1 - cw) * 0.5f, 1 - cw, (1 - cw) * 0.5f);
-    else if (type == 1) norm(a0, a1, a2, (1 + cw) * 0.5f, -(1 + cw), (1 + cw) * 0.5f);
+  void rbj(T freq, T q, int type) {
+    const T w0 = twoPiT<T> * clampT<T>(freq, T(10.0), sr_ * T(0.49)) / sr_;
+    const T cw = std::cos(w0), sw = std::sin(w0);
+    const T alpha = sw / (T(2.0) * (q < T(0.05) ? T(0.05) : q));
+    const T a0 = 1 + alpha, a1 = -2 * cw, a2 = 1 - alpha;
+    if (type == 0)      norm(a0, a1, a2, (1 - cw) * T(0.5), 1 - cw, (1 - cw) * T(0.5));
+    else if (type == 1) norm(a0, a1, a2, (1 + cw) * T(0.5), -(1 + cw), (1 + cw) * T(0.5));
     else if (type == 2) norm(a0, a1, a2, alpha, 0, -alpha);
     else if (type == 3) norm(a0, a1, a2, 1, -2 * cw, 1);
     else                norm(a0, a1, a2, 1 - alpha, -2 * cw, 1 + alpha);
   }
-  void rbjPeak(float freq, float q, float gainDb) {
-    const float A = std::pow(10.0f, gainDb / 40.0f);
-    const float w0 = kTwoPi * clampf(freq, 10.0f, sr_ * 0.49f) / sr_;
-    const float cw = std::cos(w0), sw = std::sin(w0);
-    const float alpha = sw / (2.0f * (q < 0.05f ? 0.05f : q));
+  void rbjPeak(T freq, T q, T gainDb) {
+    const T A = std::pow(T(10.0), gainDb / T(40.0));
+    const T w0 = twoPiT<T> * clampT<T>(freq, T(10.0), sr_ * T(0.49)) / sr_;
+    const T cw = std::cos(w0), sw = std::sin(w0);
+    const T alpha = sw / (T(2.0) * (q < T(0.05) ? T(0.05) : q));
     norm(1 + alpha / A, -2 * cw, 1 - alpha / A, 1 + alpha * A, -2 * cw, 1 - alpha * A);
   }
-  void rbjShelf(float freq, float q, float gainDb, bool high) {
-    const float A = std::pow(10.0f, gainDb / 40.0f);
-    const float w0 = kTwoPi * clampf(freq, 10.0f, sr_ * 0.49f) / sr_;
-    const float cw = std::cos(w0), sw = std::sin(w0);
-    const float alpha = sw / (2.0f * (q < 0.05f ? 0.05f : q));
-    const float tsa = 2.0f * std::sqrt(A) * alpha, Ap1 = A + 1.0f, Am1 = A - 1.0f;
+  void rbjShelf(T freq, T q, T gainDb, bool high) {
+    const T A = std::pow(T(10.0), gainDb / T(40.0));
+    const T w0 = twoPiT<T> * clampT<T>(freq, T(10.0), sr_ * T(0.49)) / sr_;
+    const T cw = std::cos(w0), sw = std::sin(w0);
+    const T alpha = sw / (T(2.0) * (q < T(0.05) ? T(0.05) : q));
+    const T tsa = T(2.0) * std::sqrt(A) * alpha, Ap1 = A + T(1.0), Am1 = A - T(1.0);
     if (!high)
       norm(Ap1 + Am1 * cw + tsa, -2 * (Am1 + Ap1 * cw), Ap1 + Am1 * cw - tsa,
            A * (Ap1 - Am1 * cw + tsa), 2 * A * (Am1 - Ap1 * cw), A * (Ap1 - Am1 * cw - tsa));
@@ -502,9 +592,13 @@ private:
       norm(Ap1 - Am1 * cw + tsa, 2 * (Am1 - Ap1 * cw), Ap1 - Am1 * cw - tsa,
            A * (Ap1 + Am1 * cw + tsa), -2 * A * (Am1 + Ap1 * cw), A * (Ap1 + Am1 * cw - tsa));
   }
-  float sr_ = 48000.0f;
-  float b0_ = 1, b1_ = 0, b2_ = 0, a1_ = 0, a2_ = 0, z1_ = 0, z2_ = 0;
+  T sr_ = T(48000.0);
+  T b0_ = 1, b1_ = 0, b2_ = 0, a1_ = 0, a2_ = 0, z1_ = 0, z2_ = 0;
 };
+
+/** Biquad in float, the form every plugin written before the templates
+ *  uses; BiquadT<double> is the same processor in double. */
+using Biquad = BiquadT<float>;
 
 /**
  * One second-order section in DOUBLE precision -- coefficients, state and
@@ -567,6 +661,17 @@ public:
     z1_ = (m1 >= 1e-30 && m1 <= 1e300) ? z1_ : 0.0;
     z2_ = (m2 >= 1e-30 && m2 <= 1e300) ? z2_ : 0.0;
     return (float) y;
+  }
+  /** The same, double in and double out: the section is double inside, so
+   *  a double processor loses nothing passing through it. */
+  inline double process(double x) {
+    const double y = b0_ * x + z1_;
+    z1_ = b1_ * x - a1_ * y + z2_;
+    z2_ = b2_ * x - a2_ * y;
+    const double m1 = std::fabs(z1_), m2 = std::fabs(z2_);
+    z1_ = (m1 >= 1e-30 && m1 <= 1e300) ? z1_ : 0.0;
+    z2_ = (m2 >= 1e-30 && m2 <= 1e300) ? z2_ : 0.0;
+    return y;
   }
   /** The section's gain at a frequency, in dB, from its own coefficients. */
   float magnitudeDb(float freq) const {
@@ -688,6 +793,18 @@ public:
     ic2_ = (m2 >= 1e-30 && m2 <= 1e300) ? ic2_ : 0.0;
     return (float) (mixLow_ * v2 + mixBand_ * v1 + mixIn_ * x);
   }
+  /** The same, double in and double out. */
+  inline double process(double x) {
+    const double v3 = x - ic2_;
+    const double v1 = a1_ * ic1_ + a2_ * v3;
+    const double v2 = ic2_ + a2_ * ic1_ + a3_ * v3;
+    ic1_ = 2.0 * v1 - ic1_;
+    ic2_ = 2.0 * v2 - ic2_;
+    const double m1 = std::fabs(ic1_), m2 = std::fabs(ic2_);
+    ic1_ = (m1 >= 1e-30 && m1 <= 1e300) ? ic1_ : 0.0;
+    ic2_ = (m2 >= 1e-30 && m2 <= 1e300) ? ic2_ : 0.0;
+    return mixLow_ * v2 + mixBand_ * v1 + mixIn_ * x;
+  }
 
 private:
   /** The output is a mix of the low and band states and the input: low is
@@ -714,50 +831,78 @@ private:
 
 /** State-variable filter (TPT topology): stable under heavy modulation and
  *  gives LP/HP/BP/notch simultaneously. The default filter for anything swept. */
-class SVF {
+template <typename T>
+class SVFT {
 public:
   /** Sample rate in Hz (48 kHz until set, and if not above 1, as Biquad
    *  takes it). Call set() after it, which reads it. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** Corner (or centre) in Hz, held to 10 Hz .. 0.49 of the sample rate,
    *  and resonance `q`, floored at 0.05 (0.7071 is Butterworth). One tan()
    *  per call, and safe to call every sample: that is what the structure is
    *  for. Call it before the first process(): until then the lowpass and
    *  bandpass are silent and the highpass and notch pass the input. */
-  inline void set(float freq, float q) {
-    g_ = std::tan(kPi * clampf(freq, 10.0f, sr_ * 0.49f) / sr_);
-    k_ = 1.0f / (q < 0.05f ? 0.05f : q);
-    a1_ = 1.0f / (1.0f + g_ * (g_ + k_));
+  inline void set(T freq, T q) {
+    g_ = std::tan(piT<T> * clampT<T>(freq, T(10.0), sr_ * T(0.49)) / sr_);
+    k_ = T(1.0) / (q < T(0.05) ? T(0.05) : q);
+    a1_ = T(1.0) / (T(1.0) + g_ * (g_ + k_));
     a2_ = g_ * a1_;
     a3_ = g_ * a2_;
   }
   /** One sample in. Returns nothing: the four responses land in lp, hp, bp
    *  and notch, so read whichever the caller wants after the call. */
-  inline void process(float x) {
-    const float v3 = x - ic2_;
-    const float v1 = a1_ * ic1_ + a2_ * v3;
-    const float v2 = ic2_ + a2_ * ic1_ + a3_ * v3;
-    ic1_ = flushDenormal(2 * v1 - ic1_);
-    ic2_ = flushDenormal(2 * v2 - ic2_);
+  inline void process(T x) {
+    const T v3 = x - ic2_;
+    const T v1 = a1_ * ic1_ + a2_ * v3;
+    const T v2 = ic2_ + a2_ * ic1_ + a3_ * v3;
+    ic1_ = flushDenormalT(2 * v1 - ic1_);
+    ic2_ = flushDenormalT(2 * v2 - ic2_);
     lp = v2; bp = v1; hp = x - k_ * v1 - v2; notch = x - k_ * v1;
   }
   ///@{
   /** The last process() call's outputs: 12 dB/oct lowpass and highpass, the
    *  bandpass, and the notch (lowpass plus highpass). The bandpass's gain at
    *  the centre is `q`, not 1; times 1/q it peaks at 0 dB. */
-  float lp = 0, hp = 0, bp = 0, notch = 0;
+  T lp = 0, hp = 0, bp = 0, notch = 0;
   ///@}
   /** Clear the integrators, as after silence. The outputs keep their last
    *  values until the next process(). */
   void reset() { ic1_ = ic2_ = 0; }
 
 private:
-  float sr_ = 48000.0f, g_ = 0, k_ = 1, a1_ = 0, a2_ = 0, a3_ = 0, ic1_ = 0, ic2_ = 0;
+  T sr_ = T(48000.0), g_ = 0, k_ = 1, a1_ = 0, a2_ = 0, a3_ = 0, ic1_ = 0, ic2_ = 0;
+};
+
+/** SVF in float, the form every plugin written before the templates
+ *  uses; SVFT<double> is the same processor in double. */
+using SVF = SVFT<float>;
+
+/** Which output a LadderFilter gives: its own four stages, mixed.
+ *
+ *  The ladder is four one-pole lowpasses H in a loop, so stage n's output is
+ *  H^n of the loop's input u. Highpass and bandpass are polynomials in H
+ *  (the multimode ladder of the Oberheim Xpander; Zavalishin, "The Art of VA
+ *  Filter Design"): a highpass of order N is (1 - H)^N, which the binomial
+ *  theorem expands into the stage outputs, and a bandpass is a lowpass times
+ *  a highpass. The feedback loop is the same in every mode, so every mode
+ *  resonates at the cutoff and self-oscillates past k = 4. */
+enum class LadderMode {
+  Lowpass24,  ///< y4: 24 dB/oct, the Moog's own output (the default)
+  Lowpass12,  ///< y2: 12 dB/oct
+  Highpass24, ///< (1 - H)^4 u = u - 4 y1 + 6 y2 - 4 y3 + y4: 24 dB/oct
+  Highpass12, ///< (1 - H)^2 u = u - 2 y1 + y2: 12 dB/oct
+  /** 4 H^2 (1 - H)^2 u = 4 (y2 - 2 y3 + y4): 12 dB/oct each side, scaled
+   *  so the peak is 0 dB at no resonance. */
+  Bandpass24,
+  /** 2 H (1 - H) u = 2 (y1 - y2): 6 dB/oct each side, peak 0 dB at no
+   *  resonance. */
+  Bandpass12,
 };
 
 /**
  * Four-pole resonant ladder (24 dB/oct): the Moog transistor ladder, the
- * classic analogue-synth voice filter.
+ * classic analogue-synth voice filter; with setMode(), any of LadderMode's
+ * six outputs from the same four stages.
  *
  * ZERO-DELAY FEEDBACK, solved, not approximated: each TPT stage's output is
  * G·u + (1-G)·s, so the fourth stage's output is G^4·u plus a sum of the four
@@ -778,32 +923,33 @@ private:
  * filter. setSaturation(0) removes it, and then k is held under 4 because a
  * linear ladder past the threshold is an exponential.
  */
-class LadderFilter {
+template <typename T>
+class LadderFilterT {
 public:
   /** Sample rate in Hz (48 kHz if not above 1). Call set() after it, which
    *  reads it; until set() has run the filter puts out silence. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** Clear the four stage states and the loop's last output, as after
    *  silence; the settings stay. */
   void reset() {
-    for (int i = 0; i < 4; ++i) s_[i] = 0.0f;
-    last_ = 0.0f;
+    for (int i = 0; i < 4; ++i) s_[i] = T(0.0);
+    last_ = T(0.0);
   }
   /** resonance 0..1 maps onto k = 0..4.2: the threshold is 4, so the top of
    *  the control self-oscillates (bounded by the saturation). */
-  inline void set(float cutoffHz, float resonance) {
-    const float g = std::tan(kPi * clampf(cutoffHz, 20.0f, sr_ * 0.45f) / sr_);
-    G_ = g / (1.0f + g);
+  inline void set(T cutoffHz, T resonance) {
+    const T g = std::tan(piT<T> * clampT<T>(cutoffHz, T(20.0), sr_ * T(0.45)) / sr_);
+    G_ = g / (T(1.0) + g);
     G2_ = G_ * G_;
     G3_ = G2_ * G_;
     G4_ = G2_ * G2_;
-    k_ = 4.2f * clampf(resonance, 0.0f, 1.0f);
-    if (sat_ <= 0.0f && k_ > 3.98f) k_ = 3.98f;
+    k_ = T(4.2) * clampT<T>(resonance, T(0.0), T(1.0));
+    if (sat_ <= T(0.0) && k_ > T(3.98)) k_ = T(3.98);
   }
   /** Drive into the feedback's tanh; 0 = linear (and then no self-oscillation). */
-  void setSaturation(float s) {
-    sat_ = clampf(s, 0.0f, 4.0f);
-    if (sat_ <= 0.0f && k_ > 3.98f) k_ = 3.98f;
+  void setSaturation(T s) {
+    sat_ = clampT<T>(s, T(0.0), T(4.0));
+    if (sat_ <= T(0.0) && k_ > T(3.98)) k_ = T(3.98);
   }
   /** Saturation at every STAGE input (Huovilainen 2004; D'Angelo & Välimäki
    *  2013): the transistor pairs of the real ladder each clip, which is where
@@ -811,49 +957,82 @@ public:
    *  nonlinearity above does not give. 0 = linear stages (the default: a
    *  filter), 1 = tanh at each stage on a full-scale signal. The linear
    *  ZDF solve stays the predictor for the loop, exact for a quiet signal. */
-  void setDrive(float d) { drive_ = clampf(d, 0.0f, 4.0f); }
-  /** One sample through the ladder; returns the 24 dB/oct lowpass. As in
+  void setDrive(T d) { drive_ = clampT<T>(d, T(0.0), T(4.0)); }
+  /** One sample through the ladder; returns the mode's output (the 24 dB/oct
+   *  lowpass unless setMode() chose another). As in
    *  the hardware, resonance thins the passband: the linear ladder's DC gain
    *  is 1 / (1 + k), about -14 dB at full resonance. No allocation; one
    *  tanhApprox per sample with saturation on, four more with drive. */
-  inline float process(float x) {
+  inline T process(T x) {
     // The feedback gain this sample: k compressed by how loud the loop was.
-    float k = k_;
-    if (sat_ > 0.0f) {
-      const float a = std::fabs(last_) * sat_;
-      if (a > 1e-3f) k *= fastmath::tanhApprox(a) / a;
+    T k = k_;
+    if (sat_ > T(0.0)) {
+      const T a = std::fabs(last_) * sat_;
+      if (a > T(1e-3)) k *= tanhApproxT(a) / a;
     }
-    const float oneMinusG = 1.0f - G_;
-    const float sigma = G3_ * oneMinusG * s_[0] + G2_ * oneMinusG * s_[1] + G_ * oneMinusG * s_[2] +
+    const T oneMinusG = T(1.0) - G_;
+    const T sigma = G3_ * oneMinusG * s_[0] + G2_ * oneMinusG * s_[1] + G_ * oneMinusG * s_[2] +
                         oneMinusG * s_[3];
-    float v = (x - k * sigma) / (1.0f + k * G4_);
+    T v = (x - k * sigma) / (T(1.0) + k * G4_);
+    const T u = v;
+    T y[4];
     for (int i = 0; i < 4; ++i) {
-      const float in = drive_ > 0.0f ? fastmath::tanhApprox(v * drive_) / drive_ : v;
-      const float y = G_ * (in - s_[i]) + s_[i];
-      s_[i] = flushDenormal(2.0f * y - s_[i]);
-      v = y;
+      const T in = drive_ > T(0.0) ? tanhApproxT(v * drive_) / drive_ : v;
+      const T out = G_ * (in - s_[i]) + s_[i];
+      s_[i] = flushDenormalT(T(2.0) * out - s_[i]);
+      v = out;
+      y[i] = out;
     }
+    // The loop is fed back from the fourth stage whatever the mode: the
+    // resonance is the ladder's, and only the tap changes.
     last_ = v;
+    switch (mode_) {
+    case LadderMode::Lowpass12: return y[1];
+    case LadderMode::Highpass24: return u - T(4.0) * y[0] + T(6.0) * y[1] - T(4.0) * y[2] + y[3];
+    case LadderMode::Highpass12: return u - T(2.0) * y[0] + y[1];
+    case LadderMode::Bandpass24: return T(4.0) * (y[1] - T(2.0) * y[2] + y[3]);
+    case LadderMode::Bandpass12: return T(2.0) * (y[0] - y[1]);
+    case LadderMode::Lowpass24: break;
+    }
     return v;
   }
 
+  /** Which output process() returns; Lowpass24 until set. Takes effect on
+   *  the next sample, unsmoothed: the stages are shared, so a switch is a
+   *  step in the output, not a disturbance in the filter. As in hardware,
+   *  only the lowpass modes thin with resonance (their passband is at DC,
+   *  where the loop's gain is k); a highpass passes the top at unity and a
+   *  bandpass has no passband to thin, so its peak IS the resonance. With
+   *  setDrive() above 0 the stages saturate and the highpass and bandpass
+   *  sums no longer cancel exactly at DC, which is the driven multimode's
+   *  sound, not a defect of the mix. */
+  void setMode(LadderMode mode) { mode_ = mode; }
+  /** The mode setMode() chose. */
+  LadderMode mode() const { return mode_; }
+
 private:
-  float sr_ = 48000.0f, G_ = 0, G2_ = 0, G3_ = 0, G4_ = 0, k_ = 0, sat_ = 1.0f, drive_ = 0.0f, last_ = 0.0f;
-  float s_[4] = {0, 0, 0, 0};
+  T sr_ = T(48000.0), G_ = 0, G2_ = 0, G3_ = 0, G4_ = 0, k_ = 0, sat_ = T(1.0), drive_ = T(0.0), last_ = T(0.0);
+  T s_[4] = {0, 0, 0, 0};
+  LadderMode mode_ = LadderMode::Lowpass24;
 };
+
+/** LadderFilter in float, the form every plugin written before the templates
+ *  uses; LadderFilterT<double> is the same processor in double. */
+using LadderFilter = LadderFilterT<float>;
 
 /** DC blocker: a high-pass at a few Hz. Asymmetric saturation adds DC offset;
  *  the audio gates reject it, so put one after any asymmetric shaper. */
-class DcBlocker {
+template <typename T>
+class DcBlockerT {
 public:
   /** Where the highpass sits. Low enough to leave the bottom octave alone,
    *  which is also why it takes so long to settle; see tailSamples(). */
-  static constexpr float kCornerHz = 10.0f;
+  static constexpr T kCornerHz = T(10.0);
 
   /** Sample rate in Hz (48 kHz if not above 1: at 0 the pole was minus
    *  infinity): puts the corner at kCornerHz. Until it is called the pole is
    *  0.999, about 7.6 Hz at 48 kHz. */
-  void setSampleRate(float sr) { r_ = 1.0f - (kTwoPi * kCornerHz / (sr > 1.0f ? sr : 48000.0f)); }
+  void setSampleRate(T sr) { r_ = T(1.0) - (twoPiT<T> * kCornerHz / (sr > T(1.0) ? sr : T(48000.0))); }
 
   /** How many samples a full-scale transient takes to decay below `floorDb`.
    *
@@ -866,61 +1045,66 @@ public:
    *
    *  Returned rather than hardcoded per plugin so the number cannot drift away
    *  from the filter it describes. */
-  static int tailSamples(float sr, float floorDb = -80.0f) {
-    const float r = 1.0f - (kTwoPi * kCornerHz / (sr > 1.0f ? sr : 1.0f));
-    if (r <= 0.0f || r >= 1.0f) return 0;
-    return (int) std::ceil(std::log(std::pow(10.0f, floorDb * 0.05f)) / std::log(r));
+  static int tailSamples(T sr, T floorDb = -T(80.0)) {
+    const T r = T(1.0) - (twoPiT<T> * kCornerHz / (sr > T(1.0) ? sr : T(1.0)));
+    if (r <= T(0.0) || r >= T(1.0)) return 0;
+    return (int) std::ceil(std::log(std::pow(T(10.0), floorDb * T(0.05))) / std::log(r));
   }
 
   /** One sample through the highpass; returns it. */
-  inline float process(float x) {
-    const float y = x - x1_ + r_ * y1_;
+  inline T process(T x) {
+    const T y = x - x1_ + r_ * y1_;
     x1_ = x;
-    y1_ = flushDenormal(y);
+    y1_ = flushDenormalT(y);
     return y;
   }
   /** Clear the state, as after silence. */
-  void reset() { x1_ = y1_ = 0.0f; }
+  void reset() { x1_ = y1_ = T(0.0); }
 
 private:
-  float r_ = 0.999f, x1_ = 0.0f, y1_ = 0.0f;
+  T r_ = T(0.999), x1_ = T(0.0), y1_ = T(0.0);
 };
+
+/** DcBlocker in float, the form every plugin written before the templates
+ *  uses; DcBlockerT<double> is the same processor in double. */
+using DcBlocker = DcBlockerT<float>;
 
 // ── Oscillators ──────────────────────────────────────────────────────────────
 
 /** polyBLEP band-limited oscillator. The naive shapes alias badly at high notes
  *  (the aliasing gate measures exactly that), so saw/square subtract a
  *  polynomial approximation of a band-limited step at each discontinuity. */
-class Oscillator {
+template <typename T>
+class OscillatorT {
 public:
   /** Sample rate in Hz (48 kHz until set, and if not above 1: at 0 the
    *  phase increment was 0 / 0 and every shape NaN for good). Call setFreq()
    *  after it: the phase increment is worked out there. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** Frequency in Hz, held to 0 .. half the sample rate; 0 (the default)
    *  holds the phase still. Takes effect on the next sample with no phase
    *  jump, so it may be called every sample for vibrato or FM. */
-  inline void setFreq(float hz) { inc_ = clampf(hz, 0.0f, sr_ * 0.5f) / sr_; }
+  inline void setFreq(T hz) { inc_ = clampT<T>(hz, T(0.0), sr_ * T(0.5)) / sr_; }
   /** Restart at `phase`, in turns, 0 up to (not including) 1: 0 is the
    *  start of a cycle, the sine rising through zero and the saw at its
    *  jump. Also clears the triangle's integrator, for a retriggered voice. */
-  void reset(float phase = 0.0f) { phase_ = phase; tri_ = 0.0f; }
+  void reset(T phase = T(0.0)) { phase_ = phase; tri_ = T(0.0); }
 
   /** One sample of a sine, -1..1, then the phase advances. EVERY shape call
    *  advances the phase, so call one per sample: two calls run the
    *  oscillator at twice its frequency (triangle() is already one). */
-  inline float sine() {
+  inline T sine() {
     // The phase is already in turns, so this is the library call AND the
     // multiply by 2*pi that would have preceded it. A polyphonic synth runs
     // one of these per voice per sample.
-    const float y = fastmath::sinTurns(phase_);
+    const T y = sinTurnsT(phase_);
     adv();
     return y;
   }
   /** One sample of a rising sawtooth, -1 to 1, band-limited by polyBLEP;
    *  advances the phase. */
-  inline float saw() {
-    float y = 2.0f * phase_ - 1.0f;
+  inline T saw() {
+    T y = T(2.0) * phase_ - T(1.0);
     y -= blep(phase_);
     adv();
     return y;
@@ -928,12 +1112,12 @@ public:
   /** One sample of a pulse: +1 for the first `pulseWidth` of each cycle and
    *  -1 for the rest, `pulseWidth` held to 0.02 .. 0.98 (0.5 is a square),
    *  band-limited by polyBLEP at both edges; advances the phase. */
-  inline float square(float pulseWidth = 0.5f) {
-    const float pw = clampf(pulseWidth, 0.02f, 0.98f);
-    float y = phase_ < pw ? 1.0f : -1.0f;
+  inline T square(T pulseWidth = T(0.5)) {
+    const T pw = clampT<T>(pulseWidth, T(0.02), T(0.98));
+    T y = phase_ < pw ? T(1.0) : -T(1.0);
     y += blep(phase_);
-    float p2 = phase_ - pw;
-    if (p2 < 0.0f) p2 += 1.0f;
+    T p2 = phase_ - pw;
+    if (p2 < T(0.0)) p2 += T(1.0);
     y -= blep(p2);
     adv();
     return y;
@@ -950,73 +1134,82 @@ public:
    * cost of a droop far below the fundamental that no ear reaches. tri_ is
    * cleared in reset() so a retriggered voice does not inherit stale state.
    */
-  inline float triangle() {
-    const float sq = square();
+  inline T triangle() {
+    const T sq = square();
     // Leak scaled by the increment: a fixed leak would flatten a low note and
     // barely touch a high one. This keeps the corner a constant fraction of
     // the fundamental across the range.
-    const float leak = 0.5f * inc_;
-    tri_ = flushDenormal(tri_ * (1.0f - leak) + 4.0f * inc_ * sq);
+    const T leak = T(0.5) * inc_;
+    tri_ = flushDenormalT(tri_ * (T(1.0) - leak) + T(4.0) * inc_ * sq);
     return tri_;
   }
   /** The phase the next shape call will use, in turns, 0..1. */
-  float phase() const { return phase_; }
+  T phase() const { return phase_; }
 
 private:
   inline void adv() {
     phase_ += inc_;
-    if (phase_ >= 1.0f) phase_ -= 1.0f;
+    if (phase_ >= T(1.0)) phase_ -= T(1.0);
   }
   /** Two-sided polynomial BLEP residual around a discontinuity. */
-  inline float blep(float t) const {
-    if (inc_ <= 0.0f) return 0.0f;
+  inline T blep(T t) const {
+    if (inc_ <= T(0.0)) return T(0.0);
     if (t < inc_) {
-      const float x = t / inc_;
-      return x + x - x * x - 1.0f;
+      const T x = t / inc_;
+      return x + x - x * x - T(1.0);
     }
-    if (t > 1.0f - inc_) {
-      const float x = (t - 1.0f) / inc_;
-      return x * x + x + x + 1.0f;
+    if (t > T(1.0) - inc_) {
+      const T x = (t - T(1.0)) / inc_;
+      return x * x + x + x + T(1.0);
     }
-    return 0.0f;
+    return T(0.0);
   }
-  float sr_ = 48000.0f, inc_ = 0.0f, phase_ = 0.0f, tri_ = 0.0f;
+  T sr_ = T(48000.0), inc_ = T(0.0), phase_ = T(0.0), tri_ = T(0.0);
 };
+
+/** Oscillator in float, the form every plugin written before the templates
+ *  uses; OscillatorT<double> is the same processor in double. */
+using Oscillator = OscillatorT<float>;
 
 // ── Envelopes + dynamics ─────────────────────────────────────────────────────
 
 /** Peak envelope follower with independent attack/release. */
-class EnvFollower {
+template <typename T>
+class EnvFollowerT {
 public:
   /** Sample rate in Hz (48 kHz until set, and if not above 1: a negative
    *  rate made both coefficients above 1, and the envelope grew without
    *  bound). Call setTimes() after it: the coefficients are worked out
    *  there, from this rate. */
-  void setSampleRate(float sr) { sr_ = sr > 1.0f ? sr : 48000.0f; }
+  void setSampleRate(T sr) { sr_ = sr > T(1.0) ? sr : T(48000.0); }
   /** Attack and release time constants in ms, each floored at 0.01. Until
    *  this is called both are instant and process() returns |x|. Two exp()
    *  per call. */
-  void setTimes(float attackMs, float releaseMs) {
-    aA_ = std::exp(-1.0f / (0.001f * (attackMs > 0.01f ? attackMs : 0.01f) * sr_));
-    aR_ = std::exp(-1.0f / (0.001f * (releaseMs > 0.01f ? releaseMs : 0.01f) * sr_));
+  void setTimes(T attackMs, T releaseMs) {
+    aA_ = std::exp(-T(1.0) / (T(0.001) * (attackMs > T(0.01) ? attackMs : T(0.01)) * sr_));
+    aR_ = std::exp(-T(1.0) / (T(0.001) * (releaseMs > T(0.01) ? releaseMs : T(0.01)) * sr_));
   }
   /** One sample: returns the envelope of |x|, a linear amplitude, rising at
    *  the attack rate while |x| is above the envelope and falling at the
    *  release rate otherwise. */
-  inline float process(float x) {
-    const float r = std::fabs(x);
-    const float a = r > env_ ? aA_ : aR_;
-    env_ = flushDenormal(r + a * (env_ - r));
+  inline T process(T x) {
+    const T r = std::fabs(x);
+    const T a = r > env_ ? aA_ : aR_;
+    env_ = flushDenormalT(r + a * (env_ - r));
     return env_;
   }
   /** The envelope after the last process(), without stepping. */
-  float value() const { return env_; }
+  T value() const { return env_; }
   /** Back to 0, as after silence; the times stay. */
-  void reset() { env_ = 0.0f; }
+  void reset() { env_ = T(0.0); }
 
 private:
-  float sr_ = 48000.0f, aA_ = 0, aR_ = 0, env_ = 0;
+  T sr_ = T(48000.0), aA_ = 0, aR_ = 0, env_ = 0;
 };
+
+/** EnvFollower in float, the form every plugin written before the templates
+ *  uses; EnvFollowerT<double> is the same processor in double. */
+using EnvFollower = EnvFollowerT<float>;
 
 /** ADSR in seconds, exponential-ish segments. Drives one voice's amplitude. */
 class ADSR {
@@ -1128,27 +1321,28 @@ private:
  *  `gainReduction()` reports the last computed GR in positive dB, as every
  *  dynamics class here does; the acceptance gates measure exactly this
  *  number. */
-class Compressor {
+template <typename T>
+class CompressorT {
 public:
   /** -18 dB threshold, 4:1, a 6 dB knee, no makeup, and the detector's
    *  10 ms attack and 100 ms release, at 48 kHz. The times used to wait for
    *  setSampleRate() or setAttack()/setRelease(): until then the detector
    *  followed the peak sample by sample, and a 100 Hz tone over the
    *  threshold came out with its gain modulated at 200 Hz. */
-  Compressor() {
+  CompressorT() {
     refreshQuiet();
-    setSampleRate(48000.0f);
+    setSampleRate(T(48000.0));
   }
   /** Sample rate in Hz (48 kHz if not above 1, as EnvFollower takes it);
    *  works the detector's attack and release out again for it (10 ms and
    *  100 ms unless set). */
-  void setSampleRate(float sr) {
-    sr_ = sr > 1.0f ? sr : 48000.0f;
+  void setSampleRate(T sr) {
+    sr_ = sr > T(1.0) ? sr : T(48000.0);
     env_.setSampleRate(sr_);
     env_.setTimes(attackMs_, releaseMs_);
   }
   /** Threshold in dBFS: where the knee is centred. */
-  void setThreshold(float db) {
+  void setThreshold(T db) {
     thresholdDb_ = db;
     refreshQuiet();
   }
@@ -1156,73 +1350,77 @@ public:
    *  and so is a NaN, which the old `ratio < 1` test let through: every gain
    *  above the knee came out NaN, and so did the output. There is no
    *  infinite setting: a very large ratio is a limiter's curve. */
-  void setRatio(float ratio) { ratio_ = ratio >= 1.0f ? ratio : 1.0f; }
+  void setRatio(T ratio) { ratio_ = ratio >= T(1.0) ? ratio : T(1.0); }
   /** Knee width in dB, centred on the threshold (half below, half above);
    *  0 is a hard knee, a negative width is taken as 0. */
-  void setKnee(float db) {
-    kneeDb_ = db < 0.0f ? 0.0f : db;
+  void setKnee(T db) {
+    kneeDb_ = db < T(0.0) ? T(0.0) : db;
     refreshQuiet();
   }
   /** The detector's attack time constant in ms (floored at 0.01). Two exp()
    *  per call. */
-  void setAttack(float ms) { attackMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
+  void setAttack(T ms) { attackMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
   /** The detector's release time constant in ms (floored at 0.01). Two
    *  exp() per call. */
-  void setRelease(float ms) { releaseMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
+  void setRelease(T ms) { releaseMs_ = ms; env_.setTimes(attackMs_, releaseMs_); }
   /** Gain after the compression, in dB, applied to every sample. */
-  void setMakeup(float db) {
+  void setMakeup(T db) {
     makeupDb_ = db;
     refreshQuiet();
   }
   /** Clear the detector and the reported gain reduction; the settings stay. */
-  void reset() { env_.reset(); grDb_ = 0.0f; }
+  void reset() { env_.reset(); grDb_ = T(0.0); }
 
   /** Compute the gain for this sample from a (possibly external) detector input. */
-  inline float computeGain(float detector) {
-    const float level = env_.process(detector);
+  inline T computeGain(T detector) {
+    const T level = env_.process(detector);
     // Below where the knee starts the reduction is exactly zero and the gain
     // is the makeup, a constant: a log and a pow every sample, for nothing,
     // in the range a compressor spends most of its time in.
     if (level < quietBelow_) {
-      grDb_ = 0.0f;
+      grDb_ = T(0.0);
       return quietGain_;
     }
-    const float levelDb = gainToDb(level);
-    const float over = levelDb - thresholdDb_;
-    float grDb = 0.0f;
-    if (kneeDb_ > 0.0f && over > -kneeDb_ * 0.5f && over < kneeDb_ * 0.5f) {
+    const T levelDb = gainToDbT(level);
+    const T over = levelDb - thresholdDb_;
+    T grDb = T(0.0);
+    if (kneeDb_ > T(0.0) && over > -kneeDb_ * T(0.5) && over < kneeDb_ * T(0.5)) {
       // Quadratic soft knee across the transition band.
-      const float t = over + kneeDb_ * 0.5f;
-      grDb = (1.0f / ratio_ - 1.0f) * (t * t) / (2.0f * kneeDb_);
-    } else if (over > 0.0f) {
-      grDb = (1.0f / ratio_ - 1.0f) * over;
+      const T t = over + kneeDb_ * T(0.5);
+      grDb = (T(1.0) / ratio_ - T(1.0)) * (t * t) / (T(2.0) * kneeDb_);
+    } else if (over > T(0.0)) {
+      grDb = (T(1.0) / ratio_ - T(1.0)) * over;
     }
     grDb_ = grDb;
-    return dbToGain(grDb + makeupDb_);
+    return dbToGainT(grDb + makeupDb_);
   }
   /** One sample, compressed by its own level: x times computeGain(x). For a
    *  sidechain, or one gain for linked channels, call computeGain() with the
    *  detector signal and multiply each channel by it. */
-  inline float process(float x) { return x * computeGain(x); }
+  inline T process(T x) { return x * computeGain(x); }
   /** Gain reduction in dB, POSITIVE (6 means 6 dB quieter), which is what a
    *  meter reads and what every other dynamics class here reports. The signed
    *  gain change is `-gainReduction()`. */
-  float gainReduction() const { return grDb_ < 0.0f ? -grDb_ : 0.0f; }
+  T gainReduction() const { return grDb_ < T(0.0) ? -grDb_ : T(0.0); }
 
 private:
-  float sr_ = 48000.0f;
-  float thresholdDb_ = -18.0f, ratio_ = 4.0f, kneeDb_ = 6.0f;
-  float attackMs_ = 10.0f, releaseMs_ = 100.0f, makeupDb_ = 0.0f, grDb_ = 0.0f;
+  T sr_ = T(48000.0);
+  T thresholdDb_ = -T(18.0), ratio_ = T(4.0), kneeDb_ = T(6.0);
+  T attackMs_ = T(10.0), releaseMs_ = T(100.0), makeupDb_ = T(0.0), grDb_ = T(0.0);
   /** The level under which the knee has not begun, a hair inside it so the
    *  shortcut never claims a sample the curve would have touched, and the
    *  gain there. */
-  float quietBelow_ = 0.0f, quietGain_ = 1.0f;
+  T quietBelow_ = T(0.0), quietGain_ = T(1.0);
   void refreshQuiet() {
-    quietBelow_ = dbToGain(thresholdDb_ - kneeDb_ * 0.5f) * 0.9999f;
-    quietGain_ = dbToGain(0.0f + makeupDb_);
+    quietBelow_ = dbToGainT(thresholdDb_ - kneeDb_ * T(0.5)) * T(0.9999);
+    quietGain_ = dbToGainT(T(0.0) + makeupDb_);
   }
-  EnvFollower env_;
+  EnvFollowerT<T> env_;
 };
+
+/** Compressor in float, the form every plugin written before the templates
+ *  uses; CompressorT<double> is the same processor in double. */
+using Compressor = CompressorT<float>;
 
 // ── Delay + space ────────────────────────────────────────────────────────────
 
@@ -1258,7 +1456,7 @@ private:
  *                where a lowpass on every pass would decay the high partials
  *                and detune the loop.
  */
-template <int MaxSamples>
+template <int MaxSamples, typename T = float>
 class DelayLine {
 public:
   /**
@@ -1271,23 +1469,23 @@ public:
    * itself; a head declared outside the line is reset by its owner.
    */
   struct ThiranState {
-    float y1 = 0.0f;          ///< the allpass's previous output
-    float lastDelay = -1.0f;  ///< negative: nothing read since reset, so seed
-    float coefficient = 0.0f; ///< the allpass's a, cached while the delay holds still
+    T y1 = T(0.0);          ///< the allpass's previous output
+    T lastDelay = -T(1.0);  ///< negative: nothing read since reset, so seed
+    T coefficient = T(0.0); ///< the allpass's a, cached while the delay holds still
     int integerPart = 1;      ///< N, the whole samples read straight from the buffer
     /** Forget the past: the next read seeds itself, as a head just opened
      *  does. A head kept outside the line is reset by its owner, with the
      *  line. */
     void reset() {
-      y1 = 0.0f;
-      lastDelay = -1.0f;
+      y1 = T(0.0);
+      lastDelay = -T(1.0);
     }
   };
 
   /** The spline used by readCubic(). Declared here rather than pulled from
    *  shaping.h because dsp.h defines DelayLine BEFORE that header is
    *  chained in: the alternative is a circular include. */
-  static inline float catmullRomTap(float y0, float y1, float y2, float y3, float frac) {
+  static inline T catmullRomTap(T y0, T y1, T y2, T y3, T frac) {
     // Forwarded, not copied. The same cubic lived here and in the
     // interpolator family, which is one copy too many for a rule this SDK has
     // already watched drift once.
@@ -1298,13 +1496,13 @@ public:
    *  MaxSamples writes, so from prepare() or a transport reset rather than
    *  every block for a long line. No allocation. */
   void reset() {
-    for (int i = 0; i < MaxSamples; ++i) buf_[i] = 0.0f;
+    for (int i = 0; i < MaxSamples; ++i) buf_[i] = T(0.0);
     w_ = 0;
     thiran_.reset();
   }
   /** Write the next sample, over the oldest one. Once per sample; every
    *  read counts its delay back from the last sample written. */
-  inline void write(float x) {
+  inline void write(T x) {
     buf_[w_] = x;
     if (++w_ >= MaxSamples) w_ = 0;
   }
@@ -1340,27 +1538,27 @@ public:
    * octave-up pitch shift -- is reseeded every sample and is no longer an
    * allpass. That is readCubic()'s job.
    */
-  inline float readThiran(float delaySamples, ThiranState& state) const {
+  inline T readThiran(T delaySamples, ThiranState& state) const {
     // A NaN delay is the shortest, as in readCubic; this read holds state,
     // so a NaN here would also stay in it.
-    const float d = delaySamples == delaySamples
-                        ? clampf(delaySamples, 1.0f, (float) (MaxSamples - 3))
-                        : 1.0f;
+    const T d = delaySamples == delaySamples
+                        ? clampT<T>(delaySamples, T(1.0), (T) (MaxSamples - 3))
+                        : T(1.0);
     if (d != state.lastDelay) {
       int n = (int) d; // d >= 1, so truncation is floor
-      float frac = d - (float) n;
+      T frac = d - (T) n;
       // n > 1 keeps the integer tap inside the written region. An exact
       // integer is the exception: frac becomes 1, the coefficient 0, and the
       // read is the plain sample at N+1 whatever N is.
-      if (frac < kThiranLow && (n > 1 || frac == 0.0f)) {
+      if (frac < kThiranLow && (n > 1 || frac == T(0.0))) {
         --n;
-        frac += 1.0f;
+        frac += T(1.0);
       }
-      state.coefficient = (1.0f - frac) / (1.0f + frac);
+      state.coefficient = (T(1.0) - frac) / (T(1.0) + frac);
       state.integerPart = n;
-      const bool jumped = state.lastDelay < 0.0f || std::fabs(d - state.lastDelay) >= 1.0f;
+      const bool jumped = state.lastDelay < T(0.0) || std::fabs(d - state.lastDelay) >= T(1.0);
       state.lastDelay = d;
-      if (jumped) state.y1 = read(d + 1.0f);
+      if (jumped) state.y1 = read(d + T(1.0));
     }
     int i1 = w_ - state.integerPart - 1; // delay N+1
     if (i1 < 0) i1 += MaxSamples;
@@ -1368,29 +1566,29 @@ public:
     // weighed -- but buf_[w_] is the OLDEST sample, so read a written one.
     int i0 = state.integerPart > 0 ? i1 + 1 : i1;
     if (i0 >= MaxSamples) i0 -= MaxSamples;
-    const float y = state.coefficient * (buf_[i0] - state.y1) + buf_[i1];
+    const T y = state.coefficient * (buf_[i0] - state.y1) + buf_[i1];
     state.y1 = y;
     return y;
   }
   /** The same, through the line's own head: reset() clears it. */
-  inline float readThiran(float delaySamples) { return readThiran(delaySamples, thiran_); }
+  inline T readThiran(T delaySamples) { return readThiran(delaySamples, thiran_); }
 
   /** Read with THIRD-ORDER interpolation. This is what a modulated delay
    *  should use: linear interpolation's response changes with the fraction,
    *  so sweeping the delay sweeps a lowpass along with it. */
-  inline float readCubic(float delaySamples) const {
+  inline T readCubic(T delaySamples) const {
     // A NaN read position became an index far outside the buffer: a NaN
     // delay -- an LFO fed a NaN depth, a parameter divided by zero -- reads
     // as the shortest delay instead. clampf() now sends NaN there itself;
     // the test stays where an index is at stake.
-    const float d = delaySamples == delaySamples
-                        ? clampf(delaySamples, 2.0f, (float) (MaxSamples - 3))
-                        : 2.0f;
+    const T d = delaySamples == delaySamples
+                        ? clampT<T>(delaySamples, T(2.0), (T) (MaxSamples - 3))
+                        : T(2.0);
     // The read point in whole samples and a fraction, kept apart (see
     // split()). It was w_ - d in one float, wrapped by adding MaxSamples:
     // that also rounded EXACTLY onto MaxSamples, one past the array, when a
     // modulated delay put w_ a hair under d -- UBSan's find.
-    float frac;
+    T frac;
     const int i1 = split(d, frac);
     // Neighbours wrapped by a compare, not a modulo: three signed `%` per
     // read was most of the arithmetic outside the spline itself, and every
@@ -1408,11 +1606,11 @@ public:
    *  read BEFORE write() (as tap() does) delays by exactly that many
    *  samples, and a read after it by one fewer. Held to 1 .. MaxSamples - 2;
    *  a NaN reads at 1. For a delay that does not move (see the class). */
-  inline float read(float delaySamples) const {
-    const float d = delaySamples == delaySamples // NaN: see readCubic
-                        ? clampf(delaySamples, 1.0f, (float) (MaxSamples - 2))
-                        : 1.0f;
-    float frac;
+  inline T read(T delaySamples) const {
+    const T d = delaySamples == delaySamples // NaN: see readCubic
+                        ? clampT<T>(delaySamples, T(1.0), (T) (MaxSamples - 2))
+                        : T(1.0);
+    T frac;
     const int i0 = split(d, frac);
     int i1 = i0 + 1;
     if (i1 >= MaxSamples) i1 -= MaxSamples;
@@ -1420,8 +1618,8 @@ public:
   }
   /** read(delaySamples), then write(x): one sample through a delay of
    *  `delaySamples`, linearly interpolated. Returns the delayed sample. */
-  inline float tap(float delaySamples, float x) {
-    const float y = read(delaySamples);
+  inline T tap(T delaySamples, T x) {
+    const T y = read(delaySamples);
     write(x);
     return y;
   }
@@ -1429,7 +1627,7 @@ public:
 private:
   // The golden-ratio split point: (1 - d)/(1 + d) is +0.236 at 0.618 and
   // -0.236 at 1.618.
-  static constexpr float kThiranLow = 0.618034f;
+  static constexpr T kThiranLow = T(0.618034);
 
   /** Where a read at delay `d` (at least 1) lands: the index of the sample
    *  at or before the read point, and how far past it the point sits.
@@ -1441,26 +1639,26 @@ private:
    *  rounded by an amount that moved as the write point went round: a
    *  static 100.3-sample read of a 5 kHz tone through the cubic tap was
    *  0.037 off in a 2^21-sample line, against 0.005 in a short one. */
-  inline int split(float d, float& frac) const {
+  inline int split(T d, T& frac) const {
     const int whole = (int) d; // d >= 1, so truncation is floor
-    const float part = d - (float) whole; // exact
+    const T part = d - (T) whole; // exact
     int i = w_ - whole;
-    frac = 0.0f;
-    if (part > 0.0f) {
+    frac = T(0.0);
+    if (part > T(0.0)) {
       --i;
-      frac = 1.0f - part;
+      frac = T(1.0) - part;
     }
     if (i < 0) i += MaxSamples;
     return i;
   }
 
-  float buf_[MaxSamples] = {0.0f};
+  T buf_[MaxSamples] = {T(0.0)};
   int w_ = 0;
   ThiranState thiran_;
 };
 
 /** Schroeder allpass: the diffusion element of a reverb. */
-template <int MaxSamples>
+template <int MaxSamples, typename T = float>
 class Allpass {
 public:
   /** Silence the delay line (MaxSamples writes). */
@@ -1468,23 +1666,23 @@ public:
   /** Delay in samples, which the line holds to 1 .. MaxSamples - 2, and
    *  gain `g`, held to -0.95 .. 0.95: the nearer to +-1, the longer its
    *  echoes ring. 100 samples and 0.5 until set. */
-  void set(float delaySamples, float g) { d_ = delaySamples; g_ = clampf(g, -0.95f, 0.95f); }
+  void set(T delaySamples, T g) { d_ = delaySamples; g_ = clampT<T>(g, -T(0.95), T(0.95)); }
   /** One sample through the allpass; returns it. Flat in magnitude once
    *  settled, smeared in time. */
-  inline float process(float x) {
-    const float delayed = line_.read(d_);
-    const float v = x + g_ * delayed;
-    line_.write(flushDenormal(v));
+  inline T process(T x) {
+    const T delayed = line_.read(d_);
+    const T v = x + g_ * delayed;
+    line_.write(flushDenormalT(v));
     return delayed - g_ * v;
   }
 
 private:
-  DelayLine<MaxSamples> line_;
-  float d_ = 100.0f, g_ = 0.5f;
+  DelayLine<MaxSamples, T> line_;
+  T d_ = T(100.0), g_ = T(0.5);
 };
 
 /** Feedback comb with damping: the tail element of a Schroeder/Moorer reverb. */
-template <int MaxSamples>
+template <int MaxSamples, typename T = float>
 class Comb {
 public:
   /** Silence the delay line (MaxSamples writes) and the damping filter. */
@@ -1493,55 +1691,157 @@ public:
    *  `feedback` held to 0 .. 0.98 (higher rings longer), and the corner of
    *  the lowpass in the loop, `dampingHz` at sample rate `sr`: the lower it
    *  is, the faster the highs die. One tan() per call. */
-  void set(float delaySamples, float feedback, float dampingHz, float sr) {
+  void set(T delaySamples, T feedback, T dampingHz, T sr) {
     d_ = delaySamples;
-    fb_ = clampf(feedback, 0.0f, 0.98f);
+    fb_ = clampT<T>(feedback, T(0.0), T(0.98));
     damp_.setSampleRate(sr);
     damp_.setCutoff(dampingHz);
   }
   /** One sample: returns the line's output, and writes the input plus the
    *  damped output times the feedback back into it. Until set(): 1000
    *  samples at 0.7 feedback. */
-  inline float process(float x) {
-    const float y = line_.read(d_);
-    line_.write(flushDenormal(x + fb_ * damp_.lp(y)));
+  inline T process(T x) {
+    const T y = line_.read(d_);
+    line_.write(flushDenormalT(x + fb_ * damp_.lp(y)));
     return y;
   }
 
 private:
-  DelayLine<MaxSamples> line_;
-  OnePole damp_;
-  float d_ = 1000.0f, fb_ = 0.7f;
+  DelayLine<MaxSamples, T> line_;
+  OnePoleT<T> damp_;
+  T d_ = T(1000.0), fb_ = T(0.7);
 };
 
 // ── Utility ──────────────────────────────────────────────────────────────────
 
+/**
+ * How two gains share a position that moves from one side to the other: the
+ * pan laws of a mixing desk, and the same thing for a dry/wet control, which
+ * pans between two signals instead of two speakers.
+ *
+ * Named by where the CENTRE lands, because that is the whole difference. Two
+ * UNCORRELATED signals (or one panned into a room) add in power, so a law
+ * whose two gains keep a^2 + b^2 = 1 holds the loudness constant: -3 dB.
+ * Two CORRELATED signals -- a mono source summed to mono, or a dry signal and
+ * a wet one that is mostly the dry signal delayed a little -- add in
+ * amplitude, so the law that holds them constant keeps a + b = 1: -6 dB.
+ * Desks compromised at -4.5 dB. None is wrong; each is right for something.
+ */
+enum class PanLaw {
+  /** sin/cos: -3 dB at the centre, a^2 + b^2 = 1 everywhere. The default
+   *  wherever a law is chosen. */
+  ConstantPower,
+  /** 1 - p and p: -6 dB at the centre, a + b = 1. Right for correlated
+   *  signals, and for a crossfade between two takes of the same thing. */
+  Linear,
+  /** Both at unity at the centre, only the far side turned down: 0 dB. A
+   *  balance control, and a dry/wet that keeps the dry at full level up to
+   *  the middle. */
+  Balance,
+  /** sin/cos to the power 1.5: -4.5 dB, the desk compromise. */
+  Sine4_5dB,
+  /** sin^2/cos^2: -6 dB like Linear, a + b = 1 too, on a smooth curve. */
+  Sine6dB,
+  /** sqrt(1 - p), sqrt(p): -3 dB like ConstantPower, a^2 + b^2 = 1, with a
+   *  steeper start. */
+  SquareRoot3dB,
+  /** (1 - p)^0.75, p^0.75: -4.5 dB. */
+  SquareRoot4_5dB,
+};
+
+/** The two gains of `law` at `position`, 0 (all `a`, none `b`) .. 1 (all `b`),
+ *  held to that range. ConstantPower is exactly the cos/sin the Panner and
+ *  the DryWetMixer have always computed. */
+template <typename T>
+inline void panLawGains(PanLaw law, T position, T& a, T& b) {
+  const T p = clampT<T>(position, T(0.0), T(1.0));
+  switch (law) {
+  case PanLaw::Linear:
+    a = T(1.0) - p;
+    b = p;
+    return;
+  case PanLaw::Balance: {
+    const T twoA = T(2.0) * (T(1.0) - p), twoB = T(2.0) * p;
+    a = twoA < T(1.0) ? twoA : T(1.0);
+    b = twoB < T(1.0) ? twoB : T(1.0);
+    return;
+  }
+  case PanLaw::SquareRoot3dB:
+    a = std::sqrt(T(1.0) - p);
+    b = std::sqrt(p);
+    return;
+  case PanLaw::SquareRoot4_5dB: {
+    // x^0.75 as sqrt(x) * sqrt(sqrt(x)): two square roots, correctly rounded
+    // on every platform, where std::pow is only as good as its library.
+    const T ra = std::sqrt(T(1.0) - p), rb = std::sqrt(p);
+    a = ra * std::sqrt(ra);
+    b = rb * std::sqrt(rb);
+    return;
+  }
+  default:
+    break;
+  }
+  const T c = std::cos(p * piT<T> * T(0.5));
+  const T s = std::sin(p * piT<T> * T(0.5));
+  switch (law) {
+  case PanLaw::Sine4_5dB: {
+    // cos(pi/2) in floating point is a hair below zero, and a square root
+    // of it is a NaN; the gain there is 0.
+    const T cc = c > T(0.0) ? c : T(0.0), ss = s > T(0.0) ? s : T(0.0);
+    a = cc * std::sqrt(cc);
+    b = ss * std::sqrt(ss);
+    return;
+  }
+  case PanLaw::Sine6dB:
+    a = c * c;
+    b = s * s;
+    return;
+  default:
+    a = c;
+    b = s;
+    return;
+  }
+}
+
 /** Equal-power dry/wet mixer. Keeps perceived level constant across the sweep,
- *  which is what stops "more effect" from also meaning "louder". */
-class DryWetMixer {
+ *  which is what stops "more effect" from also meaning "louder". setLaw()
+ *  picks another of PanLaw's curves: Linear (a + b = 1) for a wet path that
+ *  is mostly the dry signal delayed a little, where equal power would bulge
+ *  3 dB at the middle, or Balance for "the dry stays at full level until
+ *  halfway". */
+template <typename T>
+class DryWetMixerT {
 public:
   /** All dry: a mix of 0. */
-  DryWetMixer() = default;
+  DryWetMixerT() = default;
   /** Landed on `mix` (see setMix()), not gliding to it: what an effect
    *  whose default mix is not 0 holds its mixer as. */
-  explicit DryWetMixer(float mix) { setMix(mix); }
+  explicit DryWetMixerT(T mix) { setMix(mix); }
   /** The glide's length against the rate it runs at. Left alone it is 960
    *  calls: 20 ms at 48 kHz, 5 at 192 -- smoothing either way. */
-  void setSampleRate(float sr, float ms = 20.0f) {
-    const float n = 0.001f * (ms > 0.1f ? ms : 0.1f) * (sr > 1.0f ? sr : 48000.0f);
-    k_ = 1.0f - std::exp(-1.0f / n);
+  void setSampleRate(T sr, T ms = T(20.0)) {
+    const T n = T(0.001) * (ms > T(0.1) ? ms : T(0.1)) * (sr > T(1.0) ? sr : T(48000.0));
+    k_ = T(1.0) - std::exp(-T(1.0) / n);
   }
   /** A new mix GLIDES in once audio is running. It used to land in one
    *  sample, and a mix knob automated on a delay stepped the output 52
    *  times its largest natural step -- on every reverb, the chorus and the
    *  phaser alike. Set before the first process(), or after snap(), it
    *  lands at once: a starting mix is a setting, not a movement. */
-  void setMix(float mix) {
-    const float m = clampf(mix, 0.0f, 1.0f);
-    wetTarget_ = std::sin(m * kPi * 0.5f);
-    dryTarget_ = std::cos(m * kPi * 0.5f);
+  void setMix(T mix) {
+    mix_ = clampT<T>(mix, T(0.0), T(1.0));
+    panLawGains(law_, mix_, dryTarget_, wetTarget_);
     if (!running_) snap();
   }
+  /** The curve the two gains follow across the mix: PanLaw::ConstantPower
+   *  (equal power) until set. A change of law glides like a change of mix
+   *  once audio runs. */
+  void setLaw(PanLaw law) {
+    law_ = law;
+    setMix(mix_);
+  }
+  /** The law setLaw() chose. */
+  PanLaw law() const { return law_; }
   /** Land on the mix now: what a reset() means. */
   void snap() {
     dry_ = dryTarget_;
@@ -1549,15 +1849,23 @@ public:
     running_ = false;
   }
   /** One sample of the mix, `dry` times cos(mix pi/2) plus `wet` times
-   *  sin(mix pi/2), taking a changing mix one glide step on. The glide
-   *  steps per CALL: one mixer shared by two channels glides twice as fast
-   *  as setSampleRate() says. */
-  inline float process(float dry, float wet) {
+   *  sin(mix pi/2) (or the two gains of the law setLaw() chose), taking a
+   *  changing mix one glide step on. The glide steps per CALL: one mixer
+   *  shared by two channels glides twice as fast as setSampleRate() says. */
+  inline T process(T dry, T wet) {
     running_ = true;
     if (dry_ != dryTarget_ || wet_ != wetTarget_) {
+      const T dry0 = dry_, wet0 = wet_;
       dry_ += (dryTarget_ - dry_) * k_;
       wet_ += (wetTarget_ - wet_) * k_;
-      if (std::fabs(dryTarget_ - dry_) < 1e-6f && std::fabs(wetTarget_ - wet_) < 1e-6f) {
+      // Landed when both are within 1e-6 -- or when a step no longer moves
+      // a gain at all. In float a glide toward 1 STALLS: once (1 - g) k is
+      // under half a step of g, g + (1 - g) k rounds back to g, about 3e-5
+      // short at the default glide, and it stayed there for good. A mix
+      // automated back to 0 % then never gave back exactly the dry signal.
+      const bool dryDone = std::fabs(dryTarget_ - dry_) < T(1e-6) || dry_ == dry0;
+      const bool wetDone = std::fabs(wetTarget_ - wet_) < T(1e-6) || wet_ == wet0;
+      if (dryDone && wetDone) {
         dry_ = dryTarget_;
         wet_ = wetTarget_;
       }
@@ -1566,10 +1874,16 @@ public:
   }
 
 private:
-  float dry_ = 1.0f, wet_ = 0.0f, dryTarget_ = 1.0f, wetTarget_ = 0.0f;
-  float k_ = 0.00104112f; // 1 - exp(-1/960)
+  T dry_ = T(1.0), wet_ = T(0.0), dryTarget_ = T(1.0), wetTarget_ = T(0.0);
+  T k_ = T(0.00104112); // 1 - exp(-1/960)
+  T mix_ = T(0.0);
+  PanLaw law_ = PanLaw::ConstantPower;
   bool running_ = false;
 };
+
+/** DryWetMixer in float, the form every plugin written before the templates
+ *  uses; DryWetMixerT<double> is the same processor in double. */
+using DryWetMixer = DryWetMixerT<float>;
 
 /**
  * A dry/wet mixer that DELAYS THE DRY PATH to match a wet path that is late.
@@ -1611,6 +1925,10 @@ public:
    *  frame. */
   void setMix(float mix) {
     for (DryWetMixer& m : mixer_) m.setMix(mix);
+  }
+  /** The mix's curve, as DryWetMixer::setLaw(): equal power until set. */
+  void setLaw(PanLaw law) {
+    for (DryWetMixer& m : mixer_) m.setLaw(law);
   }
 
   /** How late the wet path is, in samples. Call from prepare(): it clears the

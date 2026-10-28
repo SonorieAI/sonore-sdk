@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 283 headers, 768 public types.
+not have. 284 headers, 840 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -88,8 +88,9 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 
 If a class or struct is not in this list, the SDK does not have it. Reaching for
 a class that sounds like it should exist is the most common way generated code
-fails to compile against this library. Functions, aliases and methods are not
-listed here (dbToGain is a function, ProcessContext an alias): look for those in
+fails to compile against this library. The names given to a listed class template
+are listed beside it (Biquad beside BiquadT, Vec8i16 beside VecIntT); functions,
+methods and other aliases are not (dbToGain is a function): look for those in
 the header itself, or ask the MCP server's `sonore_search`, which covers them.
 
 ### aax_wrapper.h
@@ -186,7 +187,7 @@ core audio types. Our own, dependency-free equivalents of the
 
 `sdk/include/sonore/audio.h`
 
-ProcessSpec, AudioBlock, MidiMessage, MidiBuffer, NoteExpressionBuffer, NoteIdBuffer, ParamModBuffer, RpnMessage, RpnDetector, HostInfo, TrackInfo, MpeZone, MpeDecoder, ProcessContextT
+ProcessSpec, AudioBlock, MidiMessage, MidiBuffer, NoteExpressionBuffer, NoteIdBuffer, ParamModBuffer, RpnMessage, RpnDetector, HostInfo, TrackInfo, MpeZone, MpeDecoder, ProcessContextT, ProcessContext
 
 ### audio_aaudio.h
 
@@ -420,6 +421,14 @@ The hardware compressors: opto, FET, VCA
 
 OptoCompressor, FetCompressor, VcaCompressor
 
+### convolution.h
+
+convolution of any length, at zero latency, with impulse
+
+`sdk/include/sonore/convolution.h`
+
+ConvolutionOptions, ConvolutionEngine, Convolution
+
 ### crossover.h
 
 a crossover into any number of bands that still sums flat
@@ -466,7 +475,7 @@ the DSP toolkit. Header-only, allocation-free, dependency-free
 
 `sdk/include/sonore/dsp.h`
 
-Smooth, Glide, LogRamp, OnePole, Biquad, IirSection, SvfSection, SVF, LadderFilter, DcBlocker, Oscillator, EnvFollower, ADSR, Compressor, DelayLine, Allpass, Comb, DryWetMixer, CompensatedDryWetMixer, VoiceManager
+SmoothT, Smooth, GlideT, Glide, LogRampT, LogRamp, OnePoleT, OnePole, BiquadT, Biquad, IirSection, SvfSection, SVFT, SVF, LadderFilterT, LadderFilter, DcBlockerT, DcBlocker, OscillatorT, Oscillator, EnvFollowerT, EnvFollower, ADSR, CompressorT, Compressor, DelayLine, Allpass, Comb, DryWetMixerT, DryWetMixer, CompensatedDryWetMixer, VoiceManager
 
 ### dynamic_eq.h
 
@@ -490,7 +499,7 @@ composite effects
 
 `sdk/include/sonore/effects.h`
 
-Reverb, Chorus, Phaser, Limiter, NoiseGate, LinkwitzRiley, StereoWidener, Panner
+Reverb, ChorusT, Chorus, PhaserT, Phaser, Limiter, NoiseGateT, NoiseGate, LinkwitzRileyT, LinkwitzRiley, StereoWidenerT, StereoWidener, PannerT, Panner
 
 ### eq.h
 
@@ -530,7 +539,7 @@ frequency domain
 
 `sdk/include/sonore/fft.h`
 
-Fft, SpectrumAnalyser, Convolver
+Fft, DynamicFft, SpectrumAnalyser, Convolver
 
 ### file_dialog.h
 
@@ -578,7 +587,7 @@ FIR filters, designed and run
 
 `sdk/include/sonore/fir.h`
 
-FirWindowParams, FirFilter
+FirWindowParams, FirBand, FirFilterT, FirFilter
 
 ### flac_encode.h
 
@@ -1498,7 +1507,7 @@ reading a stream at a rate that is not one sample per sample
 
 `sdk/include/sonore/interpolation.h`
 
-ZeroOrderHoldKernel, LinearKernel, CatmullRomKernel, Lagrange3Kernel, WindowedSincKernel, Interpolator
+ZeroOrderHoldKernel, LinearKernel, CatmullRomKernel, Lagrange3Kernel, WindowedSincKernel, Interpolator, ZeroOrderHoldInterpolator, LinearInterpolator, CatmullRomInterpolator, LagrangeInterpolator, WindowedSincInterpolator
 
 ### ipc.h
 
@@ -1594,7 +1603,7 @@ Degradation on purpose: bit depth, sample rate, wavefolding
 
 `sdk/include/sonore/lofi.h`
 
-BitCrusher, Decimator, WaveFolder, Oversampled
+BitCrusher, Decimator, WaveFolder, Oversampled, OversampledIir
 
 ### logger.h
 
@@ -1922,7 +1931,7 @@ rate conversion
 
 `sdk/include/sonore/resample.h`
 
-HalfBandFilter, PolyphaseIirHalfBand, OversamplerT, Resampler
+HalfBandFilter, PolyphaseIirHalfBand, OversamplerT, Oversampler, OversamplerIir, Oversampler2x, Oversampler4x, Oversampler8x, Oversampler16x, Oversampler32x, OversamplerIir2x, OversamplerIir4x, OversamplerIir8x, OversamplerIir16x, OversamplerIir32x, DynamicOversamplerT, DynamicOversampler, DynamicOversamplerIir, Resampler
 
 ### sample_stream.h
 
@@ -1962,7 +1971,7 @@ waveshaping, lookup tables, ballistics and chain composition
 
 `sdk/include/sonore/shaping.h`
 
-LookupTable, WaveShaper, BallisticsFilter, ProcessorChain, ProcessorDuplicator, Gain, Bias, SampleStage, LogSmooth
+LookupTableT, LookupTable, WaveShaperT, WaveShaper, BallisticsFilterT, BallisticsFilter, ProcessorChain, ProcessorDuplicator, GainT, Gain, BiasT, Bias, SampleStage, LogSmoothT, LogSmooth
 
 ### simd.h
 
@@ -1970,7 +1979,7 @@ SIMD
 
 `sdk/include/sonore/simd.h`
 
-Vec4f
+Vec4f, Vec8f, Vec2d, Vec4d, Vec4i, Vec4Of, VecIntT, Vec16i8, Vec8i16, Vec2i64, ComplexVec4T, Vec4cf, Vec4cd
 
 ### special.h
 
@@ -2330,7 +2339,7 @@ the Windows webview backend (Edge WebView2)
 
 `sdk/include/sonore/webview_win32.h`
 
-ComCallback, WebViewHost
+ComCallback, EnvHandler, ControllerHandler, SuspendHandler, MessageHandler, KeyHandler, NavigationHandler, NewWindowHandler, ResourceHandler, WebViewHost
 
 ### win_com.h
 

@@ -59,7 +59,12 @@ inline double besselI0(double x) {
  */
 inline double kaiser(double r, double beta) {
   const double arg = 1.0 - r * r;
-  if (arg <= 0.0) return 0.0;
+  // Zero only OUTSIDE the window. At its two ends, r = +-1, the Kaiser
+  // window is I0(0) / I0(beta) = 1 / I0(beta) -- MATLAB's and scipy's value,
+  // and what makes beta 0 the rectangle. This was `arg <= 0`, which set the
+  // end samples to zero: every Kaiser-windowed FIR kernel lost its first and
+  // last taps, and "beta 0" was a rectangle with its ends cut off.
+  if (arg < 0.0) return 0.0;
   return besselI0(beta * std::sqrt(arg)) / besselI0(beta);
 }
 

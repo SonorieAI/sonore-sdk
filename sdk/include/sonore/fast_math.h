@@ -124,6 +124,85 @@ inline float fastCos(float x) {
 }
 
 /**
+ * tan, to within RELATIVE error 3e-7 over (-pi/2, pi/2) -- right up to the
+ * poles, every float beside them included -- and 2e-6 wherever |x| < 1000
+ * (measured 2.4e-7 and 1.3e-6).
+ * Relative, because tan runs from 0 to infinity and an absolute bound would
+ * say nothing at either end. This is the one a TPT filter needs: its
+ * coefficient is tan(pi fc / fs), and modulating the cutoff at audio rate
+ * means one of these per sample.
+ *
+ * Lambert's continued fraction for tan, cut after four levels, is the [5/4]
+ * Pade approximant x (945 - 105 x^2 + x^4) / (945 - 420 x^2 + 15 x^4), whose
+ * own error is 1.3e-8 at pi/4: below a float. It is only ever evaluated
+ * there. Beyond pi/4 the identity tan(y) = 1 / tan(pi/2 - y) brings the
+ * argument back, and pi/2 - y is computed with pi split in three (Cody and
+ * Waite), the first parts short enough that the subtractions are exact. Near
+ * a pole the answer is the reciprocal of the distance to it, so that
+ * distance has to be right to the last bit: the float nearest pi/2 is 4.4e-8
+ * off it, which next to the pole was an error of 72%, and pi in two parts
+ * still 3e-5.
+ */
+inline float fastTan(float x) {
+  // pi = kPiA + kPiB + kPiC to 1.2e-16. The first two are short (8 and 13
+  // significant bits), so k or k +- 1/2 times either is exact.
+  constexpr float kPiA = 201.0f / 64.0f;
+  constexpr float kPiB = 8117.0f / 8388608.0f;
+  constexpr float kPiC = 3.17865094e-8f;
+  constexpr float kInvPi = 0.318309886f;
+  constexpr float kQuarterPi = 0.785398163f;
+  // Wrapped into [-pi/2, pi/2]: tan's period is pi. x - k kPiA is exact
+  // (the two are within a factor of two of each other), so y is rounded once.
+  const float k = std::floor(x * kInvPi + 0.5f);
+  const float y = ((x - k * kPiA) - k * kPiB) - k * kPiC;
+  const bool reflect = std::fabs(y) > kQuarterPi;
+  // Reflected, the argument is pi/2 - y = (k + 1/2) pi - x, or -pi/2 - y =
+  // (k - 1/2) pi - x: taken from x itself, not from the rounded y. Near the
+  // pole y's rounding (1.2e-7) is bigger than the answer (7.7e-8 at the last
+  // float below pi/2), and reflecting y made a tan 72% wrong there.
+  const float m = y > 0.0f ? k + 0.5f : k - 0.5f;
+  const float z = reflect ? ((m * kPiA - x) + m * kPiB) + m * kPiC : y;
+  const float z2 = z * z;
+  const float numerator = z * (945.0f + z2 * (-105.0f + z2));
+  const float denominator = 945.0f + z2 * (-420.0f + z2 * 15.0f);
+  return reflect ? denominator / numerator : numerator / denominator;
+}
+
+/**
+ * cosh, to within relative error 5e-6 for |x| < 20 and 1e-5 wherever
+ * |x| < 88 (measured 4.2e-6 and 7.1e-6), from fastExp: (e^|x| + e^-|x|) / 2.
+ * Nothing cancels in the sum, so the exponential's error is the whole of it,
+ * and at the top of the range that is the float's own resolution of x
+ * times log2(e).
+ */
+inline float fastCosh(float x) {
+  const float e = fastExp(std::fabs(x));
+  return 0.5f * (e + 1.0f / e);
+}
+
+/**
+ * sinh, to within relative error 2e-7 for |x| < 1, 5e-6 for |x| < 20 and
+ * 1e-5 wherever |x| < 88 (measured 1.3e-7, 4.3e-6 and 7.1e-6).
+ *
+ * (e^x - e^-x) / 2 is the definition and a poor formula near zero: the two
+ * exponentials agree there, and their difference keeps only their error --
+ * at x = 0.001 that is a relative error of 1e-2. So below 1 it is the series,
+ * odd as sinh is, through x^9 (the next term is 2.5e-8 at x = 1), and the
+ * exponentials only where they no longer cancel.
+ */
+inline float fastSinh(float x) {
+  const float a = std::fabs(x);
+  if (a < 1.0f) {
+    const float x2 = x * x;
+    return x * (1.0f + x2 * (0.166666667f + x2 * (0.00833333333f +
+                                                  x2 * (1.98412698e-4f + x2 * 2.75573192e-6f))));
+  }
+  const float e = fastExp(a);
+  const float r = 0.5f * (e - 1.0f / e);
+  return x < 0.0f ? -r : r;
+}
+
+/**
  * A natural logarithm, to within 1e-5 absolute over every positive normal
  * float, and 2e-6 between 1e-6 and 1e6 (measured 7.9e-6 and 1.0e-6). What is
  * left is the float's own resolution of the answer: ln(1e38) is 87.5, where

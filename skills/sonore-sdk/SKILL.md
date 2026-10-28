@@ -52,10 +52,10 @@ method you have not seen in this SDK:
   a complete working plugin of a given kind, and `sonore-sdk:sonore_rules`
   the rules below.
 - **Without it**, read `llms-full.txt` at the SDK root for the classes and
-  structs: every one in every header (283 headers, 768
-  types), so a class that is not in it does not exist. Functions, aliases and
-  methods are not listed there; search the headers for those before deciding
-  one is missing.
+  structs: every one in every header (284 headers, 840
+  types), so a class that is not in it does not exist. Functions, methods and
+  aliases of anything but a listed class are not listed there; search the
+  headers for those before deciding one is missing.
 
 ## Start from a generated project
 

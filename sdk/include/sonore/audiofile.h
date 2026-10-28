@@ -20,6 +20,11 @@
 // which container the user dropped on them. An application that wants the
 // operating system's decoders behind that (M4A, WMA...) opts in through
 // system_audio_format.h; the set here stays the default.
+//
+// Every reader has a twin that takes the file's BYTES instead of its path --
+// readAudioFile(data, size, &out), and readWav/readAiff/readFlac/readMp3/
+// readOgg likewise -- for audio compiled into the plugin itself. The file
+// readers read the file and call the twin, so the two cannot disagree.
 
 #pragma once
 
@@ -70,27 +75,20 @@ inline double readExtended80(const uint8_t* p) {
 
 } // namespace aiffdetail
 
-/** Read an AIFF or AIFF-C file: 16/24-bit PCM, big-endian ("NONE") or
- *  little-endian ("sowt", what modern Macs actually write). */
-inline bool readAiff(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
-  if (!path || !out) return false;
-  std::FILE* f = ::sonore::pathio::open(path, "rb");
-  if (!f) return false;
-  std::fseek(f, 0, SEEK_END);
-  const long size = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  // The whole file is read into memory, as readWav does -- and capped as it
-  // is. This reader had no cap at all.
-  if (size < 12 || size > (long) (1u << 30)) { std::fclose(f); return false; }
-  std::vector<uint8_t> data((size_t) size);
-  const bool okRead = std::fread(data.data(), 1, (size_t) size, f) == (size_t) size;
-  std::fclose(f);
-  if (!okRead) return false;
+/** Decode an AIFF or AIFF-C file that is already in memory: `size` bytes at
+ *  `fileData`, as they would be on disk (an IR compiled into the plugin, say).
+ *  The decoder the file reader below uses, with its refusals and ceiling. */
+inline bool readAiff(const void* fileData, size_t size, WavData* out,
+                     size_t maxSamples = kMaxDecodedSamples) {
+  if (!fileData || !out) return false;
+  // The bounds the file reader holds before it reads a byte.
+  if (size < 12 || size > (size_t) (1u << 30)) return false;
+  const uint8_t* const data = static_cast<const uint8_t*>(fileData);
 
   using namespace aiffdetail;
-  if (std::memcmp(data.data(), "FORM", 4) != 0) return false;
-  const bool aifc = std::memcmp(data.data() + 8, "AIFC", 4) == 0;
-  if (!aifc && std::memcmp(data.data() + 8, "AIFF", 4) != 0) return false;
+  if (std::memcmp(data, "FORM", 4) != 0) return false;
+  const bool aifc = std::memcmp(data + 8, "AIFC", 4) == 0;
+  if (!aifc && std::memcmp(data + 8, "AIFF", 4) != 0) return false;
 
   uint16_t channels = 0, bits = 0;
   uint32_t frames = 0;
@@ -102,14 +100,14 @@ inline bool readAiff(const char* path, WavData* out, size_t maxSamples = kMaxDec
   // Chunk walk, exactly like the WAV reader: trusting fixed offsets is the
   // classic shortcut that breaks on files written by real software.
   size_t pos = 12;
-  while (pos + 8 <= data.size()) {
-    const uint8_t* hdr = data.data() + pos;
+  while (pos + 8 <= size) {
+    const uint8_t* hdr = data + pos;
     const uint32_t chunkLen = readU32BE(hdr + 4);
     const uint8_t* body = hdr + 8;
-    if (chunkLen > data.size() - pos - 8) { // pos + 8 <= size: the loop guard
+    if (chunkLen > size - pos - 8) { // pos + 8 <= size: the loop guard
       // Sound data that claims more than the file holds: a take whose header
       // was never finished. What is there is read, as in a WAV.
-      const size_t there = data.size() - pos - 8;
+      const size_t there = size - pos - 8;
       if (std::memcmp(hdr, "SSND", 4) == 0 && there >= 8) {
         const uint32_t offset = readU32BE(body);
         if ((size_t) offset + 8 <= there) {
@@ -168,6 +166,25 @@ inline bool readAiff(const char* path, WavData* out, size_t maxSamples = kMaxDec
     }
   }
   return true;
+}
+
+/** Read an AIFF or AIFF-C file: 16/24-bit PCM, big-endian ("NONE") or
+ *  little-endian ("sowt", what modern Macs actually write). */
+inline bool readAiff(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
+  if (!path || !out) return false;
+  std::FILE* f = ::sonore::pathio::open(path, "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  // The whole file is read into memory, as readWav does -- and capped as it
+  // is. This reader had no cap at all.
+  if (size < 12 || size > (long) (1u << 30)) { std::fclose(f); return false; }
+  std::vector<uint8_t> data((size_t) size);
+  const bool okRead = std::fread(data.data(), 1, (size_t) size, f) == (size_t) size;
+  std::fclose(f);
+  if (!okRead) return false;
+  return readAiff(data.data(), data.size(), out, maxSamples);
 }
 
 namespace aiffwrite {
@@ -642,32 +659,20 @@ inline size_t id3v2Length(const uint8_t* data, size_t size) {
 
 } // namespace flacdetail
 
-/** Read a FLAC file: our own decoder for the published format. 16/24-bit,
- *  one to eight channels (and all four stereo decorrelation modes), any
- *  block size. It stopped at two, while writeFlac writes up to eight: the
- *  SDK could not read back its own 5.1 file. */
-inline bool readFlac(const char* path, WavData* out) {
-  if (!path || !out) return false;
-  std::FILE* f = ::sonore::pathio::open(path, "rb");
-  if (!f) return false;
-  std::fseek(f, 0, SEEK_END);
-  const long size = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  // Bounded as readWav and readAiff are: 1 GB is far past any FLAC a plugin
-  // loads whole, and past it -- on a platform whose long is 64 bits -- the
-  // whole file went into memory before a byte of it was checked.
-  if (size < 42 || size > (long) (1u << 30)) { std::fclose(f); return false; }
-  std::vector<uint8_t> data((size_t) size);
-  const bool okRead = std::fread(data.data(), 1, (size_t) size, f) == (size_t) size;
-  std::fclose(f);
-  if (!okRead) return false;
+/** Decode a FLAC file that is already in memory: `size` bytes at `fileData`,
+ *  as they would be on disk. The decoder the file reader below uses. */
+inline bool readFlac(const void* fileData, size_t size, WavData* out) {
+  if (!fileData || !out) return false;
+  // The bounds the file reader holds before it reads a byte.
+  if (size < 42 || size > (size_t) (1u << 30)) return false;
+  const uint8_t* const data = static_cast<const uint8_t*>(fileData);
   // An ID3v2 tag in front of the stream, as some taggers write into FLAC
   // files too. libFLAC and ffmpeg skip one, so every player opens such a
   // file; this decoder refused it, and readAudioFile sent it to the MP3
   // decoder, which found no MP3 in it.
-  const size_t start = flacdetail::id3v2Length(data.data(), data.size());
-  if (start > data.size() || data.size() - start < 42 ||
-      std::memcmp(data.data() + start, "fLaC", 4) != 0)
+  const size_t start = flacdetail::id3v2Length(data, size);
+  if (start > size || size - start < 42 ||
+      std::memcmp(data + start, "fLaC", 4) != 0)
     return false;
 
   using namespace flacdetail;
@@ -678,15 +683,15 @@ inline bool readFlac(const char* path, WavData* out) {
   int channels = 0, bps = 0;
   uint64_t totalSamples = 0;
   bool sawStreamInfo = false;
-  while (pos + 4 <= data.size()) {
+  while (pos + 4 <= size) {
     const bool last = (data[pos] & 0x80) != 0;
     const int type = data[pos] & 0x7f;
     const uint32_t len =
         ((uint32_t) data[pos + 1] << 16) | ((uint32_t) data[pos + 2] << 8) | data[pos + 3];
     pos += 4;
-    if (len > data.size() - pos) return false; // as what is LEFT: see state_bag.h
+    if (len > size - pos) return false; // as what is LEFT: see state_bag.h
     if (type == 0 && len >= 34) {
-      const uint8_t* si = data.data() + pos;
+      const uint8_t* si = data + pos;
       sampleRate = ((uint32_t) si[10] << 12) | ((uint32_t) si[11] << 4) | (si[12] >> 4);
       channels = ((si[12] >> 1) & 0x7) + 1;
       bps = (((si[12] & 1) << 4) | (si[13] >> 4)) + 1;
@@ -719,7 +724,7 @@ inline bool readFlac(const char* path, WavData* out) {
   std::vector<int32_t>& ch0 = chans[0];
   std::vector<int32_t>& ch1 = chans[1];
 
-  BitReader br(data.data() + pos, data.size() - pos);
+  BitReader br(data + pos, size - pos);
   while (!br.failed && br.byte < br.size) {
     // Frame header. 14-bit sync, then the layout the spec fixes.
     const uint32_t sync = (uint32_t) br.readBits(14);
@@ -832,6 +837,29 @@ inline bool readFlac(const char* path, WavData* out) {
   return !out->samples.empty();
 }
 
+/** Read a FLAC file: our own decoder for the published format. 16/24-bit,
+ *  one to eight channels (and all four stereo decorrelation modes), any
+ *  block size. It stopped at two, while writeFlac writes up to eight: the
+ *  SDK could not read back its own 5.1 file. The file is read whole and
+ *  handed to the in-memory readFlac() above. */
+inline bool readFlac(const char* path, WavData* out) {
+  if (!path || !out) return false;
+  std::FILE* f = ::sonore::pathio::open(path, "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  // Bounded as readWav and readAiff are: 1 GB is far past any FLAC a plugin
+  // loads whole, and past it -- on a platform whose long is 64 bits -- the
+  // whole file went into memory before a byte of it was checked.
+  if (size < 42 || size > (long) (1u << 30)) { std::fclose(f); return false; }
+  std::vector<uint8_t> data((size_t) size);
+  const bool okRead = std::fread(data.data(), 1, (size_t) size, f) == (size_t) size;
+  std::fclose(f);
+  if (!okRead) return false;
+  return readFlac(data.data(), data.size(), out);
+}
+
 // ── Lossy formats ────────────────────────────────────────────────────────────
 
 namespace lossydetail {
@@ -934,17 +962,15 @@ inline size_t mp3FramesEnd(const uint8_t* data, size_t size) {
 
 } // namespace lossydetail
 
-/** Read an MP3. Frames are decoded one at a time; the decoder finds its own
- *  sync, so ID3 tags and other leading junk are skipped rather than parsed.
- *
- *  Refused past `maxSamples` decoded samples, the ceiling every other format
- *  here is held to. MP3 had none, and it expands 30 to 60 times: a long mix
- *  dropped onto a sampler asked for gigabytes, and the bad_alloc took the
- *  host with it. The parameter exists for the test; callers leave it. */
-inline bool readMp3(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
-  if (!path || !out) return false;
-  std::vector<uint8_t> bytes;
-  if (!lossydetail::readFile(path, &bytes)) return false;
+/** Decode an MP3 that is already in memory: `size` bytes at `fileData`, as
+ *  they would be on disk. The decoder the file reader below uses, with its
+ *  encoder-delay trimming and its ceiling. */
+inline bool readMp3(const void* fileData, size_t size, WavData* out,
+                    size_t maxSamples = kMaxDecodedSamples) {
+  if (!fileData || !out) return false;
+  // The bound the file reader holds before it reads a byte.
+  if (size == 0 || size > (size_t) (1u << 30)) return false;
+  const uint8_t* const bytes = static_cast<const uint8_t*>(fileData);
 
   codec::mp3dec_t decoder;
   codec::mp3dec_init(&decoder);
@@ -952,8 +978,8 @@ inline bool readMp3(const char* path, WavData* out, size_t maxSamples = kMaxDeco
   out->sampleRate = 0;
   out->numChannels = 0;
 
-  const uint8_t* p = bytes.data();
-  int left = (int) lossydetail::mp3FramesEnd(bytes.data(), bytes.size());
+  const uint8_t* p = bytes;
+  int left = (int) lossydetail::mp3FramesEnd(bytes, size);
   float frame[codec::kMp3MaxSamplesPerFrame];
   // The encoder's Info frame, when there is one: decoded, it is a frame of
   // silence, and its delay and padding were never trimmed -- every MP3 from
@@ -1010,15 +1036,31 @@ inline bool readMp3(const char* path, WavData* out, size_t maxSamples = kMaxDeco
   return !out->samples.empty();
 }
 
-/** Read an Ogg Vorbis file. */
-inline bool readOgg(const char* path, WavData* out) {
+/** Read an MP3. Frames are decoded one at a time; the decoder finds its own
+ *  sync, so ID3 tags and other leading junk are skipped rather than parsed.
+ *
+ *  Refused past `maxSamples` decoded samples, the ceiling every other format
+ *  here is held to. MP3 had none, and it expands 30 to 60 times: a long mix
+ *  dropped onto a sampler asked for gigabytes, and the bad_alloc took the
+ *  host with it. The parameter exists for the test; callers leave it. */
+inline bool readMp3(const char* path, WavData* out, size_t maxSamples = kMaxDecodedSamples) {
   if (!path || !out) return false;
   std::vector<uint8_t> bytes;
   if (!lossydetail::readFile(path, &bytes)) return false;
+  return readMp3(bytes.data(), bytes.size(), out, maxSamples);
+}
+
+/** Decode an Ogg Vorbis file that is already in memory: `size` bytes at
+ *  `fileData`, as they would be on disk. */
+inline bool readOgg(const void* fileData, size_t size, WavData* out) {
+  if (!fileData || !out) return false;
+  // The bound the file reader holds before it reads a byte.
+  if (size == 0 || size > (size_t) (1u << 30)) return false;
+  const uint8_t* const bytes = static_cast<const uint8_t*>(fileData);
 
   int error = 0;
   codec::stb_vorbis* v =
-      codec::stb_vorbis_open_memory(bytes.data(), (int) bytes.size(), &error, nullptr);
+      codec::stb_vorbis_open_memory(bytes, (int) size, &error, nullptr);
   if (!v) return false;
 
   const codec::stb_vorbis_info info = codec::stb_vorbis_get_info(v);
@@ -1046,7 +1088,7 @@ inline bool readOgg(const char* path, WavData* out) {
   const uint64_t declared = codec::stb_vorbis_stream_length_in_samples(v);
   // Vorbis spends at least a few hundred bits a second per channel; 64
   // samples a byte is generous past any real encoding.
-  if (declared * channels <= kMaxDecodedSamples && declared * channels <= (uint64_t) bytes.size() * 64u)
+  if (declared * channels <= kMaxDecodedSamples && declared * channels <= (uint64_t) size * 64u)
     out->samples.reserve((size_t) (declared * channels));
   constexpr int kChunkFrames = 4096;
   std::vector<float> chunk((size_t) kChunkFrames * channels);
@@ -1066,6 +1108,14 @@ inline bool readOgg(const char* path, WavData* out) {
   }
   codec::stb_vorbis_close(v);
   return !out->samples.empty();
+}
+
+/** Read an Ogg Vorbis file. */
+inline bool readOgg(const char* path, WavData* out) {
+  if (!path || !out) return false;
+  std::vector<uint8_t> bytes;
+  if (!lossydetail::readFile(path, &bytes)) return false;
+  return readOgg(bytes.data(), bytes.size(), out);
 }
 
 /**
@@ -1146,6 +1196,32 @@ inline bool readAudioFile(const char* path, WavData* out) {
   out->sampleRate = 0;
   out->numChannels = 0;
   return fallback(path, out);
+}
+
+/**
+ * readAudioFile() for a file that is already in memory: `size` bytes at
+ * `fileData`, exactly as they would be on disk -- an impulse response or a
+ * sample compiled into the plugin's binary, which is how a plugin ships
+ * factory content that cannot go missing. The same magic, the same five
+ * decoders, the same refusals and ceilings.
+ *
+ * The fallback setAudioFileFallback() installs is not asked: the decoders it
+ * stands for are the operating system's, and they open files, not memory.
+ */
+inline bool readAudioFile(const void* fileData, size_t size, WavData* out) {
+  if (!fileData || !out || size < 4) return false;
+  const uint8_t* const magic = static_cast<const uint8_t*>(fileData);
+  // An ID3v2 tag says nothing about what follows it, as in the file reader.
+  const size_t tag = size >= 10 ? flacdetail::id3v2Length(magic, 10) : 0;
+  const bool flacBehindTag = tag > 0 && tag <= size - 4 && std::memcmp(magic + tag, "fLaC", 4) == 0;
+  if (std::memcmp(magic, "RIFF", 4) == 0) return readWav(fileData, size, out);
+  if (std::memcmp(magic, "FORM", 4) == 0) return readAiff(fileData, size, out);
+  if (std::memcmp(magic, "fLaC", 4) == 0) return readFlac(fileData, size, out);
+  if (std::memcmp(magic, "OggS", 4) == 0) return readOgg(fileData, size, out);
+  if (std::memcmp(magic, "ID3", 3) == 0)
+    return flacBehindTag ? readFlac(fileData, size, out) : readMp3(fileData, size, out);
+  if (magic[0] == 0xFF && (magic[1] & 0xE0) == 0xE0) return readMp3(fileData, size, out);
+  return false;
 }
 
 } // namespace sonore

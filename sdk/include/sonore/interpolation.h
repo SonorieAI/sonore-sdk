@@ -123,6 +123,13 @@ struct CatmullRomKernel {
     const float a2 = -0.5f * y0 + 0.5f * y2;
     return ((a0 * frac + a1) * frac + a2) * frac + y1;
   }
+  /** The same cubic in double, for the double delay lines. */
+  static double at4(double y0, double y1, double y2, double y3, double frac) {
+    const double a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    const double a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    const double a2 = -0.5 * y0 + 0.5 * y2;
+    return ((a0 * frac + a1) * frac + a2) * frac + y1;
+  }
 };
 
 /** Third-order Lagrange: the unique cubic through all four points.

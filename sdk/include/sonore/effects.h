@@ -194,14 +194,15 @@ private:
  * notches audible; a chorus uses a longer one and no feedback so it thickens
  * rather than whooshes. One implementation covers both.
  */
-class Chorus {
+template <typename T>
+class ChorusT {
 public:
   /** Sets the LFO and the glides for `spec.sampleRate` and resets (see
    *  reset()). Only the rate is read: the chorus is always stereo.
    *  Allocation-free. The line holds 8192 samples, so the 45 ms longest
    *  delay fits up to about 180 kHz and is about 42 ms at 192 kHz. */
   void prepare(const ProcessSpec& spec) {
-    sampleRate_ = (float) spec.sampleRate;
+    sampleRate_ = (T) spec.sampleRate;
     lfo_.setSampleRate(sampleRate_);
     lfo_.setFreq(rate_);
     // The delay times glide. A delay that jumps is a click -- a 6 -> 12 ms
@@ -211,7 +212,7 @@ public:
     // sounds like.
     depthSmooth_.setup(sampleRate_, kGlideMs);
     centreSmooth_.setup(sampleRate_, kGlideMs);
-    for (DryWetMixer& m : mixer_) m.setSampleRate(sampleRate_);
+    for (DryWetMixerT<T>& m : mixer_) m.setSampleRate(sampleRate_);
     reset();
   }
   /** The sweep from its start, the lines empty, the glides landed. There was
@@ -221,13 +222,13 @@ public:
     depthSmooth_.snap(depthMs_);
     centreSmooth_.snap(centreMs_);
     for (int c = 0; c < 2; ++c) line_[c].reset();
-    for (DryWetMixer& m : mixer_) m.snap();
+    for (DryWetMixerT<T>& m : mixer_) m.snap();
     running_ = false;
   }
 
   /** LFO rate in Hz (0.6 by default), held to 0 .. half the sample rate.
    *  The sweep carries on from its current phase. */
-  void setRate(float hz) { rate_ = hz; lfo_.setFreq(hz); }
+  void setRate(T hz) { rate_ = hz; lfo_.setFreq(hz); }
   /** How far the delay swings, in ms peak to peak (6 by default): it moves
    *  between centre - depth/2 and centre + depth/2. Glides with a 50 ms
    *  time constant while running.
@@ -237,33 +238,33 @@ public:
    *  before them -- the first 400 ms of a fresh chorus bent its pitch by 124
    *  cents (a flanger's by 254) on its way from the defaults. Running, a
    *  change glides, as before. */
-  void setDepth(float ms) {
+  void setDepth(T ms) {
     depthMs_ = ms;
     if (!running_) depthSmooth_.snap(ms);
   }
   /** The delay the sweep is centred on, in ms (14 by default). Lands before
    *  the first process() and glides after it, as setDepth() does. The swept
    *  delay is held to 0.1 .. 45 ms (less above about 180 kHz). */
-  void setCentreDelay(float ms) {
+  void setCentreDelay(T ms) {
     centreMs_ = ms;
     if (!running_) centreSmooth_.snap(ms);
   }
   /** Wet signal fed back into each side's line, clamped to -0.95 .. 0.95.
    *  0, the default, is a chorus; feedback on a short centre delay is a
    *  flanger. Applies at once. */
-  void setFeedback(float fb) { feedback_ = clampf(fb, -0.95f, 0.95f); }
+  void setFeedback(T fb) { feedback_ = clampT<T>(fb, -T(0.95), T(0.95)); }
   /** 0 dry .. 1 wet, clamped, on an equal-power law; glides once audio runs
    *  (see DryWetMixer::setMix()), each side over 20 ms at the rate prepare()
    *  set. Never set, the mix is 0.5, as the reference's chorus starts, and
    *  is there from construction: nothing glides up to it. It was 0, and a
    *  chorus that was never given a mix played the dry signal alone. */
-  void setMix(float mix) {
-    for (DryWetMixer& m : mixer_) m.setMix(mix);
+  void setMix(T mix) {
+    for (DryWetMixerT<T>& m : mixer_) m.setMix(mix);
   }
 
   /** One stereo frame, in place, the two sides' delays swept in quadrature.
    *  No allocation. */
-  inline void process(float& left, float& right) {
+  inline void process(T& left, T& right) {
     running_ = true;
     // Quadrature between the sides -- sine on the left, cosine on the right --
     // which is what makes a chorus wide: the two delays are never both at
@@ -271,21 +272,21 @@ public:
     // notches of a flanger never coincide. (The first version used -sine for
     // the right side and called it quadrature: that is antiphase, and both
     // sides sit still at the same instant twice a cycle.)
-    const float turns = lfo_.phase();
-    const float phase = lfo_.sine();
-    const float cosine = fastmath::sinTurns(turns + 0.25f);
-    const float dryL = left, dryR = right;
-    const float depthMs = depthSmooth_.next(depthMs_), centreMs = centreSmooth_.next(centreMs_);
+    const T turns = lfo_.phase();
+    const T phase = lfo_.sine();
+    const T cosine = sinTurnsT(turns + T(0.25));
+    const T dryL = left, dryR = right;
+    const T depthMs = depthSmooth_.next(depthMs_), centreMs = centreSmooth_.next(centreMs_);
     for (int c = 0; c < 2; ++c) {
-      const float mod = c == 0 ? phase : cosine;
-      const float ms = centreMs + mod * depthMs * 0.5f;
+      const T mod = c == 0 ? phase : cosine;
+      const T ms = centreMs + mod * depthMs * T(0.5);
       // The ceiling comes from the BUFFER, not from a constant: 45 ms is the
       // musical maximum, but at a rate where that no longer fits, the honest
       // behaviour is a stated shorter maximum rather than a silent clamp
       // deep inside the delay line.
-      const float maxMs = (float) (kChorusBuffer - 8) * 1000.0f / sampleRate_;
-      const float samples =
-          clampf(ms, 0.1f, maxMs < 45.0f ? maxMs : 45.0f) * 0.001f * sampleRate_;
+      const T maxMs = (T) (kChorusBuffer - 8) * T(1000.0) / sampleRate_;
+      const T samples =
+          clampT<T>(ms, T(0.1), maxMs < T(45.0) ? maxMs : T(45.0)) * T(0.001) * sampleRate_;
       // CUBIC, not linear, and this is the one place in the SDK where that
       // matters. Linear interpolation's magnitude response depends on the
       // fractional part of the delay, so a delay that SWEEPS sweeps a lowpass
@@ -294,9 +295,9 @@ public:
       // why the reverb combs and the limiter lookahead still use read().
       //
       // readCubic() had documented exactly this and had no callers at all.
-      const float wet = line_[c].readCubic(samples);
-      const float in = (c == 0 ? dryL : dryR) + wet * feedback_;
-      line_[c].write(flushDenormal(in));
+      const T wet = line_[c].readCubic(samples);
+      const T in = (c == 0 ? dryL : dryR) + wet * feedback_;
+      line_[c].write(flushDenormalT(in));
       if (c == 0) left = mixer_[0].process(dryL, wet);
       else right = mixer_[1].process(dryR, wet);
     }
@@ -304,17 +305,21 @@ public:
 
 private:
   static constexpr int kChorusBuffer = 8192; // 45 ms up to 96k; ~42 ms at 192k
-  static constexpr float kGlideMs = 50.0f;
-  static constexpr float kDefaultMix = 0.5f;
-  DelayLine<kChorusBuffer> line_[2];
-  Oscillator lfo_;
+  static constexpr T kGlideMs = T(50.0);
+  static constexpr T kDefaultMix = T(0.5);
+  DelayLine<kChorusBuffer, T> line_[2];
+  OscillatorT<T> lfo_;
   /** One mix glide per side: one shared by both stepped twice a frame. */
-  DryWetMixer mixer_[2]{DryWetMixer(kDefaultMix), DryWetMixer(kDefaultMix)};
-  Smooth depthSmooth_, centreSmooth_;
-  float sampleRate_ = 48000.0f;
-  float rate_ = 0.6f, depthMs_ = 6.0f, centreMs_ = 14.0f, feedback_ = 0.0f;
+  DryWetMixerT<T> mixer_[2]{DryWetMixerT<T>(kDefaultMix), DryWetMixerT<T>(kDefaultMix)};
+  SmoothT<T> depthSmooth_, centreSmooth_;
+  T sampleRate_ = T(48000.0);
+  T rate_ = T(0.6), depthMs_ = T(6.0), centreMs_ = T(14.0), feedback_ = T(0.0);
   bool running_ = false; // process() has run since prepare()
 };
+
+/** Chorus in float, the form every plugin written before the templates
+ *  uses; ChorusT<double> is the same processor in double. */
+using Chorus = ChorusT<float>;
 
 /**
  * Phaser: a chain of modulated allpass stages mixed with the dry signal. The
@@ -322,19 +327,20 @@ private:
  * spacing is not harmonic, which is what makes it sound like sweeping rather
  * than like a jet.
  */
-class Phaser {
+template <typename T>
+class PhaserT {
 public:
   /** Sets the LFO, the stages and the depth glide for `spec.sampleRate` and
    *  resets (see reset()). Only the rate is read: the phaser is always
    *  stereo. Allocation-free. */
   void prepare(const ProcessSpec& spec) {
-    sampleRate_ = (float) spec.sampleRate;
+    sampleRate_ = (T) spec.sampleRate;
     lfo_.setSampleRate(sampleRate_);
     lfo_.setFreq(rate_);
     for (int c = 0; c < 2; ++c)
       for (int s = 0; s < kStages; ++s) stage_[c][s].setSampleRate(sampleRate_);
-    depthGlide_.setSampleRate(sampleRate_, 20.0f);
-    for (DryWetMixer& m : mixer_) m.setSampleRate(sampleRate_);
+    depthGlide_.setSampleRate(sampleRate_, T(20.0));
+    for (DryWetMixerT<T>& m : mixer_) m.setSampleRate(sampleRate_);
     reset();
   }
   /** The sweep from its start, the stages and the feedback empty. There was
@@ -344,72 +350,76 @@ public:
     lfo_.reset();
     for (int c = 0; c < 2; ++c) {
       for (int s = 0; s < kStages; ++s) stage_[c][s].reset();
-      fbStore_[c] = 0.0f;
+      fbStore_[c] = T(0.0);
     }
-    for (DryWetMixer& m : mixer_) m.snap();
+    for (DryWetMixerT<T>& m : mixer_) m.snap();
     depthGlide_.snap();
   }
 
   /** LFO rate in Hz (0.5 by default), held to 0 .. half the sample rate.
    *  The sweep carries on from its current phase. */
-  void setRate(float hz) { rate_ = hz; lfo_.setFreq(hz); }
+  void setRate(T hz) { rate_ = hz; lfo_.setFreq(hz); }
   /** Glides over 20 ms once audio runs (see Glide). The depth sets where the
    *  sweep is, so in one sample it moved every stage's frequency at once --
    *  0 -> 1 near the top of the sweep stepped the output 3.4 times its
    *  largest natural step. */
-  void setDepth(float d) { depthGlide_.set(clampf(d, 0.0f, 1.0f)); }
+  void setDepth(T d) { depthGlide_.set(clampT<T>(d, T(0.0), T(1.0))); }
   /** The last stage's output fed back into the first, clamped to
    *  -0.95 .. 0.95 (0.3 by default). Applies at once. */
-  void setFeedback(float fb) { feedback_ = clampf(fb, -0.95f, 0.95f); }
+  void setFeedback(T fb) { feedback_ = clampT<T>(fb, -T(0.95), T(0.95)); }
   /** 0 dry .. 1 wet, clamped, on an equal-power law; glides once audio runs
    *  (see DryWetMixer::setMix()), each side over 20 ms at the rate prepare()
    *  set. The notches come from the mix, deepest at 0.5. Never set, the mix
    *  is 0.5, as the reference's phaser starts, and is there from
    *  construction: nothing glides up to it. It was 0, and a phaser that was
    *  never given a mix played the dry signal alone, with no notch at all. */
-  void setMix(float mix) {
-    for (DryWetMixer& m : mixer_) m.setMix(mix);
+  void setMix(T mix) {
+    for (DryWetMixerT<T>& m : mixer_) m.setMix(mix);
   }
 
   /** One stereo frame, in place. Both sides follow one sine sweep, from
    *  200 Hz up to 200 x 40^depth Hz (8 kHz at depth 1), through four
    *  allpass stages spaced 10% apart. No allocation. */
-  inline void process(float& left, float& right) {
-    const float lfo = lfo_.sine() * 0.5f + 0.5f;   // 0..1
+  inline void process(T& left, T& right) {
+    const T lfo = lfo_.sine() * T(0.5) + T(0.5);   // 0..1
     // Sweep logarithmically: linear frequency movement sounds like it slows
     // down at the top, because pitch is exponential.
-    const float freq = 200.0f * std::pow(40.0f, lfo * depthGlide_.next());
+    const T freq = T(200.0) * std::pow(T(40.0), lfo * depthGlide_.next());
     // One design per stage, shared by both channels: their sweep is the same,
     // and designing each section twice was eight sin/cos pairs a sample where
     // four give the identical filter.
     for (int s = 0; s < kStages; ++s) {
-      stage_[0][s].allpass(freq * (1.0f + 0.1f * s), 0.7f);
+      stage_[0][s].allpass(freq * (T(1.0) + T(0.1) * s), T(0.7));
       stage_[1][s].copyCoefficientsFrom(stage_[0][s]);
     }
-    float* io[2] = {&left, &right};
+    T* io[2] = {&left, &right};
     for (int c = 0; c < 2; ++c) {
-      float x = *io[c] + fbStore_[c] * feedback_;
+      T x = *io[c] + fbStore_[c] * feedback_;
       for (int s = 0; s < kStages; ++s) x = stage_[c][s].process(x);
       // Finite or nothing. An Inf fed back here re-entered every sample and
       // the phaser never recovered from one bad input sample; flushDenormal
       // now clears Inf too, and this says so where it matters most.
-      fbStore_[c] = std::isfinite(x) ? flushDenormal(x) : 0.0f;
+      fbStore_[c] = std::isfinite(x) ? flushDenormalT(x) : T(0.0);
       *io[c] = mixer_[c].process(*io[c], x);
     }
   }
 
 private:
   static constexpr int kStages = 4;
-  static constexpr float kDefaultMix = 0.5f;
-  Biquad stage_[2][kStages];
-  Oscillator lfo_;
+  static constexpr T kDefaultMix = T(0.5);
+  BiquadT<T> stage_[2][kStages];
+  OscillatorT<T> lfo_;
   /** One mix glide per side: one shared by both stepped twice a frame. */
-  DryWetMixer mixer_[2]{DryWetMixer(kDefaultMix), DryWetMixer(kDefaultMix)};
-  float sampleRate_ = 48000.0f;
-  float rate_ = 0.5f, feedback_ = 0.3f;
-  float fbStore_[2] = {0.0f, 0.0f};
-  Glide depthGlide_{0.7f, 0.7f};
+  DryWetMixerT<T> mixer_[2]{DryWetMixerT<T>(kDefaultMix), DryWetMixerT<T>(kDefaultMix)};
+  T sampleRate_ = T(48000.0);
+  T rate_ = T(0.5), feedback_ = T(0.3);
+  T fbStore_[2] = {T(0.0), T(0.0)};
+  GlideT<T> depthGlide_{T(0.7), T(0.7)};
 };
+
+/** Phaser in float, the form every plugin written before the templates
+ *  uses; PhaserT<double> is the same processor in double. */
+using Phaser = PhaserT<float>;
 
 // ── Dynamics ─────────────────────────────────────────────────────────────────
 
@@ -441,14 +451,14 @@ private:
  */
 // The default look-ahead buffer holds 3 ms up to 340 kHz; the old 512 ran out
 // just past 170 kHz and silently shortened the look-ahead.
-template <int MaxLookaheadSamples = 1024>
+template <int MaxLookaheadSamples = 1024, typename T = float>
 class Limiter {
 public:
   /** Recomputes the release and the look-ahead (3 ms by default) for
    *  `spec.sampleRate` and resets. Only the rate is read: the limiter is
    *  two channels, linked. latencySamples() is what to report afterwards. */
   void prepare(const ProcessSpec& spec) {
-    sampleRate_ = (float) spec.sampleRate;
+    sampleRate_ = (T) spec.sampleRate;
     setRelease(releaseMs_);
     setLookahead(lookaheadMs_);
     reset();
@@ -459,15 +469,15 @@ public:
    *  look-ahead were planned for the old ceiling, and the output clamp
    *  holds them to the new one. A NaN is ignored and the ceiling stays where
    *  it was: taken as given, the output clamp turned every sample into NaN. */
-  void setCeiling(float db) {
+  void setCeiling(T db) {
     if (db != db) return;
-    ceiling_ = dbToGain(db);
+    ceiling_ = dbToGainT(db);
   }
   /** Release time constant in ms (50 by default, held to at least 0.1): how
    *  fast the gain recovers, exponentially, once the peaks stop. */
-  void setRelease(float ms) {
+  void setRelease(T ms) {
     releaseMs_ = ms;
-    release_ = std::exp(-1.0f / (0.001f * (ms > 0.1f ? ms : 0.1f) * sampleRate_));
+    release_ = std::exp(-T(1.0) / (T(0.001) * (ms > T(0.1) ? ms : T(0.1)) * sampleRate_));
   }
   /** Rounded to whole samples and clamped to the buffer. Clears the state:
    *  a window that changes length mid-stream would leave the sliding minimum
@@ -478,9 +488,9 @@ public:
    *  than its size, or full reads as empty). It was kMaxWindow - 1, three
    *  past the delay: at 384 kHz the default 3 ms reported 1025 samples of
    *  latency and delayed 1022. */
-  void setLookahead(float ms) {
+  void setLookahead(T ms) {
     lookaheadMs_ = ms;
-    int n = (int) (ms * 0.001f * sampleRate_ + 0.5f);
+    int n = (int) (ms * T(0.001) * sampleRate_ + T(0.5));
     if (n < 1) n = 1;
     if (n > MaxLookaheadSamples - 2) n = MaxLookaheadSamples - 2;
     // The same window: nothing to do. This cleared the state on EVERY call,
@@ -496,14 +506,14 @@ public:
   void reset() {
     for (int c = 0; c < 2; ++c) delay_[c].reset();
     for (int i = 0; i < kMaxWindow; ++i) {
-      targets_[i] = 1.0f;
-      box_[i] = 1.0f;
+      targets_[i] = T(1.0);
+      box_[i] = T(1.0);
     }
     head_ = tail_ = 0;
     counter_ = 0;
     boxPos_ = 0;
     boxSum_ = (double) (lookahead_ + 1);
-    gain_ = 1.0f;
+    gain_ = T(1.0);
     primed_ = true;
   }
   /** Latency the host must be told about: the look-ahead IS a delay. */
@@ -512,16 +522,16 @@ public:
    *  limiting, POSITIVE while limiting (6 is 6 dB of reduction), like every
    *  other dynamics class here. A plain member: an editor reads it through
    *  something the DSP publishes, such as an atomic. */
-  float gainReduction() const { const float d = gainToDb(gain_); return d < 0.0f ? -d : 0.0f; }
+  T gainReduction() const { const T d = gainToDbT(gain_); return d < T(0.0) ? -d : T(0.0); }
   /** The gain applied to the sample that just left, before the safety clamp. */
-  float lastGain() const { return gain_; }
+  T lastGain() const { return gain_; }
 
   /** One stereo frame, in place, delayed by latencySamples(). Both sides
    *  get the same gain, set by the louder one, so the image holds still.
    *  No allocation; O(1) per sample. */
-  inline void process(float& left, float& right) {
-    const float peak = std::fabs(left) > std::fabs(right) ? std::fabs(left) : std::fabs(right);
-    const float target = peak > ceiling_ ? ceiling_ / peak : 1.0f;
+  inline void process(T& left, T& right) {
+    const T peak = std::fabs(left) > std::fabs(right) ? std::fabs(left) : std::fabs(right);
+    const T target = peak > ceiling_ ? ceiling_ / peak : T(1.0);
     const int window = lookahead_ + 1; // this sample and the N before it
 
     // ── Sliding minimum over the last `window` targets ──
@@ -543,41 +553,41 @@ public:
     deque_[tail_] = now;
     tail_ = (tail_ + 1) % kMaxWindow;
     while (head_ != tail_ && now - deque_[head_] >= (uint64_t) window) head_ = (head_ + 1) % kMaxWindow;
-    const float minimum = targets_[deque_[head_] % (uint64_t) kMaxWindow];
+    const T minimum = targets_[deque_[head_] % (uint64_t) kMaxWindow];
 
     // ── Boxcar of the same length: the attack ramp ──
     boxSum_ += (double) minimum - (double) box_[boxPos_];
     box_[boxPos_] = minimum;
     if (++boxPos_ >= window) boxPos_ = 0;
-    const float smooth = (float) (boxSum_ / (double) window);
+    const T smooth = (T) (boxSum_ / (double) window);
 
     // ── Release: down with the ramp, up exponentially ──
     gain_ = smooth < gain_ ? smooth : smooth + release_ * (gain_ - smooth);
-    if (gain_ > 1.0f) gain_ = 1.0f;
+    if (gain_ > T(1.0)) gain_ = T(1.0);
 
-    const float dl = delay_[0].tap((float) lookahead_, left);
-    const float dr = delay_[1].tap((float) lookahead_, right);
+    const T dl = delay_[0].tap((T) lookahead_, left);
+    const T dr = delay_[1].tap((T) lookahead_, right);
     left = dl * gain_;
     right = dr * gain_;
     // The construction above guarantees the ceiling; the clamp is for the
     // last ulp of float rounding, and the test asserts it never has to act.
-    left = clampf(left, -ceiling_, ceiling_);
-    right = clampf(right, -ceiling_, ceiling_);
+    left = clampT<T>(left, -ceiling_, ceiling_);
+    right = clampT<T>(right, -ceiling_, ceiling_);
   }
 
 private:
   static constexpr int kMaxWindow = MaxLookaheadSamples + 2;
 
-  DelayLine<MaxLookaheadSamples> delay_[2];
-  float targets_[kMaxWindow]{};
+  DelayLine<MaxLookaheadSamples, T> delay_[2];
+  T targets_[kMaxWindow]{};
   uint64_t deque_[kMaxWindow]{};
-  float box_[kMaxWindow]{};
+  T box_[kMaxWindow]{};
   double boxSum_ = 1.0;
   uint64_t counter_ = 0;
   int head_ = 0, tail_ = 0, boxPos_ = 0;
-  float sampleRate_ = 48000.0f;
-  float ceiling_ = 0.98f, gain_ = 1.0f, release_ = 0.999f;
-  float releaseMs_ = 50.0f, lookaheadMs_ = 3.0f;
+  T sampleRate_ = T(48000.0);
+  T ceiling_ = T(0.98), gain_ = T(1.0), release_ = T(0.999);
+  T releaseMs_ = T(50.0), lookaheadMs_ = T(3.0);
   int lookahead_ = 144;
   bool primed_ = false; // reset() has run, so the state is one
 };
@@ -589,21 +599,22 @@ private:
  * few samples. A separate (lower) close threshold plus a minimum hold is what
  * makes a gate usable on a real drum track.
  */
-class NoiseGate {
+template <typename T>
+class NoiseGateT {
 public:
   /** Sets the level detector (1 ms attack, 50 ms release) and the gate's
    *  times for `spec.sampleRate`, empties the detector and closes the gate.
    *  Only the rate is read. */
   void prepare(const ProcessSpec& spec) {
-    sampleRate_ = (float) spec.sampleRate;
+    sampleRate_ = (T) spec.sampleRate;
     env_.setSampleRate(sampleRate_);
-    env_.setTimes(1.0f, 50.0f);
+    env_.setTimes(T(1.0), T(50.0));
     // The detector too. Kept, the level of the audio before a re-prepare held
     // the gate open: a -50 dBFS tone under a -30 dB threshold leaked through
     // at full level for 240 ms, where a fresh gate passed nothing.
     env_.reset();
     setTimes(attackMs_, holdMs_, releaseMs_);
-    gain_ = 0.0f;
+    gain_ = T(0.0);
     open_ = false;
     holdLeft_ = 0;
   }
@@ -611,10 +622,10 @@ public:
   /** Open threshold in dBFS (-40 by default): the gate opens when the
    *  detected peak level rises above it and closes below it minus the
    *  hysteresis. */
-  void setThreshold(float db) {
+  void setThreshold(T db) {
     thresholdDb_ = db;
-    openThresh_ = dbToGain(db);
-    closeThresh_ = dbToGain(db - hysteresisDb_);
+    openThresh_ = dbToGainT(db);
+    closeThresh_ = dbToGainT(db - hysteresisDb_);
   }
   /** How far below the open threshold the gate closes, in dB (6 by default;
    *  a negative value counts as 0).
@@ -623,19 +634,19 @@ public:
    *  hysteresisDb_, so turning the hysteresis knob did nothing until the
    *  threshold knob was next touched -- a dead control, because the threshold
    *  in dB was never kept to recompute from. */
-  void setHysteresis(float db) {
-    hysteresisDb_ = db > 0.0f ? db : 0.0f;
-    closeThresh_ = dbToGain(thresholdDb_ - hysteresisDb_);
+  void setHysteresis(T db) {
+    hysteresisDb_ = db > T(0.0) ? db : T(0.0);
+    closeThresh_ = dbToGainT(thresholdDb_ - hysteresisDb_);
   }
   /** Times in ms (defaults 1, 50 and 100). Attack and release are the time
    *  constants of the gain's fade in and out, each held to at least
    *  0.05 ms; hold is how long the level must stay below the close
    *  threshold before the gate closes. */
-  void setTimes(float attackMs, float holdMs, float releaseMs) {
+  void setTimes(T attackMs, T holdMs, T releaseMs) {
     attackMs_ = attackMs; holdMs_ = holdMs; releaseMs_ = releaseMs;
-    attack_ = 1.0f - std::exp(-1.0f / (0.001f * (attackMs > 0.05f ? attackMs : 0.05f) * sampleRate_));
-    release_ = std::exp(-1.0f / (0.001f * (releaseMs > 0.05f ? releaseMs : 0.05f) * sampleRate_));
-    holdSamples_ = (int) (0.001f * holdMs * sampleRate_);
+    attack_ = T(1.0) - std::exp(-T(1.0) / (T(0.001) * (attackMs > T(0.05) ? attackMs : T(0.05)) * sampleRate_));
+    release_ = std::exp(-T(1.0) / (T(0.001) * (releaseMs > T(0.05) ? releaseMs : T(0.05)) * sampleRate_));
+    holdSamples_ = (int) (T(0.001) * holdMs * sampleRate_);
   }
   /** Whether the gate is open now. The gain lags it: once closed, the
    *  output fades out over the release time. */
@@ -643,8 +654,8 @@ public:
 
   /** One sample through the gate, returned. Mono: a gate per channel opens
    *  on that channel's own level. No allocation. */
-  inline float process(float x) {
-    const float level = env_.process(x);
+  inline T process(T x) {
+    const T level = env_.process(x);
     if (!open_ && level > openThresh_) {
       open_ = true;
       holdLeft_ = holdSamples_;
@@ -654,22 +665,26 @@ public:
     } else if (open_) {
       holdLeft_ = holdSamples_;
     }
-    const float target = open_ ? 1.0f : 0.0f;
+    const T target = open_ ? T(1.0) : T(0.0);
     gain_ = open_ ? gain_ + (target - gain_) * attack_ : gain_ * release_;
-    gain_ = flushDenormal(gain_);
+    gain_ = flushDenormalT(gain_);
     return x * gain_;
   }
 
 private:
-  EnvFollower env_;
-  float sampleRate_ = 48000.0f;
-  float openThresh_ = 0.01f, closeThresh_ = 0.005f, hysteresisDb_ = 6.0f;
-  float thresholdDb_ = -40.0f; // kept so setHysteresis can recompute closeThresh_
-  float attackMs_ = 1.0f, holdMs_ = 50.0f, releaseMs_ = 100.0f;
-  float attack_ = 0.5f, release_ = 0.999f, gain_ = 0.0f;
+  EnvFollowerT<T> env_;
+  T sampleRate_ = T(48000.0);
+  T openThresh_ = T(0.01), closeThresh_ = T(0.005), hysteresisDb_ = T(6.0);
+  T thresholdDb_ = -T(40.0); // kept so setHysteresis can recompute closeThresh_
+  T attackMs_ = T(1.0), holdMs_ = T(50.0), releaseMs_ = T(100.0);
+  T attack_ = T(0.5), release_ = T(0.999), gain_ = T(0.0);
   int holdSamples_ = 2400, holdLeft_ = 0;
   bool open_ = false;
 };
+
+/** NoiseGate in float, the form every plugin written before the templates
+ *  uses; NoiseGateT<double> is the same processor in double. */
+using NoiseGate = NoiseGateT<float>;
 
 // ── Stereo + routing ─────────────────────────────────────────────────────────
 
@@ -679,11 +694,12 @@ private:
  * is what makes it the right tool for multiband processing: a plain pair of
  * filters leaves a peak or a dip at the crossover point.
  */
-class LinkwitzRiley {
+template <typename T>
+class LinkwitzRileyT {
 public:
   /** Sample rate in Hz; redesigns the sections at the current crossover.
    *  Keeps the filter state. */
-  void setSampleRate(float sr) {
+  void setSampleRate(T sr) {
     sr_ = sr;
     for (int i = 0; i < 2; ++i) {
       lp_[i].setSampleRate(sr);
@@ -694,7 +710,7 @@ public:
   /** Crossover frequency in Hz (1 kHz by default), held to 10 Hz .. 0.49 x
    *  the sample rate. Safe to move every sample: the state-variable
    *  sections stay stable while swept. */
-  void setCrossover(float hz) {
+  void setCrossover(T hz) {
     freq_ = hz;
     for (int i = 0; i < 2; ++i) {
       lp_[i].lowpass(hz, 0.70710678);
@@ -716,9 +732,9 @@ public:
    *  LOWEST corner the plugin's controls allow, not the current one: the tail
    *  a host is told about has to still be true after the user turns the knob
    *  down. */
-  static int tailSamples(float sr, float crossoverHz, float floorDb = -80.0f) {
-    const float fc = crossoverHz > 1.0f ? crossoverHz : 1.0f;
-    const float sigma = 2.0f * kPi * fc * 0.70710678f; // w0 / 2Q, the pole's real part
+  static int tailSamples(T sr, T crossoverHz, T floorDb = -T(80.0)) {
+    const T fc = crossoverHz > T(1.0) ? crossoverHz : T(1.0);
+    const T sigma = T(2.0) * piT<T> * fc * T(0.70710678); // w0 / 2Q, the pole's real part
 
     // The envelope is (1 + x) e^-x, not e^-x, and the difference is not small.
     //
@@ -733,15 +749,15 @@ public:
     // Solve (1 + x) e^-x = floor for x = sigma·t by Newton, starting from the
     // single-pole answer. It converges in a handful of steps and this is
     // called once per prepare(), never per sample.
-    const float target = -std::log(std::pow(10.0f, floorDb * 0.05f)); // -ln(floor)
-    float x = target;
+    const T target = -std::log(std::pow(T(10.0), floorDb * T(0.05))); // -ln(floor)
+    T x = target;
     for (int i = 0; i < 24; ++i) {
-      const float f = std::log(1.0f + x) - x + target;
-      const float df = 1.0f / (1.0f + x) - 1.0f;
-      if (std::fabs(df) < 1e-9f) break;
-      const float step = f / df;
+      const T f = std::log(T(1.0) + x) - x + target;
+      const T df = T(1.0) / (T(1.0) + x) - T(1.0);
+      if (std::fabs(df) < T(1e-9)) break;
+      const T step = f / df;
       x -= step;
-      if (std::fabs(step) < 1e-6f) break;
+      if (std::fabs(step) < T(1e-6)) break;
     }
 
     // The model lands within 2% of the measured decay across the whole range
@@ -749,14 +765,14 @@ public:
     // that the state was at full scale when the input stopped. Erring long
     // costs a host a few milliseconds of extra render, erring short costs the
     // user the end of their sound.
-    return (int) std::ceil(1.1f * x / sigma * sr);
+    return (int) std::ceil(T(1.1) * x / sigma * sr);
   }
   /** Clears both bands' filter state. */
   void reset() {
     for (int i = 0; i < 2; ++i) { lp_[i].reset(); hp_[i].reset(); }
   }
   /** Split one sample into a low and a high band that sum back to it. */
-  inline void process(float x, float& low, float& high) {
+  inline void process(T x, T& low, T& high) {
     low = lp_[1].process(lp_[0].process(x));
     high = hp_[1].process(hp_[0].process(x));
   }
@@ -770,54 +786,82 @@ private:
   // control a user turns and a host automates, and swept every sample the
   // direct-form sections diverged (see SvfSection).
   SvfSection lp_[2], hp_[2];
-  float sr_ = 48000.0f, freq_ = 1000.0f;
+  T sr_ = T(48000.0), freq_ = T(1000.0);
 };
+
+/** LinkwitzRiley in float, the form every plugin written before the templates
+ *  uses; LinkwitzRileyT<double> is the same processor in double. */
+using LinkwitzRiley = LinkwitzRileyT<float>;
 
 /** Mid/side width control. Width 0 collapses to mono, 1 is untouched, >1
  *  exaggerates the sides. Mono compatibility is why this works on M/S rather
  *  than by panning: the mid is preserved exactly. */
-class StereoWidener {
+template <typename T>
+class StereoWidenerT {
 public:
   /** The side gain, clamped to 0..2 (1 by default). Applies on the next
    *  sample, unsmoothed. */
-  void setWidth(float w) { width_ = w < 0.0f ? 0.0f : (w > 2.0f ? 2.0f : w); }
+  void setWidth(T w) { width_ = w < T(0.0) ? T(0.0) : (w > T(2.0) ? T(2.0) : w); }
   /** One stereo frame, in place: the mid kept, the side scaled. */
-  inline void process(float& left, float& right) const {
-    const float mid = (left + right) * 0.5f;
-    const float side = (left - right) * 0.5f * width_;
+  inline void process(T& left, T& right) const {
+    const T mid = (left + right) * T(0.5);
+    const T side = (left - right) * T(0.5) * width_;
     left = mid + side;
     right = mid - side;
   }
 
 private:
-  float width_ = 1.0f;
+  T width_ = T(1.0);
 };
 
+/** StereoWidener in float, the form every plugin written before the templates
+ *  uses; StereoWidenerT<double> is the same processor in double. */
+using StereoWidener = StereoWidenerT<float>;
+
 /** Constant-power panner. `pan` is -1 (left) .. 0 (centre) .. +1 (right);
- *  the -3 dB centre law keeps perceived loudness constant across the sweep. */
-class Panner {
+ *  the -3 dB centre law keeps perceived loudness constant across the sweep.
+ *  setLaw() picks any other of PanLaw's: -6 dB (Linear, Sine6dB) for a
+ *  source that will be summed to mono, -4.5 dB for the desk compromise,
+ *  Balance for a stereo balance control. */
+template <typename T>
+class PannerT {
 public:
   /** The position, clamped to -1 .. +1; centred until it is set. Computes a
    *  sine and a cosine; the change is not smoothed. */
-  void setPan(float pan) {
-    const float p = (clampf(pan, -1.0f, 1.0f) + 1.0f) * 0.5f;
-    left_ = std::cos(p * kPi * 0.5f);
-    right_ = std::sin(p * kPi * 0.5f);
+  void setPan(T pan) {
+    pan_ = clampT<T>(pan, -T(1.0), T(1.0));
+    const T p = (pan_ + T(1.0)) * T(0.5);
+    panLawGains(law_, p, left_, right_);
   }
+  /** The pan law: PanLaw::ConstantPower until set. Recomputes the two gains
+   *  at the position last set; unsmoothed, like setPan(). */
+  void setLaw(PanLaw law) {
+    law_ = law;
+    setPan(pan_);
+  }
+  /** The law setLaw() chose. */
+  PanLaw law() const { return law_; }
   /** A mono sample out to a stereo pair at the set position. */
-  inline void process(float in, float& left, float& right) const {
+  inline void process(T in, T& left, T& right) const {
     left = in * left_;
     right = in * right_;
   }
   /** A stereo pair scaled by the same two gains, in place: a balance
-   *  control on the same law, so at the centre both sides are 3 dB down. */
-  inline void processStereo(float& left, float& right) const {
+   *  control on the same law, so at the centre both sides are 3 dB down
+   *  (and not at all with PanLaw::Balance, the law that is for this). */
+  inline void processStereo(T& left, T& right) const {
     left *= left_;
     right *= right_;
   }
 
 private:
-  float left_ = 0.7071f, right_ = 0.7071f;
+  T left_ = T(0.7071), right_ = T(0.7071);
+  T pan_ = T(0.0);
+  PanLaw law_ = PanLaw::ConstantPower;
 };
+
+/** Panner in float, the form every plugin written before the templates
+ *  uses; PannerT<double> is the same processor in double. */
+using Panner = PannerT<float>;
 
 } // namespace sonore

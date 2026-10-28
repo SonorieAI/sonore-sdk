@@ -2,7 +2,8 @@
 # The vector build and the SONORE_NO_SIMD build of simd_identity must print the
 # same hash: the same float bits out of every SIMD helper and the DSP on them.
 #
-#   cmake -DVECTOR=<simd_identity> -DSCALAR=<simd_identity_scalar> -P simd_identity.cmake
+#   cmake -DVECTOR=<simd_identity> -DSCALAR=<simd_identity_scalar> [-DWIDE=<simd_identity_avx>]
+#         -P simd_identity.cmake
 foreach(which VECTOR SCALAR)
   execute_process(COMMAND "${${which}}" OUTPUT_VARIABLE out_${which} RESULT_VARIABLE rc)
   if(NOT rc EQUAL 0)
@@ -21,5 +22,20 @@ if(backend_VECTOR STREQUAL "scalar")
 endif()
 if(NOT hash_VECTOR STREQUAL hash_SCALAR)
   message(FATAL_ERROR "${backend_VECTOR} and scalar differ: ${hash_VECTOR} against ${hash_SCALAR}")
+endif()
+if(WIDE)
+  execute_process(COMMAND "${WIDE}" OUTPUT_VARIABLE out_WIDE RESULT_VARIABLE rc)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "the AVX build exited ${rc}")
+  endif()
+  string(REGEX MATCH "wide ([a-z0-9]+)" _ "${out_WIDE}")
+  if(NOT CMAKE_MATCH_1 STREQUAL "avx")
+    message(FATAL_ERROR "the AVX build did not compile Vec8f and Vec4d to AVX (${CMAKE_MATCH_1})")
+  endif()
+  string(REGEX MATCH "HASH ([0-9a-f]+)" _ "${out_WIDE}")
+  if(NOT CMAKE_MATCH_1 STREQUAL hash_SCALAR)
+    message(FATAL_ERROR "AVX and scalar differ: ${CMAKE_MATCH_1} against ${hash_SCALAR}")
+  endif()
+  message(STATUS "AVX agrees too: ${CMAKE_MATCH_1}")
 endif()
 message(STATUS "${backend_VECTOR} and scalar agree bit for bit: ${hash_VECTOR}")
