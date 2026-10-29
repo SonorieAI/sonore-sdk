@@ -624,6 +624,32 @@ static void testOscillator() {
   }
 }
 
+// How many of an envelope's first two million release samples are each the
+// one before times one coefficient, to the bit: 1999999 for a release that
+// runs on a coefficient worked out once. From a level of exactly 1 (a
+// sustain of 1, reached) the first release sample IS that coefficient. An
+// exp() of the time elapsed is off within three. -1 when the envelope is not
+// at 1 when released, or does not fall.
+template <typename Envelope>
+static int exactReleaseSteps(Envelope env) {
+  env.reset();
+  env.noteOn();
+  for (int i = 0; i < 63; ++i) env.getNextSample();
+  if (env.getNextSample() != 1.0f) return -1;
+  env.noteOff();
+  const float k = env.getNextSample();
+  if (!(k < 1.0f)) return -1;
+  float last = k;
+  int exact = 0;
+  for (int i = 1; i < 2000000; ++i) {
+    const float v = env.getNextSample();
+    if (v != last * k) break;
+    ++exact;
+    last = v;
+  }
+  return exact;
+}
+
 static void testDynamics() {
   std::printf("dynamics\n");
   const double sr = 48000.0;
@@ -804,21 +830,30 @@ static void testDynamics() {
 
   // A voice's envelope runs every sample of every voice, so its curves are
   // coefficients worked out when the settings change -- not an exp() per
-  // sample per voice, which is what decay and release cost. Timed on a long
-  // release against the curve's multiply alone, on this machine: what is left
-  // over is the envelope's own bookkeeping, or an exp().
+  // sample per voice, which is what decay and release cost. That is proved
+  // on the samples (exactReleaseSteps), not timed: an exp() per sample
+  // measured only 3x a bare multiply loop, with MSVC and with GCC -- not the
+  // ten times or more this check once assumed -- and the DAHDSR's release
+  // 2.7x on some of CI's Windows runners. No bound on the time falls between
+  // the two.
   //
-  // In ALTERNATION, best of five each. The two used to be timed in separate
-  // phases, so a burst of load from the parallel suite during one of them
-  // decided the ratio: 3.4x under ctest -j3, about 1.5x alone. And 4x, not
-  // 2.5x: an exp() per sample costs ten times the multiply or more, so the
-  // bound still catches what it exists for, with room for a busy runner.
+  // The time is still checked, for a release grown grossly slower: a long
+  // one against the curve's multiply alone, in ALTERNATION, best of five
+  // each. The two used to be timed in separate phases, so a burst of load
+  // from the parallel suite during one of them decided the ratio: 3.4x
+  // under ctest -j3, about 1.5x alone.
   {
     sonore::ADSR slow;
     slow.setSampleRate((float) sr);
     sonore::ADSR::Parameters q;
     q.attack = 0.0001f; q.decay = 0.0001f; q.sustain = 1.0f; q.release = 60.0f;
     slow.setParameters(q);
+    char line[200];
+    const int exact = exactReleaseSteps(slow);
+    std::snprintf(line, sizeof(line), "two million ADSR release samples are each the one before "
+                  "times one coefficient, to the bit (%d of 1999999 steps)", exact);
+    check(exact == 1999999, line);
+
     double best = 1e9, reference = 1e9;
     volatile float sink = 0.0f;
     for (int round = 0; round < 5; ++round) {
@@ -848,7 +883,6 @@ static void testDynamics() {
       if (ms < reference) reference = ms;
     }
     (void) sink;
-    char line[200];
     std::snprintf(line, sizeof(line), "two million release samples take %.2f ms, %.1fx a bare "
                   "multiply loop (alternating, best of five)", best, best / reference);
     check(best < reference * 4.0, line);
@@ -32801,7 +32835,11 @@ static void testSynthesis() {
                   "(the attack's own step is %.3f)", worstStep, 1.0 / (p.attack * sr));
     check(worstStep <= 1.0f / (p.attack * (float) sr) + 1e-4f, line);
 
-    // Its curves are coefficients too, not an exp() per sample per voice.
+    // Its curves are coefficients too, not an exp() per sample per voice:
+    // proved on the samples, as the ADSR's are. The time is held to the
+    // ADSR's 4x, for a release grown grossly slower; 2.5x failed on some of
+    // CI's Windows runners at 2.7x, and no bound on the time tells an exp()
+    // apart, which measured 3x.
     {
       sonore::Dahdsr slow;
       slow.setSampleRate((float) sr);
@@ -32809,6 +32847,11 @@ static void testSynthesis() {
       q.delay = 0.0f; q.attack = 0.0001f; q.hold = 0.0f; q.decay = 0.0001f; q.sustain = 1.0f;
       q.release = 60.0f;
       slow.setParameters(q);
+      const int exact = exactReleaseSteps(slow);
+      std::snprintf(line, sizeof(line), "two million DAHDSR release samples are each the one "
+                    "before times one coefficient, to the bit (%d of 1999999 steps)", exact);
+      check(exact == 1999999, line);
+
       volatile float sink = 0.0f;
       auto releaseBody = [&] {
         // A LOCAL envelope, as a voice owns its own: reached through the
@@ -32831,11 +32874,11 @@ static void testSynthesis() {
         }
         sink = acc;
       };
-      const double ratio = relativeCost(releaseBody, multiplyBody, 2.5);
+      const double ratio = relativeCost(releaseBody, multiplyBody, 4.0);
       (void) sink;
       std::snprintf(line, sizeof(line), "two million DAHDSR release samples cost %.1fx a bare "
                     "multiply loop", ratio);
-      check(ratio < 2.5, line);
+      check(ratio < 4.0, line);
     }
   }
 
