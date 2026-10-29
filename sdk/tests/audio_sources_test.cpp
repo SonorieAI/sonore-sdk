@@ -40,6 +40,16 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <signal.h>
+#endif
+
 using namespace sonore;
 
 // ── Allocation audit ─────────────────────────────────────────────────────────
@@ -948,15 +958,121 @@ void spinUntil(Ready ready) {
     if (spins > 2000) std::this_thread::yield();
 }
 
+/** Stops a running thread wherever it is and holds it there until unpark(),
+ *  as a scheduler stops a thread it preempts: SuspendThread on Windows
+ *  (GetThreadContext returns once the stop has taken effect), elsewhere a
+ *  signal whose handler spins on a lock-free flag. The thread must not hold
+ *  a lock the parking thread needs while it is stopped. */
+class Parker {
+public:
+  explicit Parker(std::thread& thread) : thread_(thread) {
+#if !defined(_WIN32)
+    struct sigaction sa = {};
+    sa.sa_handler = &Parker::onSignal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, &previous_);
+#endif
+  }
+  ~Parker() {
+#if !defined(_WIN32)
+    sigaction(SIGUSR1, &previous_, nullptr);
+#endif
+  }
+  Parker(const Parker&) = delete;
+  Parker& operator=(const Parker&) = delete;
+
+  void park() {
+#if defined(_WIN32)
+    const HANDLE h = (HANDLE) thread_.native_handle();
+    SuspendThread(h);
+    CONTEXT context = {};
+    context.ContextFlags = CONTEXT_CONTROL;
+    GetThreadContext(h, &context);
+#else
+    release_.store(false);
+    parked_.store(false);
+    pthread_kill(thread_.native_handle(), SIGUSR1);
+    while (!parked_.load()) {}
+#endif
+  }
+  void unpark() {
+#if defined(_WIN32)
+    ResumeThread((HANDLE) thread_.native_handle());
+#else
+    release_.store(true);
+    while (parked_.load()) {}
+#endif
+  }
+
+private:
+#if !defined(_WIN32)
+  // Lock-free, and no guard to initialise them: all a handler may touch.
+  static inline std::atomic<bool> parked_{false}, release_{false};
+  static void onSignal(int) {
+    parked_.store(true);
+    while (!release_.load()) {}
+    parked_.store(false);
+  }
+  struct sigaction previous_ = {};
+#endif
+  std::thread& thread_;
+};
+
 void testBuffering() {
   section("BufferingAudioSource");
   {
     // The ring's range read the way a block reads it -- four tries, then
-    // silence -- while a writer publishes as fast as it can. With one copy
-    // the reader found the writer mid-write on every try for as long as the
-    // writer was stopped there; under load, a reader thread preempted
-    // mid-publish cost a whole block of silence with the audio in the ring.
-    // With two, the published copy is never the one being written.
+    // silence -- while the thread that publishes it is STOPPED, at a random
+    // point of publishing, as the scheduler stops a thread it preempts. With
+    // one copy the reader found the writer mid-write on every try for as
+    // long as it stayed stopped there, and the block went out as silence
+    // with the audio in the ring. With two, the published copy is never the
+    // one being written, so every one of these reads finds it -- by
+    // construction, not by winning a race. The one-copy box missed 4% to
+    // 54% of the same stops on CI's runners.
+    struct Range {
+      int64_t start, end;
+    };
+    sourcedetail::SeqBox<Range> box{Range{0, 1000}};
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> written{0};
+    std::thread writer([&] {
+      for (int64_t i = 1; !stop.load(std::memory_order_relaxed); ++i) {
+        box.write(Range{i, i + 1000});
+        written.store(i, std::memory_order_relaxed);
+      }
+    });
+    spinUntil([&] { return written.load() >= 1000; });
+    const int stops = 2000;
+    int lost = 0, torn = 0;
+    {
+      Parker parker(writer);
+      for (int k = 0; k < stops; ++k) {
+        const int64_t at = written.load();
+        spinUntil([&] { return written.load() >= at + 50; }); // publishing again between stops
+        parker.park();
+        Range r{0, 1000};
+        bool have = false;
+        for (int tries = 0; tries < 4 && !have; ++tries) have = box.tryRead(r);
+        if (!have) ++lost;
+        else if (r.end != r.start + 1000) ++torn;
+        parker.unpark();
+      }
+    }
+    stop.store(true);
+    writer.join();
+    checkf(lost == 0 && torn == 0,
+           "a block reads the range whole while the thread publishing it is stopped mid-publish, wherever it "
+           "stops (%d of %d stops found nothing, %d torn)",
+           lost, stops, torn);
+  }
+  {
+    // And while it publishes as fast as it can, never stopping, no read is
+    // torn. How many find nothing says more about the machine than about the
+    // box -- a writer that laps a read twice inside it beats any seqlock --
+    // from none to 15% of a million reads, on one machine from one run to
+    // the next, where the one-copy box lost up to 98%. So that count is held
+    // only under half, which a box that works at all keeps.
     struct Range {
       int64_t start, end;
     };
@@ -976,12 +1092,8 @@ void testBuffering() {
     }
     stop.store(true);
     writer.join();
-    // Under one in a hundred: the one-copy box lost six in a hundred here,
-    // and the two-copy one loses a read only when this thread is stopped
-    // inside one while the writer laps it twice -- a few in a million
-    // alone, some hundreds beside a full build.
-    checkf(empty <= reads / 100 && torn == 0,
-           "a block reads the range whole while it is published as fast as possible "
+    checkf(empty < reads / 2 && torn == 0,
+           "...and never torn while it is published as fast as possible "
            "(%ld of %ld reads found nothing in four tries, %ld torn)",
            empty, reads, torn);
   }
