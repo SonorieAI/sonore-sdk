@@ -17,6 +17,12 @@
 # is always written: one left untouched would stay older than the file that
 # triggered it, and every later build would run this again.
 
+# A script run with -P inherits none of the project's policies, so it sets its
+# own. Without this line CMake 3.x reads `IN_LIST` under the OLD policy
+# (CMP0057) and stops with "Unknown arguments specified". CMake 4 has removed
+# that OLD behaviour, so a machine running 4.x never shows the failure.
+cmake_minimum_required(VERSION 3.21)
+
 if(NOT DIR OR NOT OUT)
   message(FATAL_ERROR "SonoreEmbedUi.cmake needs -DDIR=<folder> and -DOUT=<header>")
 endif()
