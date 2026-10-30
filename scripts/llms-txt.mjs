@@ -187,6 +187,14 @@ const RULES = [
    "that `process()` fills. Gain reduction comes from the DSP declaring " +
    "`float gainReduction() const`, in positive dB. A display animated with " +
    "random numbers looks alive and tells the user nothing."],
+
+  ["A page's files ship in a folder compiled into the plugin.",
+   "`sonore_add_ui(target DIR ui ENTRY index.html)` (or `UI_DIR` and " +
+   "`UI_ENTRY` on `sonore_add_plugin`) serves the folder at the page's own " +
+   "origin on every backend, so `import * as THREE from \"./three.module.js\"` and " +
+   "a loader fetching `studio.hdr` work by relative URL. Nothing loads from the " +
+   "network: a CDN address never resolves inside a plugin, and a file the folder " +
+   "lacks is a 404."],
 ];
 
 // ── Emitting ────────────────────────────────────────────────────────────────

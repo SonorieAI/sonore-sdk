@@ -654,7 +654,7 @@ function(_sonore_ios_app TARGET)
   endif()
 endfunction()
 
-# ── sonore_add_standalone(<target> SOURCES a.cpp [...] [NAME n] [BUNDLE_ID id] [VERSION v]) ──
+# ── sonore_add_standalone(<target> SOURCES a.cpp [...] [NAME n] [BUNDLE_ID id] [VERSION v] [UI_DIR d [UI_ENTRY f]]) ──
 # A runnable app from the same plugin source: window + webview faceplate + OS
 # audio. Also the CI-friendly offline modes (--verify / --render out.wav),
 # which need no audio device and no display.
@@ -663,21 +663,34 @@ endfunction()
 # and plays), and the app is <target>.apk beside it: see _sonore_android_app.
 # On iOS, <target>.app is both: see _sonore_ios_app. NAME, BUNDLE_ID and
 # VERSION are the app's label, package and version there, and are not used
-# on the desktop.
+# on the desktop. UI_DIR (and UI_ENTRY) is sonore_add_ui() on the app.
 function(sonore_add_standalone TARGET)
-  cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION" "SOURCES" ${ARGN})
+  cmake_parse_arguments(ARG "" "NAME;BUNDLE_ID;VERSION;UI_DIR;UI_ENTRY" "SOURCES" ${ARGN})
+  set(_ui_args)
+  if(ARG_UI_DIR)
+    set(_ui_args DIR "${ARG_UI_DIR}")
+    if(ARG_UI_ENTRY)
+      list(APPEND _ui_args ENTRY "${ARG_UI_ENTRY}")
+    endif()
+  endif()
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_standalone(${TARGET}): SOURCES is required")
   endif()
 
   if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     _sonore_ios_app(${TARGET} ${ARGN})
+    if(_ui_args AND TARGET ${TARGET})
+      sonore_add_ui(${TARGET} ${_ui_args})
+    endif()
     return()
   endif()
 
   add_executable(${TARGET} ${ARG_SOURCES})
   target_link_libraries(${TARGET} PRIVATE sonore_sdk)
   target_compile_definitions(${TARGET} PRIVATE SONORE_BUILD_STANDALONE=1)
+  if(_ui_args)
+    sonore_add_ui(${TARGET} ${_ui_args})
+  endif()
 
   if(WIN32)
     # A console app on purpose: the offline modes print their verdicts, and an
@@ -768,6 +781,52 @@ function(sonore_add_lv2 TARGET)
   add_dependencies(${TARGET} ${TARGET}_ttlgen)
 endfunction()
 
+# ── sonore_add_ui(<target> DIR <folder> [ENTRY index.html]) ──────────────────
+# Compiles a folder into <target> and serves it to the web editor at the
+# page's own origin (sonore/ui_assets.h): the page's scripts, ES modules,
+# images, fonts, HDRIs, models and wasm load by relative URL, the way they do
+# from a web server -- `import * as THREE from "./three.module.min.js"`, a
+# loader fetching "studio.hdr". With ENTRY the page itself comes from the
+# folder too, and SONORE_UI_HTML is not needed; ENTRY must sit at the top of
+# the folder, because the page is served at the root and its relative URLs
+# resolve from there.
+#
+# DIR is relative to the CMakeLists.txt that calls this. The folder is read
+# at BUILD time (cmake/SonoreEmbedUi.cmake), so editing a file in it rebuilds
+# the plugin; adding a file is picked up by the next configure, which the
+# build triggers itself (CONFIGURE_DEPENDS). Call it on every target that
+# opens the editor: sonore_add_plugin() and sonore_add_standalone() do it for
+# their own targets when handed UI_DIR.
+function(sonore_add_ui TARGET)
+  cmake_parse_arguments(ARG "" "DIR;ENTRY" "" ${ARGN})
+  if(NOT TARGET ${TARGET})
+    message(FATAL_ERROR "sonore_add_ui(${TARGET}): no such target")
+  endif()
+  if(NOT ARG_DIR)
+    message(FATAL_ERROR "sonore_add_ui(${TARGET}): DIR is required")
+  endif()
+  get_filename_component(_dir "${ARG_DIR}" ABSOLUTE)
+  if(NOT IS_DIRECTORY "${_dir}")
+    message(FATAL_ERROR "sonore_add_ui(${TARGET}): ${_dir} is not a folder")
+  endif()
+  if(ARG_ENTRY MATCHES "[/\\\\]")
+    message(FATAL_ERROR "sonore_add_ui(${TARGET}): ENTRY ${ARG_ENTRY} must be a file at the top of the folder")
+  endif()
+  if(ARG_ENTRY AND NOT EXISTS "${_dir}/${ARG_ENTRY}")
+    message(FATAL_ERROR "sonore_add_ui(${TARGET}): ENTRY ${ARG_ENTRY} is not in ${_dir}")
+  endif()
+  file(GLOB_RECURSE _deps CONFIGURE_DEPENDS "${_dir}/*")
+  set(_out "${CMAKE_CURRENT_BINARY_DIR}/sonore_ui/${TARGET}/sonore_ui_assets.h")
+  add_custom_command(OUTPUT "${_out}"
+    COMMAND "${CMAKE_COMMAND}" "-DDIR=${_dir}" "-DOUT=${_out}" "-DENTRY=${ARG_ENTRY}"
+            -P "${SONORE_SDK_DIR}/cmake/SonoreEmbedUi.cmake"
+    DEPENDS ${_deps} "${SONORE_SDK_DIR}/cmake/SonoreEmbedUi.cmake"
+    COMMENT "Embedding the ${TARGET} interface from ${ARG_DIR}"
+    VERBATIM)
+  target_sources(${TARGET} PRIVATE "${_out}")
+  target_compile_definitions(${TARGET} PRIVATE "SONORE_UI_ASSETS_HEADER=\"${_out}\"")
+endfunction()
+
 # ── sonore_add_plugin(<name> SOURCES a.cpp [CLAP <t>] [VST3 <t>] [AU <t>] [AUV3 <t>] [LV2 <t>] [AAX <t>]) ──
 #
 #   sonore_add_plugin(MyPlugin SOURCES plugin.cpp
@@ -775,7 +834,8 @@ endfunction()
 #     AU_SUBTYPE "Mypl" AU_MANUFACTURER "Manu" AU_TYPE aufx  AUV3_SUBTYPE "Myp3"  VERSION 1.2.0
 #     [AUV3_CONTAINER MyPluginApp])
 #     AU_VENDOR "My Company" AU_NAME "My Plugin" AU_BUNDLE_ID com.mycompany.myplugin
-#     AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl")
+#     AAX_MANUFACTURER "Manu" AAX_PRODUCT "Mypl"
+#     [UI_DIR ui UI_ENTRY index.html])
 #
 # One compile of the source, then one bundle per format named, each the same
 # artifact the single-format helper would have produced under that name. AU
@@ -793,11 +853,23 @@ endfunction()
 # loading the other formats should pay for. It takes the AU_* identity, with
 # AUV3_SUBTYPE for its own code (a product shipping AUv2 and AUv3 needs two,
 # or a Mac host sees one component twice); Apple platforms only.
+#
+# UI_DIR (and UI_ENTRY) is sonore_add_ui() on each of those compiles: the
+# shared object, and AUv3's and AAX's own.
 function(sonore_add_plugin NAME)
-  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;AUV3;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AUV3_SUBTYPE;AUV3_CONTAINER;AAX_MANUFACTURER;AAX_PRODUCT;VERSION"
+  cmake_parse_arguments(ARG "" "CLAP;VST3;AU;AUV3;LV2;AAX;AU_SUBTYPE;AU_MANUFACTURER;AU_TYPE;AU_VENDOR;AU_NAME;AU_BUNDLE_ID;AUV3_SUBTYPE;AUV3_CONTAINER;AAX_MANUFACTURER;AAX_PRODUCT;VERSION;UI_DIR;UI_ENTRY"
                         "SOURCES" ${ARGN})
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): SOURCES is required")
+  endif()
+  set(_ui_args)
+  if(ARG_UI_DIR)
+    set(_ui_args DIR "${ARG_UI_DIR}")
+    if(ARG_UI_ENTRY)
+      list(APPEND _ui_args ENTRY "${ARG_UI_ENTRY}")
+    endif()
+  elseif(ARG_UI_ENTRY)
+    message(FATAL_ERROR "sonore_add_plugin(${NAME}): UI_ENTRY needs UI_DIR")
   endif()
   if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_AUV3 OR ARG_LV2 OR ARG_AAX))
     message(FATAL_ERROR "sonore_add_plugin(${NAME}): name at least one format target (CLAP/VST3/AU/AUV3/LV2/AAX)")
@@ -836,6 +908,9 @@ function(sonore_add_plugin NAME)
       list(APPEND _auv3_args CONTAINER ${ARG_AUV3_CONTAINER})
     endif()
     sonore_add_auv3(${ARG_AUV3} SOURCES ${ARG_SOURCES} ${_auv3_args})
+    if(_ui_args AND TARGET ${ARG_AUV3})
+      sonore_add_ui(${ARG_AUV3} ${_ui_args})
+    endif()
   endif()
   if(ARG_AAX)
     set(_aax_args)
@@ -848,6 +923,9 @@ function(sonore_add_plugin NAME)
       list(APPEND _aax_args VERSION "${ARG_VERSION}")
     endif()
     sonore_add_aax(${ARG_AAX} SOURCES ${ARG_SOURCES} ${_aax_args})
+    if(_ui_args AND TARGET ${ARG_AAX})
+      sonore_add_ui(${ARG_AAX} ${_ui_args})
+    endif()
   endif()
   if(NOT (ARG_CLAP OR ARG_VST3 OR ARG_AU OR ARG_LV2))
     return()
@@ -862,6 +940,9 @@ function(sonore_add_plugin NAME)
   set(_obj ${NAME}_objects)
   add_library(${_obj} OBJECT ${ARG_SOURCES})
   target_link_libraries(${_obj} PUBLIC sonore_sdk)
+  if(_ui_args)
+    sonore_add_ui(${_obj} ${_ui_args})
+  endif()
   # The properties a module would have had, on the object that goes into one.
   set_target_properties(${_obj} PROPERTIES
     POSITION_INDEPENDENT_CODE ON

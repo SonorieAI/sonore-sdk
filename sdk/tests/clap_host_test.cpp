@@ -508,7 +508,17 @@ int main(int argc, char** argv) {
   // appeared -- an editor that silently fell back to the other backend would
   // otherwise pass without a word.
   int expectEditor = 0; // 0 = no expectation, 1 = native, 2 = web
+  /** --expect-page-sets <index>=<value>: the plugin's page moves this
+   *  parameter to this value once it has loaded and checked what it needs
+   *  (tests/ui_folder_fixture.cpp). -1 = no expectation. */
+  int expectPageIndex = -1;
+  double expectPageValue = 0.0;
   for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--expect-page-sets") == 0 && i + 1 < argc) {
+      if (std::sscanf(argv[i + 1], "%d=%lf", &expectPageIndex, &expectPageValue) != 2) expectPageIndex = -1;
+      ++i;
+      continue;
+    }
     if (std::strcmp(argv[i], "--expect-native-editor") == 0) expectEditor = 1;
     if (std::strcmp(argv[i], "--expect-web-editor") == 0) expectEditor = 2;
     if (std::strcmp(argv[i], "--expect-bridge") == 0) expectBridge = true;
@@ -3705,6 +3715,29 @@ int main(int argc, char** argv) {
       uint32_t w2 = 0, h2 = 0;
       gui->get_size(plugin, &w2, &h2);
       check(w2 == 640 && h2 == 380, "…and reports the new size back");
+
+      // ── A page that proves itself before it moves a parameter ─────────
+      // The page decides whether what it loaded works (ui_folder_fixture:
+      // modules, bytes, WebGL from a folder compiled into the plugin), and
+      // only then sets the parameter. Up to 30 s: a cold WebView2 on a busy
+      // machine, then a page that loads a folder and starts a GL context.
+      if (expectPageIndex >= 0) {
+        double got = -1.0;
+        for (int i = 0; i < 3000; ++i) {
+          while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+          }
+          plugin->process(plugin, &process); // drains the UI queue
+          params->get_value(plugin, (clap_id) expectPageIndex, &got);
+          if (std::fabs(got - expectPageValue) < 1e-4) break;
+          Sleep(10);
+        }
+        char line[200];
+        std::snprintf(line, sizeof(line), "the page set parameter %d to %.4f once it had checked itself (read %.4f)",
+                      expectPageIndex, expectPageValue, got);
+        check(std::fabs(got - expectPageValue) < 1e-4, line);
+      }
 
       // ── The bridge, end to end ──────────────────────────────────────────
       // With --expect-bridge the plugin under test is the GUI probe, whose

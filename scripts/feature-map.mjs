@@ -3097,6 +3097,24 @@ const MAP = [
    "deliberately NOT written: neither can be run in this loop, and modern " +
    "WebKit pools web-content processes on its own anyway",
    "sharedEnvironment"],
+  ["extras", "WebBrowserComponent's resource provider (files served at the page's origin)",
+   "ui_assets.h + sonore_add_ui(): a FOLDER compiled into the plugin -- the page, its " +
+   "ES modules, images, fonts, HDRIs, models, wasm -- as UiAsset entries of a UiAssets " +
+   "table, served at the page's own origin by every backend: WebView2 answers " +
+   "https://<label>.sonore.invalid/ from WebResourceRequested, WebKitGTK and WKWebView " +
+   "a sonore-ui:// scheme (registered secure and CORS-enabled on GTK, where module " +
+   "scripts are refused otherwise), Android shouldInterceptRequest. So a page imports " +
+   "three.js and a loader fetches its model by relative URL, as from a web server, " +
+   "and a file the folder does not hold is a 404, never a trip to the network.\n" +
+   "      The reference's provider is a callback the plugin writes; here the folder is " +
+   "the whole interface and CMake does the rest (cmake/SonoreEmbedUi.cmake: string " +
+   "literals in 3000-byte pieces, the size MSVC's per-literal limit allows). RUN on " +
+   "Windows by webview_page_test (modules importing modules, all 256 byte values, " +
+   "types, 404, a Worker, WebGL2 read back) and clap_ui_folder (a plugin built " +
+   "with UI_DIR/UI_ENTRY whose page proves the same before it moves a parameter); " +
+   "the WebKitGTK, WKWebView and Android servers COMPILED (gcc, the Apple shim, the " +
+   "NDK and javac) and not yet run",
+   "struct UiAssets"],
   ["extras", "WebSliderRelay / WebComboBoxRelay / WebToggleButtonRelay / " +
              "WebControlParameterIndexReceiver",
    "gui.h: the bridge's sonore.params, sonore.get, sonore.set and the parameter " +

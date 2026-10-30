@@ -75,6 +75,8 @@ struct CGRectStruct { CGPointStruct origin; CGSizeStruct size; };
 class WebViewHost;
 inline void handleScriptMessage(id self, SEL, id, id message);
 inline void decideNavigationPolicy(id self, SEL, id webView, id action, id decisionHandler);
+inline void startSchemeTask(id self, SEL, id webView, id task);
+inline void stopSchemeTask(id self, SEL, id webView, id task);
 
 /** A runtime class name that is unique to THIS binary.
  *
@@ -102,6 +104,13 @@ inline Class messageHandlerClass() {
     // is looked up by selector, so no protocol needs declaring).
     class_addMethod(c, sel_registerName("webView:decidePolicyForNavigationAction:decisionHandler:"),
                     (IMP) decideNavigationPolicy, "v@:@@@?");
+    // And the view's WKURLSchemeHandler, which serves the page's folder
+    // under sonore-ui:// (ui_assets.h). The protocol is declared when the
+    // runtime has it, in case a WebKit ever checks conformance rather than
+    // selectors.
+    class_addMethod(c, sel_registerName("webView:startURLSchemeTask:"), (IMP) startSchemeTask, "v@:@@");
+    class_addMethod(c, sel_registerName("webView:stopURLSchemeTask:"), (IMP) stopSchemeTask, "v@:@@");
+    if (Protocol* scheme = objc_getProtocol("WKURLSchemeHandler")) class_addProtocol(c, scheme);
     // One instance variable: the WebViewHost that should receive the message.
     class_addIvar(c, "owner", sizeof(void*), (uint8_t) log2(sizeof(void*)), "^v");
     objc_registerClassPair(c);
@@ -136,11 +145,20 @@ public:
 
   ~WebViewHost() { destroy(); }
 
+  /** The folder the page is served with, for a page that is not the
+   *  plugin's own (see webview_win32.h). Before create(). */
+  void setAssets(const UiAssets* assets) { assets_ = assets; }
+
+  /** Where the page is served (sonore-ui://...), or empty when it is loaded
+   *  as a string: the one address besides webviewMayNavigate's it may be at. */
+  const std::string& servedPage() const { return pageUri_; }
+
   bool create(void* parentNsView, uint32_t width, uint32_t height, std::string html,
-              std::string bridge, std::string /*userDataName*/) {
+              std::string bridge, std::string userDataName) {
     if (webview_) return true;
     width_ = width;
     height_ = height;
+    if (!assets_) assets_ = registeredUiAssets();
 
     id configClass = cls("WKWebViewConfiguration");
     id controllerClass = cls("WKUserContentController");
@@ -173,6 +191,16 @@ public:
     msg<void>(controller, sel_registerName("addScriptMessageHandler:name:"), handler_,
               nsString("sonore"));
 
+    // A page with a folder is served under sonore-ui://<the plugin's origin
+    // label>/, so its modules and files load by relative URL; the handler is
+    // the same object, and the configuration must have it before the view
+    // is made from it.
+    if (assets_) {
+      msg<void>(config, sel_registerName("setURLSchemeHandler:forURLScheme:"), handler_, nsString(kUiScheme));
+      pageUri_ = std::string(kUiScheme) + "://" + uiOriginLabel(userDataName) + "/editor.html";
+      page_ = html;
+    }
+
     msg<void>(config, sel_registerName("setUserContentController:"), controller);
     msg<void>(controller, sel_registerName("release")); // the configuration holds it now
 
@@ -200,7 +228,13 @@ public:
 
     id parent = (id) parentNsView;
     msg<void>(parent, sel_registerName("addSubview:"), webview_);
-    msg<void>(webview_, sel_registerName("loadHTMLString:baseURL:"), nsString(html), (id) nullptr);
+    if (!pageUri_.empty()) {
+      id url = msg<id>(cls("NSURL"), sel_registerName("URLWithString:"), nsString(pageUri_));
+      id request = url ? msg<id>(cls("NSURLRequest"), sel_registerName("requestWithURL:"), url) : nullptr;
+      if (request) msg<id>(webview_, sel_registerName("loadRequest:"), request);
+    } else {
+      msg<void>(webview_, sel_registerName("loadHTMLString:baseURL:"), nsString(html), (id) nullptr);
+    }
 
     // The UI clock, as an NSTimer on the main run loop.
     timer_ = msg<id>(cls("NSTimer"),
@@ -242,9 +276,29 @@ public:
     }
     ready_ = false;
     captureKeys = false; // the page that asked is gone (see webview_win32.h)
+    pageUri_.clear();
+    std::string().swap(page_);
   }
 
   bool ready() const { return ready_; }
+
+  /** The answer to a request on this view's scheme: the page, a file of the
+   *  folder, or nothing (a 404). */
+  bool lookUp(const std::string& path, const unsigned char*& data, size_t& size, std::string& mime) const {
+    if (uiAssetPath(path) == "editor.html" && !page_.empty()) {
+      data = (const unsigned char*) page_.data();
+      size = page_.size();
+      mime = "text/html; charset=utf-8";
+      return true;
+    }
+    if (const UiAsset* asset = assets_ ? assets_->find(path) : nullptr) {
+      data = asset->data;
+      size = asset->size;
+      mime = uiMimeFor(asset->path);
+      return true;
+    }
+    return false;
+  }
   /** The platform window this view lives in, as an opaque handle: an HWND on
    *  Windows, a GtkWidget* under GTK, an NSView* on macOS. Only a modal
    *  dialog needs it, and only so the dialog is owned by the editor rather
@@ -326,6 +380,9 @@ private:
   id webview_ = nullptr;
   id handler_ = nullptr;
   id timer_ = nullptr;
+  /** The folder, the page kept to serve, and where it is served. */
+  const UiAssets* assets_ = nullptr;
+  std::string page_, pageUri_;
   BlockLiteral timerBlock_{};
   uint32_t width_ = 700, height_ = 420;
   bool ready_ = false;
@@ -355,11 +412,18 @@ inline void handleScriptMessage(id self, SEL, id, id message) {
  *  allows. The decision handler is a block, called through its invoke
  *  pointer, which follows isa, flags and reserved in every block's layout.
  *  WKNavigationActionPolicyCancel is 0, Allow is 1. */
-inline void decideNavigationPolicy(id, SEL, id, id action, id decisionHandler) {
+inline void decideNavigationPolicy(id self, SEL, id, id action, id decisionHandler) {
   id request = action ? msg<id>(action, sel_registerName("request")) : nullptr;
   id url = request ? msg<id>(request, sel_registerName("URL")) : nullptr;
   id text = url ? msg<id>(url, sel_registerName("absoluteString")) : nullptr;
-  const bool allowed = text && webviewMayNavigate(fromNsString(text));
+  // The served page itself (and its reload) besides webviewMayNavigate's;
+  // another file of the folder is not a page to go to.
+  void* owner = nullptr;
+  object_getInstanceVariable(self, "owner", &owner);
+  const std::string address = text ? fromNsString(text) : std::string();
+  const auto* host = static_cast<const WebViewHost*>(owner);
+  const bool allowed = text && (webviewMayNavigate(address) ||
+                                (host && !host->servedPage().empty() && host->servedPage() == address));
   struct BlockHeader {
     void* isa;
     int flags;
@@ -369,6 +433,45 @@ inline void decideNavigationPolicy(id, SEL, id, id action, id decisionHandler) {
   auto* block = reinterpret_cast<BlockHeader*>(decisionHandler);
   if (block && block->invoke) block->invoke(block, allowed ? 1L : 0L);
 }
+
+/** WKURLSchemeHandler: a request on sonore-ui://, answered at once from the
+ *  owner's page and folder with a real HTTP response -- 200 and the file's
+ *  type, or 404 -- so fetch() sees a status and a module its JavaScript type.
+ *  Answered synchronously, so a stop can never arrive between the start and
+ *  the answer, and there is nothing for stopSchemeTask to cancel. */
+inline void startSchemeTask(id self, SEL, id, id task) {
+  void* owner = nullptr;
+  object_getInstanceVariable(self, "owner", &owner);
+  id request = task ? msg<id>(task, sel_registerName("request")) : nullptr;
+  id url = request ? msg<id>(request, sel_registerName("URL")) : nullptr;
+  id text = url ? msg<id>(url, sel_registerName("absoluteString")) : nullptr;
+  if (!url) return;
+  std::string host, path;
+  uiSplitSchemeUrl(fromNsString(text), host, path);
+  const unsigned char* data = nullptr;
+  size_t size = 0;
+  std::string mime = "text/plain; charset=utf-8";
+  const bool found = owner && static_cast<const WebViewHost*>(owner)->lookUp(path, data, size, mime);
+  id headers = msg<id>(cls("NSDictionary"), sel_registerName("dictionaryWithObject:forKey:"), nsString(mime),
+                       nsString("Content-Type"));
+  using NewResponse = id (*)(id, SEL, id, long, id, id);
+  id response = reinterpret_cast<NewResponse>(objc_msgSend)(
+      msg<id>(cls("NSHTTPURLResponse"), sel_registerName("alloc")),
+      sel_registerName("initWithURL:statusCode:HTTPVersion:headerFields:"), url, (long) (found ? 200 : 404),
+      nsString("HTTP/1.1"), headers);
+  msg<void>(task, sel_registerName("didReceiveResponse:"), response);
+  if (response) msg<void>(response, sel_registerName("release"));
+  if (found && size > 0) {
+    // A copy: the page belongs to an editor that may close while WebKit
+    // still holds the data.
+    id body = msg<id>(cls("NSData"), sel_registerName("dataWithBytes:length:"), (const void*) data,
+                      (unsigned long) size);
+    msg<void>(task, sel_registerName("didReceiveData:"), body);
+  }
+  msg<void>(task, sel_registerName("didFinish"));
+}
+
+inline void stopSchemeTask(id, SEL, id, id) {}
 
 } // namespace cocoa
 } // namespace sonore

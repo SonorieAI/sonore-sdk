@@ -9,3 +9,12 @@
 *.ttf binary
 *.bmp binary
 *.zip binary
+*.bin binary
+*.hdr binary
+*.exr binary
+*.glb binary
+*.ktx2 binary
+*.webp binary
+*.jpg binary
+*.woff2 binary
+*.wasm binary

@@ -26,6 +26,7 @@ import android.graphics.Color;
 import android.media.midi.MidiDevice;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -34,11 +35,13 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.PopupWindow;
 
+import java.io.ByteArrayInputStream;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -115,8 +118,20 @@ public final class SonoreBridge {
         }
     }
 
-    /** The page, over the activity, at x, y, w x h device pixels. */
-    public static WebView createWebView(Activity activity, long owner, String html, int x, int y, int w, int h) {
+    /** A file of the page's folder (sonore/ui_assets.h) by its URL path, or
+     *  null; and its MIME type. Asked on the WebView's own thread, of a table
+     *  compiled into the plugin, which outlives every page. */
+    static native byte[] folderFile(long folder, String path);
+    static native String folderType(long folder, String path);
+
+    /** The address the page is loaded at; requests under it are answered
+     *  from the folder, never from the network. */
+    static final String PAGE_HOST = "appassets.sonore.local";
+
+    /** The page, over the activity, at x, y, w x h device pixels. The folder
+     *  is the plugin's compiled folder, or 0 for a page that is one string. */
+    public static WebView createWebView(Activity activity, long owner, long folder, String html, int x, int y,
+                                        int w, int h) {
         WebView view = new WebView(activity);
         WebSettings settings = view.getSettings();
         settings.setJavaScriptEnabled(true);
@@ -127,6 +142,22 @@ public final class SonoreBridge {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
                 return true;
+            }
+
+            // The page's own address is the folder: a module, a fetch, an
+            // image. A file it does not hold is a 404, never a lookup of a
+            // host that does not exist.
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest request) {
+                Uri url = request.getUrl();
+                if (url == null || !PAGE_HOST.equals(url.getHost())) return null;
+                String path = url.getEncodedPath();
+                byte[] body = folder != 0 && path != null ? folderFile(folder, path) : null;
+                if (body == null)
+                    return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null,
+                                                   new ByteArrayInputStream(new byte[0]));
+                return new WebResourceResponse(folderType(folder, path), null, 200, "OK", null,
+                                               new ByteArrayInputStream(body));
             }
         });
         view.setBackgroundColor(Color.BLACK);
@@ -147,7 +178,7 @@ public final class SonoreBridge {
                 if (!popup.isShowing()) popup.showAtLocation(anchor, Gravity.NO_GRAVITY, px, py);
             }
         });
-        view.loadDataWithBaseURL("https://appassets.sonore.local/", html, "text/html", "utf-8", null);
+        view.loadDataWithBaseURL("https://" + PAGE_HOST + "/", html, "text/html", "utf-8", null);
         return view;
     }
 

@@ -123,7 +123,7 @@ const AREAS = [
     title: "Web editor bridge",
     brief: "A page as the plugin's face: the window.sonore bridge and the three OS webviews.",
     guides: ["web-editor.md"],
-    headers: ["gui.h", "webview_win32.h", "webview_gtk.h", "webview_cocoa.h", "webview_android.h"],
+    headers: ["gui.h", "ui_assets.h", "webview_win32.h", "webview_gtk.h", "webview_cocoa.h", "webview_android.h"],
   },
   {
     id: "files",

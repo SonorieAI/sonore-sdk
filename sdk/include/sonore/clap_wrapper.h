@@ -4102,12 +4102,28 @@ inline bool presetFromLocation(const clap_plugin_t* plugin, uint32_t locationKin
 // supported: it is what every host implements, and a floating window would give
 // us a second lifetime to get wrong for no user-visible gain.
 
+// The page's folder, when the project has one (sonore_add_ui): the tables it
+// generated, which define kSonoreUiAssets and, with an ENTRY, SONORE_UI_HAS_ENTRY.
+#if defined(SONORE_UI_ASSETS_HEADER)
+#include SONORE_UI_ASSETS_HEADER
+#endif
+
 /** The page source, for a webview editor: the project's `uihtml` when it
- *  defines one, else a plain panel generated from the parameter table. */
+ *  defines one, else its folder's ENTRY, else a plain panel generated from
+ *  the parameter table.
+ *
+ *  It is also where the folder is handed to the backends: every format reads
+ *  this as it opens an editor -- it is an argument of each create() -- so the
+ *  folder is registered before any backend looks for it. */
 inline const std::string& uiHtml() {
+#if defined(SONORE_UI_ASSETS_HEADER)
+  registeredUiAssets() = &kSonoreUiAssets;
+#endif
   static const std::string html =
 #if defined(SONORE_UI_HTML)
       std::string(SONORE_UI_HTML);
+#elif defined(SONORE_UI_HAS_ENTRY)
+      std::string((const char*) kSonoreUiAssets.entryAsset()->data, kSonoreUiAssets.entryAsset()->size);
 #else
       fallbackHtml(kDesc);
 #endif
@@ -4131,7 +4147,7 @@ inline std::string bridgeScriptFor(const Instance& inst) {
 
 /** Whether this plugin supplied a face of its own. */
 inline bool hasWebPage() {
-#if defined(SONORE_UI_HTML)
+#if defined(SONORE_UI_HTML) || defined(SONORE_UI_HAS_ENTRY)
   return true;
 #else
   return false;

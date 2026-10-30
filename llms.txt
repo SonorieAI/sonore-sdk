@@ -7,7 +7,7 @@
 
 This file exists for language models and coding agents. It is generated from the
 headers by `scripts/llms-txt.mjs`, so it cannot describe an API the code does
-not have. 284 headers, 840 public types.
+not have. 285 headers, 842 public types.
 
 Two things are worth knowing before writing any code against it. Every claim in
 this repository has a measurement behind it in `sdk/tests`, so if you are
@@ -73,6 +73,7 @@ static const sonore::PluginDescriptor kDesc = {
 - **Big objects are members, never locals.** `FdnReverb<>` is about 1.1 MB, `StereoDelay<>` about 1.5 MB, `Convolver<256,32>` about 140 KB. Emscripten's default stack is 64 KB, so one of these as a local variable crashes the browser build while the native one looks fine.
 - **Parameters are plain values, in the order of the table.** `p[0]` is the first row of `kParamTable`. Not normalised: if the row says -24 to 12 dB, `p[0]` is decibels. The wrappers convert to and from each format's own convention.
 - **A meter or an analyzer shows what the plugin measured.** A web page reads `onLevel`, `onVU`, `onGR` and `onSpectrum` from the bridge; a native editor reads an `AudioScopeBuffer` or a `SpectrumFeed` that `process()` fills. Gain reduction comes from the DSP declaring `float gainReduction() const`, in positive dB. A display animated with random numbers looks alive and tells the user nothing.
+- **A page's files ship in a folder compiled into the plugin.** `sonore_add_ui(target DIR ui ENTRY index.html)` (or `UI_DIR` and `UI_ENTRY` on `sonore_add_plugin`) serves the folder at the page's own origin on every backend, so `import * as THREE from "./three.module.js"` and a loader fetching `studio.hdr` work by relative URL. Nothing loads from the network: a CDN address never resolves inside a plugin, and a file the folder lacks is a 404.
 
 ## Building
 
@@ -244,6 +245,7 @@ built binaries as a host, and compiles the same DSP to WebAssembly.
 - [transport.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/transport.h): musical time
 - [tube.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/tube.h): a valve gain stage and the tone stack after it
 - [turtle.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/turtle.h): enough Turtle to read an LV2 bundle
+- [ui_assets.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/ui_assets.h): the files a web editor's page brings with it
 - [ump.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/ump.h): Universal MIDI Packets: the MIDI 2.0 wire format
 - [ump128.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/ump128.h): The 128-bit Universal MIDI Packets ump.h left out: Flex Data (message type
 - [undo.h](https://github.com/SonorieAI/sonore-sdk/blob/main/sdk/include/sonore/undo.h): UndoHistory: undo and redo for a plugin's own editor

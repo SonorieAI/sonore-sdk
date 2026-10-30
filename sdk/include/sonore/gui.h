@@ -30,6 +30,7 @@
 #include "plugin.h"
 #include "presets.h" // the bridge lists preset names, so it needs the full type
 #include "state_bag.h" // the bridge shows the bag, so it needs the full type
+#include "ui_assets.h" // the files a page brings, which every backend serves
 #include "simd.h"      // measureBlock is on the audio thread, so it vectorises
 
 namespace sonore {

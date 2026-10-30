@@ -260,7 +260,9 @@ function toolSearch(args) {
   // Not declared under that name. Before saying so, read the code itself, then
   // the comments: a name the SDK calls but you write (latencySamples on your
   // own DSP), or one its prose explains, is not "nothing".
-  const word = new RegExp(`\\b${words.join("\\W*")}\\b`, "i");
+  // [\W_]: an underscore joins the words of a name like sonore_add_plugin or
+  // SONORE_UI_HTML, and \W alone stepped over every one of them.
+  const word = new RegExp(`\\b${words.join("[\\W_]*")}\\b`, "i");
   const inCode = [], inComments = [];
   for (const h of HEADERS) {
     h.lines.forEach((line, i) => {
@@ -352,6 +354,7 @@ const EXAMPLE_KINDS = {
   effect: "saturator", instrument: "synth", sidechain: "ducker",
   "aux-outputs": "splitter", "midi-output": "arp", sampler: "sampler",
   "flexible-channels": "trim", reverb: "reverb", "native-editor": "showcase", app: "player",
+  "web-3d": "three",
 };
 
 /** An example's main source, and the local headers it pulls in (generated
@@ -369,6 +372,14 @@ function exampleFiles(dir) {
     if (!generated) for (const m of body.matchAll(/^\s*#\s*include\s+"([^"]+)"/gm)) visit(m[1]);
   };
   visit(main);
+  // A face served from a folder (sonore_add_ui): the page and its scripts are
+  // the example as much as the source is.
+  const ui = join(folder, "ui");
+  if (existsSync(ui)) {
+    for (const name of readdirSync(ui).sort()) {
+      if (statSync(join(ui, name)).isFile()) files.push({ file: `ui/${name}`, body: readFileSync(join(ui, name), "utf8"), generated: false });
+    }
+  }
   return files;
 }
 

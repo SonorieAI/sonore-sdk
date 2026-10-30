@@ -29,7 +29,11 @@
 #include <dlfcn.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <map>
+#include <set>
 #include <string>
 
 #include "gui.h"
@@ -91,6 +95,32 @@ struct Api {
   const char* (*webkit_uri_request_get_uri)(GObjectPtr) = nullptr;
   void (*webkit_policy_decision_ignore)(GObjectPtr) = nullptr;
 
+  // Serving a page's folder (ui_assets.h) under sonore-ui://. Resolved
+  // OPTIONALLY: a WebKitGTK lacking one of them still shows a page that is one
+  // string, as every plugin did before there were folders; canServe says
+  // whether all of them are there.
+  void (*webkit_web_view_load_uri)(GtkWidgetPtr, const char*) = nullptr;
+  GObjectPtr (*webkit_web_view_get_context)(GtkWidgetPtr) = nullptr;
+  void (*webkit_web_context_register_uri_scheme)(GObjectPtr, const char*, void (*)(GObjectPtr, void*),
+                                                 void*, void (*)(void*)) = nullptr;
+  GObjectPtr (*webkit_web_context_get_security_manager)(GObjectPtr) = nullptr;
+  void (*webkit_security_manager_register_uri_scheme_as_secure)(GObjectPtr, const char*) = nullptr;
+  void (*webkit_security_manager_register_uri_scheme_as_cors_enabled)(GObjectPtr, const char*) = nullptr;
+  const char* (*webkit_uri_scheme_request_get_uri)(GObjectPtr) = nullptr;
+  void (*webkit_uri_scheme_request_finish)(GObjectPtr, GObjectPtr, long long, const char*) = nullptr;
+  void (*webkit_uri_scheme_request_finish_error)(GObjectPtr, void*) = nullptr;
+  // 2.36 and later: a real 404 instead of a load error. Optional on top.
+  GObjectPtr (*webkit_uri_scheme_response_new)(GObjectPtr, long long) = nullptr;
+  void (*webkit_uri_scheme_response_set_status)(GObjectPtr, unsigned, const char*) = nullptr;
+  void (*webkit_uri_scheme_request_finish_with_response)(GObjectPtr, GObjectPtr) = nullptr;
+  void (*webkit_settings_set_enable_webgl)(GObjectPtr, int) = nullptr;
+  GObjectPtr (*g_memory_input_stream_new_from_data)(const void*, long, void (*)(void*)) = nullptr;
+  void (*g_object_unref)(GObjectPtr) = nullptr;
+  void* (*g_error_new_literal)(unsigned, int, const char*) = nullptr;
+  void (*g_error_free)(void*) = nullptr;
+  unsigned (*g_quark_from_static_string)(const char*) = nullptr;
+  bool canServe = false;
+
   bool ok = false;
   std::string error;
 };
@@ -105,6 +135,12 @@ inline void bind(void* lib, const char* name, Fn* out, Api* api) {
     return;
   }
   *out = reinterpret_cast<Fn>(sym);
+}
+
+/** A symbol that may be missing: no error, just a null. */
+template <typename Fn>
+inline void bindOptional(void* lib, const char* name, Fn* out) {
+  if (void* sym = lib ? dlsym(lib, name) : nullptr) *out = reinterpret_cast<Fn>(sym);
 }
 
 /** Resolve GTK + WebKit once per process. */
@@ -179,6 +215,39 @@ inline Api& api() {
     bind(wk, "webkit_uri_request_get_uri", &api.webkit_uri_request_get_uri, &api);
     bind(wk, "webkit_policy_decision_ignore", &api.webkit_policy_decision_ignore, &api);
 
+    // GIO is WebKitGTK's own dependency, so it is already loaded by now.
+    void* gio = dlopen("libgio-2.0.so.0", RTLD_LAZY | RTLD_GLOBAL);
+    bindOptional(wk, "webkit_web_view_load_uri", &api.webkit_web_view_load_uri);
+    bindOptional(wk, "webkit_web_view_get_context", &api.webkit_web_view_get_context);
+    bindOptional(wk, "webkit_web_context_register_uri_scheme", &api.webkit_web_context_register_uri_scheme);
+    bindOptional(wk, "webkit_web_context_get_security_manager", &api.webkit_web_context_get_security_manager);
+    bindOptional(wk, "webkit_security_manager_register_uri_scheme_as_secure",
+                 &api.webkit_security_manager_register_uri_scheme_as_secure);
+    bindOptional(wk, "webkit_security_manager_register_uri_scheme_as_cors_enabled",
+                 &api.webkit_security_manager_register_uri_scheme_as_cors_enabled);
+    bindOptional(wk, "webkit_uri_scheme_request_get_uri", &api.webkit_uri_scheme_request_get_uri);
+    bindOptional(wk, "webkit_uri_scheme_request_finish", &api.webkit_uri_scheme_request_finish);
+    bindOptional(wk, "webkit_uri_scheme_request_finish_error", &api.webkit_uri_scheme_request_finish_error);
+    bindOptional(wk, "webkit_uri_scheme_response_new", &api.webkit_uri_scheme_response_new);
+    bindOptional(wk, "webkit_uri_scheme_response_set_status", &api.webkit_uri_scheme_response_set_status);
+    bindOptional(wk, "webkit_uri_scheme_request_finish_with_response",
+                 &api.webkit_uri_scheme_request_finish_with_response);
+    bindOptional(wk, "webkit_settings_set_enable_webgl", &api.webkit_settings_set_enable_webgl);
+    bindOptional(gio, "g_memory_input_stream_new_from_data", &api.g_memory_input_stream_new_from_data);
+    bindOptional(gobj, "g_object_unref", &api.g_object_unref);
+    bindOptional(glib, "g_error_new_literal", &api.g_error_new_literal);
+    bindOptional(glib, "g_error_free", &api.g_error_free);
+    bindOptional(glib, "g_quark_from_static_string", &api.g_quark_from_static_string);
+    api.canServe = api.webkit_web_view_load_uri && api.webkit_web_view_get_context &&
+                   api.webkit_web_context_register_uri_scheme &&
+                   api.webkit_web_context_get_security_manager &&
+                   api.webkit_security_manager_register_uri_scheme_as_secure &&
+                   api.webkit_security_manager_register_uri_scheme_as_cors_enabled &&
+                   api.webkit_uri_scheme_request_get_uri && api.webkit_uri_scheme_request_finish &&
+                   api.webkit_uri_scheme_request_finish_error && api.g_memory_input_stream_new_from_data &&
+                   api.g_object_unref && api.g_error_new_literal && api.g_error_free &&
+                   api.g_quark_from_static_string;
+
     api.ok = api.error.empty();
     return api;
   }();
@@ -194,6 +263,97 @@ constexpr int kInjectTopFrameOnly = 1;
 /** WebKitPolicyDecisionType. */
 constexpr int kPolicyNavigationAction = 0;
 constexpr int kPolicyNewWindowAction = 1;
+
+// ── A page's folder, served under sonore-ui://<origin label>/ ───────────────
+//
+// WebKitGTK registers a scheme once per web context, and every editor in the
+// process shares the default one, so ONE handler answers for all of them and
+// finds the page by the host part of the address: the plugin's origin label
+// (uiOriginLabel), the name Windows serves under too. Every editor of one
+// plugin serves the same page and folder, so an entry is counted rather than
+// owned. The GTK main loop is the only thread that touches any of it.
+//
+// The scheme is registered SECURE and CORS-ENABLED. Without the second,
+// WebKit refuses fetch() and module scripts on a scheme that is not http(s),
+// and a page that imports three.js fails on its first line.
+namespace uidetail {
+
+struct ServedPage {
+  std::string html;
+  const UiAssets* assets = nullptr;
+  int editors = 0;
+};
+
+inline std::map<std::string, ServedPage>& servedPages() {
+  static std::map<std::string, ServedPage> pages;
+  return pages;
+}
+
+inline void answerUiRequest(GObjectPtr request, void*) {
+  Api& a = api();
+  std::string host, path;
+  const char* uri = a.webkit_uri_scheme_request_get_uri(request);
+  uiSplitSchemeUrl(uri ? uri : "", host, path);
+  const auto page = servedPages().find(host);
+  const unsigned char* data = nullptr;
+  size_t size = 0;
+  std::string mime;
+  void (*release)(void*) = nullptr;
+  if (page != servedPages().end()) {
+    if (uiAssetPath(path) == "editor.html") {
+      // A copy: the editor that owns this page may close before WebKit has
+      // read the stream to its end.
+      void* copy = std::malloc(page->second.html.size() + 1);
+      if (copy) {
+        std::memcpy(copy, page->second.html.data(), page->second.html.size());
+        data = (const unsigned char*) copy;
+        size = page->second.html.size();
+        release = &std::free;
+        mime = "text/html";
+      }
+    } else if (const UiAsset* asset = page->second.assets ? page->second.assets->find(path) : nullptr) {
+      data = asset->data; // compiled into the plugin: lives as long as it does
+      size = asset->size;
+      mime = uiMimeFor(asset->path);
+      mime = mime.substr(0, mime.find(';')); // the type alone; WebKit takes no parameters here
+    }
+  }
+  if (data) {
+    GObjectPtr stream = a.g_memory_input_stream_new_from_data(data, (long) size, release);
+    a.webkit_uri_scheme_request_finish(request, stream, (long long) size, mime.c_str());
+    a.g_object_unref(stream);
+    return;
+  }
+  // Not in the folder: a 404 where WebKit can say one, a load error where not.
+  if (a.webkit_uri_scheme_response_new && a.webkit_uri_scheme_response_set_status &&
+      a.webkit_uri_scheme_request_finish_with_response) {
+    GObjectPtr empty = a.g_memory_input_stream_new_from_data("", 0, nullptr);
+    GObjectPtr response = a.webkit_uri_scheme_response_new(empty, 0);
+    a.webkit_uri_scheme_response_set_status(response, 404, "Not Found");
+    a.webkit_uri_scheme_request_finish_with_response(request, response);
+    a.g_object_unref(response);
+    a.g_object_unref(empty);
+    return;
+  }
+  void* error = a.g_error_new_literal(a.g_quark_from_static_string("sonore-ui"), 404,
+                                      "not in the plugin's folder");
+  a.webkit_uri_scheme_request_finish_error(request, error);
+  a.g_error_free(error);
+}
+
+/** The scheme on this view's context, registered the first time it is met. */
+inline void serveUiScheme(GObjectPtr context) {
+  static std::set<GObjectPtr> registered;
+  if (!context || !registered.insert(context).second) return;
+  Api& a = api();
+  if (GObjectPtr security = a.webkit_web_context_get_security_manager(context)) {
+    a.webkit_security_manager_register_uri_scheme_as_secure(security, kUiScheme);
+    a.webkit_security_manager_register_uri_scheme_as_cors_enabled(security, kUiScheme);
+  }
+  a.webkit_web_context_register_uri_scheme(context, kUiScheme, &answerUiRequest, nullptr, nullptr);
+}
+
+} // namespace uidetail
 
 /**
  * A webview inside a GtkPlug, embedded in the host's X11 window.
@@ -224,9 +384,14 @@ public:
 
   ~WebViewHost() { destroy(); }
 
+  /** The folder the page is served with, for a page that is not the
+   *  plugin's own (see webview_win32.h). Before create(). */
+  void setAssets(const UiAssets* assets) { assets_ = assets; }
+
   bool create(unsigned long parentXWindow, uint32_t width, uint32_t height, std::string html,
-              std::string bridge, std::string /*userDataName*/) {
+              std::string bridge, std::string userDataName) {
     if (plug_) return true;
+    id_ = std::move(userDataName);
     width_ = width;
     height_ = height;
 
@@ -257,8 +422,9 @@ public:
    *  (a gtk_window), instead of a GtkPlug embedded in someone else's window.
    *  Everything after the parent differs not at all, so it is shared. */
   bool createInContainer(GtkWidgetPtr container, uint32_t width, uint32_t height,
-                         std::string html, std::string bridge, std::string /*userDataName*/) {
+                         std::string html, std::string bridge, std::string userDataName) {
     if (plug_) return true;
+    id_ = std::move(userDataName);
     width_ = width;
     height_ = height;
     Api& a = api();
@@ -285,10 +451,14 @@ private:
       return false;
     }
 
-    // A plugin face is an appliance: no dev tools.
+    // A plugin face is an appliance: no dev tools. WebGL said in so many
+    // words: it has been on by default for years, but a page drawing in 3D
+    // should not depend on a distribution's choice of default.
     if (a.webkit_web_view_get_settings && a.webkit_settings_set_enable_developer_extras) {
-      if (GObjectPtr settings = a.webkit_web_view_get_settings(webview_))
+      if (GObjectPtr settings = a.webkit_web_view_get_settings(webview_)) {
         a.webkit_settings_set_enable_developer_extras(settings, 0);
+        if (a.webkit_settings_set_enable_webgl) a.webkit_settings_set_enable_webgl(settings, 1);
+      }
     }
 
     // The bridge, injected before page script, plus the message channel the
@@ -305,11 +475,30 @@ private:
     // The page stays the page (webviewMayNavigate): asked before every
     // navigation, in the page and in its frames, and before every new window.
     a.g_signal_connect_data(webview_, "decide-policy", (void (*)()) &WebViewHost::onDecidePolicy,
-                            nullptr, nullptr, 0);
+                            this, nullptr, 0);
 
     a.gtk_widget_set_size_request(webview_, (int) width_, (int) height_);
     a.gtk_container_add(plug_, webview_);
-    a.webkit_web_view_load_html(webview_, html.c_str(), nullptr);
+    // A page with a folder is served, under the plugin's own origin, so its
+    // modules and files load by relative URL; one without is loaded as the
+    // string it is, as it always was.
+    if (!assets_) assets_ = registeredUiAssets();
+    if (assets_ && a.canServe) {
+      uidetail::serveUiScheme(a.webkit_web_view_get_context(webview_));
+      servedHost_ = uiOriginLabel(id_);
+      uidetail::ServedPage& page = uidetail::servedPages()[servedHost_];
+      page.html = html;
+      page.assets = assets_;
+      ++page.editors;
+      pageUri_ = std::string(kUiScheme) + "://" + servedHost_ + "/editor.html";
+      a.webkit_web_view_load_uri(webview_, pageUri_.c_str());
+    } else {
+      if (assets_) {
+        status_ = "this WebKitGTK cannot serve the page's folder; showing the page alone";
+        report();
+      }
+      a.webkit_web_view_load_html(webview_, html.c_str(), nullptr);
+    }
     a.gtk_widget_show_all(plug_);
 
     ready_ = true;
@@ -332,6 +521,13 @@ public:
       else if (webview_) a.gtk_widget_destroy(webview_);
       plug_ = nullptr;
       webview_ = nullptr;
+    }
+    if (!servedHost_.empty()) {
+      auto& pages = uidetail::servedPages();
+      const auto page = pages.find(servedHost_);
+      if (page != pages.end() && --page->second.editors <= 0) pages.erase(page);
+      servedHost_.clear();
+      pageUri_.clear();
     }
     ready_ = false;
     captureKeys = false; // the page that asked is gone (see webview_win32.h)
@@ -378,14 +574,19 @@ private:
    *  WebKit, whose default for a navigation is to go ahead -- which is what an
    *  allowed one wants, and what a response (type 2) should always get. A new
    *  window is refused whatever its address. */
-  static int onDecidePolicy(GtkWidgetPtr /*view*/, GObjectPtr decision, int type, void*) {
+  static int onDecidePolicy(GtkWidgetPtr /*view*/, GObjectPtr decision, int type, void* self) {
     if (type != kPolicyNavigationAction && type != kPolicyNewWindowAction) return 0;
     Api& a = api();
     if (type == kPolicyNavigationAction) {
       GObjectPtr action = a.webkit_navigation_policy_decision_get_navigation_action(decision);
       GObjectPtr request = action ? a.webkit_navigation_action_get_request(action) : nullptr;
       const char* uri = request ? a.webkit_uri_request_get_uri(request) : nullptr;
-      if (uri && webviewMayNavigate(uri)) return 0;
+      // The served page itself (and its reload) is the one address besides
+      // webviewMayNavigate's that the page may be at; another file of the
+      // folder is not a page to go to.
+      const auto* host = static_cast<const WebViewHost*>(self);
+      if (uri && (webviewMayNavigate(uri) || (host && !host->pageUri_.empty() && host->pageUri_ == uri)))
+        return 0;
     }
     a.webkit_policy_decision_ignore(decision);
     return 1;
@@ -412,6 +613,10 @@ private:
   GtkWidgetPtr plug_ = nullptr;
   GtkWidgetPtr webview_ = nullptr;
   bool ownsPlug_ = true;
+  /** The plugin's id, the folder, and where its page is served (empty when
+   *  it is loaded as a string). */
+  std::string id_, servedHost_, pageUri_;
+  const UiAssets* assets_ = nullptr;
   unsigned timer_ = 0;
   uint32_t width_ = 700, height_ = 420;
   bool ready_ = false;

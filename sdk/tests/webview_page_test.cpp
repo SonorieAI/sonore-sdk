@@ -170,7 +170,8 @@ static const PluginDescriptor& probeDescriptor() {
 
 static Outcome run(const std::string& html, int ms, double until,
                    const PluginDescriptor& desc = probeDescriptor(), double orUntil = -1.0,
-                   const float* values = nullptr, const char* pluginId = "sonore-page-test") {
+                   const float* values = nullptr, const char* pluginId = "sonore-page-test",
+                   const UiAssets* assets = nullptr) {
   Outcome out;
   HWND parent = CreateWindowExW(0, L"STATIC", L"webview page test", WS_OVERLAPPEDWINDOW, 0, 0,
                                 760, 520, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -185,6 +186,7 @@ static Outcome run(const std::string& html, int ms, double until,
     }
     if (m.kind == BridgeMessage::Kind::CaptureKeys) out.captures.push_back(m.value >= 0.5 ? 1 : 0);
   };
+  host.setAssets(assets);
   out.created = host.create(parent, 700, 420, html, bridgeScript(desc, values), pluginId);
   if (out.created) {
     const DWORD deadline = GetTickCount() + (DWORD) ms;
@@ -198,6 +200,28 @@ static Outcome run(const std::string& html, int ms, double until,
   DestroyWindow(parent);
   pump(100);
   return out;
+}
+
+// A page's folder (ui_assets.h), as sonore_add_ui() would have compiled it:
+// a module, a module it imports from a folder with a space in its name, a
+// worker, and 256 bytes holding every byte value once, so a fetch that
+// mangled any of them -- text decoding, a NUL taken for the end -- is seen.
+static const char kAnswerJs[] = "export {deep} from './dir with space/deep.js';\nexport const answer = 0.31;\n";
+static const char kDeepJs[] = "export const deep = 0.02;\n";
+static const char kWorkerJs[] = "onmessage = function (e) { postMessage(e.data * 2); };\n";
+static unsigned char g_everyByte[256];
+static const UiAsset kFolderItems[] = {
+    {"lib/answer.js", (const unsigned char*) kAnswerJs, sizeof(kAnswerJs) - 1},
+    {"lib/dir with space/deep.js", (const unsigned char*) kDeepJs, sizeof(kDeepJs) - 1},
+    {"worker.js", (const unsigned char*) kWorkerJs, sizeof(kWorkerJs) - 1},
+    {"data/bytes.bin", g_everyByte, sizeof(g_everyByte)},
+};
+static const UiAssets kFolder = {kFolderItems, sizeof(kFolderItems) / sizeof(kFolderItems[0]), nullptr};
+
+/** A page whose module runs `body` once the bridge is ready. */
+static std::string modulePage(const std::string& body) {
+  return "<!doctype html><html><head><meta charset='utf-8'><title>probe</title></head><body>"
+         "<script type='module'>" + body + "</script></body></html>";
 }
 
 static std::string page(const std::string& onReady, const std::string& padding = std::string()) {
@@ -570,6 +594,58 @@ int main() {
     std::snprintf(line, sizeof(line), "a closed editor keeps no copy of its 2.5 MB page (%lld bytes kept)",
                   kept);
     check(shown && kept < 256 * 1024, line);
+  }
+
+  // ── A page's folder (ui_assets.h, sonore_add_ui) ──
+  for (int i = 0; i < 256; ++i) g_everyByte[i] = (unsigned char) i;
+  const double kAnswer = 0.33; // 0.31 + 0.02: both modules, one importing the other
+  {
+    const Outcome o = run(modulePage("import {answer, deep} from './lib/answer.js';"
+                                     "addEventListener('sonore:ready',()=>sonore.set(0,answer+deep));"),
+                          kPatience, kAnswer, probeDescriptor(), -1.0, nullptr, "sonore-page-test", &kFolder);
+    check(o.saw(kAnswer), "an ES module imports a module from the folder, which imports another from a folder with a space in its name");
+  }
+  {
+    const Outcome o = run(page("fetch('data/bytes.bin').then(function(r){return r.arrayBuffer();}).then(function(b){"
+                               "var a=new Uint8Array(b),ok=a.length===256;"
+                               "for(var i=0;ok&&i<256;i++)ok=a[i]===i;sonore.set(0,ok?0.9:0.1);})"
+                               ".catch(function(){sonore.set(0,0.1);});"),
+                          kPatience, kYes, probeDescriptor(), kNo, nullptr, "sonore-page-test", &kFolder);
+    check(o.saw(kYes), "a fetch from the folder brings back all 256 byte values exactly");
+  }
+  {
+    const Outcome o = run(page("Promise.all([fetch('lib/answer.js'),fetch('data/bytes.bin'),fetch('missing.txt'),"
+                               "fetch('lib/answer.js?v=2#x')]).then(function(r){"
+                               "var js=(r[0].headers.get('content-type')||'').indexOf('text/javascript')===0;"
+                               "var bin=(r[1].headers.get('content-type')||'')==='application/octet-stream';"
+                               "sonore.set(0,js&&bin&&r[2].status===404&&r[3].status===200?0.9:0.1);})"
+                               ".catch(function(){sonore.set(0,0.1);});"),
+                          kPatience, kYes, probeDescriptor(), kNo, nullptr, "sonore-page-test", &kFolder);
+    check(o.saw(kYes), "a script is served as JavaScript, bytes as bytes, a query is ignored, and a missing file is a 404");
+  }
+  {
+    const Outcome o = run(page("var w=new Worker('worker.js');w.onmessage=function(e){sonore.set(0,e.data);};"
+                               "w.onerror=function(){sonore.set(0,0.1);};w.postMessage(0.35);"),
+                          kPatience, 0.7, probeDescriptor(), kNo, nullptr, "sonore-page-test", &kFolder);
+    check(o.saw(0.7), "a Web Worker starts from a script in the folder and answers");
+  }
+  {
+    // WebGL2, drawn and read back: a context that exists but draws nothing
+    // (a blocked GPU, a software path that is off) would still pass a test
+    // that only asked getContext.
+    const Outcome o = run(page("var c=document.createElement('canvas');c.width=c.height=4;"
+                               "var gl=c.getContext('webgl2');if(!gl){sonore.set(0,0.1);return;}"
+                               "gl.clearColor(1,0.5,0,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+                               "var p=new Uint8Array(4);gl.readPixels(1,1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,p);"
+                               "sonore.set(0,p[0]===255&&p[1]>120&&p[1]<136&&p[2]===0&&p[3]===255?0.9:0.1);"),
+                          kPatience, kYes, probeDescriptor(), kNo, nullptr, "sonore-page-test", &kFolder);
+    check(o.saw(kYes), "WebGL2 draws, and what it drew reads back");
+  }
+  {
+    const Outcome o = run(page("fetch('lib/answer.js').then(function(r){sonore.set(0,r.status===404?0.9:0.1);})"
+                               ".catch(function(){sonore.set(0,0.1);});"),
+                          kPatience, kYes, probeDescriptor(), kNo);
+    check(o.saw(kYes), "a page with no folder gets a 404 for a file, not a network error");
   }
 
   // The browser outlives the editor, for the next one. WebView2 shut its

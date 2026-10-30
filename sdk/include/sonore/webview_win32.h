@@ -421,9 +421,16 @@ private:
 
 public:
 
+  /** The folder the page is served with (ui_assets.h), for a page that is
+   *  not the plugin's own -- a test's. Before create(); without it create()
+   *  takes the plugin's (registeredUiAssets), which is null for a plugin
+   *  whose page is one string. */
+  void setAssets(const UiAssets* assets) { assets_ = assets; }
+
   bool create(HWND parent, uint32_t width, uint32_t height, std::string html,
               std::string bridge, std::string userDataName) {
     if (hwnd_) return true;
+    if (!assets_) assets_ = registeredUiAssets();
     width_ = width;
     height_ = height;
     html_ = std::move(html);
@@ -917,21 +924,8 @@ private:
    *  label is the id's letters and digits, lowered, the rest made hyphens,
    *  and a hash of the whole id, so two ids that read alike stay apart. */
   static std::wstring servedPageFor(const std::string& id) {
-    std::wstring label;
-    for (unsigned char c : id) {
-      if (label.size() >= 40) break;
-      if (c >= 'A' && c <= 'Z') c = (unsigned char) (c - 'A' + 'a');
-      const bool keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
-      if (keep) label += (wchar_t) c;
-      else if (!label.empty() && label.back() != L'-') label += L'-';
-    }
-    if (label.empty()) label = L"plugin"; // a label may not start with a hyphen
-    if (label.back() != L'-') label += L'-';
-    uint32_t hash = 2166136261u; // FNV-1a: stable across builds and runs
-    for (unsigned char c : id) hash = (hash ^ c) * 16777619u;
-    wchar_t hex[9];
-    std::swprintf(hex, 9, L"%08x", (unsigned) hash);
-    return L"https://" + label + hex + L".sonore.invalid/editor.html";
+    // uiOriginLabel is ASCII, so widening it is exact.
+    return L"https://" + widen(uiOriginLabel(id)) + L".sonore.invalid/editor.html";
   }
 
   /** The page, as the answer to a request for servedPage_, from memory.
@@ -945,29 +939,55 @@ private:
    *  every page reloads, and stores what it stores under its plugin's
    *  address. The copy is kept while the editor is open, as the answer to
    *  every request, and let go in destroy(). Only with no environment to
-   *  make a response in does the page go by NavigateToString. */
+   *  make a response in does the page go by NavigateToString.
+   *
+   *  The page's FOLDER is answered here too (ui_assets.h): every request to
+   *  this editor's origin -- a module, a fetch, an image, a worker -- is
+   *  looked up in it, and one it does not hold is a 404, never a trip to the
+   *  network (.invalid could not go anywhere anyway). A page without a
+   *  folder gets 404s for anything but itself, which is what it had. */
   void loadPage(ICoreWebView2Environment* env) {
     if (!env) {
       webview_->NavigateToString(widen(html_).c_str());
       std::string().swap(html_);
       return;
     }
-    webview_->AddWebResourceRequestedFilter(servedPage_.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    const std::wstring origin = servedPage_.substr(0, servedPage_.rfind(L'/') + 1);
+    webview_->AddWebResourceRequestedFilter((origin + L"*").c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
     EventRegistrationToken token{};
     auto* handler = new ResourceHandler(
-        [this, env](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+        [this, env, origin](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
           ICoreWebView2WebResourceRequest* request = nullptr;
           if (!args || FAILED(args->get_Request(&request)) || !request) return S_OK;
           LPWSTR uri = nullptr;
-          const bool ours =
-              SUCCEEDED(request->get_Uri(&uri)) && uri && servedPage_ == uri;
+          std::wstring address;
+          if (SUCCEEDED(request->get_Uri(&uri)) && uri) address = uri;
           if (uri) CoTaskMemFree(uri);
           request->Release();
-          if (!ours) return S_OK;
-          IStream* body = SHCreateMemStream((const BYTE*) html_.data(), (UINT) html_.size());
+          if (address.compare(0, origin.size(), origin) != 0) return S_OK;
+          const std::string path = narrow(address.substr(origin.size()).c_str());
+          const unsigned char* data = nullptr;
+          size_t size = 0;
+          std::wstring headers = L"Content-Type: text/html; charset=utf-8";
+          int status = 200;
+          if (uiAssetPath(path) == "editor.html") {
+            data = (const unsigned char*) html_.data();
+            size = html_.size();
+          } else if (const UiAsset* asset = assets_ ? assets_->find(path) : nullptr) {
+            data = asset->data;
+            size = asset->size;
+            headers = L"Content-Type: " + widen(uiMimeFor(asset->path));
+          } else {
+            status = 404;
+            headers = L"Content-Type: text/plain; charset=utf-8";
+          }
+          // A memory stream copies what it is given, so the answer outlives
+          // nothing it points at.
+          IStream* body = status == 200 ? SHCreateMemStream(data, (UINT) size) : nullptr;
           ICoreWebView2WebResourceResponse* response = nullptr;
-          if (body && SUCCEEDED(env->CreateWebResourceResponse(
-                          body, 200, L"OK", L"Content-Type: text/html; charset=utf-8", &response)) &&
+          if ((body || status != 200) &&
+              SUCCEEDED(env->CreateWebResourceResponse(body, status, status == 200 ? L"OK" : L"Not Found",
+                                                       headers.c_str(), &response)) &&
               response) {
             args->put_Response(response);
             response->Release();
@@ -1005,6 +1025,8 @@ private:
   /** Shared with every pending async handler; see startWebView. */
   std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
   std::string html_, bridge_, userDataName_, status_;
+  /** The page's folder, served beside it; null when it has none. */
+  const UiAssets* assets_ = nullptr;
   /** Where this editor's page is served (servedPageFor), set by create(). */
   std::wstring servedPage_;
 

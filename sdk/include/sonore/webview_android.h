@@ -67,6 +67,28 @@ inline void pageMessage(JNIEnv* e, jclass, jlong owner, jstring json) {
   });
 }
 
+/** SonoreBridge.folderFile: a file of the page's folder, on the WebView's
+ *  own thread. The folder is a table compiled into the plugin, so it is
+ *  there whatever the editor is doing. */
+inline jbyteArray folderFile(JNIEnv* e, jclass, jlong folder, jstring path) {
+  const auto* assets = reinterpret_cast<const UiAssets*>((intptr_t) folder);
+  const UiAsset* file = assets ? assets->find(utf8(e, path)) : nullptr;
+  if (!file) return nullptr;
+  jbyteArray out = e->NewByteArray((jsize) file->size);
+  if (out && file->size) e->SetByteArrayRegion(out, 0, (jsize) file->size, (const jbyte*) file->data);
+  return out;
+}
+
+/** SonoreBridge.folderType: its MIME type, without parameters (Android takes
+ *  the encoding apart). */
+inline jstring folderType(JNIEnv* e, jclass, jlong folder, jstring path) {
+  const auto* assets = reinterpret_cast<const UiAssets*>((intptr_t) folder);
+  const UiAsset* file = assets ? assets->find(utf8(e, path)) : nullptr;
+  std::string mime = file ? uiMimeFor(file->path) : "application/octet-stream";
+  mime = mime.substr(0, mime.find(';'));
+  return e->NewStringUTF(mime.c_str());
+}
+
 } // namespace webviewdetail
 
 /** The plugin's page in an Android WebView. The shape every backend has. */
@@ -82,11 +104,16 @@ public:
   WebViewHost(const WebViewHost&) = delete;
   WebViewHost& operator=(const WebViewHost&) = delete;
 
+  /** The folder the page is served with, for a page that is not the
+   *  plugin's own (see webview_win32.h). Before create(). */
+  void setAssets(const UiAssets* assets) { assets_ = assets; }
+
   /** The page, `width` x `height` logical pixels at the top left of the free
    *  part of the screen. `parent` is unused: the activity is the parent. */
   bool create(void* /*parent*/, uint32_t width, uint32_t height, std::string html, std::string bridge,
               std::string /*userDataName*/) {
     if (view_) return true;
+    if (!assets_) assets_ = registeredUiAssets();
     JNIEnv* e = env();
     ANativeActivity* activity = currentActivity();
     jclass bridgeClass = android::bridgeClass();
@@ -98,16 +125,18 @@ public:
     if (!bound) {
       static const JNINativeMethod natives[] = {
           {"pageMessage", "(JLjava/lang/String;)V", (void*) &webviewdetail::pageMessage},
+          {"folderFile", "(JLjava/lang/String;)[B", (void*) &webviewdetail::folderFile},
+          {"folderType", "(JLjava/lang/String;)Ljava/lang/String;", (void*) &webviewdetail::folderType},
       };
-      bound = registerNatives(natives, 1);
+      bound = registerNatives(natives, 3);
       if (!bound) {
-        status_ = "the app's SonoreBridge has no pageMessage";
+        status_ = "the app's SonoreBridge lacks pageMessage, folderFile or folderType";
         return false;
       }
     }
     jmethodID make = e->GetStaticMethodID(
         bridgeClass, "createWebView",
-        "(Landroid/app/Activity;JLjava/lang/String;IIII)Landroid/webkit/WebView;");
+        "(Landroid/app/Activity;JJLjava/lang/String;IIII)Landroid/webkit/WebView;");
     if (failed(e) || !make) {
       status_ = "SonoreBridge.createWebView is missing";
       return false;
@@ -119,7 +148,8 @@ public:
     placement(&x, &y, &w, &h);
     jstring page = e->NewStringUTF(withBridge(html, bridge).c_str());
     jobject view = e->CallStaticObjectMethod(bridgeClass, make, activity->clazz,
-                                             (jlong) (intptr_t) this, page, x, y, w, h);
+                                             (jlong) (intptr_t) this, (jlong) (intptr_t) assets_, page,
+                                             x, y, w, h);
     e->DeleteLocalRef(page);
     if (failed(e) || !view) {
       webviewdetail::live().erase(this);
@@ -228,6 +258,8 @@ private:
   }
 
   jobject view_ = nullptr;
+  /** The page's folder, handed to Java by address; null when it has none. */
+  const UiAssets* assets_ = nullptr;
   uint32_t width_ = 700, height_ = 420;
   bool ready_ = false;
   uint64_t frames_ = 0;

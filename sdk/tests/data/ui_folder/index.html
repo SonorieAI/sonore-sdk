@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>UI folder probe</title></head>
+<body style="margin:0;background:#101317;color:#cfe;font:13px system-ui">
+<div id="log">loading the folder...</div>
+<script type="module">
+// Every link of a page served from a folder, checked before anything moves:
+// two ES modules, a binary fetch, and WebGL2 drawn and read back.
+import { half, part } from "./lib/proof.js";
+
+const log = (t) => (document.getElementById("log").textContent = t);
+
+async function prove() {
+  if (half !== 0.388 || part !== 0.001) return "modules";
+  const bytes = new Uint8Array(await (await fetch("data/bytes.bin")).arrayBuffer());
+  if (bytes.length !== 256) return "bytes: length " + bytes.length;
+  for (let i = 0; i < 256; ++i) if (bytes[i] !== i) return "bytes: " + i;
+  const c = document.createElement("canvas");
+  c.width = c.height = 4;
+  const gl = c.getContext("webgl2");
+  if (!gl) return "webgl2: no context";
+  gl.clearColor(0, 1, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  const px = new Uint8Array(4);
+  gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  if (px[0] !== 0 || px[1] !== 255 || px[2] !== 0) return "webgl2: read " + px.join(",");
+  return "";
+}
+
+addEventListener("sonore:ready", async () => {
+  let fault;
+  try {
+    fault = await prove();
+  } catch (e) {
+    fault = String(e && e.message || e);
+  }
+  log(fault ? "FAILED: " + fault : "folder ok");
+  if (fault) return;
+  sonore.begin("proof");
+  sonore.set("proof", half * 2 + part);
+  sonore.end("proof");
+});
+</script>
+</body>
+</html>

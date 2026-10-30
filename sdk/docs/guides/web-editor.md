@@ -153,6 +153,54 @@ The frames arrive only when the spectrum changes, so do not use them as a
 clock. `sonore.spectrumFrame` holds the newest frame as `{out, in, sr}`. LV2 does not feed a
 spectrum yet, because its interface is a separate module that sees only ports.
 
+## A folder beside the page
+
+A page can bring files: ES modules, a 3D library and its models, textures,
+HDRIs, fonts, wasm. Put them in a folder next to the page and compile the
+folder into the plugin. Every backend serves it at the page's own address, so
+the page loads its files by relative URL, as it would from a web server:
+
+```cmake
+sonore_add_plugin(Orbit SOURCES plugin.cpp
+  CLAP Orbit VST3 OrbitVST3
+  UI_DIR ui UI_ENTRY index.html)
+sonore_add_standalone(OrbitApp SOURCES plugin.cpp UI_DIR ui UI_ENTRY index.html)
+```
+
+With `UI_ENTRY` the page itself comes from the folder, so the source needs no
+`SONORE_UI_HTML`; the entry has to sit at the top of the folder. For a target
+made by one of the single-format helpers, call `sonore_add_ui(<target> DIR ui
+ENTRY index.html)`. The folder is read at build time, so an edited file is
+rebuilt in; a new file is picked up on the next configure, which the build
+starts by itself.
+
+```html
+<script type="importmap">
+  { "imports": { "three": "./vendor/three.module.js" } }
+</script>
+<script type="module">
+  import * as THREE from "three";
+  const bytes = await (await fetch("models/knob.glb")).arrayBuffer();
+  addEventListener("sonore:ready", () => { /* build the scene, bind sonore.on */ });
+</script>
+```
+
+A module runs before `sonore:ready` fires, so a module can listen for it.
+What the folder holds is answered from memory with its MIME type (a module as
+JavaScript, wasm as `application/wasm`); anything else under the page's
+address is a 404. Nothing comes from the network: a page still cannot navigate
+away, and a CDN address does not resolve inside a plugin. Hidden files
+(`.DS_Store`) stay out. The folder ends up in the binary: about 1.3 MB of
+three.js and an HDRI embeds in two seconds and compiles in one.
+
+WebGL works in every webview, on the GPU (Direct3D on Windows, Metal on
+macOS). Draw when something changed, or at most 30 frames a second while an
+animation runs, and stop while `document.hidden` is true: an editor left open
+in a DAW otherwise keeps a GPU busy all session. The first frame compiles the
+scene's shaders, which on Direct3D takes a second or two for a lit scene;
+WebView2 keeps them for the next open. A page should still work if
+`getContext("webgl2")` returns null.
+
 ## Per platform
 
 - **Windows**: Edge WebView2. Its SDK (BSD-3-Clause) is fetched from nuget.org
@@ -170,9 +218,11 @@ On Windows the page is served from memory at an address of the plugin's own,
 `https://<plugin id>-<hash>.sonore.invalid/editor.html`, which never leaves the
 process. It reloads like any page, and `localStorage` and IndexedDB work: kept
 per plugin (shared by its instances, not by other plugins) and across sessions.
-On Linux and macOS the page is loaded as a string with no address of its own,
-so a page that has to run on every platform should not depend on `localStorage`
-or on reloading itself.
+On Linux and macOS a page with a folder is served the same way, under
+`sonore-ui://<plugin id>-<hash>/editor.html`, and on Android under
+`https://appassets.sonore.local/`. A page without a folder is loaded there as a
+string, with no address of its own, so a page that has to run on every
+platform should not depend on `localStorage` or on reloading itself.
 
 Either way, keep anything the session must restore in a parameter or in the
 plugin's own state (what its `saveState` writes; the page reads it as

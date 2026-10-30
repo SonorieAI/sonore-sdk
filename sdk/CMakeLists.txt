@@ -194,6 +194,23 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   sonore_add_clap(SonoreArp SOURCES examples/arp/plugin.cpp)
   sonore_add_clap(SonoreSampler SOURCES examples/sampler/plugin.cpp)
   sonore_add_clap(SonoreReverb SOURCES examples/reverb/plugin.cpp)
+  # A face drawn with three.js, served from a folder (sonore_add_ui). three.js
+  # is fetched at configure, pinned and checked (examples/three/three.cmake);
+  # offline, or with SONORE_EXAMPLE_THREE=OFF, the example is skipped.
+  option(SONORE_EXAMPLE_THREE "Build examples/three (fetches three.js from npm at configure)" ON)
+  if(SONORE_EXAMPLE_THREE)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/examples/three/three.cmake")
+    if(SONORE_THREE_UI)
+      sonore_add_plugin(SonoreThree SOURCES examples/three/plugin.cpp
+        CLAP SonoreThree VST3 SonoreThreeVST3
+        UI_DIR "${SONORE_THREE_UI}" UI_ENTRY index.html)
+      sonore_add_standalone(SonoreThreeApp SOURCES examples/three/plugin.cpp
+        UI_DIR "${SONORE_THREE_UI}" UI_ENTRY index.html)
+      if(WIN32 AND SONORE_GUI)
+        add_test(NAME clap_three COMMAND clap_host_test $<TARGET_FILE:SonoreThree> --expect-web-editor)
+      endif()
+    endif()
+  endif()
   # The two examples that put the newer pieces together. The showcase is a
   # plugin with a NATIVE editor of its own -- APVTS attachments, menus, an SVG
   # logo, a JPEG backdrop, a typed curve -- built like the saturator: one
@@ -1354,6 +1371,17 @@ elseif(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     sonore_add_vst3(SonoreGuiProbeVST3 SOURCES examples/guiprobe/plugin.cpp)
     add_test(NAME vst3_gui_bridge
              COMMAND vst3_host_test $<TARGET_FILE:SonoreGuiProbeVST3> --expect-bridge)
+
+    # A page that is a FOLDER (sonore_add_ui), through the whole helper:
+    # sonore_add_plugin's UI_DIR/UI_ENTRY, the generated tables, the
+    # registration in the wrapper and WebView2 serving them. The page checks
+    # its modules, its bytes and WebGL2 before it moves the parameter.
+    sonore_add_plugin(SonoreUiFolderProbe SOURCES tests/ui_folder_fixture.cpp
+      CLAP SonoreUiFolderProbe
+      UI_DIR tests/data/ui_folder UI_ENTRY index.html)
+    add_test(NAME clap_ui_folder
+             COMMAND clap_host_test $<TARGET_FILE:SonoreUiFolderProbe> --expect-web-editor
+                     --expect-page-sets 0=0.777)
 
     # Photographs a built plugin's real interface. Not a ctest: it needs a
     # desktop session, and its output is for a human to look at.

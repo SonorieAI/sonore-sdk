@@ -13197,6 +13197,70 @@ static void testWebviewNavigation() {
         "the bridge sets itself up in the page's own document, not in its frames");
 }
 
+// ── The files a page brings (ui_assets.h) ────────────────────────────────────
+//
+// Every backend turns a request's path into a key with uiAssetPath and serves
+// what the folder holds under it, with uiMimeFor's type. Pure, so tested here
+// where every platform runs it; the serving itself is webview_page_test's and
+// clap_ui_folder's, on a real webview.
+static void testUiAssets() {
+  std::printf("\n[ui assets]\n");
+  using sonore::uiAssetPath;
+  check(uiAssetPath("/three.module.min.js") == "three.module.min.js" &&
+            uiAssetPath("lib/app.js") == "lib/app.js" &&
+            uiAssetPath("/lib/app.js?v=2#top") == "lib/app.js" &&
+            uiAssetPath("/dir%20with%20space/a.js") == "dir with space/a.js" &&
+            uiAssetPath("/%E2%9C%93.png") == "\xE2\x9C\x93.png",
+        "a request's path becomes a key: no leading slash, query and fragment dropped, %XX decoded");
+  check(uiAssetPath("") == "" && uiAssetPath("/") == "" && uiAssetPath("?x") == "" &&
+            uiAssetPath("../editor.html") == "" && uiAssetPath("/a/../b.js") == "" &&
+            uiAssetPath("/./a.js") == "" && uiAssetPath("/a//b.js") == "" &&
+            uiAssetPath("/a/b.js/") == "" && uiAssetPath("/a\\b.js") == "" &&
+            uiAssetPath("/%2e%2e/secret") == "" && uiAssetPath("/a%5C..%5Cb") == "" &&
+            uiAssetPath("/a%00b.js") == "" && uiAssetPath("/a%2") == "" && uiAssetPath("/a%zz") == "",
+        "a path that names nothing or climbs, spelled plainly or %-encoded, is refused");
+
+  using sonore::uiMimeFor;
+  check(std::string(uiMimeFor("app.js")).rfind("text/javascript", 0) == 0 &&
+            std::string(uiMimeFor("x.MJS")).rfind("text/javascript", 0) == 0 &&
+            std::string(uiMimeFor("index.html")).rfind("text/html", 0) == 0 &&
+            std::string(uiMimeFor("decoder.WASM")) == "application/wasm" &&
+            std::string(uiMimeFor("model.glb")) == "model/gltf-binary" &&
+            std::string(uiMimeFor("studio.hdr")) == "image/vnd.radiance" &&
+            std::string(uiMimeFor("font.woff2")) == "font/woff2",
+        "a module is served as JavaScript and wasm as wasm, in any case of extension");
+  check(std::string(uiMimeFor("LICENSE")) == "application/octet-stream" &&
+            std::string(uiMimeFor("v1.2/LICENSE")) == "application/octet-stream" &&
+            std::string(uiMimeFor("data.unknownext")) == "application/octet-stream",
+        "anything else is bytes: no extension, a dot only in a folder name, an unknown one");
+
+  static const char kIndex[] = "<!doctype html>";
+  static const unsigned char kBytes[] = {0, 1, 2, 255};
+  static const sonore::UiAsset kItems[] = {
+      {"index.html", (const unsigned char*) kIndex, sizeof(kIndex) - 1},
+      {"data/four.bin", kBytes, sizeof(kBytes)},
+  };
+  const sonore::UiAssets folder{kItems, 2, "index.html"};
+  const sonore::UiAsset* four = folder.find("/data/four.bin?cache=1");
+  check(four && four->size == 4 && four->data[3] == 255 && !folder.find("/data/") &&
+            !folder.find("/data/four.bin/") && !folder.find("/DATA/four.bin") &&
+            !folder.find("/data/../index.html"),
+        "the folder finds a file by its exact path, and nothing by a near miss or a climb");
+  check(folder.entryAsset() && folder.entryAsset()->size == sizeof(kIndex) - 1 &&
+            !sonore::UiAssets{kItems, 2, nullptr}.entryAsset() &&
+            !sonore::UiAssets{kItems, 2, "missing.html"}.entryAsset(),
+        "the entry page is a file of the folder, or nothing");
+  // The origin a plugin's page is served at: computed by the rule Windows
+  // used before it was shared, so a page's stored settings are still found.
+  using sonore::uiOriginLabel;
+  check(uiOriginLabel("com.sonorie.example.saturator") == "com-sonorie-example-saturator-a6b57d9e" &&
+            uiOriginLabel("") == "plugin-811c9dc5" &&
+            uiOriginLabel("\xC3\x9Cn\xC3\xAF" "code Plugin!!") == "n-code-plugin-8d9c28fc" &&
+            uiOriginLabel("com.a-very-long-vendor-name.with-a-very-long-product-name.v2") ==
+                "com-a-very-long-vendor-name-with-a-very-c7a912f0",
+        "a plugin's page keeps the origin it always had, so its stored settings stay found");
+}
+
 static void testDeviceBridge() {
   using sonore::BridgeMessage;
   using sonore::parseBridgeMessage;
@@ -39904,6 +39968,7 @@ int main() {
 #endif
   testDeviceBridge();
   testWebviewNavigation();
+  testUiAssets();
   testLoadMeasurer();
   testRpnGenerator();
   testGfxGeometry();

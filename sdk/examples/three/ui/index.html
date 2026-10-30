@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sonore Orbit</title>
+<link rel="icon" href="data:,">
+<!-- three.js is in the folder too (the build puts it in vendor/three), so the
+     import map names it by relative URL: nothing here reaches the network. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/three.module.js",
+    "three/addons/": "./vendor/three/addons/"
+  }
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1013; overflow: hidden;
+               font: 600 12px/1.2 system-ui, sans-serif; color: #d9dde2; }
+  #stage { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  /* The text is HTML over the canvas: sharp at any scale, and readable. */
+  .label { position: absolute; transform: translate(-50%, 0); text-align: center;
+           pointer-events: none; letter-spacing: .12em; }
+  .label b { display: block; margin-top: 3px; font-size: 14px; letter-spacing: 0; color: #f2e6c8; }
+  #title { position: absolute; left: 22px; top: 16px; letter-spacing: .3em; color: #9aa3ad; }
+  #fallback { padding: 20px; display: none; }
+  #fallback label { display: flex; gap: 12px; align-items: center; margin: 10px 0; }
+  #fallback input { flex: 1; }
+</style>
+</head>
+<body>
+<canvas id="stage" aria-hidden="true"></canvas>
+<div id="title">SONORE ORBIT</div>
+<div id="labels"></div>
+<div id="fallback"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
